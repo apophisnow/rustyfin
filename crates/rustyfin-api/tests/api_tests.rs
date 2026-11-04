@@ -469,7 +469,12 @@ async fn test_remote_browsing_burst_is_not_rate_limited() {
     .bind(lib.id.to_string())
     .bind("Burst Movie")
     .bind("Movie")
-    .bind(media_dir.join("Burst Movie.mkv").to_string_lossy().to_string())
+    .bind(
+        media_dir
+            .join("Burst Movie.mkv")
+            .to_string_lossy()
+            .to_string(),
+    )
     .execute(&state.db)
     .await
     .unwrap();
@@ -554,7 +559,11 @@ async fn test_public_non_login_endpoints_are_not_rate_limited() {
     state.rate_limiter = RateLimiter::new(3, 60);
     let app = remote_app(state);
 
-    for uri in ["/System/Info/Public", "/QuickConnect/Enabled", "/Users/Public"] {
+    for uri in [
+        "/System/Info/Public",
+        "/QuickConnect/Enabled",
+        "/Users/Public",
+    ] {
         for attempt in 1..=10 {
             let resp = app
                 .clone()
@@ -610,7 +619,12 @@ async fn test_password_reset_endpoints_share_the_login_rate_limit() {
             .body(Body::from(body.to_string()))
             .unwrap()
     };
-    let login = || post("/Users/AuthenticateByName", r#"{"Username":"nobody","Pw":"x"}"#);
+    let login = || {
+        post(
+            "/Users/AuthenticateByName",
+            r#"{"Username":"nobody","Pw":"x"}"#,
+        )
+    };
     let forgot = || post("/Users/ForgotPassword", r#"{"EnteredUsername":"nobody"}"#);
     let reset = || {
         post(
