@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Web client translations**: The web client is localized with i18next, with English and German translations in `crates/rustyfin-web/src/translations/` (one JSON file per language, English as the source). The display language follows the browser and can be changed in the setup wizard and in the user settings; picking it in the wizard switches the UI immediately. Previously the UI was German only.
 
+### Changed
+- **pnpm for the web client**: `crates/rustyfin-web` uses pnpm instead of npm. `package.json` pins the version in `packageManager` (Corepack and `pnpm/action-setup` read it), and `pnpm-lock.yaml` replaces `package-lock.json` with the same dependency versions. The release workflow, `build.sh`, `start.sh` and the README use pnpm.
+
 ### Fixed
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
 
