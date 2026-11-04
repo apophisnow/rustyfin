@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A leftover `admin` account whose password is still `admin` is disabled once the owner is created under another name.
   - The wizard shows every failed step and resumes there on retry.
   - `start.sh smoke` creates a throwaway owner in a temporary data directory.
+- **Library folders**: Creating a library now checks its folders. Before, `POST /Library/VirtualFolders` stored any path, so the setup wizard and the library dialog accepted a folder that does not exist, and the library's scan found nothing. Now each path must be a full path to a folder that exists on the server and that the server can list. Otherwise the server stores nothing and answers 400 with a message that names each bad path and the reason, for example `The folder "/media/films" was not found on the server.` In Docker, the paths are the ones inside the container.
 
 ## [0.14.0] - 2026-11-03
 
