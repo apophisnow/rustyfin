@@ -239,6 +239,7 @@ async function wizComplete() {
                     const lib = await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
                     wizProgress.libraryCreated = true;
                     // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
+                    toast(t('library.created', { name: libName }));
                     API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
                 } catch (e) {
                     showFinishError(t('wizard.library_create_failed', { message: e.message }));
@@ -304,14 +305,36 @@ function closeUserMenu() { $('user-dropdown')?.classList.add('hidden'); }
 document.addEventListener('click', e => {
     if (!e.target.closest('#nav-user-menu')) closeUserMenu();
 });
+
+// Toasts that a scan started, once. Refresh answers only when the scan ends, so the toast shows 300 ms after
+// sending, or when the request ends if sooner; a request that fails before then, such as a 404 for a deleted
+// library, shows only the error.
+function startScanWithToast(request, startedMessage) {
+    let started = false;
+    const showStarted = () => {
+        if (started) return;
+        started = true;
+        toast(startedMessage);
+    };
+    const timer = setTimeout(showStarted, 300);
+    return request.then(showStarted, err => {
+        clearTimeout(timer);
+        toast(t(started ? 'library.scan_failed' : 'library.scan_start_failed', { message: err.message }), 'error');
+    }).finally(() => clearTimeout(timer));
+}
+
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
     play: el => playItem(el.dataset.id, el.dataset.streamType, el.dataset.title, { fromStart: el.dataset.fromStart === 'true' }),
-    'scan-library': el => API.scanLibrary(el.dataset.id).then(() => toast(t('library.scan_started_for', { name: el.dataset.name }))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
-    'scan-library-page': el => API.scanLibrary(el.dataset.id).then(() => { toast(t('library.media_scan_started_for', { name: el.dataset.name })); scanStatuses[el.dataset.id] = true; }).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
-    'scan-library-admin': el => API.scanLibrary(el.dataset.id).then(() => toast(t('admin.scan_started'))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
-    'scan-all': () => API.scanAllLibraries().then(() => toast(t('admin.scanning_all'))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
+    'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
+    'scan-library-page': el => {
+        const id = el.dataset.id;
+        scanStatuses[id] = true;
+        startScanWithToast(API.scanLibrary(id), t('library.media_scan_started_for', { name: el.dataset.name })).finally(() => delete scanStatuses[id]);
+    },
+    'scan-library-admin': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('admin.scan_started')),
+    'scan-all': () => startScanWithToast(API.scanAllLibraries(), t('admin.scanning_all')),
     'jump-letter': el => jumpToLetter(el.dataset.id, el.dataset.letter),
     'toggle-favorite': el => toggleFavorite(el.dataset.id, el.dataset.favorite === 'true'),
     'toggle-played': el => togglePlayed(el.dataset.id, el.dataset.played === 'true'),
@@ -2745,33 +2768,6 @@ openAddLibrary = function() {
     _origOpenAddLibrary();
 };
 
-// --- Scan Progress ---
-let scanProgressTimeout = null;
-
-function showScanProgress(message) {
-    const el = $('scan-progress');
-    const textEl = $('scan-progress-text');
-    if (el) el.classList.remove('hidden');
-    if (textEl) textEl.textContent = message;
-    
-    // Clear any existing timeout
-    if (scanProgressTimeout) {
-        clearTimeout(scanProgressTimeout);
-        scanProgressTimeout = null;
-    }
-}
-
-function hideScanProgress() {
-    const el = $('scan-progress');
-    if (el) el.classList.add('hidden');
-    
-    // Auto-hide after 3 seconds
-    scanProgressTimeout = setTimeout(() => {
-        if (el) el.classList.add('hidden');
-        scanProgressTimeout = null;
-    }, 3000);
-}
-
 // --- WebSocket for scan progress ---
 // The scan progress socket while it connects or is open, or null
 let scanSocket = null;
@@ -2807,7 +2803,6 @@ function initScanProgressWebSocket() {
         try {
             const data = JSON.parse(event.data);
             if (data.MessageType === 'ScheduledTaskStarted') {
-                showScanProgress(data.Name || t('library.processing'));
                 // Track per-library scan status
                 const libId = data.ItemId;
                 if (libId) scanStatuses[libId] = true;
@@ -2817,10 +2812,7 @@ function initScanProgressWebSocket() {
                 // Clear per-library scan status
                 const libId = data.ItemId;
                 if (libId) delete scanStatuses[libId];
-                if (data.State === 'Completed') {
-                    hideScanProgress();
-                } else if (data.State === 'Failed') {
-                    hideScanProgress();
+                if (data.State === 'Failed') {
                     toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
                 }
                 // Refresh tasks tab if visible
