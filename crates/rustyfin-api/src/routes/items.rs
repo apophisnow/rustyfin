@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::routes::playback::path_user;
+use crate::routes::playback::{path_user, query_user};
 use crate::state::AppState;
 
 /// Populate `media_sources` on each item using a single batched query.
@@ -1647,6 +1647,7 @@ async fn get_items(
         query.premiere_date(),
         query.date_created(),
         runtime_parts,
+        Some(claims.sub),
     )
     .await?;
 
@@ -1949,8 +1950,12 @@ async fn get_resume(
     Query(query): Query<ResumeQuery>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    let user = query_user(&state, &claims, query.user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
     let limit = query.limit.unwrap_or(10);
-    let mut items = rustyfin_db::repo_media::get_resume_items(&state.db_ro, limit).await?;
+    let mut items =
+        rustyfin_db::repo_media::get_user_resume_items(&state.db_ro, user, limit).await?;
     let total = items.len() as i64;
     // Enrich resume items using batch queries
     // Skip blurhash for list views to avoid per-item disk I/O
@@ -1959,7 +1964,7 @@ async fn get_resume(
     enrich_items(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        Some(user),
         &mut items,
         &state.http_client,
         tmdb.as_ref(),
@@ -1979,6 +1984,8 @@ async fn get_resume(
 #[serde(rename_all = "PascalCase")]
 struct ResumeQuery {
     limit: Option<i64>,
+    #[serde(alias = "userId")]
+    user_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -2210,6 +2217,9 @@ async fn delete_rating(
     Extension(claims): Extension<Claims>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
+        .await?
+        .ok_or(ApiError::NotFound("item not found".into()))?;
     rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id)
         .await
         .ok();
