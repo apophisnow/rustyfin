@@ -6357,3 +6357,35 @@ async fn g2c_direct_lan_client_is_local_only_without_a_forwarding_header() {
         "the same LAN peer without it stays local"
     );
 }
+
+#[tokio::test]
+async fn g2c_device_delete_by_path_ends_that_devices_sessions() {
+    // DELETE /Devices/{deviceId} signs the device out like DELETE /Devices?id=. 9dd5a44 deleted only
+    // the device row and left its tokens valid.
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (victim_t, _) = g2_login_device(&app, "owner", "pw-owner", "victim-dev")
+        .await
+        .expect("login on the device to delete");
+    let (admin_t, _) = g2_login_device(&app, "owner", "pw-owner", "admin-dev")
+        .await
+        .expect("login on another device");
+    let (status, body) = send(
+        &app,
+        request("DELETE", "/Devices/victim-dev", Some(&admin_t), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "device delete: {body:?}");
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&victim_t), None)).await;
+    assert_eq!(
+        me,
+        StatusCode::UNAUTHORIZED,
+        "the deleted device's token is revoked"
+    );
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&admin_t), None)).await;
+    assert_eq!(me, StatusCode::OK, "other devices stay signed in");
+}
