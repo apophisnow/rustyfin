@@ -5026,3 +5026,102 @@ async fn g4_active_encodings_needs_a_name() {
     let (status, _) = send(&app, request("DELETE", uri, None, None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// Stores a media source for `item` at `file` with one stream per (CodecType, codec) pair.
+async fn g4_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    container: &str,
+    file: &std::path::Path,
+    streams: &[(&str, &str)],
+) {
+    let streams: Vec<serde_json::Value> = streams
+        .iter()
+        .enumerate()
+        .map(|(index, (codec_type, codec))| {
+            serde_json::json!({ "Index": index, "Codec": codec, "CodecType": codec_type })
+        })
+        .collect();
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": container,
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn g4_universal_sends_unplayable_audio_to_transcode() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-universal");
+    let mut items = Vec::new();
+    for (name, video, audio) in [
+        ("G4 AC3.mp4", "h264", "ac3"),
+        ("G4 HEVC.mp4", "hevc", "aac"),
+        ("G4 AAC.mp4", "h264", "aac"),
+    ] {
+        let file = std::path::Path::new(&folder).join(name);
+        std::fs::write(&file, b"g4").unwrap();
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        g4_insert_source(
+            &state,
+            id,
+            "mp4",
+            &file,
+            &[("Video", video), ("Audio", audio)],
+        )
+        .await;
+        items.push(id);
+    }
+    let (ac3, hevc, aac) = (items[0], items[1], items[2]);
+    let app = app(state);
+
+    let lists = "&VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+    for (id, codecs, transcode) in [
+        // The browser plays the video but not the audio, or the audio but not the video
+        (ac3, lists, true),
+        (hevc, lists, true),
+        // A client without lists plays only what every browser plays
+        (ac3, "", true),
+        (hevc, "", true),
+        (aac, lists, false),
+        (aac, "", false),
+    ] {
+        let uri = format!("/Videos/{id}/Universal?MaxStreamingBitrate=100000000{codecs}");
+        let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let url = body["Url"].as_str().unwrap_or_default();
+        let source = &body["MediaSources"][0];
+        if transcode {
+            let play_session = body["PlaySessionId"].as_str().unwrap();
+            assert!(
+                url.starts_with(&format!("/Videos/{id}/main.m3u8?")),
+                "{uri}: {url}"
+            );
+            assert!(
+                url.contains(&format!("PlaySessionId={play_session}")),
+                "{uri}: {url}"
+            );
+            if !codecs.is_empty() {
+                assert!(url.contains("VideoCodec=h264,vp8,vp9,av1"), "{uri}: {url}");
+            }
+            assert_eq!(source["SupportsDirectPlay"], false, "{uri}");
+            assert_eq!(source["SupportsDirectStream"], false, "{uri}");
+        } else {
+            assert!(
+                url.starts_with(&format!("/Videos/{id}/stream?")) && url.contains("Static=true"),
+                "{uri}: {url}"
+            );
+            assert_eq!(source["SupportsDirectPlay"], true, "{uri}");
+        }
+    }
+}

@@ -682,6 +682,7 @@ async fn video_universal(
         if let Some(seg_time) = query.segment_time {
             url.push_str(&format!("&SegmentTime={}", seg_time));
         }
+        url.push_str(&format!("&PlaySessionId={}", play_session_id));
         Some(url)
     } else {
         None
@@ -799,6 +800,44 @@ async fn get_chapters(
         .into_response())
 }
 
+/// Whether the first video and audio streams use a codec from the client's lists.
+/// A list without entries falls back to the codecs a client is assumed to play.
+fn codecs_playable(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    query: &VideoPlaybackInfoQuery,
+) -> bool {
+    // Comma-separated, e.g. "h264,hevc,vp9"
+    let codec_list = |list: Option<&str>, fallback: &[&str]| -> Vec<String> {
+        let entries: Vec<String> = list
+            .unwrap_or_default()
+            .split(',')
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if entries.is_empty() {
+            fallback.iter().map(|c| c.to_string()).collect()
+        } else {
+            entries
+        }
+    };
+    let video_codecs = codec_list(query.video_codec.as_deref(), &["h264", "avc1"]);
+    let audio_codecs = codec_list(query.audio_codec.as_deref(), &["aac", "mp4a", "mp3"]);
+
+    // A stream without a codec passes
+    let listed = |codec_type: &str, codecs: &[String]| {
+        source
+            .media_streams
+            .iter()
+            .find(|s| s.codec_type == codec_type)
+            .and_then(|s| s.codec.as_ref())
+            .is_none_or(|codec| {
+                let codec = codec.to_lowercase();
+                codecs.iter().any(|c| codec.contains(c.as_str()))
+            })
+    };
+    listed("Video", &video_codecs) && listed("Audio", &audio_codecs)
+}
+
 /// Check if a media source can be directly played by the client.
 /// Direct play requires the client to support all codecs without any transcoding.
 fn check_direct_play(
@@ -851,110 +890,17 @@ fn check_direct_play(
         }
     }
 
-    // Parse codec lists (comma-separated, e.g. "h264,hevc,vp9")
-    let video_codecs: Vec<String> = query
-        .video_codec
-        .as_ref()
-        .map(|s| s.split(',').map(|c| c.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-    let audio_codecs: Vec<String> = query
-        .audio_codec
-        .as_ref()
-        .map(|s| s.split(',').map(|c| c.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-
-    // If no codec preferences are specified, check browser compatibility
-    if video_codecs.is_empty() && audio_codecs.is_empty() {
-        // Check if video codec is browser-compatible (H.264/AVC is the safest)
-        let browser_compatible_video_codecs =
-            ["h264", "avc1", "hevc", "h265", "vp8", "vp9", "av01"];
-        if let Some(video_stream) = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Video")
-            && let Some(ref codec) = video_stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_video_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
-        // Check if audio codec is browser-compatible
-        let browser_compatible_audio_codecs = ["mp3", "aac", "opus", "ac3", "mp4a"];
-        if let Some(audio_stream) = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Audio")
-            && let Some(ref codec) = audio_stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
+    // Codecs must be in the client's lists, or in the fallback lists if it sent none
+    if !codecs_playable(source, query) {
+        return false;
+    }
+    // Without any list, the codec check is the whole answer
+    let sent_list = [&query.video_codec, &query.audio_codec]
+        .into_iter()
+        .flatten()
+        .any(|list| list.split(',').any(|c| !c.trim().is_empty()));
+    if !sent_list {
         return true;
-    }
-
-    // Check video codec compatibility
-    if !video_codecs.is_empty() {
-        let video_stream = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Video");
-        if let Some(stream) = video_stream
-            && let Some(ref codec) = stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            // Video codec must be in the list of supported codecs
-            if !video_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c.as_str()))
-            {
-                return false;
-            }
-        }
-    }
-
-    // Check audio codec compatibility
-    if !audio_codecs.is_empty() {
-        let audio_stream = source
-            .media_streams
-            .iter()
-            .find(|s| s.codec_type == "Audio");
-        if let Some(stream) = audio_stream
-            && let Some(ref codec) = stream.codec
-        {
-            let codec_lower = codec.to_lowercase();
-            // Audio codec must be in the list of supported codecs
-            if !audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c.as_str()))
-            {
-                return false;
-            }
-        }
-    } else if let Some(audio_stream) = source
-        .media_streams
-        .iter()
-        .find(|s| s.codec_type == "Audio")
-    {
-        // If no audio codec preference is specified, check if the audio codec is browser-compatible
-        let browser_compatible_audio_codecs = ["mp3", "aac", "opus", "ac3", "mp4a"];
-        if let Some(ref codec) = audio_stream.codec {
-            let codec_lower = codec.to_lowercase();
-            if !browser_compatible_audio_codecs
-                .iter()
-                .any(|c| codec_lower.contains(c))
-            {
-                return false;
-            }
-        }
     }
 
     // Check bitrate constraints
@@ -1015,6 +961,11 @@ fn check_direct_stream(
         {
             return false;
         }
+    }
+
+    // Codecs must be in the client's lists, or in the fallback lists if it sent none
+    if !codecs_playable(source, query) {
+        return false;
     }
 
     // If video stream copy is not enabled and there's a video stream, need transcoding
@@ -1320,5 +1271,127 @@ mod tests {
     #[test]
     fn test_mime_3gp() {
         assert_eq!(mime_from_path("/path/to/video.3gp"), "video/3gpp");
+    }
+
+    // ── check_direct_play / check_direct_stream ──
+
+    const LISTS: &str = "VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac";
+
+    /// A source in `container` with one video and one audio stream and a 4 Mbit/s video bitrate.
+    fn source_with(
+        container: &str,
+        video: &str,
+        audio: &str,
+    ) -> rustyfin_model::media_source::MediaSourceResponse {
+        serde_json::from_value(serde_json::json!({
+            "Id": "source",
+            "Uid": "source",
+            "Container": container,
+            "Protocol": "File",
+            "Path": format!("/media/movie.{container}"),
+            "VideoBitrate": 4_000_000,
+            "MediaStreams": [
+                { "Index": 0, "Codec": video, "CodecType": "Video" },
+                { "Index": 1, "Codec": audio, "CodecType": "Audio" },
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// The query of a client that sends `params` (`Key=value&...`).
+    fn query_from(params: &str) -> VideoPlaybackInfoQuery {
+        let params: HashMap<String, String> = params
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        VideoPlaybackInfoQuery::from(params)
+    }
+
+    #[test]
+    fn test_direct_play_and_stream_need_listed_codecs() {
+        let query = query_from(LISTS);
+        // The browser plays the video but not the AC3 audio, or the audio but not the HEVC video
+        for (video, audio) in [("h264", "ac3"), ("hevc", "aac")] {
+            let source = source_with("mp4", video, audio);
+            assert!(!check_direct_play(&source, &query), "{video} + {audio}");
+            assert!(!check_direct_stream(&source, &query), "{video} + {audio}");
+        }
+        let source = source_with("mp4", "h264", "aac");
+        assert!(check_direct_play(&source, &query));
+        assert!(check_direct_stream(&source, &query));
+    }
+
+    #[test]
+    fn test_direct_play_without_lists_takes_h264_with_aac_or_mp3() {
+        let query = query_from("");
+        for (video, audio, playable) in [
+            ("h264", "aac", true),
+            ("h264", "mp3", true),
+            ("h264", "ac3", false),
+            ("h264", "eac3", false),
+            ("h264", "opus", false),
+            ("hevc", "aac", false),
+            ("vp9", "aac", false),
+        ] {
+            let source = source_with("mp4", video, audio);
+            assert_eq!(
+                check_direct_play(&source, &query),
+                playable,
+                "{video} + {audio}"
+            );
+            assert_eq!(
+                check_direct_stream(&source, &query),
+                playable,
+                "{video} + {audio}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_direct_play_falls_back_for_a_missing_or_empty_list() {
+        // Only an audio list: the video must still be H.264
+        let query = query_from("AudioCodecs=aac,ac3");
+        assert!(!check_direct_play(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(!check_direct_stream(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(check_direct_play(
+            &source_with("mp4", "h264", "ac3"),
+            &query
+        ));
+        // Empty lists count as none
+        let query = query_from("VideoCodecs=&AudioCodecs=");
+        assert!(!check_direct_play(
+            &source_with("mp4", "hevc", "aac"),
+            &query
+        ));
+        assert!(!check_direct_play(
+            &source_with("mp4", "h264", "ac3"),
+            &query
+        ));
+        assert!(check_direct_play(
+            &source_with("mp4", "h264", "aac"),
+            &query
+        ));
+    }
+
+    #[test]
+    fn test_direct_play_keeps_container_and_bitrate_rules() {
+        let query = query_from(LISTS);
+        for container in ["mkv", "avi"] {
+            let source = source_with(container, "h264", "aac");
+            assert!(!check_direct_play(&source, &query), "{container}");
+            assert!(!check_direct_stream(&source, &query), "{container}");
+        }
+        let query = query_from(&format!("{LISTS}&MaxVideoBitrate=1000000"));
+        assert!(!check_direct_play(
+            &source_with("mp4", "h264", "aac"),
+            &query
+        ));
     }
 }
