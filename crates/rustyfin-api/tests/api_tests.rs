@@ -5380,3 +5380,52 @@ async fn g4_audio_only_transcode_has_audio() {
     assert_eq!(streams[0]["codec_type"], "audio", "{streams:?}");
     assert_eq!(streams[0]["codec_name"], "aac", "{streams:?}");
 }
+
+#[tokio::test]
+async fn g4_universal_direct_plays_a_probed_mp4() {
+    if !g4_have_ffmpeg("g4_universal_direct_plays_a_probed_mp4") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-probed");
+    let file = std::path::Path::new(&folder).join("G4 Playable.mp4");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-t",
+        "2",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        file.to_str().unwrap(),
+    ]);
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    // The streams as the scanner stores them, with ffprobe's stream types
+    rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let uri = format!(
+        "/Videos/{id}/Universal?VideoCodecs=h264,vp8,vp9,av1&AudioCodecs=aac,mp3,opus,flac"
+    );
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["Url"].as_str().unwrap_or_default();
+    assert!(
+        url.starts_with(&format!("/Videos/{id}/stream?")) && url.contains("Static=true"),
+        "{url}"
+    );
+    assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
+}

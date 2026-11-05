@@ -828,7 +828,7 @@ fn codecs_playable(
         source
             .media_streams
             .iter()
-            .find(|s| s.codec_type == codec_type)
+            .find(|s| is_stream_type(s, codec_type))
             .and_then(|s| s.codec.as_ref())
             .is_none_or(|codec| {
                 let codec = codec.to_lowercase();
@@ -836,6 +836,11 @@ fn codecs_playable(
             })
     };
     listed("Video", &video_codecs) && listed("Audio", &audio_codecs)
+}
+
+/// Whether `stream` is of `kind` ("Video", "Audio"). The probe stores ffprobe's lowercase types.
+fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str) -> bool {
+    stream.codec_type.eq_ignore_ascii_case(kind)
 }
 
 /// Check if a media source can be directly played by the client.
@@ -846,8 +851,14 @@ fn check_direct_play(
 ) -> bool {
     // If no media streams are available, we cannot verify codec compatibility.
     // Reject direct play to avoid Format errors in the browser.
-    let has_video_stream = source.media_streams.iter().any(|s| s.codec_type == "Video");
-    let has_audio_stream = source.media_streams.iter().any(|s| s.codec_type == "Audio");
+    let has_video_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Video"));
+    let has_audio_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Audio"));
     if !has_video_stream && !has_audio_stream {
         // No stream info at all - cannot verify compatibility, reject direct play
         return false;
@@ -934,8 +945,14 @@ fn check_direct_stream(
 
     // If no media streams are available, we cannot verify codec compatibility.
     // Reject direct stream to avoid Format errors in the browser.
-    let has_video_stream = source.media_streams.iter().any(|s| s.codec_type == "Video");
-    let has_audio_stream = source.media_streams.iter().any(|s| s.codec_type == "Audio");
+    let has_video_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Video"));
+    let has_audio_stream = source
+        .media_streams
+        .iter()
+        .any(|s| is_stream_type(s, "Audio"));
     if !has_video_stream && !has_audio_stream {
         return false;
     }
@@ -969,19 +986,13 @@ fn check_direct_stream(
     }
 
     // If video stream copy is not enabled and there's a video stream, need transcoding
-    if !query.enable_video_stream_copy {
-        let has_video = source.media_streams.iter().any(|s| s.codec_type == "Video");
-        if has_video {
-            return false;
-        }
+    if !query.enable_video_stream_copy && has_video_stream {
+        return false;
     }
 
     // If audio stream copy is not enabled and there's an audio stream, need transcoding
-    if !query.enable_audio_stream_copy {
-        let has_audio = source.media_streams.iter().any(|s| s.codec_type == "Audio");
-        if has_audio {
-            return false;
-        }
+    if !query.enable_audio_stream_copy && has_audio_stream {
+        return false;
     }
 
     // Check bitrate constraints — direct stream may still need to respect bitrate limits
@@ -1393,5 +1404,32 @@ mod tests {
             &source_with("mp4", "h264", "aac"),
             &query
         ));
+    }
+
+    #[test]
+    fn test_probed_lowercase_stream_types_count() {
+        // The probe stores ffprobe's stream types, "video" and "audio"
+        let probed = |video: &str, audio: &str| {
+            let mut source = source_with("mp4", video, audio);
+            for stream in &mut source.media_streams {
+                stream.codec_type = stream.codec_type.to_lowercase();
+            }
+            source
+        };
+        let query = query_from(LISTS);
+        assert!(check_direct_play(&probed("h264", "aac"), &query));
+        assert!(check_direct_stream(&probed("h264", "aac"), &query));
+        for (video, audio) in [("h264", "ac3"), ("hevc", "aac")] {
+            let source = probed(video, audio);
+            assert!(!check_direct_play(&source, &query), "{video} + {audio}");
+            assert!(!check_direct_stream(&source, &query), "{video} + {audio}");
+        }
+        for copy in ["EnableVideoStreamCopy", "EnableAudioStreamCopy"] {
+            let query = query_from(&format!("{LISTS}&{copy}=false"));
+            assert!(
+                !check_direct_stream(&probed("h264", "aac"), &query),
+                "{copy}"
+            );
+        }
     }
 }
