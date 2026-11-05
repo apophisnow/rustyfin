@@ -3980,6 +3980,8 @@ async fn g1_log_file_route_reads_only_listed_logs() {
     std::fs::write(logs.join("rustyfin.log"), "g1 log line\n").unwrap();
     let secret = g1_secret_file(&state);
     std::fs::write(state.data_dir.join("outside.log"), "g1-outside-content").unwrap();
+    // A symlink to the secret on unix; elsewhere "link.log" below is a name that does not exist.
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&secret, logs.join("link.log")).unwrap();
     std::fs::create_dir_all(logs.join("sub")).unwrap();
     std::fs::write(logs.join("sub").join("inner.log"), "g1-inner-content").unwrap();
@@ -4034,6 +4036,8 @@ async fn g1_segment_path_stays_in_item_dir() {
     std::fs::write(dir.join("segment_0000.ts"), "g1-segment").unwrap();
     std::fs::write(dir.join("sub").join("inner.ts"), "g1-inner").unwrap();
     let secret = g1_secret_file(&state);
+    // A symlink to the secret on unix; elsewhere "evil.ts" below is a name that does not exist.
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&secret, dir.join("evil.ts")).unwrap();
     let other = uuid::Uuid::new_v4();
     std::fs::create_dir_all(transcodes.join(other.to_string())).unwrap();
@@ -4078,6 +4082,8 @@ async fn g1_legacy_hls_segment_refuses_traversal() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("segment_0000.ts"), "g1-segment").unwrap();
     let secret = g1_secret_file(&state);
+    // A symlink to the secret on unix; elsewhere "evil.ts" below is a name that does not exist.
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&secret, dir.join("evil.ts")).unwrap();
 
     let uri = format!("/Videos/{item}/hls/segment_0000.ts");
@@ -4105,6 +4111,9 @@ async fn g1_legacy_hls_segment_refuses_traversal() {
     }
 }
 
+/// Needs an executable shell script, so unix only; `g1_media_encoder_path_cannot_be_set` checks
+/// the same routes everywhere.
+#[cfg(unix)]
 #[tokio::test]
 async fn g1_media_encoder_runs_no_request_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -4127,6 +4136,15 @@ async fn g1_media_encoder_runs_no_request_path() {
         }
     }
     assert!(!marker.exists(), "an encoder path from a request was run");
+}
+
+#[tokio::test]
+async fn g1_media_encoder_path_cannot_be_set() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let probe = state.data_dir.join("g1-probe.sh");
+    let body = serde_json::json!({ "Value": probe.to_str().unwrap() });
 
     let req = request(
         "PUT",
