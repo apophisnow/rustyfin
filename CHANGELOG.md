@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Quick Connect sign-in**: `POST /Users/AuthenticateWithQuickConnect` signs a device in with the secret of an approved Quick Connect request, as the user who approved it, and counts toward the sign-in rate limit. A secret works once; an unknown, unapproved or expired secret, or a disabled approver, gets 401. Before, the endpoint was missing, so a device could show a code that got approved but never received a token.
+- **Approving a Quick Connect code in the web client**: The web client sends the code as `?code=`, which is where the server reads it. Before, it sent the code in the body, so every approval failed with 400.
 - **New administrators**: `POST /Users/New` honors `IsAdministrator`. Before, it was ignored, so every new user was created without administrator rights.
 - **Played and favorite marks of another user**: `POST` and `DELETE /Users/{userId}/PlayedItems/{itemId}` and `/Users/{userId}/FavoriteItems/{itemId}` act on `{userId}`. Before, they ignored it and changed the caller's own marks. An administrator can set them for any user; other users get 403 for anyone but themselves.
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.

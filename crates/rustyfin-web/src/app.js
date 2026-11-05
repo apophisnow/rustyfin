@@ -2053,7 +2053,7 @@ async function authorizeQuickConnect() {
         return;
     }
     try {
-        await API.post('/QuickConnect/Authorize', { Code: code });
+        await API.post('/QuickConnect/Authorize?code=' + encodeURIComponent(code));
         toast(t('quick_connect.authorized'));
         $('qc-modal')?.close();
     } catch (e) {
