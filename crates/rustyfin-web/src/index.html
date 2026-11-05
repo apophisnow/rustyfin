@@ -409,13 +409,17 @@
                 <div id="add-lib-selected-paths" class="mt-2 space-y-1"></div>
                 <p class="text-[11px] text-white/30 mt-1" data-i18n="library.paths_hint">Or separate multiple paths with commas: /media/movies, /srv/movies</p>
             </div>
-            <!-- Directory Picker Modal (inline) -->
+            <!-- Folder picker (inline): the field shows the open folder; type a path and press Enter to open it -->
             <div id="directory-picker" class="hidden">
                 <div class="flex items-center gap-2 mb-2">
                     <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="directoryPickerBack()" data-i18n="wizard.back">← Back</button>
-                    <span id="directory-picker-path" class="text-xs text-white/60 font-mono truncate">/</span>
+                    <input id="directory-picker-path" type="text" value="/" class="jf-input flex-1 !py-1 text-xs font-mono" spellcheck="false" autocomplete="off" aria-label="Folder path" data-i18n-aria-label="library.folder_path" onkeydown="directoryPickerPathKeydown(event)">
+                    <button type="button" class="jf-btn-ghost !px-2 !py-1 text-xs" onclick="closeDirectoryPicker()" data-i18n="common.close">Close</button>
                 </div>
                 <div id="directory-picker-list" class="max-h-48 overflow-y-auto space-y-0.5 border border-white/10 rounded-lg"></div>
+                <div class="flex justify-end mt-2">
+                    <button type="button" class="jf-btn-primary !px-3 !py-1.5 text-xs" onclick="selectCurrentDirectory()" data-i18n="library.select_folder">Select this folder</button>
+                </div>
             </div>
             <p id="add-lib-error" role="alert" class="hidden text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2"></p>
             <div class="flex justify-end gap-2 pt-3 border-t border-white/10">

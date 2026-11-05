@@ -351,7 +351,6 @@ const clickActions = {
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'dir-open': el => navigateDirectoryPicker(el.dataset.path),
-    'dir-select': el => selectDirectoryPath(el.dataset.path),
     'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
 };
 document.addEventListener('click', e => {
@@ -2652,9 +2651,12 @@ async function submitAddLibrary(e) {
     const f = e.target;
     const name = f.name.value.trim();
     const type = f.type.value;
-    // Combine selected paths from picker with manual input
+    // The chosen folders, the typed paths and, while the picker is open, the folder it shows (unless it is still at "/")
     const manualPaths = f.paths.value.split(',').map(p => p.trim()).filter(Boolean);
     const paths = [...new Set([...selectedLibraryPaths, ...manualPaths])];
+    const picker = $('directory-picker');
+    const pickerPath = picker && !picker.classList.contains('hidden') ? directoryPickerFieldPath() : '';
+    if (pickerPath && pickerPath !== '/' && !paths.includes(pickerPath)) paths.push(pickerPath);
     const submitBtn = $('add-lib-submit');
 
     setAddLibraryError('');
@@ -2693,17 +2695,13 @@ async function openDirectoryPicker() {
     directoryPickerPath = '/';
     directoryPickerHistory = ['/'];
     const picker = $('directory-picker');
-    const input = $('add-lib-path-input');
     if (picker) picker.classList.remove('hidden');
-    if (input) input.classList.add('hidden');
     await loadDirectoryList('/');
 }
 
 function closeDirectoryPicker() {
     const picker = $('directory-picker');
-    const input = $('add-lib-path-input');
     if (picker) picker.classList.add('hidden');
-    if (input) input.classList.remove('hidden');
 }
 
 function directoryPickerBack() {
@@ -2716,8 +2714,8 @@ function directoryPickerBack() {
 
 async function loadDirectoryList(path) {
     const list = $('directory-picker-list');
-    const pathLabel = $('directory-picker-path');
-    if (pathLabel) pathLabel.textContent = path;
+    const pathField = $('directory-picker-path');
+    if (pathField) pathField.value = path;
     if (!list) return;
 
     list.innerHTML = '<div class="p-3 text-center text-white/40 text-xs"><div class="w-4 h-4 border-2 border-[#00a4dc] border-t-transparent rounded-full animate-spin mx-auto"></div></div>';
@@ -2745,13 +2743,10 @@ async function loadDirectoryList(path) {
                     <span class="text-white/30 text-[10px] ml-auto">${t('library.no_access')}</span>
                 </div>`;
             } else {
-                // Click navigates into the directory, double-click or button selects it
-                html += `<div class="flex items-center gap-1">
-                    <button type="button" class="flex-1 text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(dir.path)}">
-                        <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
-                    </button>
-                    <button type="button" class="px-2 py-2 text-[10px] text-[#00a4dc] hover:text-[#38bdf8] rounded" data-action="dir-select" data-path="${escapeHtml(dir.path)}" title="${escapeHtml(t('library.select_folder'))}">✓</button>
-                </div>`;
+                // A click opens the folder; "Select this folder" below the list takes the open one
+                html += `<button type="button" class="w-full text-left px-3 py-2 text-xs text-white hover:bg-white/5 flex items-center gap-2 rounded" data-action="dir-open" data-path="${escapeHtml(dir.path)}">
+                    <span>📁</span> <span class="truncate">${escapeHtml(dir.name)}</span>
+                </button>`;
             }
         }
         list.innerHTML = html;
@@ -2766,18 +2761,27 @@ function navigateDirectoryPicker(path) {
     loadDirectoryList(path);
 }
 
-function selectDirectoryPath(path) {
-    if (!selectedLibraryPaths.includes(path)) {
-        selectedLibraryPaths.push(path);
-    }
-    // Update the input field with all selected paths
-    const input = $('add-lib-path-input');
-    if (input) input.value = selectedLibraryPaths.join(', ');
-    // Show selected paths
+// The folder path in the picker's field, without trailing slashes ("/" stays "/")
+function directoryPickerFieldPath() {
+    const value = ($('directory-picker-path')?.value || '').trim();
+    return value.replace(/\/+$/, '') || (value ? '/' : '');
+}
+
+// Enter in the picker's field opens the typed folder instead of submitting the form
+function directoryPickerPathKeydown(e) {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const path = directoryPickerFieldPath();
+    if (path) navigateDirectoryPicker(path);
+}
+
+// Adds the folder in the picker's field to the chosen paths and closes the picker
+function selectCurrentDirectory() {
+    const path = directoryPickerFieldPath();
+    if (!path) return;
+    if (!selectedLibraryPaths.includes(path)) selectedLibraryPaths.push(path);
     renderSelectedPaths();
-    // Close picker
     closeDirectoryPicker();
-    toast(t('library.path_added', { path }));
 }
 
 function renderSelectedPaths() {
@@ -2797,8 +2801,6 @@ function renderSelectedPaths() {
 
 function removeSelectedPath(index) {
     selectedLibraryPaths.splice(index, 1);
-    const input = $('add-lib-path-input');
-    if (input) input.value = selectedLibraryPaths.join(', ');
     renderSelectedPaths();
 }
 
@@ -2809,9 +2811,6 @@ openAddLibrary = function() {
     renderSelectedPaths();
     const picker = $('directory-picker');
     if (picker) picker.classList.add('hidden');
-    // The picker hides the path input; restore it in case the dialog was closed while the picker was open
-    const input = $('add-lib-path-input');
-    if (input) input.classList.remove('hidden');
     setAddLibraryError('');
     const submitBtn = $('add-lib-submit');
     if (submitBtn) submitBtn.disabled = false;

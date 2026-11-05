@@ -159,7 +159,7 @@
         "parent_folder": "Elternordner",
         "no_access": "Kein Zugriff",
         "select_folder": "Diesen Ordner auswählen",
-        "path_added": "Pfad hinzugefügt: {{path}}"
+        "folder_path": "Ordnerpfad"
     },
     "player": {
         "close_tooltip": "Schließen (Esc)",

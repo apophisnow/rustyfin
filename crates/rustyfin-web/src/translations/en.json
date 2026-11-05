@@ -159,7 +159,7 @@
         "parent_folder": "Parent folder",
         "no_access": "No access",
         "select_folder": "Select this folder",
-        "path_added": "Path added: {{path}}"
+        "folder_path": "Folder path"
     },
     "player": {
         "close_tooltip": "Close (Esc)",
