@@ -416,6 +416,48 @@ async fn rescan_keeps_items_in_unreadable_dirs() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_rescans_remove_items_in_both_libraries() {
+    let fx = Fixture::new().await;
+    let user = insert_user(&fx.pool).await;
+    let mut libs = Vec::new();
+    for name in ["film-a", "film-b"] {
+        let lib = fx.library(name, LibraryContentType::Movies).await;
+        let root = root_of(&lib);
+        // The real file is already known, so the rescans only remove.
+        let argo = touch(&root, "Argo (2012)/Argo (2012).mkv");
+        insert_item(&fx.pool, &lib, "Movie", &argo, None).await;
+        for i in 0..20 {
+            let junk = touch(&root, &format!("Argo (2012)/.@__thumb/Argo {i}.mkv"));
+            let id = insert_item(&fx.pool, &lib, "Movie", &junk, None)
+                .await
+                .to_string();
+            exec(
+                &fx.pool,
+                "INSERT INTO user_item_data (user_id, item_id) VALUES (?1, ?2)",
+                &[&user, &id],
+            )
+            .await;
+        }
+        libs.push(lib);
+    }
+
+    tokio::join!(scan(&fx.pool, &libs[0]), scan(&fx.pool, &libs[1]));
+
+    for lib in &libs {
+        assert_eq!(
+            paths(&fx.pool, lib, "Movie").await,
+            ["Argo (2012)/Argo (2012).mkv"],
+            "library {}",
+            lib.name
+        );
+    }
+    assert_eq!(
+        count(&fx.pool, "SELECT COUNT(*) FROM user_item_data").await,
+        0
+    );
+}
+
 #[tokio::test]
 async fn rescan_removes_empty_tv_seasons_and_series() {
     let fx = Fixture::new().await;

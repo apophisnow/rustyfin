@@ -12,7 +12,9 @@ use sqlx::SqlitePool;
 /// An item that still has children is not deleted: this logs a warning and returns `Ok(false)`.
 /// Returns `Ok(true)` when the item was deleted.
 pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    // The write lock is taken first: under the shared cache, a read-then-write transaction can
+    // deadlock with another one, and the busy timeout does not help.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let children: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE parent_id = ?1")
         .bind(id)
         .fetch_one(&mut *tx)
