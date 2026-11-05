@@ -404,6 +404,52 @@ async fn test_b8_socket_rejects_an_empty_token() {
     std::fs::remove_dir_all(base.data_dir.as_path()).ok();
 }
 
+#[tokio::test]
+async fn test_b8_socket_accepts_a_user_token_while_an_api_key_is_set() {
+    let base = test_state().await;
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: "b8-user".to_string(),
+        password_hash: String::new(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::Value::Null,
+    };
+    let token = rustyfin_auth::create_token(&user, &base.jwt_secret).unwrap();
+    let foreign = rustyfin_auth::create_token(&user, "another-secret").unwrap();
+    for key in [Some("b8-key"), None] {
+        let state = b8_with_key(&base, key);
+        // The web client sends `authorization=Bearer <token>`, Jellyfin clients `api_key=<token>`
+        let web = format!("?authorization=Bearer%20{token}");
+        assert_eq!(
+            b8_socket_status(state.clone(), &web).await,
+            101,
+            "key {key:?}"
+        );
+        let jellyfin = format!("?api_key={token}");
+        assert_eq!(
+            b8_socket_status(state.clone(), &jellyfin).await,
+            101,
+            "key {key:?}"
+        );
+        let signed_elsewhere = format!("?api_key={foreign}");
+        assert_eq!(
+            b8_socket_status(state.clone(), &signed_elsewhere).await,
+            401,
+            "key {key:?}"
+        );
+        assert_eq!(
+            b8_socket_status(state, "?api_key=wrong-key").await,
+            401,
+            "key {key:?}"
+        );
+    }
+    let state = b8_with_key(&base, Some("b8-key"));
+    assert_eq!(b8_socket_status(state, "?api_key=b8-key").await, 101);
+    std::fs::remove_dir_all(base.data_dir.as_path()).ok();
+}
+
 // ── Error Response Format Tests ──
 
 #[tokio::test]

@@ -72,13 +72,9 @@ async fn ws_handler(
             ApiError::Unauthorized
         })?;
 
-    // Check if the token matches a configured API key
-    let authenticated = if let Some(ref api_key) = state.api_key {
-        token == **api_key
-    } else {
-        // Otherwise validate as JWT
-        rustyfin_auth::validate_token(&token, &state.jwt_secret).is_ok()
-    };
+    // The configured API key or a valid user token opens the socket
+    let authenticated = state.api_key.as_ref().is_some_and(|key| token == **key)
+        || rustyfin_auth::validate_token(&token, &state.jwt_secret).is_ok();
 
     if !authenticated {
         tracing::warn!("WebSocket: unauthenticated connection attempt");
