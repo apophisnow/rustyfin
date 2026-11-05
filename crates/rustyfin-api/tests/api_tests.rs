@@ -6389,3 +6389,59 @@ async fn g2c_device_delete_by_path_ends_that_devices_sessions() {
     let (me, _) = send(&app, request("GET", "/Users/Me", Some(&admin_t), None)).await;
     assert_eq!(me, StatusCode::OK, "other devices stay signed in");
 }
+
+#[tokio::test]
+async fn g2c_forgot_password_time_does_not_depend_on_the_name() {
+    // A known name answered only after its PIN row and file were written, an unknown one at once,
+    // so the time told whether the account exists; with the write lock held elsewhere (a scan, say)
+    // the known name waited for the lock. Both now answer after the same fixed delay (250 ms in
+    // users.rs), and the reset still happens once the lock is free.
+    let state = test_state().await;
+    g2f_with_owner(&state).await;
+    let app = app(state.clone());
+    let mut lock = state.db.begin().await.unwrap();
+    sqlx::query("DELETE FROM password_reset_pins WHERE 0")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let mut times = Vec::new();
+    let mut files = Vec::new();
+    for user in ["owner", "ghost"] {
+        let start = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            g2c_forgot(&app, user, &[]),
+        )
+        .await;
+        times.push(start.elapsed());
+        files.push(answer.unwrap_or_else(|_| {
+            panic!("ForgotPassword for {user} answers while the write lock is held")
+        }));
+    }
+    assert!(
+        times[0].abs_diff(times[1]) < std::time::Duration::from_millis(200),
+        "a known and an unknown name answer alike: {times:?}"
+    );
+    assert!(
+        times
+            .iter()
+            .all(|t| *t >= std::time::Duration::from_millis(200)),
+        "both answer after the fixed delay: {times:?}"
+    );
+
+    lock.rollback().await.unwrap();
+    let mut written = false;
+    for _ in 0..250 {
+        if files[0].exists() {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        written,
+        "the owner's reset file appears once the lock is free"
+    );
+    assert!(!files[1].exists(), "an unknown name gets no file");
+}

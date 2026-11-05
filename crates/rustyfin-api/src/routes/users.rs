@@ -10,7 +10,9 @@ use rustyfin_model::user::{
     UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo,
     UserPreferences, UserSecurityInfo,
 };
+use sqlx::SqlitePool;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -265,45 +267,78 @@ async fn update_configuration(
     Ok(Json(serde_json::json!({})))
 }
 
+/// Every ForgotPassword answer waits until this long after the request reached the handler, so its
+/// timing reveals neither whether the name exists nor whether the reset work was slow.
+const FORGOT_PASSWORD_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Start a password reset. The response is uniform whether or not the user exists, so it never
 /// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
 /// to a file under the data dir ONLY when the user exists AND the resolved client (see
 /// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
 /// new request never replaces an open reset. Every other request gets the same 200 with a file path
-/// that is not created.
+/// that is not created. Every answer comes `FORGOT_PASSWORD_DELAY` (250 ms) after the request
+/// reached the handler. The reset work runs in its own task: it finishes before the answer when it
+/// is quick, and in the background when it takes longer.
 async fn forgot_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
+    let deadline = tokio::time::Instant::now() + FORGOT_PASSWORD_DELAY;
     let pin_path = state
         .data_dir
         .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
     let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
 
-    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local()
-        && let Some(user) =
-            rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username).await?
-        && let Some(pin) = rustyfin_auth::create_reset_pin(&state.db, user.id, &expires_at)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-    {
-        // The PIN lives only in this file. Never log it.
-        let contents = serde_json::json!({
-            "Pin": pin,
-            "ExpirationDate": expires_at,
-            "UserName": user.name,
-        })
-        .to_string();
-        write_reset_file(&pin_path, &contents)?;
+    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local() {
+        let handle = tokio::spawn(issue_reset_pin(
+            state.db.clone(),
+            req.entered_username.clone(),
+            pin_path.clone(),
+            expires_at.clone(),
+        ));
+        // Waited for only until the deadline; a slower task is detached and finishes alone.
+        let _ = tokio::time::timeout_at(deadline, handle).await;
     }
+    tokio::time::sleep_until(deadline).await;
 
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
         pin_file: pin_path.to_string_lossy().into_owned(),
         pin_expiration_date: expires_at,
     }))
+}
+
+/// The reset work for a local ForgotPassword, run in its own task (see `forgot_password`). Nothing
+/// is returned to the client; a failure is logged without the PIN.
+async fn issue_reset_pin(db: SqlitePool, name: String, pin_path: PathBuf, expires_at: String) {
+    let user = match rustyfin_db::repo_user::get_user_by_name(&db, &name).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "reset PIN: user lookup failed");
+            return;
+        }
+    };
+    let pin = match rustyfin_auth::create_reset_pin(&db, user.id, &expires_at).await {
+        Ok(Some(pin)) => pin,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "reset PIN: could not store the PIN");
+            return;
+        }
+    };
+    // The PIN lives only in this file. Never log it.
+    let contents = serde_json::json!({
+        "Pin": pin,
+        "ExpirationDate": expires_at,
+        "UserName": user.name,
+    })
+    .to_string();
+    if let Err(e) = write_reset_file(&pin_path, &contents) {
+        tracing::warn!(error = %e, "reset PIN: could not write the reset file");
+    }
 }
 
 /// Write the reset file, truncating any prior file. On Unix it is created owner-only (mode 0600).
