@@ -756,6 +756,56 @@ pub fn spawn_probe_and_add_source(
     })
 }
 
+/// One file of a probe plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeStep {
+    /// Probes the file as the item's primary source: it replaces the item's sources, and sets its runtime and chapters.
+    Primary(String),
+    /// Probes the file and adds it to the item as another source.
+    Alternate(String),
+}
+
+/// Runs `steps` for one item, in order, under one probe permit.
+/// A step that fails is logged, and the next step still runs.
+pub fn spawn_probe_plan(
+    pool: sqlx::SqlitePool,
+    item_id: uuid::Uuid,
+    steps: Vec<ProbeStep>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // One permit for the whole plan, so that its steps run in order
+        let _permit = probe_semaphore().acquire().await;
+        for step in steps {
+            let (path, result) = match &step {
+                ProbeStep::Primary(path) => (path, probe_and_save(&pool, &item_id, path).await),
+                ProbeStep::Alternate(path) => {
+                    (path, probe_and_add_alternate(&pool, &item_id, path).await)
+                }
+            };
+            if let Err(e) = result {
+                warn!("failed to probe '{}': {}", path, e);
+            }
+        }
+    })
+}
+
+/// Adds `path` to an item as another source: probes the file and inserts it with its streams.
+/// Unlike `probe_and_add_source`, it leaves the item's runtime and chapters alone.
+pub async fn probe_and_add_alternate(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    path: &str,
+) -> Result<(), ProbeError> {
+    let result = probe_file(path).await?;
+    let _source_id = rustyfin_db::repo_media_source::insert_media_source_with_streams(
+        pool,
+        item_id,
+        &result.source,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Internal: probe a file and insert it as a media source for an item.
 /// Uses a single transaction for source + streams + runtime update + chapters.
 async fn probe_and_add_source_internal(

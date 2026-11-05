@@ -2,9 +2,10 @@ use chrono::Utc;
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{MediaItem, MediaType};
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use crate::local_images;
@@ -102,31 +103,6 @@ fn normalize_name(file_stem: &str) -> String {
     }
 
     result
-}
-
-/// Build a HashMap for O(1) version detection lookups.
-/// Key: (normalized_name, parent_dir) -> Value: item_id
-/// Pre-loading all movies eliminates the N+1 query pattern during scanning.
-async fn build_version_map(
-    pool: &SqlitePool,
-    library_id: Uuid,
-) -> Result<HashMap<(String, String), Uuid>, sqlx::Error> {
-    let movies = rustyfin_db::repo_media::get_library_movies(pool, library_id).await?;
-    let mut map = HashMap::new();
-    for (path, id_str) in movies {
-        if let Ok(id) = Uuid::parse_str(&id_str) {
-            let path_buf = Path::new(&path);
-            if let Some(stem) = path_buf.file_stem().and_then(|s| s.to_str()) {
-                let normalized = normalize_name(stem);
-                let parent_dir = path_buf
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                map.insert((normalized, parent_dir), id);
-            }
-        }
-    }
-    Ok(map)
 }
 
 /// Build a HashMap for O(1) episode version detection lookups.
@@ -238,11 +214,47 @@ pub async fn scan_library_with_metadata(
     Ok(count)
 }
 
+/// Serializes the scans that write items and queue probes. A scan takes it first and holds it
+/// until the probes it queued have finished (see `spawn_plans_under_lock`).
+static SCAN_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Waits until no scan is running and the probes of the last scan have finished.
+pub async fn wait_for_idle() {
+    drop(SCAN_LOCK.lock().await);
+}
+
+/// Runs the probe plans of a scan in the background. One task owns `guard` until every plan has
+/// finished, so the next scan waits for them.
+fn spawn_plans_under_lock(
+    pool: SqlitePool,
+    guard: MutexGuard<'static, ()>,
+    library_name: String,
+    plans: Vec<(Uuid, Vec<probe::ProbeStep>)>,
+) {
+    tokio::spawn(async move {
+        let total_steps: usize = plans.iter().map(|(_, steps)| steps.len()).sum();
+        let handles: Vec<_> = plans
+            .into_iter()
+            .map(|(item_id, steps)| probe::spawn_probe_plan(pool.clone(), item_id, steps))
+            .collect();
+        for handle in handles {
+            let _ = handle.await;
+        }
+        tracing::info!(
+            "probes finished for library '{}': {} files",
+            library_name,
+            total_steps
+        );
+        drop(guard);
+    });
+}
+
 /// Flat scan for Movies, Photos, Mixed libraries
 async fn scan_flat_library(
     pool: &SqlitePool,
     library: &Library,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
+    let guard = SCAN_LOCK.lock().await;
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
@@ -255,13 +267,13 @@ async fn scan_flat_library(
             .into_iter()
             .collect();
 
-    // Pre-load all existing movies into a HashMap for O(1) version detection.
-    // Key: (normalized_name, parent_dir) -> item_id
-    // Eliminates the N+1 query pattern where each movie file triggered a DB query.
-    let version_map: HashMap<(String, String), Uuid> = build_version_map(pool, library.id).await?;
-
     // Collect new items for batch insert in a single transaction
     let mut new_items: Vec<MediaItem> = Vec::new();
+    // Probe plans. The plans of new items wait in `new_plans` until their rows are inserted.
+    let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
+    let mut new_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
+    // The video files of each folder. They are grouped into movies after the walk.
+    let mut movie_files: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -297,6 +309,19 @@ async fn scan_flat_library(
 
             let file_path = file_path_buf.to_string_lossy().to_string();
 
+            // Movies are grouped per folder after the walk. Existing files are grouped too.
+            if matches!(media_type, MediaType::Movie) {
+                if existing_paths.contains(&file_path) {
+                    existing_count += 1;
+                }
+                let folder = file_path_buf
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                movie_files.entry(folder).or_default().push(file_path_buf);
+                continue;
+            }
+
             // Skip if this exact file path already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
@@ -308,43 +333,6 @@ async fn scan_flat_library(
                 .and_then(|s| s.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
-
-            // For video content, check if this is a version of an existing item
-            let normalized = normalize_name(&file_name);
-            let parent_dir = file_path_buf
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let is_version = if matches!(media_type, MediaType::Movie) {
-                // O(1) HashMap lookup instead of DB query
-                if let Some(existing_id) = version_map
-                    .get(&(normalized.clone(), parent_dir.clone()))
-                    .copied()
-                {
-                    // This is a version of an existing item — add as a new media source
-                    tracing::info!(
-                        "detected version of item {}: {} -> {}",
-                        existing_id,
-                        file_path,
-                        normalized
-                    );
-                    let file_path_clone = file_path.clone();
-                    let pool_clone = pool.clone();
-                    let item_id = existing_id;
-                    probe::spawn_probe_and_add_source(pool_clone, item_id, file_path_clone);
-                    count += 1;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if is_version {
-                continue;
-            }
 
             let item = MediaItem {
                 id: Uuid::new_v4(),
@@ -368,7 +356,53 @@ async fn scan_flat_library(
                 ..MediaItem::default_dto_fields()
             };
 
+            new_plans.push((item.id, vec![probe::ProbeStep::Primary(item.path.clone())]));
             new_items.push(item);
+        }
+    }
+
+    // Group the movie files of each folder into movies, then reconcile them with the items
+    let mut movie_groups: Vec<naming::VersionGroup> = Vec::new();
+    for (folder, files) in &movie_files {
+        let is_library_root = library
+            .paths
+            .iter()
+            .any(|p| Path::new(p) == folder.as_path());
+        movie_groups.extend(naming::group_movie_files(folder, files, is_library_root));
+    }
+    let outcomes = scan_sync::reconcile_movie_groups(pool, library.id, &movie_groups).await?;
+    for (group, outcome) in movie_groups.iter().zip(outcomes) {
+        match outcome {
+            scan_sync::GroupOutcome::Existing { item_id, steps } => {
+                if !steps.is_empty() {
+                    plans.push((item_id, steps));
+                }
+            }
+            scan_sync::GroupOutcome::New { steps } => {
+                let item = MediaItem {
+                    id: Uuid::new_v4(),
+                    name: group.title.clone(),
+                    sort_name: Some(group.title.to_lowercase()),
+                    overview: None,
+                    media_type: MediaType::Movie,
+                    path: group.files[0].to_string_lossy().into_owned(),
+                    parent_id: None,
+                    library_id: library.id,
+                    production_year: group.year,
+                    community_rating: None,
+                    official_rating: None,
+                    genres: vec![],
+                    date_created: Utc::now(),
+                    premiere_date: None,
+                    runtime_ticks: None,
+                    index_number: None,
+                    parent_index_number: None,
+                    media_sources: Vec::new(),
+                    ..MediaItem::default_dto_fields()
+                };
+                new_plans.push((item.id, steps));
+                new_items.push(item);
+            }
         }
     }
 
@@ -397,12 +431,8 @@ async fn scan_flat_library(
                 }
             }
 
-            // Spawn async probes for all newly inserted items (fire-and-forget).
-            // The semaphore in probe module limits concurrency, so probes run in the background
-            // without blocking the scan from returning.
-            for item in &new_items {
-                probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
-            }
+            // The plans of the new items run with the other plans, when the scan has finished.
+            plans.append(&mut new_plans);
             count += new_items.len() as u32;
             // Collect IDs for metadata refresh
             new_item_ids = new_items.iter().map(|item| item.id).collect();
@@ -428,6 +458,7 @@ async fn scan_flat_library(
             e
         ),
     }
+    spawn_plans_under_lock(pool.clone(), guard, library.name.clone(), plans);
     Ok((count, new_item_ids))
 }
 
@@ -436,7 +467,9 @@ async fn scan_tv_library(
     pool: &SqlitePool,
     library: &Library,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
+    let guard = SCAN_LOCK.lock().await;
     let mut count = 0u32;
+    let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     let mut existing_count = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
 
@@ -632,9 +665,10 @@ async fn scan_tv_library(
                     file_path,
                     normalized
                 );
-                let file_path_clone = file_path.clone();
-                let pool_clone = pool.clone();
-                probe::spawn_probe_and_add_source(pool_clone, existing_id, file_path_clone);
+                plans.push((
+                    existing_id,
+                    vec![probe::ProbeStep::Alternate(file_path.clone())],
+                ));
                 count += 1;
                 true
             } else {
@@ -717,11 +751,10 @@ async fn scan_tv_library(
                     }
                 }
 
-                // Spawn async probes for episode items (fire-and-forget).
-                // The semaphore in probe module limits concurrency.
+                // The new episodes are probed when the scan has finished.
                 for item in &new_items {
                     if item.media_type == MediaType::Episode {
-                        probe::spawn_probe_and_save(pool.clone(), item.id, item.path.clone());
+                        plans.push((item.id, vec![probe::ProbeStep::Primary(item.path.clone())]));
                     }
                 }
                 count += new_items.len() as u32;
@@ -749,6 +782,7 @@ async fn scan_tv_library(
             e
         ),
     }
+    spawn_plans_under_lock(pool.clone(), guard, library.name.clone(), plans);
     Ok((count, new_item_ids))
 }
 
@@ -758,6 +792,7 @@ async fn scan_music_library(
     pool: &SqlitePool,
     library: &Library,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
+    let _guard = SCAN_LOCK.lock().await;
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
@@ -1088,7 +1123,7 @@ fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<Med
     }
 }
 
-fn parse_year(name: &str) -> Option<i32> {
+pub(crate) fn parse_year(name: &str) -> Option<i32> {
     // Try to find a 4-digit year in parentheses like "Movie Name (2023)"
     if let Some(start) = name.rfind('(')
         && let Some(end) = name[start..].find(')')
