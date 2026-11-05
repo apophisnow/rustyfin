@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Web client translations**: The web client is localized with i18next, with English and German translations in `crates/rustyfin-web/src/translations/` (one JSON file per language, English as the source). The display language follows the browser and can be changed in the setup wizard and in the user settings; picking it in the wizard switches the UI immediately. Previously the UI was German only.
+- **Library scan progress**: Every library scan reports its progress on the socket (`/socket`) to every signed-in user: `RefreshProgress` frames with the library id and a whole percent, `"0"` when the scan is queued, each higher percent as its probes (and, with a metadata provider configured, the metadata refresh of new items) finish, and `"100"` when it ends. A new socket first gets one frame per scan in progress. This covers scans started from the web client, Scan All and the scheduler, including its scan 60 s after start. A web scan's `ScheduledTaskCompleted` now comes when the scan has ended, after its probes, instead of when the scan request returns.
 
 ### Changed
 - **pnpm for the web client**: `crates/rustyfin-web` uses pnpm instead of npm. `package.json` pins the version in `packageManager` (Corepack and `pnpm/action-setup` read it), and `pnpm-lock.yaml` replaces `package-lock.json` with the same dependency versions. The Dockerfile, the release workflow, `build.sh`, `start.sh` and the README use pnpm.
