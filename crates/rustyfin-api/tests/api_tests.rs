@@ -9064,6 +9064,821 @@ async fn b18_library_monitor_delay_round_trips_and_sets_the_queue_delay() {
     assert_eq!(old.library_monitor_delay, 60);
 }
 
+// ── B18: POST /Library/Media/Updated, the *arr Webhook, and the *arr lookups ──
+// Media/Updated and the Webhook feed each path that they get to the change queue. The tests set an
+// hour's settle delay, so that the queued units stay pending and can be read. The payloads under
+// tests/fixtures/arr are Sonarr's, Radarr's and Lidarr's Webhook events (see the README there).
+
+/// The API key in the two headers that Sonarr's and Radarr's Emby / Jellyfin connection sends.
+const B18_ARR_AUTH: [(&str, &str); 2] = [
+    ("X-MediaBrowser-Token", "test-api-key"),
+    ("Authorization", "MediaBrowser Token=\"test-api-key\""),
+];
+
+/// Request headers, as names and values.
+type B18Headers<'a> = &'a [(&'a str, &'a str)];
+
+/// Sends a request with `headers` and an optional body. Returns the status and the body's text.
+async fn b18_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let body = body.map_or_else(Body::empty, |body| Body::from(body.to_string()));
+    let resp = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// GETs `uri` with only the API key, as the *arr apps send it, and returns the JSON body.
+async fn b18_arr_get(app: &axum::Router, uri: &str) -> serde_json::Value {
+    let (status, text) = b18_send(app, "GET", uri, &B18_ARR_AUTH, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{uri}: {e}: {text}"))
+}
+
+/// The folder that holds the *arr fixtures.
+fn b18_fixtures() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/arr")
+}
+
+/// The text of the fixture `file`, a path below `tests/fixtures/arr`.
+fn b18_fixture(file: &str) -> String {
+    let path = b18_fixtures().join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Every fixture, as `<app>/<name>.json`, sorted.
+fn b18_fixture_files() -> Vec<String> {
+    let mut files = Vec::new();
+    for app in std::fs::read_dir(b18_fixtures()).unwrap() {
+        let app = app.unwrap();
+        if !app.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let app_name = app.file_name().into_string().unwrap();
+        for file in std::fs::read_dir(app.path()).unwrap() {
+            let name = file.unwrap().file_name().into_string().unwrap();
+            if name.ends_with(".json") {
+                files.push(format!("{app_name}/{name}"));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `value` percent-encoded for a query string. Letters, digits, `-._~` and `/` stay as they are.
+fn b18_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// `units`, sorted as `ChangeQueue::pending` sorts them.
+fn b18_sorted(
+    mut units: Vec<(uuid::Uuid, rustyfin_core::scanner::ScanScope)>,
+) -> Vec<(uuid::Uuid, rustyfin_core::scanner::ScanScope)> {
+    units.sort();
+    units
+}
+
+/// A buffer for the log lines of a test.
+#[derive(Clone, Default)]
+struct B18Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl B18Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for B18Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes this thread's log lines of level INFO and above, without colours, to the returned buffer
+/// until the guard is dropped. A `#[tokio::test]` runs its tasks on the test's own thread.
+fn b18_capture_logs() -> (tracing::subscriber::DefaultGuard, B18Logs) {
+    let logs = B18Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (tracing::subscriber::set_default(subscriber), logs)
+}
+
+#[tokio::test]
+async fn b18_media_updated_queues_the_folder_of_each_path() {
+    use rustyfin_core::scanner::ScanScope;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let film = create_library_via_api(&app, &state, &token, "B18 Film", "Movies").await;
+    let shows = create_library_via_api(&app, &state, &token, "B18 Shows", "TvShows").await;
+    let film_dir = std::path::PathBuf::from(media_folder(&state, "b18 film"));
+    let shows_dir = std::path::PathBuf::from(media_folder(&state, "b18 shows"));
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::from_secs(3600));
+    let uri = "/Library/Media/Updated";
+
+    // camelCase, as Sonarr and Radarr send it, with their two headers.
+    let gone = film_dir.join("Gone (1990)");
+    let harbor = shows_dir.join("Harbor Lights (2020)");
+    let body = serde_json::json!({ "updates": [
+        { "path": gone.join("Gone (1990).mkv"), "updateType": "Deleted" },
+        { "path": harbor.join("Season 01/Harbor Lights (2020) - S01E01.mkv"), "updateType": "Created" },
+        { "path": "/elsewhere/Other (2001)/Other (2001).mkv", "updateType": "Modified" },
+    ]})
+    .to_string();
+    let headers = [
+        B18_ARR_AUTH[0],
+        B18_ARR_AUTH[1],
+        ("Content-Type", "application/json"),
+    ];
+    let (status, text) = b18_send(&app, "POST", uri, &headers, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    assert_eq!(
+        changes.pending(),
+        b18_sorted(vec![
+            (film, ScanScope::Folder(gone)),
+            (shows, ScanScope::Folder(harbor.clone())),
+        ]),
+        "the path in no library is dropped"
+    );
+
+    // PascalCase, from a signed-in administrator. The library's own path is the whole library.
+    let body = serde_json::json!({ "Updates": [{ "Path": film_dir, "UpdateType": "Modified" }] })
+        .to_string();
+    let (status, json) = send_authed(&app, "POST", uri, &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        changes.pending(),
+        b18_sorted(vec![
+            (film, ScanScope::Library),
+            (shows, ScanScope::Folder(harbor.clone())),
+        ])
+    );
+
+    // UpdateType may be left out, and the list may be empty.
+    let second = shows_dir.join("Second Show (2021)");
+    let body = serde_json::json!({ "Updates": [{ "Path": second }] }).to_string();
+    let (status, json) = send_authed(&app, "POST", uri, &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    let (status, json) = send_authed(&app, "POST", uri, &token, Some(r#"{"Updates":[]}"#)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{json}");
+    assert_eq!(
+        changes.pending(),
+        b18_sorted(vec![
+            (film, ScanScope::Library),
+            (shows, ScanScope::Folder(harbor)),
+            (shows, ScanScope::Folder(second)),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn b18_media_updated_refuses_bad_callers_and_bodies() {
+    use rustyfin_core::scanner::ScanScope;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let library = create_library_via_api(&app, &state, &owner, "B18 Strict", "Movies").await;
+    let kept = std::path::Path::new(&media_folder(&state, "b18 strict")).join("Kept (2002)");
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::from_secs(3600));
+    let uri = "/Library/Media/Updated";
+    let json = ("Content-Type", "application/json");
+    let owner_auth = format!("Bearer {owner}");
+    let owner_auth = ("Authorization", owner_auth.as_str());
+    let viewer_auth = format!("Bearer {viewer}");
+    let movie = kept.join("Kept (2002).mkv");
+    let good = serde_json::json!({ "Updates": [{ "Path": movie }] }).to_string();
+
+    let callers: [(&str, B18Headers<'_>, StatusCode); 5] = [
+        ("no token", &[json], StatusCode::UNAUTHORIZED),
+        (
+            "a bad token",
+            &[("X-MediaBrowser-Token", "not-the-key"), json],
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "a non-admin",
+            &[("Authorization", viewer_auth.as_str()), json],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "text/plain",
+            &[owner_auth, ("Content-Type", "text/plain")],
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            "no content type",
+            &[owner_auth],
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ];
+    for (what, headers, expected) in callers {
+        let (status, text) = b18_send(&app, "POST", uri, headers, Some(&good)).await;
+        assert_eq!(status, expected, "{what}: {text}");
+    }
+
+    let bodies = [
+        ("no body", String::new()),
+        ("not JSON", "{".to_string()),
+        ("no Updates", "{}".to_string()),
+        (
+            "Updates that are not a list",
+            r#"{"Updates":"x"}"#.to_string(),
+        ),
+        (
+            "an update without a Path",
+            r#"{"Updates":[{"UpdateType":"Created"}]}"#.to_string(),
+        ),
+        ("a null Path", r#"{"Updates":[{"Path":null}]}"#.to_string()),
+        ("an empty Path", r#"{"Updates":[{"Path":""}]}"#.to_string()),
+        (
+            "a good update and an empty one",
+            serde_json::json!({ "Updates": [{ "Path": movie }, { "Path": "" }] }).to_string(),
+        ),
+    ];
+    for (what, body) in bodies {
+        let (status, text) = b18_send(&app, "POST", uri, &[owner_auth, json], Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {text}");
+    }
+    assert!(
+        changes.pending().is_empty(),
+        "a refused request queues nothing: {:?}",
+        changes.pending()
+    );
+
+    let (status, text) = b18_send(&app, "POST", uri, &[owner_auth, json], Some(&good)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    assert_eq!(changes.pending(), vec![(library, ScanScope::Folder(kept))]);
+}
+
+#[tokio::test]
+async fn b18_arr_lookups_work_with_only_the_api_key() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let film = create_library_via_api(&app, &state, &token, "B18 Lookup", "Movies").await;
+    let shows = create_library_via_api(&app, &state, &token, "B18 Lookup Shows", "TvShows").await;
+    let film_dir = media_folder(&state, "b18 lookup");
+    let early = b18_movie(&film_dir, "B18 Lookup Early (2003)").join("B18 Lookup Early (2003).mkv");
+    b18_movie(&film_dir, "B18 Lookup Late (2010)");
+    let series = std::path::Path::new(&media_folder(&state, "b18 lookup shows"))
+        .join("Harbor Lights (2020)");
+    std::fs::create_dir_all(series.join("Season 01")).unwrap();
+    let episode = series.join("Season 01/Harbor Lights (2020) - S01E01 - Pilot.mkv");
+    std::fs::write(episode, b"").unwrap();
+    for library in [film, shows] {
+        let uri = format!("/Library/VirtualFolders/{library}/Refresh");
+        let (status, body) = send_authed(&app, "POST", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        rustyfin_core::scanner::wait_for_idle().await;
+    }
+
+    let config = b18_arr_get(&app, "/System/Configuration").await;
+    assert!(config["ServerName"].is_string(), "{config}");
+
+    // Radarr's lookup of a movie, by year.
+    let uri = "/Items?recursive=true&includeItemTypes=Movie&fields=Path,ProviderIds&years=2003";
+    let body = b18_arr_get(&app, uri).await;
+    let items = body["Items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "years=2003 leaves the 2010 movie out: {body}"
+    );
+    assert_eq!(items[0]["Path"], early.to_str().unwrap(), "{body}");
+    assert!(items[0]["ProviderIds"].is_object(), "{body}");
+    let early_id: uuid::Uuid = items[0]["Id"].as_str().unwrap().parse().unwrap();
+
+    // Sonarr's lookup of a series.
+    let uri = "/Items?recursive=true&includeItemTypes=Series&fields=Path,ProviderIds";
+    let body = b18_arr_get(&app, uri).await;
+    let items = body["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["Path"], series.to_str().unwrap(), "{body}");
+    assert!(items[0]["ProviderIds"].is_object(), "{body}");
+    let series_id = items[0]["Id"].as_str().unwrap();
+
+    // The episode lies in a season of the series, so only a recursive query finds it.
+    for (recursive, count) in [("Recursive=true&", 1), ("recursive=true&", 1), ("", 0)] {
+        let uri = format!("/Items?{recursive}parentId={series_id}&includeItemTypes=Episode");
+        let body = b18_arr_get(&app, &uri).await;
+        assert_eq!(
+            body["Items"].as_array().unwrap().len(),
+            count,
+            "{uri}: {body}"
+        );
+    }
+
+    // fields=MediaSources adds the media sources.
+    g4_insert_source(
+        &state,
+        early_id,
+        "mkv",
+        &early,
+        &[("Video", "h264"), ("Audio", "aac")],
+    )
+    .await;
+    for uri in [
+        "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=MediaSources&Years=2003",
+        "/Items?recursive=true&includeItemTypes=Movie&fields=MediaSources&years=2003",
+    ] {
+        let body = b18_arr_get(&app, uri).await;
+        let sources = body["Items"][0]["MediaSources"].as_array().map(Vec::len);
+        assert_eq!(sources, Some(1), "{uri}: {body}");
+    }
+}
+
+#[test]
+fn b18_webhook_changed_paths_of_every_fixture() {
+    use rustyfin_api::arr_webhook::changed_paths;
+    // Each fixture, with the JSON pointers of the paths that it reports, in order. A path that
+    // comes again is reported once, at its first place.
+    let lidarr_upgrade = &[
+        "/trackFiles/0/path",
+        "/trackFiles/1/path",
+        "/trackFiles/2/path",
+        "/deletedFiles/0/path",
+        "/deletedFiles/1/path",
+        "/deletedFiles/2/path",
+    ];
+    let table: [(&str, &[&str]); 40] = [
+        ("lidarr/album-delete-files-kept.json", &["/artist/path"]),
+        ("lidarr/album-delete.json", &["/artist/path"]),
+        ("lidarr/artist-add.json", &[]),
+        ("lidarr/artist-delete-files-kept.json", &["/artist/path"]),
+        ("lidarr/artist-delete.json", &["/artist/path"]),
+        ("lidarr/download-failure.json", &[]),
+        ("lidarr/download-upgrade-same-path.json", lidarr_upgrade),
+        ("lidarr/download-upgrade.json", lidarr_upgrade),
+        (
+            "lidarr/download.json",
+            &[
+                "/trackFiles/0/path",
+                "/trackFiles/1/path",
+                "/trackFiles/2/path",
+            ],
+        ),
+        ("lidarr/grab.json", &[]),
+        ("lidarr/health.json", &[]),
+        ("lidarr/import-failure.json", &[]),
+        (
+            "lidarr/rename.json",
+            &[
+                "/renamedTrackFiles/0/previousPath",
+                "/renamedTrackFiles/0/path",
+                "/renamedTrackFiles/1/previousPath",
+                "/renamedTrackFiles/1/path",
+                "/renamedTrackFiles/2/previousPath",
+                "/renamedTrackFiles/2/path",
+            ],
+        ),
+        ("lidarr/retag.json", &[]),
+        ("lidarr/test.json", &[]),
+        (
+            "radarr/download-upgrade-same-path.json",
+            &["/movieFile/path", "/deletedFiles/0/path"],
+        ),
+        (
+            "radarr/download-upgrade.json",
+            &["/movieFile/path", "/deletedFiles/0/path"],
+        ),
+        ("radarr/download.json", &["/movieFile/path"]),
+        ("radarr/grab.json", &[]),
+        ("radarr/health.json", &[]),
+        ("radarr/movie-added.json", &[]),
+        (
+            "radarr/movie-delete-files-kept.json",
+            &["/movie/folderPath"],
+        ),
+        ("radarr/movie-delete.json", &["/movie/folderPath"]),
+        (
+            "radarr/movie-file-delete-upgrade.json",
+            &["/movieFile/path"],
+        ),
+        ("radarr/movie-file-delete.json", &["/movieFile/path"]),
+        (
+            "radarr/rename.json",
+            &[
+                "/renamedMovieFiles/0/previousPath",
+                "/renamedMovieFiles/0/path",
+            ],
+        ),
+        ("radarr/test.json", &[]),
+        (
+            "sonarr/download-upgrade-same-path.json",
+            &["/episodeFile/path", "/deletedFiles/0/path"],
+        ),
+        (
+            "sonarr/download-upgrade.json",
+            &["/episodeFile/path", "/deletedFiles/0/path"],
+        ),
+        ("sonarr/download.json", &["/episodeFile/path"]),
+        (
+            "sonarr/episode-file-delete-upgrade.json",
+            &["/episodeFile/path"],
+        ),
+        ("sonarr/episode-file-delete.json", &["/episodeFile/path"]),
+        ("sonarr/grab.json", &[]),
+        ("sonarr/health.json", &[]),
+        (
+            "sonarr/import-complete.json",
+            &[
+                "/episodeFiles/0/path",
+                "/episodeFiles/1/path",
+                "/episodeFiles/2/path",
+            ],
+        ),
+        (
+            "sonarr/rename.json",
+            &[
+                "/renamedEpisodeFiles/0/previousPath",
+                "/renamedEpisodeFiles/0/path",
+                "/renamedEpisodeFiles/1/previousPath",
+                "/renamedEpisodeFiles/1/path",
+            ],
+        ),
+        ("sonarr/series-add.json", &[]),
+        ("sonarr/series-delete-files-kept.json", &["/series/path"]),
+        ("sonarr/series-delete.json", &["/series/path"]),
+        ("sonarr/test.json", &[]),
+    ];
+    let files: Vec<&str> = table.iter().map(|(file, _)| *file).collect();
+    assert_eq!(files, b18_fixture_files(), "the table names every fixture");
+
+    for (file, pointers) in table {
+        let payload: serde_json::Value = serde_json::from_str(&b18_fixture(file)).unwrap();
+        let mut expected: Vec<&str> = Vec::new();
+        for pointer in pointers {
+            let path = payload
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{file} has no path at {pointer}"));
+            if !expected.contains(&path) {
+                expected.push(path);
+            }
+        }
+        if file.contains("same-path") {
+            assert!(expected.len() < pointers.len(), "{file} repeats a path");
+        }
+        assert_eq!(changed_paths(&payload), expected, "{file}");
+    }
+}
+
+#[test]
+fn b18_webhook_changed_paths_skip_what_is_not_a_path() {
+    use rustyfin_api::arr_webhook::changed_paths;
+    use serde_json::json;
+
+    // A Download's fields in this order: episodeFile, episodeFiles, movieFile, trackFiles, then
+    // deletedFiles.
+    let all = json!({
+        "eventType": "Download",
+        "deletedFiles": [{ "path": "/5" }],
+        "trackFiles": [{ "path": "/4" }],
+        "movieFile": { "path": "/3" },
+        "episodeFiles": [{ "path": "/2a" }, { "path": "/2b" }],
+        "episodeFile": { "path": "/1" },
+    });
+    assert_eq!(changed_paths(&all), ["/1", "/2a", "/2b", "/3", "/4", "/5"]);
+
+    // deletedFiles: true says that files were deleted, and names none.
+    let flag = json!({
+        "eventType": "Download",
+        "movieFile": { "path": "/movies/A (2001)/A (2001).mkv" },
+        "deletedFiles": true,
+    });
+    assert_eq!(changed_paths(&flag), ["/movies/A (2001)/A (2001).mkv"]);
+
+    // Empty, null and non-string paths are skipped, and so are lists that are not lists. A path
+    // that comes again is reported once.
+    let odd = json!({
+        "eventType": "Download",
+        "episodeFile": { "path": "" },
+        "episodeFiles": [{ "path": null }, { "path": 7 }, {}, "x", { "path": "/tv/B/S01/b.mkv" }],
+        "trackFiles": { "path": "/music/A/not-a-list.flac" },
+        "deletedFiles": [{ "path": ["/x"] }, { "path": "/tv/B/S01/b.mkv" }],
+    });
+    assert_eq!(changed_paths(&odd), ["/tv/B/S01/b.mkv"]);
+
+    // A Rename: each file's old path, then its new one; episode files, then movie files, then
+    // track files.
+    let rename = json!({
+        "eventType": "Rename",
+        "renamedTrackFiles": [{ "previousPath": "/t/old", "path": "/t/new" }],
+        "renamedMovieFiles": [{ "previousPath": "/m/old", "path": "/m/new" }],
+        "renamedEpisodeFiles": [
+            { "previousPath": "/e/old1", "path": "/e/new1" },
+            { "previousPath": "/e/old2", "path": "/e/new2" },
+        ],
+    });
+    assert_eq!(
+        changed_paths(&rename),
+        [
+            "/e/old1", "/e/new1", "/e/old2", "/e/new2", "/m/old", "/m/new", "/t/old", "/t/new"
+        ]
+    );
+
+    // No eventType, an unknown one, one without paths, or a payload that is not an object.
+    let file = json!({ "path": "/movies/A (2001)/A (2001).mkv" });
+    for payload in [
+        json!({ "movieFile": file }),
+        json!({ "eventType": null, "movieFile": file }),
+        json!({ "eventType": "MovieImported", "movieFile": file }),
+        json!({ "eventType": "Grab", "movie": { "folderPath": "/movies/A (2001)" }, "movieFile": file }),
+        json!({ "eventType": "Retag", "artist": { "path": "/music/A" }, "trackFile": file }),
+        json!([1, 2]),
+        json!("Download"),
+        serde_json::Value::Null,
+    ] {
+        assert!(changed_paths(&payload).is_empty(), "{payload}");
+    }
+}
+
+#[test]
+fn b18_webhook_path_map_replaces_the_longest_matching_prefix() {
+    use rustyfin_api::arr_webhook::PathMap;
+    let map = PathMap::from_query("api_key=K&from=/tv&to=/mnt/media/TV").unwrap();
+    assert_eq!(
+        map.apply("/tv/Show (2020)/Season 01/e.mkv"),
+        "/mnt/media/TV/Show (2020)/Season 01/e.mkv"
+    );
+    assert_eq!(map.apply("/tv"), "/mnt/media/TV");
+    assert_eq!(
+        map.apply("/tvshows/Show/e.mkv"),
+        "/tvshows/Show/e.mkv",
+        "from must end at a separator"
+    );
+    assert_eq!(map.apply("/TV/Show/e.mkv"), "/TV/Show/e.mkv", "case counts");
+    assert_eq!(
+        map.apply("/movies/A (2001)/A.mkv"),
+        "/movies/A (2001)/A.mkv"
+    );
+
+    // Without pairs every path passes unchanged.
+    for query in ["", "api_key=K"] {
+        let map = PathMap::from_query(query).unwrap();
+        assert_eq!(map.apply("/tv/Show/e.mkv"), "/tv/Show/e.mkv", "{query}");
+    }
+
+    // Values are form-decoded, and the i-th from pairs with the i-th to, whatever lies between. A
+    // trailing separator on from is dropped. The longest from wins; of equal ones, the first.
+    let map = PathMap::from_query(
+        "from=/data/&api_key=K&from=%2Fdata%2Fmedia%20tv&to=/a&from=/data/media+tv&to=/b+c&to=/d",
+    )
+    .unwrap();
+    assert_eq!(map.apply("/data/media tv/S/e.mkv"), "/b c/S/e.mkv");
+    assert_eq!(map.apply("/data/media tvx/e.mkv"), "/a/media tvx/e.mkv");
+    assert_eq!(map.apply("/data"), "/a");
+
+    // A Windows from. When to starts with a slash, the backslashes after the from become slashes.
+    let map = PathMap::from_query(
+        "from=C:%5CMedia%5CTV&to=/mnt/media/TV&from=C:%5CMedia%5CFilm%5C&to=D:%5CFilm",
+    )
+    .unwrap();
+    assert_eq!(
+        map.apply(r"C:\Media\TV\Show (2020)\Season 01\e.mkv"),
+        "/mnt/media/TV/Show (2020)/Season 01/e.mkv"
+    );
+    assert_eq!(
+        map.apply(r"C:\Media\TVShows\e.mkv"),
+        r"C:\Media\TVShows\e.mkv"
+    );
+    assert_eq!(
+        map.apply(r"C:\Media\Film\A (2001)\A.mkv"),
+        r"D:\Film\A (2001)\A.mkv"
+    );
+
+    // Unequal counts, and a from that is empty or only a separator.
+    for query in [
+        "from=/tv",
+        "to=/x",
+        "from=/tv&to=/a&to=/b",
+        "from=&to=/x",
+        "from=/&to=/x",
+        "from=%5C&to=/x",
+    ] {
+        assert!(PathMap::from_query(query).is_err(), "{query}");
+    }
+}
+
+#[tokio::test]
+async fn b18_webhook_queues_the_mapped_folder_of_every_fixture() {
+    use rustyfin_core::scanner::ScanScope;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let tv = create_library_via_api(&app, &state, &token, "B18 Hook TV", "TvShows").await;
+    let film = create_library_via_api(&app, &state, &token, "B18 Hook Film", "Movies").await;
+    let music = create_library_via_api(&app, &state, &token, "B18 Hook Music", "Music").await;
+    let tv_dir = media_folder(&state, "b18 hook tv");
+    let film_dir = media_folder(&state, "b18 hook film");
+    let music_dir = media_folder(&state, "b18 hook music");
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::from_secs(3600));
+    let files = b18_fixture_files();
+    assert_eq!(files.len(), 40, "{files:?}");
+    let json = ("Content-Type", "application/json");
+
+    // Without a map, the paths are the ones that the *arr apps see: /tv, /movies and /music, which
+    // are in no library.
+    let (guard, logs) = b18_capture_logs();
+    for file in &files {
+        let uri = "/Library/Media/Webhook?api_key=test-api-key";
+        let (status, text) = b18_send(&app, "POST", uri, &[json], Some(&b18_fixture(file))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{file}: {text}");
+    }
+    drop(guard);
+    assert!(changes.pending().is_empty(), "{:?}", changes.pending());
+    let logs = logs.text();
+    assert!(
+        logs.lines().any(|line| line.contains(" INFO ")
+            && line.contains("webhook: /movies/The Long Signal (2019) is in no library")),
+        "{logs}"
+    );
+
+    let map = format!(
+        "from=/tv&to={}&from=/movies&to={}&from=/music&to={}",
+        b18_query_value(&tv_dir),
+        b18_query_value(&film_dir),
+        b18_query_value(&music_dir),
+    );
+    for file in &files {
+        // Sonarr POSTs with the key in the URL, Radarr PUTs, Lidarr sends the key in a header, and
+        // each Test event comes with X-MediaBrowser-Token.
+        let (method, uri, auth) = if file.ends_with("/test.json") {
+            (
+                "POST",
+                format!("/Library/Media/Webhook?{map}"),
+                Some(("X-MediaBrowser-Token", "test-api-key")),
+            )
+        } else if file.starts_with("sonarr/") {
+            (
+                "POST",
+                format!("/Library/Media/Webhook?api_key=test-api-key&{map}"),
+                None,
+            )
+        } else if file.starts_with("radarr/") {
+            (
+                "PUT",
+                format!("/Library/Media/Webhook?{map}&api_key=test-api-key"),
+                None,
+            )
+        } else {
+            (
+                "POST",
+                format!("/Library/Media/Webhook?{map}"),
+                Some(("X-Emby-Token", "test-api-key")),
+            )
+        };
+        let headers: Vec<(&str, &str)> = auth.into_iter().chain([json]).collect();
+        let body = b18_fixture(file);
+        let (status, text) = b18_send(&app, method, &uri, &headers, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{method} {file}: {text}");
+    }
+    let unit = |dir: &str, name: &str| ScanScope::Folder(std::path::Path::new(dir).join(name));
+    assert_eq!(
+        changes.pending(),
+        b18_sorted(vec![
+            (tv, unit(&tv_dir, "Harbor Lights (2020)")),
+            (film, unit(&film_dir, "The Long Signal (2019)")),
+            (music, unit(&music_dir, "Velvet Static")),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn b18_webhook_refuses_bad_callers_maps_and_bodies() {
+    use rustyfin_core::scanner::ScanScope;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let library = create_library_via_api(&app, &state, &owner, "B18 Hook Auth", "Movies").await;
+    let dir = media_folder(&state, "b18 hook auth");
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::from_secs(3600));
+    let map = format!("from=/movies&to={}", b18_query_value(&dir));
+    let payload = b18_fixture("radarr/download.json");
+    let json = ("Content-Type", "application/json");
+    // The owner's own name and password, which the Webhook does not take as Basic auth.
+    let basic = ("Authorization", "Basic b3duZXI6b3duZXJwYXNz");
+
+    let refused: [(&str, String, B18Headers<'_>, Option<&str>, StatusCode); 9] = [
+        (
+            "no credentials",
+            format!("?{map}"),
+            &[json],
+            Some(&payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "a wrong key",
+            format!("?api_key=not-the-key&{map}"),
+            &[json],
+            Some(&payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "Basic auth",
+            format!("?{map}"),
+            &[basic, json],
+            Some(&payload),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "a non-admin's token in the URL",
+            format!("?api_key={viewer}&{map}"),
+            &[json],
+            Some(&payload),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "a non-admin's token in X-Emby-Token",
+            format!("?{map}"),
+            &[("X-Emby-Token", viewer.as_str()), json],
+            Some(&payload),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "a body that is not JSON",
+            format!("?api_key={owner}&{map}"),
+            &[json],
+            Some("{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "no body",
+            format!("?api_key={owner}&{map}"),
+            &[json],
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "a from without a to",
+            format!("?api_key={owner}&from=/movies"),
+            &[json],
+            Some(&payload),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "an empty from",
+            format!("?api_key={owner}&from=&to={}", b18_query_value(&dir)),
+            &[json],
+            Some(&payload),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (what, query, headers, body, expected) in refused {
+        let uri = format!("/Library/Media/Webhook{query}");
+        let (status, text) = b18_send(&app, "POST", &uri, headers, body).await;
+        assert_eq!(status, expected, "{what}: {text}");
+    }
+    assert!(
+        changes.pending().is_empty(),
+        "a refused request queues nothing: {:?}",
+        changes.pending()
+    );
+
+    // The content type is not checked: a JSON body sent as text/plain is taken.
+    let uri = format!("/Library/Media/Webhook?api_key={owner}&{map}");
+    let headers = [("Content-Type", "text/plain")];
+    let (status, text) = b18_send(&app, "POST", &uri, &headers, Some(&payload)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    let movie = std::path::Path::new(&dir).join("The Long Signal (2019)");
+    assert_eq!(changes.pending(), vec![(library, ScanScope::Folder(movie))]);
+}
+
 // ── G4: transcode pipeline and byte ranges ──
 //
 // Unsatisfiable ranges get 416 instead of a panic or the whole file. Tests that need ffmpeg skip

@@ -80,6 +80,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(session::admin_routes())
         .merge(users::admin_routes())
         .merge(library::admin_routes())
+        .merge(library_monitor::admin_routes())
         .merge(images::admin_routes())
         .merge(items::admin_routes())
         .merge(subtitle::admin_routes())

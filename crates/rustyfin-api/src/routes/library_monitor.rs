@@ -1,6 +1,18 @@
-use std::future::Future;
-use std::pin::Pin;
+//! The library monitor's runner, and the endpoints that report changed paths to it: Jellyfin's
+//! `Media/Updated` and the *arr Webhook.
 
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{RawQuery, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
 use rustyfin_core::library_monitor::RescanRunner;
 use rustyfin_core::scan_progress::ScanTicket;
 use rustyfin_core::scanner::{self, ScanChanges, ScanScope};
@@ -8,12 +20,14 @@ use rustyfin_core::tmdb_client::TmdbClient;
 use rustyfin_model::library::Library;
 use rustyfin_model::server_info::ServerConfiguration;
 use rustyfin_model::ws_event::WsEvent;
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
-use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
+use crate::arr_webhook::{PathMap, changed_paths};
 use crate::cache::{ApiCache, ImageCache};
+use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The library monitor's runner in the API. A rescan scans as a library scan does, without progress
@@ -84,4 +98,77 @@ impl RescanRunner for LibraryMonitorRunner {
             Ok(changes)
         })
     }
+}
+
+/// Administrator-only routes that report changed paths to the monitor. `routes::build_router`
+/// wraps them in `require_admin`.
+pub fn admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Library/Media/Updated", post(media_updated))
+        .route("/Library/Media/Webhook", post(arr_webhook).put(arr_webhook))
+}
+
+/// The body of `POST /Library/Media/Updated`, as Jellyfin's clients and the *arr apps send it.
+#[derive(Deserialize)]
+struct MediaUpdates {
+    #[serde(rename = "Updates", alias = "updates")]
+    updates: Vec<MediaUpdate>,
+}
+
+/// One changed path of a `MediaUpdates` body. Its `UpdateType` is not read.
+#[derive(Deserialize)]
+struct MediaUpdate {
+    #[serde(rename = "Path", alias = "path")]
+    path: String,
+}
+
+/// `POST /Library/Media/Updated`: the files at the paths of the body changed. The whole body is
+/// checked before any path is reported, so one bad update queues nothing.
+async fn media_updated(
+    State(state): State<AppState>,
+    body: Result<Json<MediaUpdates>, JsonRejection>,
+) -> Response {
+    let updates = match body {
+        Ok(Json(updates)) => updates,
+        // A body that is not sent as JSON gets axum's own 415.
+        Err(rejection @ JsonRejection::MissingJsonContentType(_)) => {
+            return rejection.into_response();
+        }
+        Err(rejection) => return ApiError::BadRequest(rejection.body_text()).into_response(),
+    };
+    if updates.updates.iter().any(|update| update.path.is_empty()) {
+        return ApiError::BadRequest("an update has an empty Path".to_string()).into_response();
+    }
+    let changes = state.task_scheduler.changes();
+    for update in &updates.updates {
+        changes.report(Path::new(&update.path)).await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST|PUT /Library/Media/Webhook`: the Webhook of Sonarr, Radarr and Lidarr. The `from` and `to`
+/// pairs of the URL map the apps' paths to this server's. The body is read whatever its type.
+async fn arr_webhook(
+    State(state): State<AppState>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    let map = match PathMap::from_query(query.as_deref().unwrap_or("")) {
+        Ok(map) => map,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return ApiError::BadRequest(format!("the body is not JSON: {e}")).into_response();
+        }
+    };
+    let changes = state.task_scheduler.changes();
+    for path in changed_paths(&payload) {
+        let mapped = map.apply(&path);
+        if !changes.report(Path::new(&mapped)).await {
+            tracing::info!("webhook: {mapped} is in no library");
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
