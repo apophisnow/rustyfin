@@ -5978,3 +5978,185 @@ async fn g1c_list_user_data_is_the_callers() {
         }
     }
 }
+
+/// A raw websocket client of `/socket` that reads the server's text frames.
+struct G1cSocket(tokio::io::BufReader<tokio::net::TcpStream>);
+
+impl G1cSocket {
+    /// Opens `/socket?api_key={token}` and reads up to the TimeSync frame. The server subscribes the
+    /// socket to the broadcast channel before it sends its first frame.
+    async fn open(addr: SocketAddr, token: &str) -> G1cSocket {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /socket?api_key={token} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(
+            line.starts_with("HTTP/1.1 101"),
+            "websocket upgrade: {line:?}"
+        );
+        while line != "\r\n" {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0, "headers end");
+        }
+        let mut socket = G1cSocket(reader);
+        while socket.next().await["MessageType"] != "TimeSync" {}
+        socket
+    }
+
+    /// The JSON of the next text frame. Server frames are not masked.
+    async fn next(&mut self) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+
+        loop {
+            let mut head = [0u8; 2];
+            self.0.read_exact(&mut head).await.unwrap();
+            let len = match head[1] & 0x7f {
+                126 => {
+                    let mut len = [0u8; 2];
+                    self.0.read_exact(&mut len).await.unwrap();
+                    u16::from_be_bytes(len) as usize
+                }
+                127 => {
+                    let mut len = [0u8; 8];
+                    self.0.read_exact(&mut len).await.unwrap();
+                    u64::from_be_bytes(len) as usize
+                }
+                len => len as usize,
+            };
+            let mut payload = vec![0u8; len];
+            self.0.read_exact(&mut payload).await.unwrap();
+            // Opcode 1 is a text frame.
+            if head[0] & 0x0f == 1 {
+                return serde_json::from_slice(&payload).unwrap();
+            }
+        }
+    }
+
+    /// The frames before the "g1c-end" LibraryChanged marker, sorted, each as its `MessageType`
+    /// and then its `UserId` or `LibraryName`, if any.
+    async fn until_end(&mut self) -> Vec<String> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), self.next())
+                .await
+                .expect("no end marker within 10 s");
+            let about = frame["UserId"]
+                .as_str()
+                .or(frame["LibraryName"].as_str())
+                .unwrap_or_default();
+            if about == "g1c-end" {
+                break;
+            }
+            let kind = frame["MessageType"].as_str().unwrap_or_default();
+            frames.push(format!("{kind} {about}").trim_end().to_string());
+        }
+        frames.sort();
+        frames
+    }
+}
+
+/// Sorts the frame lines, for comparing with `G1cSocket::until_end`.
+fn g1c_sorted(lines: &[&str]) -> Vec<String> {
+    let mut lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+    lines.sort();
+    lines
+}
+
+#[tokio::test]
+async fn g1c_session_events_reach_only_their_owner_and_admins() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let m = g1c_insert_movies(&state, 1).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    let mut owner_socket = G1cSocket::open(addr, &owner).await;
+    let mut viewer_socket = G1cSocket::open(addr, &viewer).await;
+    let mut key_socket = G1cSocket::open(addr, "test-api-key").await;
+
+    // Each user starts playing, which sends a SessionChanged with their UserId.
+    for token in [&owner, &viewer] {
+        let body = serde_json::json!({ "ItemId": m[0], "PositionTicks": 0 });
+        let req = request("POST", "/Sessions/Playing", Some(token), Some(body));
+        assert!(send(&app, req).await.0.is_success());
+    }
+    let log = rustyfin_model::ws_event::LogMessageData {
+        timestamp: String::new(),
+        level: "INFO".to_string(),
+        message: format!("g1c: a log line naming {owner_id}"),
+        target: None,
+    };
+    let events = [
+        WsEvent::SessionChanged {
+            data: serde_json::json!({ "Id": "g1c-no-user" }),
+        },
+        WsEvent::LogMessage { data: log },
+        WsEvent::LibraryChanged {
+            data: serde_json::json!({ "LibraryName": "g1c-shared" }),
+        },
+        WsEvent::PlaybackStart {
+            data: serde_json::json!({ "UserId": owner_id }),
+        },
+        WsEvent::PlaybackProgress {
+            data: serde_json::json!({ "UserId": viewer_id }),
+        },
+        WsEvent::PlaybackStop {
+            data: serde_json::json!({ "UserId": owner_id }),
+        },
+        WsEvent::LibraryChanged {
+            data: serde_json::json!({ "LibraryName": "g1c-end" }),
+        },
+    ];
+    for event in events {
+        state.ws_broadcast.send(event).unwrap();
+    }
+
+    let session_owner = format!("SessionChanged {owner_id}");
+    let session_viewer = format!("SessionChanged {viewer_id}");
+    let start_owner = format!("PlaybackStart {owner_id}");
+    let progress_viewer = format!("PlaybackProgress {viewer_id}");
+    let stop_owner = format!("PlaybackStop {owner_id}");
+    let everything = g1c_sorted(&[
+        &session_owner,
+        &session_viewer,
+        "SessionChanged",
+        "LogMessage",
+        "LibraryChanged g1c-shared",
+        &start_owner,
+        &progress_viewer,
+        &stop_owner,
+    ]);
+    // A user who is not an administrator gets their own session and playback events and the shared
+    // ones: not another user's, not one without a user, and no server log lines.
+    let viewers = g1c_sorted(&[
+        &session_viewer,
+        "LibraryChanged g1c-shared",
+        &progress_viewer,
+    ]);
+    assert_eq!(
+        owner_socket.until_end().await,
+        everything,
+        "an administrator's socket"
+    );
+    assert_eq!(
+        key_socket.until_end().await,
+        everything,
+        "the API key's socket"
+    );
+    assert_eq!(
+        viewer_socket.until_end().await,
+        viewers,
+        "the viewer's socket"
+    );
+}
