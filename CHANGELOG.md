@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scan and Stop errors**: Every Scan button and Scan All now show an error toast when the scan can't start, for example "library not found". The task Stop button sent no request (`this.delete is not a function`); it now sends it and shows the server's error, for example when the task has already finished.
 - **Setup wizard library scan**: The library created in the setup wizard is scanned right away. Before, it stayed empty until the next scheduled scan, up to 12 hours later.
 
+### Security
+- **Empty API key and secret**: An empty `RUSTYFIN_API_KEY` (for example `RUSTYFIN_API_KEY=` in compose or an empty field in a NAS template) gave administrator access to any request with an empty token, such as `?api_key=`. An empty `RUSTYFIN_SECRET` let anyone sign their own administrator tokens. Both variables are now trimmed, an empty value counts as unset, and the server logs a warning that names the variable. An empty token never authenticates. The `/socket` websocket now also accepts user tokens when an API key is set, so the web client's scan progress works on such servers. The docs use placeholders instead of example keys.
+
 ## [0.14.0] - 2026-11-03
 
 ### Fixed
