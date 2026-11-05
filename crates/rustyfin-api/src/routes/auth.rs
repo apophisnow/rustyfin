@@ -3,14 +3,20 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use rustyfin_model::auth::{AuthResponse, AuthSessionInfo, LoginRequest};
-use rustyfin_model::user::UserDto;
+use rustyfin_model::user::{User, UserDto};
 use uuid::Uuid;
 
+use super::quick_connect;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/Users/AuthenticateByName", post(login))
+    Router::new()
+        .route("/Users/AuthenticateByName", post(login))
+        .route(
+            "/Users/AuthenticateWithQuickConnect",
+            post(quick_connect_sign_in),
+        )
 }
 
 async fn login(
@@ -18,21 +24,60 @@ async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    let (client, version, device, device_id) = parse_emby_auth(&headers);
-    let token_device = rustyfin_auth::TokenDevice {
-        device_id: device_id.clone(),
-        device_name: device.clone(),
-        app_name: client.clone(),
-        app_version: version.clone(),
-    };
+    let device = token_device(&headers);
     let (user, token) =
-        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &token_device).await?;
+        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &device).await?;
+    Ok(Json(start_session(&state, &device, user, token).await))
+}
 
+/// `POST /Users/AuthenticateWithQuickConnect` – signs in with the secret of a Quick Connect request
+/// that a user approved, as that user (AC26). Public, but behind the login rate limit.
+async fn quick_connect_sign_in(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let secret = body
+        .get("Secret")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("Secret is required.".to_string()))?;
+    let approver = quick_connect::redeem(&state, secret).await?;
+    let device = token_device(&headers);
+    let (user, token) = rustyfin_auth::authenticate_approved(&state.db, approver, &device).await?;
+    Ok(Json(start_session(&state, &device, user, token).await))
+}
+
+/// The device of a sign-in, from its `X-Emby-Authorization` header.
+fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
+    let (client, version, device, device_id) = parse_emby_auth(headers);
+    rustyfin_auth::TokenDevice {
+        device_id,
+        device_name: device,
+        app_name: client,
+        app_version: version,
+    }
+}
+
+/// Starts the session of a sign-in on `device` and builds the answer that every sign-in returns.
+async fn start_session(
+    state: &AppState,
+    device: &rustyfin_auth::TokenDevice,
+    user: User,
+    token: String,
+) -> AuthResponse {
     let session_id = Uuid::new_v4();
 
     // Create session in database with empty capabilities (will be updated by client)
     rustyfin_db::repo_session::create_session(
-        &state.db, session_id, user.id, &user.name, &client, &device, &device_id, &version, "{}",
+        &state.db,
+        session_id,
+        user.id,
+        &user.name,
+        &device.app_name,
+        &device.device_name,
+        &device.device_id,
+        &device.app_version,
+        "{}",
     )
     .await
     .ok();
@@ -41,10 +86,10 @@ async fn login(
         id: session_id.to_string(),
         user_id: user.id,
         user_name: user.name.clone(),
-        client,
-        device_name: device,
-        device_id,
-        application_version: version,
+        client: device.app_name.clone(),
+        device_name: device.device_name.clone(),
+        device_id: device.device_id.clone(),
+        application_version: device.app_version.clone(),
         is_active: true,
         server_id: state.server_id.to_string(),
         supports_media_control: false,
@@ -58,12 +103,12 @@ async fn login(
         capabilities: serde_json::json!({}),
     };
 
-    Ok(Json(AuthResponse {
+    AuthResponse {
         user: UserDto::from(user),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),
-    }))
+    }
 }
 
 /// Parst den `X-Emby-Authorization`/`Authorization` Header.

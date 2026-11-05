@@ -232,8 +232,7 @@ pub async fn logout(pool: &SqlitePool, token: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Checks a login and, if it succeeds, issues a token for `device`. The returned user is re-read
-/// after the login, so its LastLoginDate is the new one (M-16).
+/// Checks a login and, if it succeeds, issues a token for `device`.
 pub async fn authenticate(
     pool: &SqlitePool,
     username: &str,
@@ -253,12 +252,38 @@ pub async fn authenticate(
         return Err(AuthError::InvalidCredentials);
     }
 
-    repo_user::update_last_login(pool, user.id).await?;
-    let user = repo_user::get_user_by_name(pool, username)
+    issue_login_token(pool, user.id, device).await
+}
+
+/// Issues a token for a user who signed in with an approved Quick Connect request instead of a
+/// password. A missing or disabled user gets the same answer as a wrong password.
+pub async fn authenticate_approved(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
+    let user = repo_user::get_user_by_id(pool, user_id)
+        .await?
+        .ok_or(AuthError::UserNotFound)?;
+    if repo_user::is_disabled(pool, user.id).await? {
+        return Err(AuthError::InvalidCredentials);
+    }
+    issue_login_token(pool, user.id, device).await
+}
+
+/// Records a login and issues a token for `device`. The returned user is re-read after the login,
+/// so its LastLoginDate is the new one (M-16). A new login on a device replaces that device's
+/// previous token.
+async fn issue_login_token(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
+    repo_user::update_last_login(pool, user_id).await?;
+    let user = repo_user::get_user_by_id(pool, user_id)
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
-    // A new login on a device replaces that device's previous token.
     if !device.device_id.is_empty() {
         repo_token::delete_user_device_tokens(pool, user.id, &device.device_id).await?;
     }

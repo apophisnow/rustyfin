@@ -124,6 +124,24 @@ async fn authorize(
     Ok(Json(true))
 }
 
+/// Takes an approved Quick Connect request for a sign-in (AC26) and returns the id of the user who
+/// approved it. The request is removed as it is taken, so a secret signs in once. An unknown,
+/// unapproved or expired request is refused; an expired one is also removed.
+pub(super) async fn redeem(state: &AppState, secret: &str) -> Result<Uuid, ApiError> {
+    let mut store = state.quick_connect.write().await;
+    let entry = store.get(secret).ok_or(ApiError::Unauthorized)?;
+    if (Utc::now() - entry.date_added).num_seconds() >= EXPIRY_SECS {
+        store.remove(secret);
+        return Err(ApiError::Unauthorized);
+    }
+    if !entry.authenticated {
+        return Err(ApiError::Unauthorized);
+    }
+    let user_id = entry.user_id.ok_or(ApiError::Unauthorized)?;
+    store.remove(secret);
+    Ok(user_id)
+}
+
 /// Generate a random 6-digit code using basic means (no extra crate needed).
 fn rand_code() -> u32 {
     // Use uuid randomness to derive a number.

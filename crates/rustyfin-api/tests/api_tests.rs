@@ -3231,7 +3231,6 @@ async fn b21_fake_provider_works() {
 // Task 1: Quick Connect's token step (AC26).
 
 #[tokio::test]
-#[ignore = "B21 task 1"]
 async fn b21_quick_connect_secret_signs_in_the_approver() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -3266,7 +3265,6 @@ async fn b21_quick_connect_secret_signs_in_the_approver() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 1"]
 async fn b21_quick_connect_refuses_unknown_unapproved_and_expired() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -3301,7 +3299,6 @@ async fn b21_quick_connect_refuses_unknown_unapproved_and_expired() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 1"]
 async fn b21_quick_connect_refuses_a_disabled_approver() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -3327,7 +3324,6 @@ async fn b21_quick_connect_refuses_a_disabled_approver() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 1"]
 async fn b21_quick_connect_replaces_the_device_token() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -3351,7 +3347,6 @@ async fn b21_quick_connect_replaces_the_device_token() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 1"]
 async fn b21_quick_connect_sign_in_shares_the_login_limit() {
     let state = test_state().await;
     add_user(&state, "alice", "pw-alice", false).await;
