@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Intro and outro detection**: Detection now stores its segments. ffmpeg's arguments were built as one string and split on whitespace, so a path with a space or a quote reached ffmpeg in pieces, and every run then failed on two columns that no migration creates. Each argument is now passed on its own, and a new run replaces the item's earlier intro and outro segments.
+
 ## [0.14.0] - 2026-11-03
 
 ### Fixed
