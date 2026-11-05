@@ -9881,3 +9881,649 @@ async fn b20_track_defaults_per_media_source() {
     let expected = vec![(2, (Some(serde_json::json!(1)), None)), (5, b20_both(1, 3))];
     assert_eq!(sources, expected);
 }
+
+// Import from Jellyfin: the importer reads a Jellyfin data folder read-only (synthetic databases
+// in both layouts, written by `jellyfin_fixture`), matches users by name and items by path pair or
+// provider id, and its preview reports what an import would do without writing anything.
+
+mod jellyfin_fixture;
+use jellyfin_fixture as jf;
+
+/// A server with an admin, the user "alice", the libraries "Movies" (`media/movies`: Alpha, Beta
+/// with TMDB 222) and "Shows" (`media/tv`: Show with TVDB 333, its Season 1 and S01E01-S01E03),
+/// and the Jellyfin install `source` (`b20_source`), which each test writes where it needs it.
+struct B20World {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    alice: uuid::Uuid,
+    movies: String,
+    tv: String,
+    source: jf::JfSource,
+    /// An empty folder for Jellyfin installs, removed when the test ends.
+    jf_root: std::path::PathBuf,
+}
+
+/// A Rustyfin item row for the B20 import tests.
+#[derive(Default)]
+struct B20Row {
+    media_type: &'static str,
+    name: String,
+    path: String,
+    parent: Option<uuid::Uuid>,
+    parent_index: Option<i32>,
+    index: Option<i32>,
+    tmdb: Option<i64>,
+    tvdb: Option<i64>,
+}
+
+/// Stores `row` in `library` and returns the new item's id.
+async fn b20_insert(state: &AppState, library: uuid::Uuid, row: B20Row) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+         parent_index_number, index_number, tmdb_id, tvdb_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library.to_string())
+    .bind(&row.name)
+    .bind(row.media_type)
+    .bind(&row.path)
+    .bind(row.parent.map(|p| p.to_string()))
+    .bind(row.parent_index)
+    .bind(row.index)
+    .bind(row.tmdb)
+    .bind(row.tvdb)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Stores the library `name` of `content_type` on `path` and returns its id.
+async fn b20_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+    path: &str,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![path.to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Stores the user `name` without hashing a password (nobody signs in as them); returns the id.
+async fn b20_plain_user(state: &AppState, name: &str) -> uuid::Uuid {
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        password_hash: "unused".to_string(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::json!({}),
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &user)
+        .await
+        .unwrap();
+    user.id
+}
+
+/// Jellyfin's side: "Alice" (admin; Rustyfin has "alice") and "bob" (new); the libraries Movies
+/// (`/data/movies`), Music (`/data/music`, no Rustyfin library) and Shows (`/data/tvshows`);
+/// items matched by path (Alpha, Show, Season 1, S01E01, S01E02), by id (Beta by TMDB, the episode
+/// 1x03 under an old path by its series and numbers) or not at all (Gamma, Song), and a folder,
+/// which is not imported. User data: Alice has Alpha, S01E01, Gamma and a detached row; bob has
+/// Beta and 1x03.
+fn b20_source() -> jf::JfSource {
+    let alice = jf::JfUser::new(1, "Alice", true);
+    let bob = jf::JfUser::new(2, "bob", false);
+    let folder = jf::JfItem::new("Folder", "Movies", Some("/data/movies"));
+    let alpha = jf::JfItem::new(
+        "Movie",
+        "Alpha",
+        Some("/data/movies/Alpha (2001)/Alpha.mkv"),
+    );
+    let beta = jf::JfItem::new("Movie", "Beta", Some("/data/movies/Beta (old)/Beta.avi"))
+        .provider("Tmdb", "222");
+    let gamma = jf::JfItem::new(
+        "Movie",
+        "Gamma",
+        Some("/data/movies/Gamma (2003)/Gamma.mkv"),
+    )
+    .provider("Tmdb", "999");
+    let show =
+        jf::JfItem::new("Series", "Show", Some("/data/tvshows/Show")).provider("Tvdb", "333");
+    let season = jf::JfItem::new("Season", "Season 1", Some("/data/tvshows/Show/Season 01"))
+        .in_series(show.id)
+        .numbers(None, Some(1));
+    let episode = |name: &str, path: &str, number: i32| {
+        jf::JfItem::new("Episode", name, Some(path))
+            .in_season(show.id, season.id)
+            .numbers(Some(1), Some(number))
+    };
+    let e1 = episode(
+        "Show S01E01",
+        "/data/tvshows/Show/Season 01/Show S01E01.mkv",
+        1,
+    );
+    let e2 = episode(
+        "Show S01E02",
+        "/data/tvshows/Show/Season 01/Show S01E02.mkv",
+        2,
+    );
+    let e3 = episode(
+        "Show 1x03",
+        "/data/tvshows/Show/Season 1/Show - 1x03.mkv",
+        3,
+    );
+    let song = jf::JfItem::new("Audio", "Song", Some("/data/music/Song.flac"));
+    let played = |user: &jf::JfUser, item: uuid::Uuid, last: &'static str| jf::JfUserData {
+        user: user.id,
+        item,
+        played: true,
+        play_count: 1,
+        last_played: Some(last),
+        ..Default::default()
+    };
+    let user_data = vec![
+        jf::JfUserData {
+            play_count: 2,
+            favorite: true,
+            rating: Some(7.6),
+            ..played(&alice, alpha.id, "2025-01-02 03:04:05.1234567")
+        },
+        jf::JfUserData {
+            played: false,
+            play_count: 0,
+            position: 6_000_000_000,
+            ..played(&alice, e1.id, "2025-02-01 10:00:00")
+        },
+        played(&alice, gamma.id, "2025-01-05 12:00:00"),
+        played(&alice, jf::DETACHED, "2024-12-01 00:00:00"),
+        jf::JfUserData {
+            rating: Some(9.5),
+            ..played(&bob, beta.id, "2025-03-01 20:00:00")
+        },
+        played(&bob, e3.id, "2025-03-02 21:00:00"),
+    ];
+    let library = |name, collection_type, path| jf::JfLibrary {
+        name,
+        collection_type,
+        paths: vec![path],
+    };
+    jf::JfSource {
+        users: vec![alice, bob],
+        items: vec![folder, alpha, beta, gamma, show, season, e1, e2, e3, song],
+        user_data,
+        streams: Vec::new(),
+        libraries: vec![
+            library("Movies", "movies", "/data/movies"),
+            library("Music", "music", "/data/music"),
+            library("Shows", "tvshows", "/data/tvshows"),
+        ],
+    }
+}
+
+async fn b20_world() -> B20World {
+    use rustyfin_model::library::LibraryContentType as Kind;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let alice = add_user(&state, "alice", "alicepass", false).await;
+    let movies = media_folder(&state, "movies");
+    let tv = media_folder(&state, "tv");
+    let movie_lib = b20_library(&state, "Movies", Kind::Movies, &movies).await;
+    let show_lib = b20_library(&state, "Shows", Kind::TvShows, &tv).await;
+    let row = |media_type: &'static str, name: &str, path: String| B20Row {
+        media_type,
+        name: name.to_string(),
+        path,
+        ..Default::default()
+    };
+    let alpha_path = format!("{movies}/Alpha (2001)/Alpha.mkv");
+    b20_insert(&state, movie_lib, row("Movie", "Alpha", alpha_path)).await;
+    let beta_row = B20Row {
+        tmdb: Some(222),
+        ..row("Movie", "Beta", format!("{movies}/Beta (2002)/Beta.mkv"))
+    };
+    b20_insert(&state, movie_lib, beta_row).await;
+    let show_row = B20Row {
+        tvdb: Some(333),
+        ..row("Series", "Show", format!("{tv}/Show"))
+    };
+    let show = b20_insert(&state, show_lib, show_row).await;
+    let season_row = B20Row {
+        parent: Some(show),
+        index: Some(1),
+        ..row("Season", "Season 1", format!("{tv}/Show/Season 01"))
+    };
+    let season = b20_insert(&state, show_lib, season_row).await;
+    for n in 1..=3 {
+        let name = format!("Show S01E0{n}");
+        let episode = B20Row {
+            parent: Some(season),
+            parent_index: Some(1),
+            index: Some(n),
+            ..row("Episode", &name, format!("{tv}/Show/Season 01/{name}.mkv"))
+        };
+        b20_insert(&state, show_lib, episode).await;
+    }
+    let jf_root =
+        std::env::temp_dir().join(format!("rustyfin_b20_jf_{}", uuid::Uuid::new_v4().simple()));
+    remove_when_test_ends(&jf_root);
+    std::fs::create_dir_all(&jf_root).unwrap();
+    B20World {
+        state,
+        app,
+        token,
+        alice,
+        movies,
+        tv,
+        source: b20_source(),
+        jf_root,
+    }
+}
+
+/// Writes the world's Jellyfin install in `layout` into the folder `name` and returns that folder
+/// (Jellyfin's program data folder, the official image's `/config`).
+async fn b20_install(w: &B20World, name: &str, layout: jf::Layout) -> std::path::PathBuf {
+    let dir = w.jf_root.join(name);
+    w.source.write(&dir, layout).await;
+    dir
+}
+
+/// POSTs `body` to `/JellyfinImport/{route}` as the admin.
+async fn b20_post(
+    w: &B20World,
+    route: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let uri = format!("/JellyfinImport/{route}");
+    send_authed(&w.app, "POST", &uri, &w.token, Some(&body.to_string())).await
+}
+
+/// Previews an import with `body` and expects 200; returns the report.
+async fn b20_preview(w: &B20World, body: serde_json::Value) -> serde_json::Value {
+    let (status, report) = b20_post(w, "Preview", body).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    report
+}
+
+/// A report's item counts: (Total, MatchedByPath, MatchedById, Unmatched).
+fn b20_item_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["Items"][key].as_i64().unwrap_or(-1);
+    (
+        count("Total"),
+        count("MatchedByPath"),
+        count("MatchedById"),
+        count("Unmatched"),
+    )
+}
+
+/// A report's path pairs under `key` as (From, To).
+fn b20_pairs(report: &serde_json::Value, key: &str) -> Vec<(String, String)> {
+    let pairs = report[key].as_array();
+    pairs
+        .unwrap_or_else(|| panic!("no {key}: {report}"))
+        .iter()
+        .map(|p| {
+            (
+                p["From"].as_str().unwrap().into(),
+                p["To"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+/// A report's `UnmatchedSamples` as (Type, Name, Path).
+fn b20_samples(report: &serde_json::Value) -> Vec<(String, String, String)> {
+    let samples = report["Items"]["UnmatchedSamples"].as_array();
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    samples
+        .unwrap_or_else(|| panic!("no UnmatchedSamples: {report}"))
+        .iter()
+        .map(|s| (text(&s["Type"]), text(&s["Name"]), text(&s["Path"])))
+        .collect()
+}
+
+/// One entry of a report's `Users`.
+#[derive(Debug, PartialEq)]
+struct B20User {
+    jellyfin_id: uuid::Uuid,
+    name: String,
+    was_admin: bool,
+    action: String,
+    reason: Option<String>,
+    user_id: Option<uuid::Uuid>,
+    code: Option<String>,
+}
+
+fn b20_users(report: &serde_json::Value) -> Vec<B20User> {
+    let id = |v: &serde_json::Value| v.as_str().map(|s| uuid::Uuid::parse_str(s).unwrap());
+    let users = report["Users"].as_array();
+    users
+        .unwrap_or_else(|| panic!("no Users: {report}"))
+        .iter()
+        .map(|u| B20User {
+            jellyfin_id: id(&u["JellyfinId"]).unwrap_or_else(|| panic!("JellyfinId: {u}")),
+            name: u["Name"].as_str().unwrap().to_string(),
+            was_admin: u["WasAdministrator"].as_bool().unwrap(),
+            action: u["Action"].as_str().unwrap().to_string(),
+            reason: u["Reason"].as_str().map(str::to_string),
+            user_id: id(&u["UserId"]),
+            code: u["Code"].as_str().map(str::to_string),
+        })
+        .collect()
+}
+
+/// The report entry expected for the Jellyfin user `name` (no code).
+fn b20_user(
+    w: &B20World,
+    name: &str,
+    action: &str,
+    reason: Option<&str>,
+    user_id: Option<uuid::Uuid>,
+) -> B20User {
+    let jf_user = w.source.user(name);
+    B20User {
+        jellyfin_id: jf_user.id,
+        name: name.to_string(),
+        was_admin: jf_user.admin,
+        action: action.to_string(),
+        reason: reason.map(str::to_string),
+        user_id,
+        code: None,
+    }
+}
+
+/// Row counts of the tables an import may write, then every user and user-data row.
+async fn b20_db_digest(state: &AppState) -> Vec<String> {
+    let mut digest = Vec::new();
+    for table in [
+        "users",
+        "user_item_data",
+        "media_items",
+        "media_sources",
+        "media_streams",
+        "item_images",
+        "people",
+        "item_people",
+        "libraries",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        digest.push(format!("{table} {n}"));
+    }
+    let users: Vec<String> = sqlx::query_scalar(
+        "SELECT id || ' ' || name || ' ' || password_hash || ' ' || is_administrator FROM users \
+         ORDER BY id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT quote(user_id) || quote(item_id) || quote(played) || quote(play_count) || \
+         quote(playback_position_ticks) || quote(last_played_date) || quote(is_favorite) || \
+         quote(user_rating) || quote(likes) || quote(audio_stream_index) || \
+         quote(subtitle_stream_index) FROM user_item_data ORDER BY user_id, item_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    digest.extend(users);
+    digest.extend(rows);
+    digest
+}
+
+#[tokio::test]
+async fn b20_import_preview_is_admin_only() {
+    let w = b20_world().await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = Some(serde_json::json!({ "SourcePath": install }));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Preview", &body, &viewer).await;
+}
+
+#[tokio::test]
+async fn b20_import_preview_rejects_bad_sources() {
+    let w = b20_world().await;
+    let new = b20_install(&w, "new", jf::Layout::New).await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let junk = w.jf_root.join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("jellyfin.db"), b"not a database").unwrap();
+    let missing = w.jf_root.join("missing");
+    let cases = [
+        ("empty", serde_json::json!({ "SourcePath": "" })),
+        (
+            "relative",
+            serde_json::json!({ "SourcePath": "relative/config" }),
+        ),
+        ("missing", serde_json::json!({ "SourcePath": missing })),
+        ("not a database", serde_json::json!({ "SourcePath": junk })),
+        (
+            "Old without library.db",
+            serde_json::json!({ "SourcePath": new, "Layout": "Old" }),
+        ),
+        (
+            "New without BaseItems",
+            serde_json::json!({ "SourcePath": old, "Layout": "New" }),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, answer) = b20_post(&w, "Preview", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+
+    // A missing database names the three places searched, and nothing is created.
+    let body = serde_json::json!({ "SourcePath": missing });
+    let (_, answer) = b20_post(&w, "Preview", body).await;
+    let detail = answer["Detail"].as_str().unwrap_or_default();
+    for place in ["jellyfin.db", "data/jellyfin.db", "data/data/jellyfin.db"] {
+        let path = missing.join(place);
+        assert!(detail.contains(path.to_str().unwrap()), "{place}: {detail}");
+    }
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn b20_import_preview_finds_the_database_in_three_places() {
+    let w = b20_world().await;
+    // linuxserver's image: /config/data/data/jellyfin.db
+    let config = w.jf_root.join("config");
+    w.source.write(&config.join("data"), jf::Layout::New).await;
+    let data = config.join("data").join("data");
+    for source in [config.clone(), config.join("data"), data.clone()] {
+        let report = b20_preview(&w, serde_json::json!({ "SourcePath": source })).await;
+        let shown = source.display();
+        assert_eq!(report["DataPath"], serde_json::json!(data), "{shown}");
+        assert_eq!(b20_item_counts(&report), (9, 5, 2, 2), "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_preview_reports_without_writing() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let before = b20_db_digest(&w.state).await;
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a preview writes nothing"
+    );
+
+    assert_eq!(report["Layout"], "New");
+    assert_eq!(report["DataPath"], serde_json::json!(install.join("data")));
+    let text = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let suggested = vec![
+        ("/data/movies".to_string(), w.movies.clone()),
+        ("/data/tvshows".to_string(), w.tv.clone()),
+        ("%MetadataPath%".to_string(), text(install.join("metadata"))),
+        ("%AppDataPath%".to_string(), text(install.join("data"))),
+    ];
+    assert_eq!(b20_pairs(&report, "SuggestedPathMappings"), suggested);
+    assert_eq!(
+        b20_pairs(&report, "PathMappings"),
+        suggested,
+        "absent = suggested"
+    );
+    assert_eq!(
+        report["UnpairedLibraryPaths"],
+        serde_json::json!(["/data/music"])
+    );
+    let users = vec![
+        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_user(&w, "bob", "Create", None, None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+    let gamma = "/data/movies/Gamma (2003)/Gamma.mkv";
+    let samples = vec![("Movie".to_string(), "Gamma".to_string(), gamma.to_string())];
+    assert_eq!(b20_samples(&report), samples);
+}
+
+#[tokio::test]
+async fn b20_import_preview_reads_the_old_layout() {
+    let w = b20_world().await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": old })).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+    let users = vec![
+        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_user(&w, "bob", "Create", None, None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    let names: Vec<String> = b20_samples(&report).into_iter().map(|s| s.1).collect();
+    assert_eq!(names, ["Gamma"]);
+
+    // An upgrade renamed library.db to library.db.old
+    let renamed = b20_install(&w, "renamed", jf::Layout::Old).await;
+    let data = renamed.join("data");
+    std::fs::rename(data.join("library.db"), data.join("library.db.old")).unwrap();
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": renamed })).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+
+    // A migrated install reads the new layout unless Old is asked for
+    let migrated = b20_install(&w, "migrated", jf::Layout::New).await;
+    let old_db = migrated.join("data").join("library.db.old");
+    w.source.write_library_db(&old_db).await;
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": migrated })).await;
+    assert_eq!(report["Layout"], "New");
+    let body = serde_json::json!({ "SourcePath": migrated, "Layout": "Old" });
+    let report = b20_preview(&w, body).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+}
+
+#[tokio::test]
+async fn b20_import_preview_uses_given_path_pairs() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+
+    // No pairs: only provider ids match (Beta; the show, its season and its episodes)
+    let body = serde_json::json!({ "SourcePath": install, "PathMappings": [] });
+    let report = b20_preview(&w, body).await;
+    assert_eq!(
+        b20_pairs(&report, "PathMappings"),
+        Vec::<(String, String)>::new()
+    );
+    assert_eq!(b20_pairs(&report, "SuggestedPathMappings").len(), 4);
+    assert_eq!(b20_item_counts(&report), (9, 0, 6, 3));
+    let names: Vec<String> = b20_samples(&report).into_iter().map(|s| s.1).collect();
+    assert_eq!(names, ["Alpha", "Gamma"]);
+
+    // One pair, with trailing slashes
+    let pairs = serde_json::json!([{ "From": "/data/movies/", "To": format!("{}/", w.movies) }]);
+    let body = serde_json::json!({ "SourcePath": install, "PathMappings": pairs });
+    let report = b20_preview(&w, body).await;
+    assert_eq!(b20_item_counts(&report), (9, 1, 6, 2));
+}
+
+#[tokio::test]
+async fn b20_import_preview_matches_and_picks_users() {
+    let mut w = b20_world().await;
+    let mut ids = HashMap::new();
+    for name in ["Dave", "DAVE", "Erin", "ERIN"] {
+        ids.insert(name, b20_plain_user(&w.state, name).await);
+    }
+    w.source.users.push(jf::JfUser::new(3, "dave", false));
+    w.source.users.push(jf::JfUser::new(4, "Erin", true));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+    let users = vec![
+        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_user(&w, "bob", "Create", None, None),
+        b20_user(&w, "dave", "Skip", Some("Ambiguous"), None),
+        b20_user(&w, "Erin", "Match", None, Some(ids["Erin"])),
+    ];
+    assert_eq!(b20_users(&report), users);
+
+    // Only picked users count; unknown ids are ignored
+    let bob = w
+        .source
+        .user("bob")
+        .id
+        .hyphenated()
+        .to_string()
+        .to_uppercase();
+    let picks = serde_json::json!([bob, uuid::Uuid::new_v4()]);
+    let body = serde_json::json!({ "SourcePath": install, "UserIds": picks });
+    let report = b20_preview(&w, body).await;
+    let users = vec![
+        b20_user(&w, "Alice", "Skip", Some("NotSelected"), None),
+        b20_user(&w, "bob", "Create", None, None),
+        b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
+        b20_user(&w, "Erin", "Skip", Some("NotSelected"), None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    assert_eq!(b20_samples(&report), Vec::new(), "bob's items all match");
+}
+
+#[tokio::test]
+async fn b20_import_preview_leaves_the_source_and_its_secrets_alone() {
+    let w = b20_world().await;
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let install = b20_install(&w, name, layout).await;
+        let before = jf::listing(&install);
+        let log = jf::LogCapture::start();
+        let body = serde_json::json!({ "SourcePath": install });
+        let (status, answer) = b20_post(&w, "Preview", body).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(jf::listing(&install), before, "{name}: the source changed");
+        assert!(
+            !answer.to_string().contains(jf::CANARY),
+            "{name}: secret in the answer"
+        );
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import");
+        assert!(text.lines().any(info), "{name}: no INFO line in {text}");
+    }
+    let db = w.state.data_dir.join("test.db");
+    let files = [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+    ];
+    assert!(
+        !jf::files_hold_canary(&files),
+        "secret in Rustyfin's database"
+    );
+}

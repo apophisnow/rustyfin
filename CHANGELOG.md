@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Remembered audio and subtitle tracks**: The playback reports (`/Sessions/Playing`, `/Progress` and `/Stopped`) store the reported `AudioStreamIndex` and `SubtitleStreamIndex` per user and item (subtitle `-1` means off; a report without them keeps the stored ones), and `GET /Videos/{id}/PlaybackInfo` returns them as each media source's `DefaultAudioStreamIndex` and `DefaultSubtitleStreamIndex` while that source still has the stream, as Jellyfin does with its "remember" settings on. Jellyfin apps read these defaults; the web player has no track choice yet.
+- **Jellyfin import preview**: `POST /JellyfinImport/Preview` (administrators only) reads a Jellyfin data folder and reports what an import would do. It writes nothing.
+  - **Finding the database**: `SourcePath` is the folder holding `jellyfin.db`, or a folder above it (`data/` or `data/data/`, as Docker images mount `/config`).
+  - **Layouts**: both Jellyfin database layouts are read, the current one in `jellyfin.db` and the older `library.db`.
+  - **Read-only**: each database opens read-only, immutable when no WAL is pending. Password hashes, API keys and device tables are never read.
+  - **The report**:
+    - the suggested path pairs, from Jellyfin's library links to Rustyfin's library paths, which a request can replace;
+    - the users, matched by name case-insensitively, to match, create or skip, with the former administrators marked;
+    - the items matched by path, matched by TMDB or TVDB id (seasons and episodes through their series), and unmatched, with up to 200 unmatched items that hold watch data.
 - **Web client translations**: The web client is localized with i18next, with English and German translations in `crates/rustyfin-web/src/translations/` (one JSON file per language, English as the source). The display language follows the browser and can be changed in the setup wizard and in the user settings; picking it in the wizard switches the UI immediately. Previously the UI was German only.
 - **Library scan progress**: Every library scan reports its progress on the socket (`/socket`) to every signed-in user: `RefreshProgress` frames with the library id and a whole percent, `"0"` when the scan is queued, each higher percent as its probes (and, with a metadata provider configured, the metadata refresh of new items) finish, and `"100"` when it ends. A new socket first gets one frame per scan in progress. This covers scans started from the web client, Scan All and the scheduler, including its scan 60 s after start. A web scan's `ScheduledTaskCompleted` now comes when the scan has ended, after its probes, instead of when the scan request returns.
 

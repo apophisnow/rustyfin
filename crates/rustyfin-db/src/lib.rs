@@ -6,6 +6,7 @@ pub mod repo_chapter;
 pub mod repo_collection;
 pub mod repo_device;
 pub mod repo_image;
+pub mod repo_jellyfin_import;
 pub mod repo_library;
 pub mod repo_live_tv;
 pub mod repo_media;

@@ -12,6 +12,7 @@ mod dynamic_hls;
 mod encoding_manager;
 mod images;
 mod items;
+mod jellyfin_import;
 mod library;
 mod live_tv;
 mod localization;
@@ -87,6 +88,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(backup::routes())
         .merge(devices::routes())
         .merge(dlna_streaming::routes())
+        .merge(jellyfin_import::routes())
         .route_layer(axum_mw::from_fn(require_admin));
 
     let protected = Router::new()
