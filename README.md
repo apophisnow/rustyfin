@@ -289,7 +289,7 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_SECRET` | Deprecated and ignored — access tokens are stored server-side and survive restarts | *(unused)* |
 | `RUSTYFIN_SERVER_ID` | Unique server identifier | Stable; persisted to `<data>/server_id` |
 | `RUSTYFIN_API_KEY` | Static API key for integrations | Disabled |
-| `RUSTYFIN_KNOWN_PROXIES` | Reverse proxies trusted to set `X-Forwarded-For`, comma-separated IPs or CIDRs (loopback is always trusted) | *(none)* |
+| `RUSTYFIN_KNOWN_PROXIES` | Reverse proxies trusted to set `X-Forwarded-For`, comma-separated IPs or CIDRs. Loopback is trusted only when listed. Behind a reverse proxy, list it: otherwise every client counts as the proxy's address | *(none)* |
 | `RUSTYFIN_RATE_LIMIT` | Login and password-reset attempts per window, per client IP (`0` disables) | `10` |
 | `RUSTYFIN_RATE_WINDOW` | Rate-limit window, in seconds | `60` |
 | `RUST_LOG` | Log level (`debug`, `info`, `rustyfin=trace`) | `info` |

@@ -1,4 +1,5 @@
 use axum::extract::{ConnectInfo, Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
@@ -13,7 +14,7 @@ use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::middleware::is_local_network;
+use crate::middleware::resolve_client;
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -254,12 +255,14 @@ async fn update_configuration(
 }
 
 /// Start a password reset. The response is uniform whether or not the user exists, so it never
-/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600) to a
-/// file under the data dir ONLY when the user exists AND the caller is on the local network; a
-/// remote caller gets the same 200 with a file path that is not created.
+/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// to a file under the data dir ONLY when the user exists AND the resolved client (see
+/// `resolve_client`) is on the local network. A remote caller gets the same 200 with a file path
+/// that is not created.
 async fn forgot_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
     let pin_path = state
@@ -267,7 +270,7 @@ async fn forgot_password(
         .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
     let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
 
-    if is_local_network(peer.ip())
+    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local()
         && let Some(user) =
             rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username).await?
     {
@@ -291,15 +294,17 @@ async fn forgot_password(
     }))
 }
 
-/// Write the reset file with owner-only permissions (0600), truncating any prior file.
+/// Write the reset file, truncating any prior file. On Unix it is created owner-only (mode 0600).
 fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiError> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(path)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     f.write_all(contents.as_bytes())

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **pnpm for the web client**: `crates/rustyfin-web` uses pnpm instead of npm. `package.json` pins the version in `packageManager` (Corepack and `pnpm/action-setup` read it), and `pnpm-lock.yaml` replaces `package-lock.json` with the same dependency versions. The Dockerfile, the release workflow, `build.sh`, `start.sh` and the README use pnpm.
 - **Access tokens survive restarts**: Access tokens are now opaque values stored server-side, one per device, instead of self-contained JWTs signed with a per-start secret. A restart no longer logs anyone out, and the server id is stable across restarts (persisted to `<data>/server_id`). `RUSTYFIN_SECRET` is now ignored (with a one-time startup notice). **Upgrade note:** tokens issued by an older build stop working once, at the upgrade — every client signs in again after updating.
-- **Stricter login rate limit**: The login, forgot-password and reset endpoints now allow 10 requests per 60 seconds per client IP by default (was 500/60 s), tunable with `RUSTYFIN_RATE_LIMIT` and `RUSTYFIN_RATE_WINDOW` (`0` disables). `X-Forwarded-For` is trusted only from a proxy listed in the new `RUSTYFIN_KNOWN_PROXIES` (comma-separated IPs or CIDRs; loopback is always trusted); otherwise the connecting peer address is used, so a spoofed header can no longer claim the loopback exemption or rotate past the limit.
+- **Stricter login rate limit**: The login, forgot-password and reset endpoints now allow 10 requests per 60 seconds per client IP by default (was 500/60 s), tunable with `RUSTYFIN_RATE_LIMIT` and `RUSTYFIN_RATE_WINDOW` (`0` disables). `X-Forwarded-For` is trusted only from a proxy listed in the new `RUSTYFIN_KNOWN_PROXIES` (comma-separated IPs or CIDRs; loopback only when listed); otherwise the connecting peer address is used, so a spoofed header can no longer claim the loopback exemption or rotate past the limit.
 
 ### Fixed
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`admin`/`admin` after an upgrade**: At startup the server logs a warning naming any enabled administrator whose password is still `admin`.
 - **Password hashing no longer blocks the server (M-15)**: argon2 hashing and verification run on a blocking thread pool, so a burst of logins no longer stalls unrelated requests.
 - **Login response reflects the current login (M-16)**: `AuthenticateByName` now returns the user with the `LastLoginDate` set by that login, not the previous one.
+- **Proxy address handling**: `X-Forwarded-For` is read across all header lines, right to left, with `ip:port` and `[v6]:port` entries; loopback is trusted as a proxy only when listed in `RUSTYFIN_KNOWN_PROXIES`, and a malformed entry no longer resolves to a client-chosen address. The reset-PIN LAN check uses the same client address, IPv4-mapped IPv6 peers count as their IPv4 address, and IPv6 clients share one login budget per /64. Before, a client behind a same-host proxy could claim the loopback exemption.
 
 ## [0.14.0] - 2026-11-03
 

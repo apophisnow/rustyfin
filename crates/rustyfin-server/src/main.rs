@@ -175,7 +175,7 @@ async fn main() {
     rate_limiter.start_cleanup();
 
     // Reverse proxies we trust to set X-Forwarded-For (comma-separated CIDRs or IPs). Loopback is
-    // always trusted implicitly.
+    // trusted only when listed.
     let known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(
         &std::env::var("RUSTYFIN_KNOWN_PROXIES").unwrap_or_default(),
     ));

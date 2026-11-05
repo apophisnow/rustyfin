@@ -3880,3 +3880,290 @@ fn g2_parse_known_proxies_reads_cidrs_and_hosts_and_skips_junk() {
     let nets = rustyfin_api::middleware::parse_known_proxies("10.0.0.0/8, 192.168.1.1 , not-an-ip");
     assert_eq!(nets.len(), 2, "two valid entries, junk skipped: {nets:?}");
 }
+
+// ── G2 follow-up: security-review fixes. HTTP-level like the block above, so they compile on
+// 90c99b5 and fail there at runtime. ──
+
+/// A router whose connecting peer is `addr`, any `SocketAddr` text such as `[::ffff:10.0.0.7]:1`.
+fn g2f_app_from(state: AppState, addr: &str) -> axum::Router {
+    build_router(state).layer(MockConnectInfo(addr.parse::<SocketAddr>().unwrap()))
+}
+
+/// A state with a login budget of 3 per 60 s that trusts the proxies in `proxies` (CSV).
+async fn g2f_state(proxies: &str) -> AppState {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    state.known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies(proxies));
+    state
+}
+
+/// A failed login that carries each of `xff` as its own `X-Forwarded-For` header line.
+fn g2f_bad_login(xff: &[&str]) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json");
+    for line in xff {
+        b = b.header("X-Forwarded-For", *line);
+    }
+    b.body(Body::from(r#"{"Username":"nobody","Pw":"x"}"#))
+        .unwrap()
+}
+
+/// Sends `n` failed logins with the given XFF lines and returns how many got 429.
+async fn g2f_limited(app: &axum::Router, n: usize, xff: &[&str]) -> usize {
+    let mut limited = 0;
+    for _ in 0..n {
+        let status = app
+            .clone()
+            .oneshot(g2f_bad_login(xff))
+            .await
+            .unwrap()
+            .status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    limited
+}
+
+/// Sends ForgotPassword for `user` with the given XFF lines; returns whether the reset file exists.
+async fn g2f_forgot_writes_file(app: &axum::Router, user: &str, xff: &[&str]) -> bool {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/Users/ForgotPassword")
+        .header("Content-Type", "application/json");
+    for line in xff {
+        b = b.header("X-Forwarded-For", *line);
+    }
+    let req = b
+        .body(Body::from(
+            serde_json::json!({ "EnteredUsername": user }).to_string(),
+        ))
+        .unwrap();
+    let (status, body) = send(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ForgotPassword is always 200: {body:?}"
+    );
+    std::path::Path::new(body["PinFile"].as_str().expect("a PinFile path")).exists()
+}
+
+/// Creates the owner "owner" through the setup wizard.
+async fn g2f_with_owner(state: &AppState) {
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn g2f_unlisted_loopback_peer_xff_is_ignored() {
+    // Loopback is a trusted proxy only when listed, so its XFF is ignored and the request stays the
+    // loopback peer's own, which is exempt. 90c99b5 always trusted loopback and limited 203.0.113.5.
+    let app = g2f_app_from(g2f_state("").await, "127.0.0.1:6100");
+    assert_eq!(
+        g2f_limited(&app, 5, &["203.0.113.5"]).await,
+        0,
+        "an unlisted loopback peer's XFF is ignored"
+    );
+}
+
+#[tokio::test]
+async fn g2f_listed_loopback_proxy_limits_the_forwarded_client() {
+    // Guard: once listed, loopback forwards like any other proxy.
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6101");
+    assert!(
+        g2f_limited(&app, 5, &["203.0.113.5"]).await > 0,
+        "the client behind a listed loopback proxy is limited"
+    );
+}
+
+#[tokio::test]
+async fn g2f_listed_loopback_without_xff_is_not_exempt() {
+    // A listed proxy with no XFF has only trusted hops: unresolved, keyed on the peer, not exempt.
+    // 90c99b5 exempted it.
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6102");
+    assert!(
+        g2f_limited(&app, 5, &[]).await > 0,
+        "a listed proxy without XFF is limited on its own address"
+    );
+}
+
+#[tokio::test]
+async fn g2f_second_xff_line_is_read() {
+    // The client writes `X-Forwarded-For: 127.0.0.1`; the proxy appends its own line with the real
+    // client. 90c99b5 read only the first line and exempted the request as loopback.
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6103");
+    assert!(
+        g2f_limited(&app, 5, &["127.0.0.1", "203.0.113.5"]).await > 0,
+        "the real client in the last XFF line is limited"
+    );
+}
+
+#[tokio::test]
+async fn g2f_xff_entries_with_ports_and_brackets_resolve() {
+    // `ip:port`, `[v6]:port` and `[v6]` all parse, and the port is not part of the key, so one
+    // client on changing ports shares one budget. 90c99b5 dropped these entries and fell back to
+    // loopback, which was exempt.
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6104");
+    let mut limited = 0;
+    for i in 0..5 {
+        let line = format!("127.0.0.1, 203.0.113.5:{}", 1000 + i);
+        limited += g2f_limited(&app, 1, &[&line]).await;
+    }
+    assert!(limited > 0, "ip:port on changing ports shares one budget");
+
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6105");
+    let mut limited = 0;
+    for i in 0..5 {
+        let line = format!("[2001:db8:5::5]:{}", 1000 + i);
+        limited += g2f_limited(&app, 1, &[&line]).await;
+    }
+    assert!(limited > 0, "[v6]:port resolves and is limited");
+
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6106");
+    assert!(
+        g2f_limited(&app, 5, &["[2001:db8:6::6]"]).await > 0,
+        "[v6] resolves and is limited"
+    );
+}
+
+#[tokio::test]
+async fn g2f_malformed_xff_entry_is_neither_exempt_nor_local() {
+    // A malformed entry reached by the right-to-left walk leaves the request unresolved: keyed on
+    // the peer, not exempt, not local. 90c99b5 skipped the junk and fell back to the client-written
+    // 127.0.0.1 (exempt), and its LAN gate used the raw LAN peer.
+    let app = g2f_app_from(g2f_state("127.0.0.1").await, "127.0.0.1:6107");
+    assert!(
+        g2f_limited(&app, 5, &["127.0.0.1, not-an-ip"]).await > 0,
+        "a malformed entry must not resolve to the client-written loopback"
+    );
+
+    let state = g2f_state("10.0.0.7").await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "10.0.0.7:6108");
+    assert!(
+        !g2f_forgot_writes_file(&app, "owner", &["192.168.1.5, not-an-ip"]).await,
+        "a malformed entry is not local: no reset file"
+    );
+}
+
+#[tokio::test]
+async fn g2f_junk_left_of_the_proxy_entry_is_ignored() {
+    // Guard: junk a client wrote before the proxy's own entry is never read, so the request still
+    // resolves to that entry. A client cannot move everyone onto the proxy's shared budget.
+    let app = g2f_app_from(g2f_state("10.0.0.7").await, "10.0.0.7:6109");
+    let _ = g2f_limited(&app, 3, &["not-an-ip, 203.0.113.5"]).await;
+    assert_eq!(
+        g2f_limited(&app, 1, &["203.0.113.5"]).await,
+        1,
+        "the junk-prefixed requests drew on 203.0.113.5's budget"
+    );
+}
+
+#[tokio::test]
+async fn g2f_all_hops_trusted_is_not_local() {
+    // Every XFF hop is a listed proxy: unresolved, so no reset file. 90c99b5 gated on the raw,
+    // private peer and wrote one.
+    let state = g2f_state("10.0.0.0/8").await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "10.0.0.7:6110");
+    assert!(
+        !g2f_forgot_writes_file(&app, "owner", &["10.0.0.8"]).await,
+        "an all-trusted chain is not local"
+    );
+}
+
+#[tokio::test]
+async fn g2f_lan_gate_uses_the_resolved_client() {
+    // Behind a listed LAN proxy the gate follows the real client in the last XFF line. 90c99b5
+    // checked the raw peer, so every client behind a LAN proxy got a reset file.
+    let state = g2f_state("10.0.0.7").await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "10.0.0.7:6111");
+    assert!(
+        !g2f_forgot_writes_file(&app, "owner", &["192.168.1.5", "203.0.113.5"]).await,
+        "a remote client behind a LAN proxy gets no reset file"
+    );
+    assert!(
+        g2f_forgot_writes_file(&app, "owner", &["203.0.113.5", "192.168.1.5"]).await,
+        "a LAN client behind the same proxy gets one"
+    );
+}
+
+#[tokio::test]
+async fn g2f_untrusted_peer_xff_cannot_claim_the_lan() {
+    // Guard: an untrusted remote peer's XFF is ignored by the LAN gate as by the limiter.
+    let state = g2f_state("10.0.0.7").await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "203.0.113.9:6112");
+    assert!(
+        !g2f_forgot_writes_file(&app, "owner", &["192.168.1.5"]).await,
+        "a spoofed LAN XFF from a remote peer gets no reset file"
+    );
+    assert!(
+        g2f_limited(&app, 5, &["127.0.0.1"]).await > 0,
+        "a spoofed loopback XFF from a remote peer is limited"
+    );
+}
+
+#[tokio::test]
+async fn g2f_mapped_ipv4_lan_peer_gets_a_reset_file() {
+    // A dual-stack listener sees IPv4 LAN peers as ::ffff:a.b.c.d. 90c99b5 did not canonicalize
+    // them and wrote no file.
+    let state = g2f_state("").await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "[::ffff:192.168.1.20]:6113");
+    assert!(
+        g2f_forgot_writes_file(&app, "owner", &[]).await,
+        "a mapped LAN peer gets a reset file"
+    );
+}
+
+#[tokio::test]
+async fn g2f_mapped_loopback_peer_is_exempt() {
+    // ::ffff:127.0.0.1 is exact loopback once canonicalized. 90c99b5 limited it.
+    let app = g2f_app_from(g2f_state("").await, "[::ffff:127.0.0.1]:6114");
+    assert_eq!(
+        g2f_limited(&app, 5, &[]).await,
+        0,
+        "a mapped loopback peer is exempt"
+    );
+}
+
+#[tokio::test]
+async fn g2f_mapped_proxy_peer_is_trusted() {
+    // A listed IPv4 proxy that reaches a dual-stack listener as ::ffff:10.0.0.7 is still that proxy,
+    // so two clients behind it keep separate budgets. 90c99b5 keyed both on the mapped peer.
+    let app = g2f_app_from(g2f_state("10.0.0.7").await, "[::ffff:10.0.0.7]:6115");
+    let _ = g2f_limited(&app, 3, &["203.0.113.5"]).await;
+    assert_eq!(
+        g2f_limited(&app, 1, &["203.0.113.6"]).await,
+        0,
+        "a second client behind the mapped proxy keeps its own budget"
+    );
+}
+
+#[tokio::test]
+async fn g2f_ipv6_clients_share_a_slash64_budget() {
+    // One host rotating through its /64 must not get a fresh budget per address. 90c99b5 keyed
+    // every full IPv6 address separately.
+    let state = g2f_state("").await;
+    let a = g2f_app_from(state.clone(), "[2001:db8:1:2::10]:6116");
+    let b = g2f_app_from(state.clone(), "[2001:db8:1:2::20]:6117");
+    let other = g2f_app_from(state, "[2001:db8:1:3::10]:6118");
+    let _ = g2f_limited(&a, 3, &[]).await;
+    assert_eq!(
+        g2f_limited(&b, 1, &[]).await,
+        1,
+        "a second address in the same /64 shares the budget"
+    );
+    assert_eq!(
+        g2f_limited(&other, 1, &[]).await,
+        0,
+        "a different /64 keeps its own budget"
+    );
+}

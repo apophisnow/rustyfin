@@ -16,7 +16,7 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_SECRET` | Veraltet und ohne Wirkung — Access-Token werden serverseitig gespeichert und überstehen Neustarts | *(ungenutzt)* |
 | `RUSTYFIN_SERVER_ID` | Eindeutige Server-Kennung | Stabil; in `<data_dir>/server_id` gespeichert |
 | `RUSTYFIN_API_KEY` | Statischer API-Key für externe Integrationen | *(deaktiviert)* |
-| `RUSTYFIN_KNOWN_PROXIES` | Reverse-Proxies, denen beim Setzen von `X-Forwarded-For` vertraut wird, kommagetrennte IPs oder CIDRs (Loopback wird immer vertraut) | *(keine)* |
+| `RUSTYFIN_KNOWN_PROXIES` | Reverse-Proxies, denen beim Setzen von `X-Forwarded-For` vertraut wird, kommagetrennte IPs oder CIDRs (Loopback nur, wenn eingetragen) | *(keine)* |
 | `RUSTYFIN_RATE_LIMIT` | Erlaubte Anmelde- und Passwort-Reset-Versuche pro Zeitfenster, pro Client-IP (`0` deaktiviert) | `10` |
 | `RUSTYFIN_RATE_WINDOW` | Zeitfenster der Ratenbegrenzung in Sekunden | `60` |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
@@ -79,7 +79,9 @@ Rustyfin unterstützt den Betrieb hinter einem Reverse Proxy. Die folgenden Head
 - `X-Forwarded-Proto`
 - `X-Forwarded-Host`
 
-`X-Forwarded-For` wird nur ausgewertet, wenn die Verbindung von einem in `RUSTYFIN_KNOWN_PROXIES` eingetragenen Proxy stammt (Loopback wird immer vertraut); andernfalls wird die Peer-Adresse verwendet. So kann ein gefälschter Header die Ratenbegrenzung nicht umgehen.
+`X-Forwarded-For` wird nur ausgewertet, wenn die Verbindung von einem in `RUSTYFIN_KNOWN_PROXIES` eingetragenen Proxy stammt; das gilt auch für Loopback (`127.0.0.1`, `::1`). Rustyfin liest alle `X-Forwarded-For`-Zeilen von rechts nach links und nimmt die erste Adresse, die kein eingetragener Proxy ist; `ip`, `ip:port`, `[v6]` und `[v6]:port` werden erkannt. Ist ein Eintrag unlesbar oder sind alle Einträge eingetragene Proxies, zählt die Anfrage als vom Proxy kommend: Sie ist weder lokal noch von der Ratenbegrenzung ausgenommen. IPv6-Clients teilen sich ein Budget pro /64-Netz.
+
+⚠️ **Hinter einem Reverse Proxy `RUSTYFIN_KNOWN_PROXIES` setzen.** Ohne diese Variable zählt jeder Client als die Adresse des Proxys. Läuft der Proxy auf demselben Host wie im Beispiel unten, gilt damit jeder Client als Loopback: Er ist von der Ratenbegrenzung ausgenommen und kann einen Passwort-Reset starten. Für das Beispiel: `RUSTYFIN_KNOWN_PROXIES=127.0.0.1`.
 
 #### Nginx-Beispiel
 

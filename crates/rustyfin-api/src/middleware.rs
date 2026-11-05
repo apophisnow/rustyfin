@@ -4,10 +4,11 @@ use axum::http::{HeaderMap, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
 use dashmap::DashMap;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv6Net};
 use rustyfin_model::auth::Claims;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::error::ApiError;
@@ -121,9 +122,10 @@ impl<T> ClaimsExt for axum::extract::Request<T> {
 }
 
 /// True if `ip` is on a local/private network: loopback, RFC1918, link-local (169.254/16),
-/// IPv6 loopback/ULA (fc00::/7)/link-local (fe80::/10). Used to gate who may receive a reset PIN.
+/// IPv6 loopback/ULA (fc00::/7)/link-local (fe80::/10). An IPv4-mapped IPv6 address is checked as
+/// its IPv4 address. Used to gate who may receive a reset PIN.
 pub fn is_local_network(ip: IpAddr) -> bool {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         IpAddr::V6(v6) => {
             if v6.is_loopback() {
@@ -196,7 +198,8 @@ pub const DEFAULT_LOGIN_LIMIT: usize = 10;
 pub const DEFAULT_LOGIN_WINDOW_SECS: u64 = 60;
 
 /// Parse a comma-separated `RUSTYFIN_KNOWN_PROXIES` value into networks. Accepts CIDR blocks
-/// (`10.0.0.0/8`) and bare host IPs (`192.168.1.1` → a /32 or /128). Unparseable entries are dropped.
+/// (`10.0.0.0/8`) and bare host IPs (`192.168.1.1` → a /32 or /128). A bare IPv4-mapped IPv6 host
+/// (`::ffff:10.0.0.7`) becomes its IPv4 address. Unparseable entries are dropped.
 pub fn parse_known_proxies(csv: &str) -> Vec<IpNet> {
     csv.split(',')
         .map(str::trim)
@@ -204,6 +207,7 @@ pub fn parse_known_proxies(csv: &str) -> Vec<IpNet> {
         .filter_map(|s| {
             s.parse::<IpNet>().ok().or_else(|| {
                 s.parse::<IpAddr>().ok().and_then(|ip| {
+                    let ip = ip.to_canonical();
                     let bits = if ip.is_ipv4() { 32 } else { 128 };
                     IpNet::new(ip, bits).ok()
                 })
@@ -214,57 +218,138 @@ pub fn parse_known_proxies(csv: &str) -> Vec<IpNet> {
 
 /// Exactly 127.0.0.1 or ::1. NOT all of 127.0.0.0/8 — 127.0.0.2 is treated as a normal client.
 fn is_exempt_loopback(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
     ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
 }
 
-/// A peer we trust to set `X-Forwarded-For`: exact loopback, or inside a configured known-proxy net.
+/// A peer that may set `X-Forwarded-For`: a canonical address inside a configured known-proxy net.
+/// Loopback is a trusted proxy only when it is listed there.
 fn is_trusted_proxy(ip: IpAddr, known: &[IpNet]) -> bool {
-    is_exempt_loopback(ip) || known.iter().any(|n| n.contains(&ip))
+    let ip = ip.to_canonical();
+    known.iter().any(|n| n.contains(&ip))
 }
 
-/// Resolve the real client IP. `X-Forwarded-For` is honored ONLY when the connecting peer is a
-/// trusted proxy; we then return the right-most forwarded address that is not itself a trusted proxy.
-/// An untrusted peer's XFF is ignored entirely, so a spoofed header cannot change or hide the client.
-pub fn client_ip(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) -> IpAddr {
-    if !is_trusted_proxy(peer, known) {
-        return peer;
+/// The client a request is attributed to, from [`resolve_client`]. `ip` is canonical. An unresolved
+/// request carries the connecting peer as `ip`.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientAddr {
+    pub ip: IpAddr,
+    /// The connecting peer, canonical.
+    peer: IpAddr,
+    /// False when the forwarded chain could not be read to a client address.
+    resolved: bool,
+}
+
+impl ClientAddr {
+    /// On the local network (the reset-PIN gate). An unresolved request is never local.
+    pub fn is_local(&self) -> bool {
+        self.resolved && is_local_network(self.ip)
     }
-    let forwarded: Vec<IpAddr> = headers
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    for ip in forwarded.iter().rev() {
-        if !is_trusted_proxy(*ip, known) {
-            return *ip;
+
+    /// Exempt from the login limit: resolved, with the client and the peer both exact loopback.
+    pub fn is_exempt(&self) -> bool {
+        self.resolved && is_exempt_loopback(self.ip) && is_exempt_loopback(self.peer)
+    }
+
+    /// The login-limiter key: the IPv4 address (no port), or the IPv6 /64 network, so one host that
+    /// rotates addresses within its /64 shares one budget.
+    pub fn limiter_key(&self) -> String {
+        match self.ip {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => {
+                Ipv6Net::new(v6, 64).map_or_else(|_| v6.to_string(), |net| net.trunc().to_string())
+            }
         }
     }
-    forwarded.first().copied().unwrap_or(peer)
 }
 
-/// Per-client-IP budget for the login endpoints only (AuthenticateByName, ForgotPassword,
-/// ForgotPassword/Pin, ResetPassword), mounted on those routes in `routes::build_router`. The
-/// client IP is resolved via `client_ip` (X-Forwarded-For is trusted only from a trusted proxy).
-/// A request is exempt only when both the peer and the resolved client are exact loopback, and a
-/// budget of 0 disables the limit.
+/// Logs once per process when a local-network peer sends `X-Forwarded-For` while no proxies are
+/// configured, so the header is ignored. The header value is never logged.
+fn warn_forwarded_without_proxies(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if known.is_empty()
+        && is_local_network(peer)
+        && headers.contains_key("x-forwarded-for")
+        && !WARNED.swap(true, Ordering::Relaxed)
+    {
+        tracing::warn!("X-Forwarded-For from {peer} ignored: RUSTYFIN_KNOWN_PROXIES is not set");
+    }
+}
+
+/// Parses one `X-Forwarded-For` entry (`ip`, `ip:port`, `[v6]` or `[v6]:port`) to a canonical
+/// address. Empty or unreadable entries give `None`.
+fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
+    let entry = entry.trim();
+    let ip = entry
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| entry.parse::<SocketAddr>().ok().map(|sa| sa.ip()))
+        .or_else(|| {
+            let inner = entry.strip_prefix('[')?.strip_suffix(']')?;
+            inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
+        })?;
+    Some(ip.to_canonical())
+}
+
+/// Resolves the client a request is attributed to. The peer is canonicalized first.
+///
+/// A peer that is not a trusted proxy is the client, and its `X-Forwarded-For` is ignored. A trusted
+/// peer's `X-Forwarded-For` lines are read last line first, each line right to left. The first entry
+/// that is not a trusted proxy is the client, and entries to its left are never read. If an entry
+/// cannot be read, or every hop is a trusted proxy, the request is unresolved: it is keyed on the
+/// peer and is neither local nor exempt from the login limit.
+pub fn resolve_client(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) -> ClientAddr {
+    let peer = peer.to_canonical();
+    warn_forwarded_without_proxies(peer, headers, known);
+    let unresolved = ClientAddr {
+        ip: peer,
+        peer,
+        resolved: false,
+    };
+    if !is_trusted_proxy(peer, known) {
+        return ClientAddr {
+            ip: peer,
+            peer,
+            resolved: true,
+        };
+    }
+    let lines: Vec<_> = headers.get_all("x-forwarded-for").into_iter().collect();
+    for line in lines.iter().rev() {
+        let Ok(text) = line.to_str() else {
+            return unresolved;
+        };
+        for entry in text.rsplit(',') {
+            let Some(addr) = parse_forwarded_entry(entry) else {
+                return unresolved;
+            };
+            if !is_trusted_proxy(addr, known) {
+                return ClientAddr {
+                    ip: addr,
+                    peer,
+                    resolved: true,
+                };
+            }
+        }
+    }
+    unresolved
+}
+
+/// Per-client budget for the login endpoints only (AuthenticateByName, ForgotPassword,
+/// ForgotPassword/Pin, ResetPassword), mounted on those routes in `routes::build_router`. The client
+/// comes from `resolve_client`, so X-Forwarded-For is read only from a trusted proxy. A request is
+/// exempt only when it resolves to exact loopback and the peer is exact loopback. A budget of 0
+/// disables the limit.
 pub async fn rate_limit(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let client = client_ip(addr.ip(), req.headers(), &state.known_proxies);
+    let client = resolve_client(addr.ip(), req.headers(), &state.known_proxies);
 
-    // Exempt only when both the peer and the resolved client are exact loopback; every other client
-    // draws on a per-IP budget. A budget of 0 disables it.
-    if !(is_exempt_loopback(addr.ip()) && is_exempt_loopback(client))
-        && !state.rate_limiter.check(&client.to_string()).await
-    {
-        tracing::warn!(ip = %client, "rate limit exceeded");
+    // Every client that is not exempt draws on its limiter key: the IPv4 address, or the IPv6 /64.
+    if !client.is_exempt() && !state.rate_limiter.check(&client.limiter_key()).await {
+        tracing::warn!(ip = %client.ip, "rate limit exceeded");
         return Err(ApiError::RateLimited);
     }
 
