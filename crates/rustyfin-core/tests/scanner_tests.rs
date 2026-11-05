@@ -7,13 +7,16 @@
 //! The tests marked "ffmpeg" write real clips and need ffmpeg and ffprobe; without them they
 //! print a line and pass.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyfin_core::scan_progress::{ScanRegistry, ScanState, ScanStatus, ScanTicket, ScanUpdate};
+use rustyfin_core::scanner::{ScanChanges, ScanScope};
 use rustyfin_core::scheduler::{TASK_LIBRARY_SCAN, TaskScheduler};
+use rustyfin_core::tmdb_client::{TmdbApi, TmdbClient, TmdbKey, TmdbSettings};
 use rustyfin_core::{probe, scanner};
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::SqlitePool;
@@ -3840,4 +3843,425 @@ async fn b18_music_rescan_keeps_tracks_in_unreadable_dirs() {
     scan(&fx.pool, &lib).await;
 
     assert_eq!(paths(&fx.pool, &lib, "Audio").await, songs);
+}
+
+// B18: a rescan of one top-level folder of a library, or of the files directly in one of its
+// paths, walks and loads only that part, and leaves the database as a full scan of the files would.
+// It counts the items that it added, removed and probed again, refreshes the metadata of its new
+// items as a full scan does, and rebuilds the filter tables only when it changed something.
+
+/// Rescans `scope` of `lib` with no metadata provider and waits for the probes it queued.
+async fn b18_scan_scope(pool: &SqlitePool, lib: &Library, scope: &ScanScope) -> ScanChanges {
+    let changes = scanner::scan_with_metadata(
+        pool,
+        lib,
+        scope,
+        &reqwest::Client::new(),
+        None,
+        None,
+        None,
+        &ScanTicket::untracked(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("rescan of {scope:?}: {e}"));
+    scanner::wait_for_idle().await;
+    changes
+}
+
+/// `b18_scan_scope`, with its counts as (added, removed, reread).
+async fn b18_rescan(pool: &SqlitePool, lib: &Library, scope: &ScanScope) -> (u32, u32, u32) {
+    let changes = b18_scan_scope(pool, lib, scope).await;
+    (changes.added, changes.removed, changes.reread)
+}
+
+/// Waits up to 30 s until every track of `lib` has a stamped source: music probes run after their
+/// scan has returned, and a probe stores the stamp last.
+async fn b18_tracks_probed(pool: &SqlitePool, lib: &Library) {
+    for _ in 0..300 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items AS i
+             WHERE i.library_id = ?1 AND i.media_type = 'Audio'
+               AND NOT EXISTS (SELECT 1 FROM media_sources AS s
+                               WHERE s.item_id = i.id AND s.modified IS NOT NULL)",
+        )
+        .bind(lib.id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{}: tracks without a probed source after 30 s", lib.name);
+}
+
+/// Asserts that `fx.pool` holds what a full scan of `lib`'s files, as they are now, gives in a new
+/// database, `<temp dir>/<file>` (AC 2).
+async fn b18_assert_like_full_scan(fx: &Fixture, lib: &Library, file: &str) {
+    let fresh = fx.second_db(file, lib).await;
+    scan_idle(&fresh, lib).await;
+    b18_tracks_probed(&fx.pool, lib).await;
+    b18_tracks_probed(&fresh, lib).await;
+    assert_eq!(
+        snapshot(&fx.pool, lib).await,
+        snapshot(&fresh, lib).await,
+        "{file}: the rescanned library (left) differs from a full scan of its files (right)"
+    );
+}
+
+#[tokio::test]
+async fn b18_scoped_movie_rescans_match_a_full_scan() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    write_films(&fx, &root);
+    scan_idle(&fx.pool, &lib).await;
+    let folder = |name: &str| ScanScope::Folder(root.join(name));
+    let root_files = ScanScope::RootFiles(root.clone());
+
+    clip(&fx, &root, "Ronin (1998)/Ronin (1998).mkv", 2);
+    let changes = b18_rescan(&fx.pool, &lib, &folder("Ronin (1998)")).await;
+    assert_eq!(changes, (1, 0, 0), "a new folder");
+    b18_assert_like_full_scan(&fx, &lib, "new-folder.db").await;
+
+    // The new version is the longer clip, so a runtime taken from the wrong file shows.
+    clip(&fx, &root, "Heat (1995)/Heat (1995) Bluray-2160p.mkv", 3);
+    let changes = b18_rescan(&fx.pool, &lib, &folder("Heat (1995)")).await;
+    assert_eq!(changes, (0, 0, 1), "a new version in a known folder");
+    b18_assert_like_full_scan(&fx, &lib, "new-version.db").await;
+
+    // The same name, a longer clip, another size.
+    clip(&fx, &root, "Ronin (1998)/Ronin (1998).mkv", 3);
+    let changes = b18_rescan(&fx.pool, &lib, &folder("Ronin (1998)")).await;
+    assert_eq!(changes, (0, 0, 1), "a file replaced under the same name");
+    b18_assert_like_full_scan(&fx, &lib, "replaced.db").await;
+
+    // Argo's primary goes, so its other version becomes the item's path.
+    std::fs::remove_file(root.join("Argo (2012)/Argo (2012) Bluray-2160p.mkv")).unwrap();
+    let changes = b18_rescan(&fx.pool, &lib, &folder("Argo (2012)")).await;
+    assert_eq!(changes, (0, 0, 1), "a removed version");
+    b18_assert_like_full_scan(&fx, &lib, "removed-version.db").await;
+
+    std::fs::remove_dir_all(root.join("Heat (1995)")).unwrap();
+    let changes = b18_rescan(&fx.pool, &lib, &folder("Heat (1995)")).await;
+    assert_eq!(changes, (0, 1, 0), "a removed folder");
+    b18_assert_like_full_scan(&fx, &lib, "removed-folder.db").await;
+
+    clip(&fx, &root, "Alien (1979).mkv", 2);
+    let changes = b18_rescan(&fx.pool, &lib, &root_files).await;
+    assert_eq!(changes, (1, 0, 0), "a new file at the root");
+    b18_assert_like_full_scan(&fx, &lib, "new-root-file.db").await;
+
+    std::fs::remove_file(root.join("The Room.mkv")).unwrap();
+    let changes = b18_rescan(&fx.pool, &lib, &root_files).await;
+    assert_eq!(changes, (0, 1, 0), "a removed file at the root");
+    b18_assert_like_full_scan(&fx, &lib, "removed-root-file.db").await;
+}
+
+#[tokio::test]
+async fn b18_scoped_tv_rescans_match_a_full_scan() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("shows", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    clip(&fx, &root, "Show A/Season 1/Show A S01E01.mkv", 2);
+    clip(&fx, &root, "Show B/Season 1/Show B S01E01.mkv", 2);
+    scan_idle(&fx.pool, &lib).await;
+    let show_a = ScanScope::Folder(root.join("Show A"));
+    let root_files = ScanScope::RootFiles(root.clone());
+
+    clip(&fx, &root, "Show A/Season 1/Show A S01E02.mkv", 3);
+    let changes = b18_rescan(&fx.pool, &lib, &show_a).await;
+    assert_eq!(changes, (1, 0, 0), "a new episode");
+    b18_assert_like_full_scan(&fx, &lib, "new-episode.db").await;
+
+    clip(&fx, &root, "Show A/Season 2/Show A S02E01.mkv", 2);
+    let changes = b18_rescan(&fx.pool, &lib, &show_a).await;
+    assert_eq!(changes, (2, 0, 0), "a new season and its episode");
+    b18_assert_like_full_scan(&fx, &lib, "new-season.db").await;
+
+    // The episode, its season and its series.
+    std::fs::remove_dir_all(root.join("Show B")).unwrap();
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Show B"))).await;
+    assert_eq!(changes, (0, 3, 0), "a removed series");
+    b18_assert_like_full_scan(&fx, &lib, "removed-series.db").await;
+
+    // An episode directly in the library path goes to the series `<path>/Unknown Series` and its
+    // `Season 1`. The second one reuses both.
+    clip(&fx, &root, "Pilot S01E01.mkv", 2);
+    let changes = b18_rescan(&fx.pool, &lib, &root_files).await;
+    assert_eq!(changes, (3, 0, 0), "a first episode at the root");
+    b18_assert_like_full_scan(&fx, &lib, "first-root-file.db").await;
+
+    clip(&fx, &root, "Pilot S01E02.mkv", 2);
+    let changes = b18_rescan(&fx.pool, &lib, &root_files).await;
+    assert_eq!(changes, (1, 0, 0), "a second episode at the root");
+    b18_assert_like_full_scan(&fx, &lib, "second-root-file.db").await;
+}
+
+#[tokio::test]
+async fn b18_scoped_music_rescans_match_a_full_scan() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let root = root_of(&lib);
+    b18_tone(&root, "Artist A/Album 1/01 One.flac", 1);
+    b18_tone(&root, "Artist A/Album 1/02 Two.flac", 1);
+    b18_tone(&root, "Loose 1.flac", 1);
+    scan(&fx.pool, &lib).await;
+    b18_tracks_probed(&fx.pool, &lib).await;
+
+    b18_tone(&root, "Artist A/Album 2/01 Three.flac", 2);
+    b18_tone(&root, "Artist A/Album 2/02 Four.flac", 1);
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Artist A"))).await;
+    assert_eq!(changes, (3, 0, 0), "a new album of a known artist");
+    b18_assert_like_full_scan(&fx, &lib, "new-album.db").await;
+
+    // A track directly in the library path belongs to the album whose path is the library path.
+    b18_tone(&root, "Loose 2.flac", 2);
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::RootFiles(root.clone())).await;
+    assert_eq!(changes, (1, 0, 0), "a new track at the root");
+    b18_assert_like_full_scan(&fx, &lib, "new-root-track.db").await;
+}
+
+#[tokio::test]
+async fn b18_scoped_rescans_stay_in_their_scope() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    let heat = touch(&root, "Heat (1995)/Heat (1995).mkv");
+    // Its folder's name starts with that of Heat's folder, so a prefix match takes it for Heat's.
+    let extended = touch(&root, "Heat (1995) Extended/Heat (1995) Extended.mkv");
+    touch(&root, "Ronin (1998)/Ronin (1998).mkv");
+    let loose = touch(&root, "Loose (2001).mkv");
+    scan_idle(&fx.pool, &lib).await;
+    assert_eq!(paths(&fx.pool, &lib, "Movie").await.len(), 4);
+
+    std::fs::remove_file(&heat).unwrap();
+    std::fs::remove_file(&extended).unwrap();
+    std::fs::remove_file(&loose).unwrap();
+    touch(&root, "New (2010)/New (2010).mkv");
+
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Heat (1995)"))).await;
+    assert_eq!(changes, (0, 1, 0), "Heat's folder");
+    assert_eq!(
+        paths(&fx.pool, &lib, "Movie").await,
+        [
+            "Heat (1995) Extended/Heat (1995) Extended.mkv",
+            "Loose (2001).mkv",
+            "Ronin (1998)/Ronin (1998).mkv",
+        ],
+        "a folder rescan removes only the missing files of its folder, and adds no file of another"
+    );
+
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::RootFiles(root.clone())).await;
+    assert_eq!(changes, (0, 1, 0), "the files at the root");
+    assert_eq!(
+        paths(&fx.pool, &lib, "Movie").await,
+        [
+            "Heat (1995) Extended/Heat (1995) Extended.mkv",
+            "Ronin (1998)/Ronin (1998).mkv",
+        ],
+        "a root-files rescan removes only the missing files directly in the root"
+    );
+
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("New (2010)"))).await;
+    assert_eq!(changes, (1, 0, 0), "the new folder");
+
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Library).await;
+    assert_eq!(changes, (0, 1, 0), "the whole library");
+    assert_eq!(
+        paths(&fx.pool, &lib, "Movie").await,
+        ["New (2010)/New (2010).mkv", "Ronin (1998)/Ronin (1998).mkv"]
+    );
+}
+
+#[tokio::test]
+async fn b18_scoped_rescans_outside_the_library_paths_change_nothing() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "Heat (1995)/Heat (1995).mkv");
+    touch(&root, "Ronin (1998)/Ronin (1998).mkv");
+    scan_idle(&fx.pool, &lib).await;
+    let before = paths(&fx.pool, &lib, "Movie").await;
+    assert_eq!(before.len(), 2);
+
+    // The folder that holds the library path walks no library path, so it must not remove the items
+    // under it as files it did not collect.
+    let above = root.parent().unwrap().to_path_buf();
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(above)).await;
+    assert_eq!(changes, (0, 0, 0), "a folder above the library path");
+    assert_eq!(paths(&fx.pool, &lib, "Movie").await, before);
+
+    // Nor do the files directly in a folder that is not a library path.
+    let inside = root.join("Heat (1995)");
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::RootFiles(inside)).await;
+    assert_eq!(
+        changes,
+        (0, 0, 0),
+        "the files of a folder inside the library path"
+    );
+    assert_eq!(paths(&fx.pool, &lib, "Movie").await, before);
+}
+
+#[tokio::test]
+async fn b18_scoped_rescans_reread_only_their_scope() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    clip(&fx, &root, "Argo (2012)/Argo (2012).mkv", 2);
+    clip(&fx, &root, "Heat (1995)/Heat (1995).mkv", 2);
+    scan_idle(&fx.pool, &lib).await;
+    let before = b18_source_ids(&fx.pool, &lib).await;
+
+    // Both files are replaced by longer clips.
+    clip(&fx, &root, "Argo (2012)/Argo (2012).mkv", 3);
+    clip(&fx, &root, "Heat (1995)/Heat (1995).mkv", 3);
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Argo (2012)"))).await;
+    assert_eq!(changes, (0, 0, 1), "Argo's folder");
+    let after = b18_source_ids(&fx.pool, &lib).await;
+    assert_eq!(
+        b18_reprobed(&before, &after),
+        ["Argo (2012)/Argo (2012).mkv"]
+    );
+
+    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Library).await;
+    assert_eq!(
+        changes,
+        (0, 0, 1),
+        "the whole library, where only Heat is left to read"
+    );
+    let last = b18_source_ids(&fx.pool, &lib).await;
+    assert_eq!(b18_reprobed(&after, &last), ["Heat (1995)/Heat (1995).mkv"]);
+}
+
+/// A stub TMDb on 127.0.0.1:0 that finds nothing, and the `query` of each movie search it got.
+async fn b18_tmdb_stub() -> (TmdbApi, Arc<std::sync::Mutex<Vec<String>>>) {
+    let searches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = searches.clone();
+    let app = axum::Router::new().fallback(
+        move |uri: axum::http::Uri,
+              axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+            let seen = seen.clone();
+            async move {
+                if uri.path() == "/3/search/movie" {
+                    let name = query.get("query").cloned().unwrap_or_default();
+                    seen.lock().unwrap().push(name);
+                }
+                axum::Json(serde_json::json!({ "results": [] }))
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let settings = TmdbSettings {
+        api_base_url: format!("{origin}/3"),
+        image_base_url: format!("{origin}/t/p/original"),
+        env_key: TmdbKey::new("b18-fake-key"),
+        min_interval: Duration::from_millis(1),
+        initial_backoff: Duration::from_millis(5),
+        ..TmdbSettings::default()
+    };
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let api = TmdbClient::new(http, settings)
+        .api(None)
+        .expect("the env key is set");
+    (api, searches)
+}
+
+#[tokio::test]
+async fn b18_scoped_rescans_refresh_the_metadata_of_new_items() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "Ronin (1998)/Ronin (1998).mkv");
+    scan_idle(&fx.pool, &lib).await;
+    touch(&root, "Heat (1995)/Heat (1995).mkv");
+    let (tmdb, searches) = b18_tmdb_stub().await;
+
+    for unit in ["Ronin (1998)", "Heat (1995)"] {
+        scanner::scan_with_metadata(
+            &fx.pool,
+            &lib,
+            &ScanScope::Folder(root.join(unit)),
+            &reqwest::Client::new(),
+            Some(&tmdb),
+            None,
+            None,
+            &ScanTicket::untracked(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("rescan of {unit}: {e}"));
+        scanner::wait_for_idle().await;
+    }
+
+    let searches = searches.lock().unwrap().clone();
+    assert!(
+        searches.iter().any(|query| query.contains("Heat")),
+        "no TMDb search for the new movie: {searches:?}"
+    );
+    assert!(
+        !searches.iter().any(|query| query.contains("Ronin")),
+        "a TMDb search for a known movie: {searches:?}"
+    );
+}
+
+/// The rows of the year filter table, as (year, item count), by year.
+async fn b18_filter_years(pool: &SqlitePool) -> Vec<(i64, i64)> {
+    sqlx::query_as("SELECT year, item_count FROM filter_year_index ORDER BY year")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn b18_scoped_rescans_rebuild_the_filter_tables_only_after_a_change() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "Ronin (1998)/Ronin (1998).mkv");
+    scan_idle(&fx.pool, &lib).await;
+    // No item has this year, so a rebuild removes the row.
+    exec(
+        &fx.pool,
+        "INSERT INTO filter_year_index (year, item_count) VALUES (1, 99)",
+        &[],
+    )
+    .await;
+
+    let ronin = ScanScope::Folder(root.join("Ronin (1998)"));
+    let changes = b18_scan_scope(&fx.pool, &lib, &ronin).await;
+    assert!(!changes.changed(), "{changes:?}");
+    assert_eq!(
+        b18_filter_years(&fx.pool).await,
+        [(1, 99), (1998, 1)],
+        "a rescan that changed nothing rebuilt the filter tables"
+    );
+
+    touch(&root, "Heat (1995)/Heat (1995).mkv");
+    let changes =
+        b18_scan_scope(&fx.pool, &lib, &ScanScope::Folder(root.join("Heat (1995)"))).await;
+    assert!(changes.changed(), "{changes:?}");
+    assert_eq!(
+        b18_filter_years(&fx.pool).await,
+        [(1995, 1), (1998, 1)],
+        "a rescan that added a movie did not rebuild the filter tables"
+    );
 }

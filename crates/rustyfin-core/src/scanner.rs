@@ -1,4 +1,5 @@
 use chrono::Utc;
+use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{MediaItem, MediaType};
 use sqlx::SqlitePool;
@@ -34,8 +35,39 @@ pub async fn scan_library(pool: &SqlitePool, library: &Library) -> Result<u32, s
     .await
 }
 
-/// Scans the library, then refreshes the metadata of its new items. `ticket` is the caller's
-/// share of the library's scan, which the registry lists until the share and the probes end.
+/// What a scan covers in a library: all of it, one folder of a library path with its subfolders,
+/// or the files directly in one library path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScanScope {
+    /// Every library path, with all of its folders.
+    Library,
+    /// A folder under a library path, with its subfolders.
+    Folder(PathBuf),
+    /// The files directly in a library path, not the ones in its folders.
+    RootFiles(PathBuf),
+}
+
+/// How many items a scan added, removed and read again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanChanges {
+    /// New items of every type, series, seasons, artists and albums included.
+    pub added: u32,
+    /// Items that the scan no longer collected, and deleted.
+    pub removed: u32,
+    /// Existing items that got probe steps again, because their files changed.
+    pub reread: u32,
+}
+
+impl ScanChanges {
+    /// Whether the scan added, removed or read again at least one item.
+    pub fn changed(&self) -> bool {
+        self.added > 0 || self.removed > 0 || self.reread > 0
+    }
+}
+
+/// Scans the library, then refreshes the metadata of its new items. Returns how many items were
+/// added. `ticket` is the caller's share of the library's scan, which the registry lists until the
+/// share and the probes end.
 pub async fn scan_library_with_metadata(
     pool: &SqlitePool,
     library: &Library,
@@ -45,18 +77,61 @@ pub async fn scan_library_with_metadata(
     fanart_api_key: Option<&str>,
     ticket: &ScanTicket,
 ) -> Result<u32, sqlx::Error> {
-    tracing::info!(
-        "scanning library '{}' (content_type={:?}, paths={:?})",
-        library.name,
-        library.content_type,
-        library.paths
-    );
+    scan_with_metadata(
+        pool,
+        library,
+        &ScanScope::Library,
+        http_client,
+        tmdb,
+        omdb_api_key,
+        fanart_api_key,
+        ticket,
+    )
+    .await
+    .map(|changes| changes.added)
+}
+
+/// Scans the part of the library that `scope` names, then refreshes the metadata of its new items.
+/// `ticket` is the caller's share of the library's scan, which the registry lists until the share
+/// and the probes end.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_with_metadata(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &ScanScope,
+    http_client: &reqwest::Client,
+    tmdb: Option<&TmdbApi>,
+    omdb_api_key: Option<&str>,
+    fanart_api_key: Option<&str>,
+    ticket: &ScanTicket,
+) -> Result<ScanChanges, sqlx::Error> {
+    if *scope == ScanScope::Library {
+        tracing::info!(
+            "scanning library '{}' (content_type={:?}, paths={:?})",
+            library.name,
+            library.content_type,
+            library.paths
+        );
+    } else {
+        tracing::info!("scanning {scope:?} of library '{}'", library.name);
+    }
+    let scope = &effective_scope(library, scope).await;
+    // No library path holds this scope, so no walk covers it, and the removal would delete its items.
+    if *scope != ScanScope::Library && scope_roots(library, scope).is_empty() {
+        tracing::warn!(
+            "{scope:?} is in no library path of library '{}', so nothing is scanned",
+            library.name
+        );
+        return Ok(ScanChanges::default());
+    }
     // The refresh shows as progress only when a provider is configured to make API calls.
     let counted = tmdb.is_some() || omdb_api_key.is_some() || fanart_api_key.is_some();
-    let (count, new_item_ids) = match library.content_type {
-        LibraryContentType::TvShows => scan_tv_library(pool, library, ticket).await?,
-        LibraryContentType::Music => scan_music_library(pool, library, ticket, counted).await?,
-        _ => scan_flat_library(pool, library, ticket).await?,
+    let (changes, new_item_ids) = match library.content_type {
+        LibraryContentType::TvShows => scan_tv_library(pool, library, scope, ticket).await?,
+        LibraryContentType::Music => {
+            scan_music_library(pool, library, scope, ticket, counted).await?
+        }
+        _ => scan_flat_library(pool, library, scope, ticket).await?,
     };
 
     // Refresh metadata only for newly added items, not all items in the library.
@@ -112,12 +187,15 @@ pub async fn scan_library_with_metadata(
     }
 
     // Rebuild materialized filter indexes after scan completes
-    // This keeps the filter_genre_index, filter_year_index, filter_rating_index up-to-date
-    if let Err(e) = rustyfin_db::repo_media::rebuild_filter_indexes(pool).await {
+    // This keeps the filter_genre_index, filter_year_index, filter_rating_index up-to-date.
+    // A scoped rescan that changed nothing leaves them as they are.
+    if (*scope == ScanScope::Library || changes.changed())
+        && let Err(e) = rustyfin_db::repo_media::rebuild_filter_indexes(pool).await
+    {
         tracing::warn!("failed to rebuild filter indexes: {}", e);
     }
 
-    Ok(count)
+    Ok(changes)
 }
 
 /// Serializes the scans that write items. Held until the probes they queued have finished.
@@ -159,22 +237,131 @@ fn spawn_plans_under_lock(
     });
 }
 
+/// The scope that a scan of `scope` reads. A `Folder` that names a file is read as the folder that
+/// holds the file: `RootFiles` when that folder is a library path, else `Folder`.
+async fn effective_scope(library: &Library, scope: &ScanScope) -> ScanScope {
+    let ScanScope::Folder(folder) = scope else {
+        return scope.clone();
+    };
+    let is_file = fs::metadata(folder).await.is_ok_and(|meta| !meta.is_dir());
+    let Some(parent) = folder.parent().filter(|_| is_file) else {
+        return scope.clone();
+    };
+    if library.paths.iter().any(|root| Path::new(root) == parent) {
+        ScanScope::RootFiles(parent.to_path_buf())
+    } else {
+        ScanScope::Folder(parent.to_path_buf())
+    }
+}
+
+/// The path filter of a scan of `scope`. Its folders have no trailing `/`, as no path of an item has
+/// one.
+fn path_scope(scope: &ScanScope) -> PathScope {
+    match scope {
+        ScanScope::Library => PathScope::All,
+        ScanScope::Folder(folder) => {
+            PathScope::Under(folder.to_string_lossy().trim_end_matches('/').to_string())
+        }
+        ScanScope::RootFiles(dir) => {
+            PathScope::DirectlyIn(dir.to_string_lossy().trim_end_matches('/').to_string())
+        }
+    }
+}
+
+/// The library paths that a scan of `scope` walks, in library order. A folder belongs to the longest
+/// library path that holds it, so no other path is walked for it.
+fn scope_roots<'a>(library: &'a Library, scope: &ScanScope) -> Vec<&'a str> {
+    let paths = library.paths.iter().map(String::as_str);
+    match scope {
+        ScanScope::Library => paths.collect(),
+        ScanScope::Folder(folder) => paths
+            .filter(|root| folder.starts_with(root))
+            .max_by_key(|root| Path::new(root).components().count())
+            .into_iter()
+            .collect(),
+        ScanScope::RootFiles(dir) => paths.filter(|root| Path::new(root) == dir).collect(),
+    }
+}
+
+/// The item of `media_type` at `path`, for a miss in a preload of a scan. A full scan preloads
+/// every item of the library, so it looks up nothing.
+async fn lookup_item(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &ScanScope,
+    media_type: &str,
+    path: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    if *scope == ScanScope::Library {
+        return Ok(None);
+    }
+    rustyfin_db::repo_media::get_library_item_id(pool, library_id, media_type, path).await
+}
+
+/// The artist at `path`, for a miss in the artist preload of a scan. As in `lookup_item`, a full
+/// scan looks up nothing. Nor does a name-keyed artist, with the empty path: the preload has all of
+/// them, in every scope.
+async fn lookup_artist(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &ScanScope,
+    path: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    if *scope == ScanScope::Library || path.is_empty() {
+        return Ok(None);
+    }
+    rustyfin_db::repo_media::get_library_artist_id(pool, library_id, path).await
+}
+
+/// Removes the items of `filter` that the scan no longer collected, and returns how many. A failure
+/// is logged, and counts as none.
+async fn remove_uncollected(
+    pool: &SqlitePool,
+    library: &Library,
+    filter: &PathScope,
+    collected: &HashSet<String>,
+    unreadable: &[PathBuf],
+    loops: &[PathBuf],
+) -> u32 {
+    match scan_sync::remove_not_collected(pool, library, filter, collected, unreadable, loops).await
+    {
+        Ok(removed) => {
+            tracing::info!(
+                "removed {removed} items no longer collected from library '{}'",
+                library.name
+            );
+            removed
+        }
+        Err(e) => {
+            tracing::warn!(
+                "removing items no longer collected from library '{}' failed: {}",
+                library.name,
+                e
+            );
+            0
+        }
+    }
+}
+
 /// Flat scan for Movies, Photos, Mixed libraries
 async fn scan_flat_library(
     pool: &SqlitePool,
     library: &Library,
+    scope: &ScanScope,
     ticket: &ScanTicket,
-) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
+) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
+    let mut reread = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     // Avoids firing one DB query per file during scanning.
     let existing_paths: HashSet<String> =
-        rustyfin_db::repo_media::get_library_paths(pool, library.id)
+        rustyfin_db::repo_media::get_library_paths(pool, library.id, &filter)
             .await?
             .into_iter()
             .collect();
@@ -193,7 +380,7 @@ async fn scan_flat_library(
     let mut unreadable: Vec<PathBuf> = Vec::new();
     let mut loops: Vec<PathBuf> = Vec::new();
 
-    for lib_path in &library.paths {
+    for lib_path in scope_roots(library, scope) {
         let path = Path::new(lib_path);
         if !path.exists() {
             tracing::warn!("library path does not exist: {}", lib_path);
@@ -201,7 +388,7 @@ async fn scan_flat_library(
         }
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, unreadable_dirs, loop_dirs) = collect_files(path).await;
+        let (files, unreadable_dirs, loop_dirs) = collect_in_scope(path, scope).await;
         collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
         unreadable.extend(unreadable_dirs);
         loops.extend(loop_dirs);
@@ -282,11 +469,13 @@ async fn scan_flat_library(
             .any(|p| Path::new(p) == folder.as_path());
         movie_groups.extend(naming::group_movie_files(folder, files, is_library_root));
     }
-    let outcomes = scan_sync::reconcile_movie_groups(pool, library.id, &movie_groups).await?;
+    let outcomes =
+        scan_sync::reconcile_movie_groups(pool, library.id, &filter, &movie_groups).await?;
     for (group, outcome) in movie_groups.iter().zip(outcomes) {
         match outcome {
             scan_sync::GroupOutcome::Existing { item_id, steps } => {
                 if !steps.is_empty() {
+                    reread += 1;
                     plans.push((item_id, steps));
                 }
             }
@@ -359,17 +548,7 @@ async fn scan_flat_library(
     );
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable, &loops).await {
-        Ok(removed) => tracing::info!(
-            "removed {removed} items no longer collected from library '{}'",
-            library.name
-        ),
-        Err(e) => tracing::warn!(
-            "removing items no longer collected from library '{}' failed: {}",
-            library.name,
-            e
-        ),
-    }
+    let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     spawn_plans_under_lock(
         pool.clone(),
         guard,
@@ -377,35 +556,46 @@ async fn scan_flat_library(
         plans,
         ticket.clone(),
     );
-    Ok((count, new_item_ids))
+    let changes = ScanChanges {
+        added: count,
+        removed,
+        reread,
+    };
+    Ok((changes, new_item_ids))
 }
 
 /// Recursive scan for TV Shows: path/ShowName/Season XX/episode files
 async fn scan_tv_library(
     pool: &SqlitePool,
     library: &Library,
+    scope: &ScanScope,
     ticket: &ScanTicket,
-) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
+) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let guard = SCAN_LOCK.lock().await;
     ticket.start();
+    let filter = path_scope(scope);
     let mut count = 0u32;
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     let mut existing_count = 0u32;
+    let mut reread = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
-        rustyfin_db::repo_media::get_library_paths(pool, library.id)
+        rustyfin_db::repo_media::get_library_paths(pool, library.id, &filter)
             .await?
             .into_iter()
             .collect();
 
     // Pre-load all existing series and season paths into HashMaps for O(1) ID lookup.
-    // Eliminates per-series/season database queries during directory traversal.
+    // Eliminates per-series/season database queries during directory traversal. A scoped scan
+    // loads the ones in its scope, and looks up the others when it meets them.
     let existing_series: HashMap<String, Uuid> =
-        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Series").await?;
+        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Series", &filter)
+            .await?;
     let existing_seasons: HashMap<String, Uuid> =
-        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season").await?;
+        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season", &filter)
+            .await?;
     // The episode files of each season, by season id: the season's name, then its files in walk
     // order. The episodes are reconciled once every path has been walked.
     let mut episode_files: BTreeMap<Uuid, (String, Vec<PathBuf>)> = BTreeMap::new();
@@ -416,7 +606,7 @@ async fn scan_tv_library(
     let mut unreadable: Vec<PathBuf> = Vec::new();
     let mut loops: Vec<PathBuf> = Vec::new();
 
-    for lib_path in &library.paths {
+    for lib_path in scope_roots(library, scope) {
         let path = Path::new(lib_path);
         if !path.exists() {
             tracing::warn!("library path does not exist: {}", lib_path);
@@ -432,7 +622,7 @@ async fn scan_tv_library(
         let mut new_items: Vec<MediaItem> = Vec::new();
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, unreadable_dirs, loop_dirs) = collect_files(path).await;
+        let (files, unreadable_dirs, loop_dirs) = collect_in_scope(path, scope).await;
         collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
         unreadable.extend(unreadable_dirs);
         loops.extend(loop_dirs);
@@ -499,6 +689,11 @@ async fn scan_tv_library(
             // Ensure series item exists — use pre-loaded HashMap first, then create new
             let series_id = if let Some(id) = series_map.get(&series_dir) {
                 *id
+            } else if let Some(id) =
+                lookup_item(pool, library.id, scope, "Series", &series_dir).await?
+            {
+                series_map.insert(series_dir.clone(), id);
+                id
             } else {
                 let id = Uuid::new_v4();
                 let series_item = MediaItem {
@@ -531,6 +726,11 @@ async fn scan_tv_library(
             let season_path = format!("{}/{}", series_dir, season_name);
             let season_id = if let Some(id) = season_map.get(&season_path) {
                 *id
+            } else if let Some(id) =
+                lookup_item(pool, library.id, scope, "Season", &season_path).await?
+            {
+                season_map.insert(season_path.clone(), id);
+                id
             } else {
                 let id = Uuid::new_v4();
                 let season_index = parse_season_number(&season_name);
@@ -625,13 +825,15 @@ async fn scan_tv_library(
             });
         }
     }
-    let outcomes = scan_sync::reconcile_episode_groups(pool, library.id, &episode_groups).await?;
+    let outcomes =
+        scan_sync::reconcile_episode_groups(pool, library.id, &filter, &episode_groups).await?;
     let mut new_episodes: Vec<MediaItem> = Vec::new();
     let mut new_episode_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     for (group, outcome) in episode_groups.iter().zip(outcomes) {
         match outcome {
             scan_sync::GroupOutcome::Existing { item_id, steps } => {
                 if !steps.is_empty() {
+                    reread += 1;
                     plans.push((item_id, steps));
                 }
             }
@@ -689,17 +891,7 @@ async fn scan_tv_library(
     );
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable, &loops).await {
-        Ok(removed) => tracing::info!(
-            "removed {removed} items no longer collected from library '{}'",
-            library.name
-        ),
-        Err(e) => tracing::warn!(
-            "removing items no longer collected from library '{}' failed: {}",
-            library.name,
-            e
-        ),
-    }
+    let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     spawn_plans_under_lock(
         pool.clone(),
         guard,
@@ -707,7 +899,12 @@ async fn scan_tv_library(
         plans,
         ticket.clone(),
     );
-    Ok((count, new_item_ids))
+    let changes = ScanChanges {
+        added: count,
+        removed,
+        reread,
+    };
+    Ok((changes, new_item_ids))
 }
 
 /// Recursive scan for Music: path/Artist/Album/track files
@@ -716,25 +913,28 @@ async fn scan_tv_library(
 async fn scan_music_library(
     pool: &SqlitePool,
     library: &Library,
+    scope: &ScanScope,
     ticket: &ScanTicket,
     counted: bool,
-) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
+) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
     let _guard = SCAN_LOCK.lock().await;
     ticket.start();
+    let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
+    let mut reread = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
-        rustyfin_db::repo_media::get_library_paths(pool, library.id)
+        rustyfin_db::repo_media::get_library_paths(pool, library.id, &filter)
             .await?
             .into_iter()
             .collect();
 
     // The source of each known track, by path: its item, and the stamp that it stores.
     let known_tracks: HashMap<String, (Uuid, Option<i64>, Option<i64>)> =
-        rustyfin_db::repo_media::get_library_audio_sources(pool, library.id)
+        rustyfin_db::repo_media::get_library_audio_sources(pool, library.id, &filter)
             .await?
             .into_iter()
             .map(|(id, path, size, modified)| (path, (id, size, modified)))
@@ -742,12 +942,14 @@ async fn scan_music_library(
 
     // Pre-load the music album rows once for the whole scan, for O(1) ID lookup.
     // Artists and albums both use MediaType::MusicAlbum in the DB, so artist paths are here too.
+    // A scoped scan loads the rows in its scope, and looks up the others when it meets them.
     // album_path -> album_id
     let mut album_map: HashMap<String, Uuid> =
-        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "MusicAlbum").await?;
+        rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "MusicAlbum", &filter)
+            .await?;
     // artist_key -> artist_id, for the artist rows of earlier scans, keyed as the loop keys them
     let mut artist_map: HashMap<String, Uuid> =
-        rustyfin_db::repo_media::get_library_artists(pool, library.id)
+        rustyfin_db::repo_media::get_library_artists(pool, library.id, &filter)
             .await?
             .into_iter()
             .map(|(id, path, name)| {
@@ -766,7 +968,7 @@ async fn scan_music_library(
     let mut collected: HashSet<String> = HashSet::new();
     let mut unreadable: Vec<PathBuf> = Vec::new();
     let mut loops: Vec<PathBuf> = Vec::new();
-    for lib_path in &library.paths {
+    for lib_path in scope_roots(library, scope) {
         let path = Path::new(lib_path);
         if !path.exists() {
             tracing::warn!("library path does not exist: {}", lib_path);
@@ -774,7 +976,7 @@ async fn scan_music_library(
         }
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, unreadable_dirs, loop_dirs) = collect_files(path).await;
+        let (files, unreadable_dirs, loop_dirs) = collect_in_scope(path, scope).await;
         tracing::info!(
             "music library '{}': found {} files in path {}",
             library.name,
@@ -822,6 +1024,7 @@ async fn scan_music_library(
                         scan_sync::store_stamp(pool, &item_id.to_string(), &file_path, stamp)
                             .await?;
                     } else if scan_sync::source_changed(&file_path, size, modified) {
+                        reread += 1;
                         probe::spawn_probe_and_save(pool.clone(), item_id, file_path.clone());
                     }
                 }
@@ -914,6 +1117,10 @@ async fn scan_music_library(
                 };
                 if let Some(id) = artist_map.get(&artist_key) {
                     Some(*id)
+                } else if let Some(id) = lookup_artist(pool, library.id, scope, &artist_dir).await?
+                {
+                    artist_map.insert(artist_key, id);
+                    Some(id)
                 } else {
                     let id = Uuid::new_v4();
                     let artist_item = MediaItem {
@@ -951,6 +1158,11 @@ async fn scan_music_library(
             // Resolve album with parent_id pointing to artist — use pre-loaded HashMap first
             let album_id = if let Some(id) = album_map.get(&album_dir) {
                 *id
+            } else if let Some(id) =
+                lookup_item(pool, library.id, scope, "MusicAlbum", &album_dir).await?
+            {
+                album_map.insert(album_dir.clone(), id);
+                id
             } else {
                 let id = Uuid::new_v4();
                 let album_item = MediaItem {
@@ -1083,24 +1295,19 @@ async fn scan_music_library(
     }
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable, &loops).await {
-        Ok(removed) => tracing::info!(
-            "removed {removed} items no longer collected from library '{}'",
-            library.name
-        ),
-        Err(e) => tracing::warn!(
-            "removing items no longer collected from library '{}' failed: {}",
-            library.name,
-            e
-        ),
-    }
+    let removed = remove_uncollected(pool, library, &filter, &collected, &unreadable, &loops).await;
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,
         count,
         existing_count
     );
-    Ok((count, new_item_ids))
+    let changes = ScanChanges {
+        added: count,
+        removed,
+        reread,
+    };
+    Ok((changes, new_item_ids))
 }
 
 fn detect_media_type(ext: &str, content_type: &LibraryContentType) -> Option<MediaType> {
@@ -1166,28 +1373,46 @@ async fn dir_id(path: &Path) -> std::io::Result<DirId> {
     fs::canonicalize(path).await
 }
 
-/// Recursively collects the file paths under `root`, using async I/O and an iterative work queue.
-///
-/// Returns three lists. The first is the files, sorted by path. The second is the directories that
-/// could not be listed completely, from a failed `read_dir` or an error part way through one. The
-/// third is the subdirectories skipped as symlink loops: a subdirectory whose identity is already
-/// among its ancestors. Entries that `naming` ignores are skipped, and so are dangling symlinks,
-/// which name no file or folder. Two links to one folder are both followed. The root's own name is
-/// never checked.
-async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+/// What a scan makes of one entry of a folder.
+enum EntryKind {
+    /// A folder, which a walk descends into unless its name is ignored.
+    Dir,
+    /// A file, which a scan collects unless its name is ignored.
+    File,
+    /// A dangling symlink, which names no file or folder, so it is skipped and its item is gone.
+    Dangling,
+}
+
+/// Classifies `entry`, an entry of a folder that a scan lists. A symlink takes the kind of its
+/// target, since `fs::metadata` follows it.
+async fn entry_kind(entry: &fs::DirEntry) -> EntryKind {
+    let path = entry.path();
+    match entry.file_type().await {
+        Ok(ft) if ft.is_dir() => EntryKind::Dir,
+        Ok(ft) if ft.is_symlink() => match fs::metadata(&path).await {
+            Ok(meta) if meta.is_dir() => EntryKind::Dir,
+            Ok(_) => EntryKind::File,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EntryKind::Dangling,
+            Err(_) => EntryKind::File,
+        },
+        Ok(_) => EntryKind::File,
+        Err(_) if path.is_dir() => EntryKind::Dir,
+        Err(_) => EntryKind::File,
+    }
+}
+
+/// Walks the folder `start` and the folders under it, as `collect_files` walks a root. `chain` holds
+/// the identities of `start` and its ancestors, and each subfolder is checked against it.
+async fn walk_from(
+    start: PathBuf,
+    chain: Vec<DirId>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut result = Vec::new();
     let mut unreadable = Vec::new();
     let mut loops = Vec::new();
 
-    let root_id = match dir_id(root).await {
-        Ok(id) => id,
-        Err(err) => {
-            tracing::warn!("cannot read directory {}: {}", root.display(), err);
-            return (result, vec![root.to_path_buf()], Vec::new());
-        }
-    };
-    // Each queued directory carries the identities of itself and its ancestors, root included.
-    let mut work_queue = vec![(root.to_path_buf(), vec![root_id])];
+    // Each queued directory carries the identities of itself and its ancestors, the start included.
+    let mut work_queue = vec![(start, chain)];
 
     while let Some((current, chain)) = work_queue.pop() {
         let mut entries = match fs::read_dir(&current).await {
@@ -1206,29 +1431,18 @@ async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>
                     let path = entry.path();
                     let file_name = entry.file_name();
                     let name = file_name.to_string_lossy();
-                    let is_dir = if let Ok(ft) = entry.file_type().await {
-                        if ft.is_dir() {
-                            true
-                        } else if ft.is_symlink() {
-                            match fs::metadata(&path).await {
-                                Ok(meta) => meta.is_dir(),
-                                // A dangling link names nothing, so it is skipped and its item is gone.
-                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                                Err(_) => false,
+                    match entry_kind(&entry).await {
+                        EntryKind::Dir => {
+                            if !naming::is_ignored_dir(&name) {
+                                children.push(path);
                             }
-                        } else {
-                            false
                         }
-                    } else {
-                        path.is_dir()
-                    };
-
-                    if is_dir {
-                        if !naming::is_ignored_dir(&name) {
-                            children.push(path);
+                        EntryKind::File => {
+                            if !naming::is_ignored_file(&name) {
+                                result.push(path);
+                            }
                         }
-                    } else if !naming::is_ignored_file(&name) {
-                        result.push(path);
+                        EntryKind::Dangling => {}
                     }
                 }
                 Ok(None) => break,
@@ -1262,6 +1476,107 @@ async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>
 
     result.sort();
     (result, unreadable, loops)
+}
+
+/// Recursively collects the file paths under `root`, using async I/O and an iterative work queue.
+///
+/// Returns three lists. The first is the files, sorted by path. The second is the directories that
+/// could not be listed completely, from a failed `read_dir` or an error part way through one. The
+/// third is the subdirectories skipped as symlink loops: a subdirectory whose identity is already
+/// among its ancestors. Entries that `naming` ignores are skipped, and so are dangling symlinks,
+/// which name no file or folder. Two links to one folder are both followed. The root's own name is
+/// never checked.
+async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    match dir_id(root).await {
+        Ok(root_id) => walk_from(root.to_path_buf(), vec![root_id]).await,
+        Err(err) => {
+            tracing::warn!("cannot read directory {}: {}", root.display(), err);
+            (Vec::new(), vec![root.to_path_buf()], Vec::new())
+        }
+    }
+}
+
+/// Collects the files that a scan of `scope` reads under `root`, a library path, as `collect_files`
+/// does for a full scan.
+async fn collect_in_scope(
+    root: &Path,
+    scope: &ScanScope,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    match scope {
+        ScanScope::Library => collect_files(root).await,
+        ScanScope::Folder(folder) => collect_folder(root, folder).await,
+        ScanScope::RootFiles(_) => list_root_files(root).await,
+    }
+}
+
+/// Collects the files under `folder`, a folder of the library path `root`. The walk starts with the
+/// identities of `root` and `folder` in its chain, so a link back to `root` is a loop.
+async fn collect_folder(root: &Path, folder: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    // The library path itself is walked as a root is.
+    if folder == root {
+        return collect_files(root).await;
+    }
+    let name = folder.file_name().map(|name| name.to_string_lossy());
+    if name.is_some_and(|name| naming::is_ignored_dir(&name)) {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let root_id = match dir_id(root).await {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!("cannot read directory {}: {}", root.display(), err);
+            return (Vec::new(), vec![root.to_path_buf()], Vec::new());
+        }
+    };
+    let folder_id = match dir_id(folder).await {
+        Ok(id) => id,
+        // A folder that is gone collects nothing, and its items are removed.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        Err(err) => {
+            tracing::warn!("cannot read directory {}: {}", folder.display(), err);
+            return (Vec::new(), vec![folder.to_path_buf()], Vec::new());
+        }
+    };
+    if folder_id == root_id {
+        tracing::warn!("skipping symlink loop at {}", folder.display());
+        return (Vec::new(), Vec::new(), vec![folder.to_path_buf()]);
+    }
+    walk_from(folder.to_path_buf(), vec![root_id, folder_id]).await
+}
+
+/// Lists the files directly in `root`, a library path, as `collect_files` keeps them: the same ignore
+/// rules, and no folders or dangling links. A `read_dir` error, even part way, makes `root` unreadable.
+async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut result = Vec::new();
+    let mut unreadable = Vec::new();
+    match fs::read_dir(root).await {
+        Ok(mut entries) => loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let file_name = entry.file_name();
+                    let name = file_name.to_string_lossy();
+                    if matches!(entry_kind(&entry).await, EntryKind::File)
+                        && !naming::is_ignored_file(&name)
+                    {
+                        result.push(entry.path());
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!("cannot read directory {}: {}", root.display(), err);
+                    unreadable.push(root.to_path_buf());
+                    break;
+                }
+            }
+        },
+        Err(err) => {
+            tracing::warn!("cannot read directory {}: {}", root.display(), err);
+            unreadable.push(root.to_path_buf());
+        }
+    }
+    result.sort();
+    (result, unreadable, Vec::new())
 }
 
 fn parse_season_number(name: &str) -> Option<i32> {

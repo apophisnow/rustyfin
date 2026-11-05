@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
+use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -64,7 +65,8 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
     Ok(true)
 }
 
-/// Deletes the items of `library` that the scan did not collect, and returns how many were deleted.
+/// Deletes the items of `library` whose path is in `scope` that the scan did not collect, and returns how
+/// many were deleted. `PathScope::All` covers the whole library.
 ///
 /// Step 1 covers the media types that the library's content type scans. An item is deleted only
 /// when all of these hold: its path is under a library root; its path is not in `collected`; no
@@ -75,10 +77,13 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
 /// missing under it is deleted, and a warning is logged once for each such root.
 /// Step 2 then deletes the containers with no children: the Seasons and Series of a TV library, and
 /// the MusicAlbums of a music library, which hold both albums and artists. It repeats until a pass
-/// deletes nothing, because a deleted container can leave its parent without children.
+/// deletes nothing, because a deleted container can leave its parent without children. A scope other
+/// than `PathScope::All` runs step 2 over the parents of the items it deleted and the containers in
+/// scope instead (see `remove_empty_containers_in_scope`).
 pub async fn remove_not_collected(
     pool: &SqlitePool,
     library: &Library,
+    scope: &PathScope,
     collected: &HashSet<String>,
     unreadable: &[PathBuf],
     loops: &[PathBuf],
@@ -88,17 +93,23 @@ pub async fn remove_not_collected(
     // Whether each root lists something, looked up once per root, and the roots already warned about.
     let mut listed: HashMap<usize, bool> = HashMap::new();
     let mut warned: HashSet<usize> = HashSet::new();
+    // The parents of the items that step 1 deletes.
+    let mut parents: HashSet<String> = HashSet::new();
     let mut removed = 0;
 
     for &media_type in scanned_types(&library.content_type) {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, path FROM media_items WHERE library_id = ?1 AND media_type = ?2",
-        )
-        .bind(library_id.as_str())
-        .bind(media_type)
-        .fetch_all(pool)
-        .await?;
-        for (id, path) in rows {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT id, path, parent_id FROM media_items
+                 WHERE library_id = ?1 AND media_type = ?2 AND {}",
+                scope.sql("path", 3)
+            )))
+            .bind(library_id.as_str())
+            .bind(media_type)
+            .bind(scope.param())
+            .fetch_all(pool)
+            .await?;
+        for (id, path, parent_id) in rows {
             let item = Path::new(&path);
             let Some(root) = roots
                 .iter()
@@ -137,6 +148,7 @@ pub async fn remove_not_collected(
             }
             if delete_item(pool, &id).await? {
                 removed += 1;
+                parents.extend(parent_id);
             }
         }
     }
@@ -147,6 +159,11 @@ pub async fn remove_not_collected(
         LibraryContentType::Music => &["MusicAlbum"],
         _ => &[],
     };
+    if !matches!(scope, PathScope::All) {
+        removed +=
+            remove_empty_containers_in_scope(pool, &library_id, scope, containers, parents).await?;
+        return Ok(removed);
+    }
     loop {
         let mut deleted_in_pass: u32 = 0;
         for &media_type in containers {
@@ -171,6 +188,63 @@ pub async fn remove_not_collected(
         removed += deleted_in_pass;
     }
 
+    Ok(removed)
+}
+
+/// Deletes the childless containers that a scoped removal reaches: the childless ones with a path in
+/// `scope`, and the `candidates`, which are the parents of the items the removal deleted. A deleted container
+/// makes its parent a candidate, so the removal goes up the tree; a container that loses its last child is
+/// reached that way too. It stops after a pass that deletes nothing. Returns how many items were deleted.
+async fn remove_empty_containers_in_scope(
+    pool: &SqlitePool,
+    library_id: &str,
+    scope: &PathScope,
+    containers: &[&str],
+    mut candidates: HashSet<String>,
+) -> Result<u32, sqlx::Error> {
+    for &media_type in containers {
+        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT m.id FROM media_items AS m
+             WHERE m.library_id = ?1 AND m.media_type = ?2 AND {}
+               AND NOT EXISTS (SELECT 1 FROM media_items AS c WHERE c.parent_id = m.id)",
+            scope.sql("m.path", 3)
+        )))
+        .bind(library_id)
+        .bind(media_type)
+        .bind(scope.param())
+        .fetch_all(pool)
+        .await?;
+        candidates.extend(ids);
+    }
+    let mut removed = 0;
+    while !candidates.is_empty() {
+        let mut next: HashSet<String> = HashSet::new();
+        let mut deleted_in_pass: u32 = 0;
+        let batch: Vec<String> = candidates.drain().collect();
+        for id in batch {
+            // The row is read again: an earlier deletion in this pass may have removed it already.
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT m.media_type, m.parent_id FROM media_items AS m
+                 WHERE m.id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM media_items AS c WHERE c.parent_id = m.id)",
+            )
+            .bind(id.as_str())
+            .fetch_optional(pool)
+            .await?;
+            let Some((media_type, parent_id)) = row else {
+                continue;
+            };
+            if containers.contains(&media_type.as_str()) && delete_item(pool, &id).await? {
+                deleted_in_pass += 1;
+                next.extend(parent_id);
+            }
+        }
+        if deleted_in_pass == 0 {
+            break;
+        }
+        removed += deleted_in_pass;
+        candidates = next;
+    }
     Ok(removed)
 }
 
@@ -361,10 +435,12 @@ pub enum GroupOutcome {
 
 /// Matches each movie version group with its item, merges the other owners of a group into the
 /// survivor, updates the survivor's path and names, and says what to probe. The outcomes are in the
-/// order of `groups`. Call this before the removal of items that are no longer collected.
+/// order of `groups`. `scope` is the part of the library that the scan collected: only the items in it
+/// are read. Call this before the removal of items that are no longer collected.
 pub async fn reconcile_movie_groups(
     pool: &SqlitePool,
     library_id: Uuid,
+    scope: &PathScope,
     groups: &[VersionGroup],
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let wanted: Vec<WantedGroup> = groups
@@ -377,7 +453,7 @@ pub async fn reconcile_movie_groups(
             },
         })
         .collect();
-    reconcile_groups(pool, library_id, "Movie", &wanted).await
+    reconcile_groups(pool, library_id, "Movie", scope, &wanted).await
 }
 
 /// One episode's files in version order, and the fields that the episode gives its item.
@@ -390,10 +466,12 @@ pub struct EpisodeGroup {
 
 /// Matches each episode group with its item, as [`reconcile_movie_groups`] does for movies. The
 /// outcomes are in the order of `groups`. The name and sort name of an episode come from the stem
-/// of its first file. Call this before the removal of items that are no longer collected.
+/// of its first file. `scope` is the part of the library that the scan collected: only the items in it
+/// are read. Call this before the removal of items that are no longer collected.
 pub async fn reconcile_episode_groups(
     pool: &SqlitePool,
     library_id: Uuid,
+    scope: &PathScope,
     groups: &[EpisodeGroup],
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let wanted: Vec<WantedGroup> = groups
@@ -413,49 +491,64 @@ pub async fn reconcile_episode_groups(
             },
         })
         .collect();
-    reconcile_groups(pool, library_id, "Episode", &wanted).await
+    reconcile_groups(pool, library_id, "Episode", scope, &wanted).await
 }
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
 ///
 /// Groups are handled in order of their first file, and the writes for one group run in one
-/// transaction.
+/// transaction. Only the items with a path or a source in `scope` are read, with all the sources of
+/// those items. Only the probe failures in `scope` are read, since every file of `groups` is in `scope`.
 async fn reconcile_groups(
     pool: &SqlitePool,
     library_id: Uuid,
     media_type: &str,
+    scope: &PathScope,
     groups: &[WantedGroup],
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let library = library_id.to_string();
-    let items: Vec<ItemRow> = sqlx::query_as(
+    // An item is loaded when its path is in `scope`, or when one of its sources is.
+    let loaded = format!(
+        "({} OR EXISTS (SELECT 1 FROM media_sources AS q WHERE q.item_id = m.id AND {}))",
+        scope.sql("m.path", 3),
+        scope.sql("q.path", 3)
+    );
+    let items: Vec<ItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created,
                 index_number, parent_index_number, parent_id
-         FROM media_items WHERE library_id = ?1 AND media_type = ?2",
-    )
+         FROM media_items AS m
+         WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}"
+    )))
     .bind(library.as_str())
     .bind(media_type)
+    .bind(scope.param())
     .fetch_all(pool)
     .await?;
-    let sources: Vec<SourceRow> = sqlx::query_as(
+    let sources: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified
          FROM media_sources AS s
          JOIN media_items AS m ON m.id = s.item_id
-         WHERE m.library_id = ?1 AND m.media_type = ?2
-         ORDER BY s.rowid",
-    )
+         WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}
+         ORDER BY s.rowid"
+    )))
     .bind(library.as_str())
     .bind(media_type)
+    .bind(scope.param())
     .fetch_all(pool)
     .await?;
 
     // The files whose probe failed, with the size and modification time that they had then.
     let failures: HashMap<String, (i64, i64)> =
-        sqlx::query_as::<_, (String, i64, i64)>("SELECT path, size, modified FROM probe_failures")
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .map(|(path, size, modified)| (path, (size, modified)))
-            .collect();
+        sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(format!(
+            "SELECT path, size, modified FROM probe_failures WHERE {}",
+            scope.sql("path", 1)
+        )))
+        .bind(scope.param())
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(path, size, modified)| (path, (size, modified)))
+        .collect();
 
     let item_by_id: HashMap<&str, &ItemRow> = items.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut by_path: HashMap<&str, Vec<&ItemRow>> = HashMap::new();
@@ -473,11 +566,18 @@ async fn reconcile_groups(
             by_source.entry(row.path.as_str()).or_default().push(item);
         }
     }
-    let group_paths: HashSet<&str> = groups
+    let mut group_paths: HashSet<&str> = groups
         .iter()
         .flat_map(|group| group.files.iter())
         .map(String::as_str)
         .collect();
+    // An item outside the scope is loaded for its sources. A full scan holds its path in `group_paths`
+    // while its file exists, so it is not an owner of a group by source here either.
+    for item in &items {
+        if !scope.contains(&item.path) && is_regular_file(Path::new(&item.path)).await {
+            group_paths.insert(item.path.as_str());
+        }
+    }
 
     let mut order: Vec<usize> = (0..groups.len()).collect();
     order.sort_by_key(|&idx| groups[idx].files.first());
