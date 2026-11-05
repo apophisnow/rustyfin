@@ -1,14 +1,15 @@
 //! Library scans of real files in a temp dir: ignored folders and files (R1-12), symlink
 //! loops (M-19), removal of items that a scan no longer collects, episode numbers (R1-13),
 //! movie titles (R1-27), and the versions of a movie or an episode as one item (R1-20), which
-//! keeps the user data of every copy (G9b).
+//! keeps the user data of every copy and does not start on a version that cannot be probed
+//! (G9b).
 //!
 //! The tests marked "ffmpeg" write real clips and need ffmpeg and ffprobe; without them they
 //! print a line and pass.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustyfin_core::{probe, scanner};
 use rustyfin_model::library::{Library, LibraryContentType};
@@ -2450,4 +2451,224 @@ async fn merged_episode_copies_keep_pins_and_user_data() {
     assert_eq!(marks_of(pool, &user1, hd).await, Some(combined));
     assert_eq!(marks_of(pool, &user2, hd).await, Some(on_sd));
     assert_eq!(count(pool, "SELECT COUNT(*) FROM user_item_data").await, 2);
+}
+
+// G9b: a version that cannot be probed is not the primary
+
+/// A `failed_at` older than any scan, so that a new probe of the file shows.
+const LONG_AGO: &str = "2000-01-01T00:00:00+00:00";
+
+/// The size of `path` and its modification time in whole seconds since the Unix epoch.
+fn stat(path: &Path) -> (i64, i64) {
+    let meta = std::fs::metadata(path).unwrap();
+    let modified = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap();
+    (
+        i64::try_from(meta.len()).unwrap(),
+        i64::try_from(modified.as_secs()).unwrap(),
+    )
+}
+
+/// The probe failure recorded for `path`, as (size, modified, failed_at).
+async fn failure_of(pool: &SqlitePool, path: &Path) -> Option<(i64, i64, String)> {
+    sqlx::query_as("SELECT size, modified, failed_at FROM probe_failures WHERE path = ?1")
+        .bind(path.to_str().unwrap())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// The record of a failed probe of `path` as the file is now, failed at `failed_at`.
+fn failure(path: &Path, failed_at: &str) -> Option<(i64, i64, String)> {
+    let (size, modified) = stat(path);
+    Some((size, modified, failed_at.to_string()))
+}
+
+/// ffmpeg. When the primary version cannot be probed, the next version that can is the item's
+/// path, first source and runtime. Rescans probe nothing and keep the item, and once the broken
+/// file is fixed it is the primary again, on the same item (G9b AC 9, AC 11-14).
+#[tokio::test]
+async fn unprobeable_primary_gives_way() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let uhd = "Alien vs Predator (2004)/Alien vs Predator (2004) Bluray-2160p.mkv";
+    let hd = "Alien vs Predator (2004)/Alien vs Predator (2004) Bluray-1080p.mkv";
+    let broken = touch(&root, uhd);
+    clip(&fx, &root, hd, 2);
+
+    scan_idle(pool, &lib).await;
+
+    // AC 13: the 2160p failed as the primary, so the 1080p took its place.
+    assert_groups(pool, &lib, &[(hd, &[hd])]).await;
+    let (_, _, failed_at) = failure_of(pool, &broken)
+        .await
+        .expect("the failed probe is recorded");
+    assert_eq!(
+        failure_of(pool, &broken).await,
+        failure(&broken, &failed_at)
+    );
+
+    // AC 12, AC 14: rescans probe neither file and keep the item.
+    let item = item_at(pool, &lib, hd).await;
+    let ids = source_ids(pool, &lib).await;
+    exec(
+        pool,
+        "UPDATE probe_failures SET failed_at = ?1",
+        &[LONG_AGO],
+    )
+    .await;
+    for _ in 0..2 {
+        scan_idle(pool, &lib).await;
+        assert_eq!(source_ids(pool, &lib).await, ids, "a rescan probed again");
+        assert_eq!(
+            failure_of(pool, &broken).await,
+            failure(&broken, LONG_AGO),
+            "a rescan probed the broken file again"
+        );
+        assert_eq!(item_at(pool, &lib, hd).await, item);
+    }
+
+    // AC 14: the fixed file is the primary again, on the same item, and its record is gone.
+    clip(&fx, &root, uhd, 3);
+    scan_idle(pool, &lib).await;
+    assert_groups(pool, &lib, &[(uhd, &[uhd, hd])]).await;
+    assert_eq!(item_at(pool, &lib, uhd).await, item);
+    assert_eq!(failure_of(pool, &broken).await, None);
+}
+
+/// ffmpeg. A file that cannot be probed is recorded with its size and modification time, and
+/// scans probe it again only when it changes. A probe that works removes the record. A group
+/// whose files all fail keeps its first file as the path (G9b AC 9-12).
+#[tokio::test]
+async fn failed_probes_are_not_repeated() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let broken = "Broken (2010)/Broken (2010).mkv";
+    let twice_uhd = "Twice (2011)/Twice (2011) Bluray-2160p.mkv";
+    let twice_hd = "Twice (2011)/Twice (2011) Bluray-1080p.mkv";
+    let files = [broken, twice_uhd, twice_hd].map(|rel| touch(&root, rel));
+
+    scan_idle(pool, &lib).await;
+
+    // AC 9: every failed probe is recorded with the file's size and modification time.
+    for file in &files {
+        let (_, _, failed_at) = failure_of(pool, file)
+            .await
+            .unwrap_or_else(|| panic!("{}: the failed probe is not recorded", file.display()));
+        assert_eq!(failure_of(pool, file).await, failure(file, &failed_at));
+    }
+    // AC 11: a group whose files all fail starts on its first file.
+    assert_eq!(paths(pool, &lib, "Movie").await, [broken, twice_uhd]);
+
+    // AC 10, AC 12: files that have not changed are not probed again.
+    exec(
+        pool,
+        "UPDATE probe_failures SET failed_at = ?1",
+        &[LONG_AGO],
+    )
+    .await;
+    for _ in 0..2 {
+        scan_idle(pool, &lib).await;
+        for file in &files {
+            assert_eq!(
+                failure_of(pool, file).await,
+                failure(file, LONG_AGO),
+                "{}: a rescan probed it again",
+                file.display()
+            );
+        }
+    }
+    assert_eq!(paths(pool, &lib, "Movie").await, [broken, twice_uhd]);
+
+    // AC 10: a changed file is probed again. It still fails, and its record follows the file.
+    std::fs::write(&files[0], b"not a video file\n").unwrap();
+    scan_idle(pool, &lib).await;
+    let (_, _, failed_at) = failure_of(pool, &files[0]).await.unwrap();
+    assert_ne!(failed_at, LONG_AGO, "the changed file was not probed");
+    assert_eq!(
+        failure_of(pool, &files[0]).await,
+        failure(&files[0], &failed_at)
+    );
+    scan_idle(pool, &lib).await;
+    assert_eq!(
+        failure_of(pool, &files[0]).await,
+        failure(&files[0], &failed_at),
+        "a rescan probed the changed file again"
+    );
+
+    // AC 9: once the file can be probed, it is the item's source and its record is gone.
+    clip(&fx, &root, broken, 2);
+    scan_idle(pool, &lib).await;
+    assert_eq!(failure_of(pool, &files[0]).await, None);
+    let items = snapshot(pool, &lib).await;
+    let fixed = items.iter().find(|i| i.path == broken).unwrap();
+    assert_eq!(fixed.sources, [broken]);
+    assert!(
+        fixed.runtime_ticks.is_some(),
+        "the fixed file gave no runtime"
+    );
+}
+
+/// ffmpeg. A new movie or episode does not start on a version whose probe failed before, such
+/// as in a library that was removed and added again: its path is the first version that can
+/// be probed, and the known failure is not probed again (G9b AC 11, AC 12).
+#[tokio::test]
+async fn new_items_skip_known_failures() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let uhd = "Alien vs Predator (2004)/Alien vs Predator (2004) Bluray-2160p.mkv";
+    let hd = "Alien vs Predator (2004)/Alien vs Predator (2004) Bluray-1080p.mkv";
+    let episode_uhd = "Show/Season 1/Show S01E01 2160p.mkv";
+    let episode_hd = "Show/Season 1/Show S01E01 1080p.mkv";
+    let broken = [
+        touch(&root_of(&film), uhd),
+        touch(&root_of(&tv), episode_uhd),
+    ];
+    clip(&fx, &root_of(&film), hd, 2);
+    clip(&fx, &root_of(&tv), episode_hd, 2);
+    for file in &broken {
+        let (size, modified) = stat(file);
+        exec(
+            pool,
+            "INSERT INTO probe_failures (path, size, modified, failed_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                file.to_str().unwrap(),
+                &size.to_string(),
+                &modified.to_string(),
+                LONG_AGO,
+            ],
+        )
+        .await;
+    }
+
+    scan_idle(pool, &film).await;
+    scan_idle(pool, &tv).await;
+
+    assert_groups(pool, &film, &[(hd, &[hd])]).await;
+    assert_groups(pool, &tv, &[(episode_hd, &[episode_hd])]).await;
+    for file in &broken {
+        assert_eq!(
+            failure_of(pool, file).await,
+            failure(file, LONG_AGO),
+            "{}: a known failure was probed again",
+            file.display()
+        );
+    }
 }

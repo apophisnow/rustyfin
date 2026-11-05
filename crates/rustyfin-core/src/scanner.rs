@@ -258,14 +258,14 @@ async fn scan_flat_library(
                     plans.push((item_id, steps));
                 }
             }
-            scan_sync::GroupOutcome::New { steps } => {
+            scan_sync::GroupOutcome::New { path, steps } => {
                 let item = MediaItem {
                     id: Uuid::new_v4(),
                     name: group.title.clone(),
                     sort_name: Some(group.title.to_lowercase()),
                     overview: None,
                     media_type: MediaType::Movie,
-                    path: group.files[0].to_string_lossy().into_owned(),
+                    path,
                     parent_id: None,
                     library_id: library.id,
                     production_year: group.year,
@@ -595,7 +595,7 @@ async fn scan_tv_library(
                     plans.push((item_id, steps));
                 }
             }
-            scan_sync::GroupOutcome::New { steps } => {
+            scan_sync::GroupOutcome::New { path, steps } => {
                 let name = group.files[0]
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -607,7 +607,7 @@ async fn scan_tv_library(
                     sort_name: Some(name.to_lowercase()),
                     overview: None,
                     media_type: MediaType::Episode,
-                    path: group.files[0].to_string_lossy().into_owned(),
+                    path,
                     parent_id: Some(group.season_id),
                     library_id: library.id,
                     production_year: None,

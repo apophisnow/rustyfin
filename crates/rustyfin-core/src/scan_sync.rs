@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_model::library::{Library, LibraryContentType};
@@ -150,6 +151,56 @@ async fn is_regular_file(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file())
 }
 
+/// The size and modification time of the file at `path`, the modification time in whole seconds
+/// since the Unix epoch. `std::fs::metadata` follows symlinks. `None` when either cannot be read.
+fn file_stamp(path: &str) -> Option<(i64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((
+        i64::try_from(meta.len()).ok()?,
+        i64::try_from(modified.as_secs()).ok()?,
+    ))
+}
+
+/// Whether `file` is a known failure: it has a probe failure on record, and it is still the file
+/// that failed, with the same size and modification time. Only a file with a record is stat'ed.
+fn is_known_failure(file: &str, failures: &HashMap<String, (i64, i64)>) -> bool {
+    failures
+        .get(file)
+        .is_some_and(|&stamp| file_stamp(file) == Some(stamp))
+}
+
+/// Records that the probe of `path` failed, with the file's size and modification time now. Does
+/// nothing when the file's metadata cannot be read.
+pub(crate) async fn record_probe_failure(pool: &SqlitePool, path: &str) -> Result<(), sqlx::Error> {
+    let Some((size, modified)) = file_stamp(path) else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO probe_failures (path, size, modified, failed_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path) DO UPDATE SET
+           size = excluded.size,
+           modified = excluded.modified,
+           failed_at = excluded.failed_at",
+    )
+    .bind(path)
+    .bind(size)
+    .bind(modified)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Forgets the probe failure of `path`, if it has one.
+pub(crate) async fn clear_probe_failure(pool: &SqlitePool, path: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM probe_failures WHERE path = ?1")
+        .bind(path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// An item of the library, as [`reconcile_groups`] reads it.
 #[derive(sqlx::FromRow)]
 struct ItemRow {
@@ -177,7 +228,7 @@ struct SourceRow {
 enum Wanted {
     /// A movie: its title and year.
     Movie { title: String, year: Option<i32> },
-    /// An episode: the stem of its primary file, its numbers, and its season.
+    /// An episode: the stem of its first file, its numbers, and its season.
     Episode {
         name: String,
         index_number: Option<i32>,
@@ -186,7 +237,7 @@ enum Wanted {
     },
 }
 
-/// A group that [`reconcile_groups`] settles: its files, primary first, and the fields it gives.
+/// A group that [`reconcile_groups`] settles: its files in version order, and the fields it gives.
 struct WantedGroup {
     files: Vec<String>,
     wanted: Wanted,
@@ -201,8 +252,9 @@ pub enum GroupOutcome {
         item_id: Uuid,
         steps: Vec<ProbeStep>,
     },
-    /// The group has no item yet. The scan creates one, then runs `steps` on it.
-    New { steps: Vec<ProbeStep> },
+    /// The group has no item yet. The scan creates one at `path`, the group's primary, then runs
+    /// `steps` on it.
+    New { path: String, steps: Vec<ProbeStep> },
 }
 
 /// Matches each movie version group with its item, merges the other owners of a group into the
@@ -226,7 +278,7 @@ pub async fn reconcile_movie_groups(
     reconcile_groups(pool, library_id, "Movie", &wanted).await
 }
 
-/// One episode's files, primary first, and the fields that its primary gives the item.
+/// One episode's files in version order, and the fields that the episode gives its item.
 pub struct EpisodeGroup {
     pub files: Vec<PathBuf>,
     pub season_id: Uuid,
@@ -236,7 +288,7 @@ pub struct EpisodeGroup {
 
 /// Matches each episode group with its item, as [`reconcile_movie_groups`] does for movies. The
 /// outcomes are in the order of `groups`. The name and sort name of an episode come from the stem
-/// of its primary file. Call this before the removal of items that are no longer collected.
+/// of its first file. Call this before the removal of items that are no longer collected.
 pub async fn reconcile_episode_groups(
     pool: &SqlitePool,
     library_id: Uuid,
@@ -264,7 +316,7 @@ pub async fn reconcile_episode_groups(
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
 ///
-/// Groups are handled in order of primary path, and the writes for one group run in one
+/// Groups are handled in order of their first file, and the writes for one group run in one
 /// transaction.
 async fn reconcile_groups(
     pool: &SqlitePool,
@@ -294,6 +346,15 @@ async fn reconcile_groups(
     .fetch_all(pool)
     .await?;
 
+    // The files whose probe failed, with the size and modification time that they had then.
+    let failures: HashMap<String, (i64, i64)> =
+        sqlx::query_as::<_, (String, i64, i64)>("SELECT path, size, modified FROM probe_failures")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(path, size, modified)| (path, (size, modified)))
+            .collect();
+
     let item_by_id: HashMap<&str, &ItemRow> = items.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut by_path: HashMap<&str, Vec<&ItemRow>> = HashMap::new();
     for item in &items {
@@ -322,10 +383,27 @@ async fn reconcile_groups(
     let mut outcomes: Vec<(usize, GroupOutcome)> = Vec::with_capacity(groups.len());
     for idx in order {
         let group = &groups[idx];
-        let owners = owners_of(&group.files, &by_path, &by_source, &group_paths, &claimed);
+        // The files that are not known failures, in order. The primary is the first of them, or the
+        // group's first file when none is left.
+        let probeable: Vec<String> = group
+            .files
+            .iter()
+            .filter(|file| !is_known_failure(file, &failures))
+            .cloned()
+            .collect();
+        let primary = probeable.first().unwrap_or(&group.files[0]);
+        let owners = owners_of(
+            &group.files,
+            primary,
+            &by_path,
+            &by_source,
+            &group_paths,
+            &claimed,
+        );
         let outcome = match owners.split_first() {
             None => GroupOutcome::New {
-                steps: group_steps(&group.files),
+                path: primary.clone(),
+                steps: group_steps(&probeable),
             },
             Some((&survivor, others)) => {
                 claimed.extend(owners.iter().map(|owner| owner.id.as_str()));
@@ -333,7 +411,16 @@ async fn reconcile_groups(
                     .get(survivor.id.as_str())
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                settle_group(pool, group, survivor, others, survivor_sources).await?
+                settle_group(
+                    pool,
+                    group,
+                    &probeable,
+                    primary,
+                    survivor,
+                    others,
+                    survivor_sources,
+                )
+                .await?
             }
         };
         outcomes.push((idx, outcome));
@@ -342,11 +429,12 @@ async fn reconcile_groups(
     Ok(outcomes.into_iter().map(|(_, outcome)| outcome).collect())
 }
 
-/// The items that own a group, sorted with the survivor first and without repeats. An owner is an
-/// item whose path is one of `files`, or an unclaimed item whose path is in no group of this scan
-/// and that has a source among `files`.
+/// The items that own a group, sorted with the item at `primary` first, then by creation date, and
+/// without repeats. An owner is an item whose path is one of `files`, or an unclaimed item whose
+/// path is in no group of this scan and that has a source among `files`.
 fn owners_of<'a>(
     files: &[String],
+    primary: &str,
     by_path: &HashMap<&str, Vec<&'a ItemRow>>,
     by_source: &HashMap<&str, Vec<&'a ItemRow>>,
     group_paths: &HashSet<&str>,
@@ -361,7 +449,6 @@ fn owners_of<'a>(
             }
         }
     }
-    let primary = files.first().map_or("", String::as_str);
     owners.sort_by(|a, b| {
         (a.path != primary, created_at(&a.date_created), &a.id).cmp(&(
             b.path != primary,
@@ -374,16 +461,17 @@ fn owners_of<'a>(
 }
 
 /// Settles one group whose owners are known. Merges the other owners into the survivor, writes the
-/// survivor's fields that changed, and works out what to probe.
+/// survivor's fields that changed (its path becomes `primary`), and works out what to probe: the
+/// `probeable` files.
 async fn settle_group(
     pool: &SqlitePool,
     group: &WantedGroup,
+    probeable: &[String],
+    primary: &str,
     survivor: &ItemRow,
     others: &[&ItemRow],
     sources: &[&SourceRow],
 ) -> Result<GroupOutcome, sqlx::Error> {
-    // The owners come from the group's files, so there is a primary.
-    let primary = group.files[0].as_str();
     // The survivor's path and names before this scan. A name that the old code made from the file
     // stem is rewritten; a name that metadata set is kept.
     let old_stem = Path::new(&survivor.path)
@@ -477,22 +565,24 @@ async fn settle_group(
         tx.commit().await?;
     }
 
-    // Steady state: nothing else owns the group, and the survivor's sources are the group's files,
-    // in order, with the right duration. Otherwise the whole group is probed again. A primary with
-    // no duration cannot be fixed by probing, so it counts as right.
+    // Steady state: nothing else owns the group, the survivor is at the primary, and its sources
+    // are the probeable files, in order, with the right duration. Otherwise they are probed again.
+    // A primary with no duration cannot be fixed by probing, so it counts as right.
     let source_paths_match = sources
         .iter()
         .map(|source| source.path.as_str())
-        .eq(group.files.iter().map(String::as_str));
+        .eq(probeable.iter().map(String::as_str));
     let runtime_match = sources.first().is_some_and(|first| {
         first.run_time_ticks.is_none() || first.run_time_ticks == survivor.runtime_ticks
     });
-    let steady =
-        others.is_empty() && survivor.path == primary && source_paths_match && runtime_match;
+    let steady = others.is_empty()
+        && survivor.path == primary
+        && source_paths_match
+        && (probeable.is_empty() || runtime_match);
     let steps = if steady {
         Vec::new()
     } else {
-        group_steps(&group.files)
+        group_steps(probeable)
     };
     Ok(GroupOutcome::Existing {
         item_id: parse_id(&survivor.id)?,
@@ -653,7 +743,8 @@ fn strings_of(files: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// The full probe plan for a group: the primary file, then each other file as an alternate version.
+/// The probe plan for a group's probeable files: the first is the primary, and each other file is
+/// an alternate version. Empty when there are no files.
 fn group_steps(files: &[String]) -> Vec<ProbeStep> {
     let mut steps = Vec::with_capacity(files.len());
     if let Some((primary, rest)) = files.split_first() {
