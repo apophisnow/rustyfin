@@ -44,7 +44,6 @@ async fn test_state() -> AppState {
     AppState {
         db: pool.clone(),
         db_ro: pool,
-        jwt_secret: Arc::new("test-secret".to_string()),
         server_id: Arc::new("test-server-id".to_string()),
         data_dir: data_dir_arc,
         config: Arc::new(RwLock::new(ServerConfiguration::default())),
@@ -56,6 +55,7 @@ async fn test_state() -> AppState {
         task_scheduler,
         plugin_manager,
         rate_limiter,
+        known_proxies: Arc::new(Vec::new()),
         ws_broadcast: ws_tx,
         log_level_tx: _log_level_tx,
         cache,
@@ -242,7 +242,9 @@ async fn test_protected_endpoint_with_jwt() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -444,7 +446,9 @@ async fn test_remote_browsing_burst_is_not_rate_limited() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
 
     let media_dir = state.data_dir.join("movies");
     std::fs::create_dir_all(&media_dir).unwrap();
@@ -635,8 +639,9 @@ async fn test_password_reset_endpoints_share_the_login_rate_limit() {
 
     let resp = app.clone().oneshot(login()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // G2: ForgotPassword no longer reveals whether the user exists; unknown users get 200.
     let resp = app.clone().oneshot(forgot()).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
     let resp = app.clone().oneshot(reset()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
@@ -660,7 +665,9 @@ async fn test_item_image_missing_returns_404_not_500() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -689,7 +696,9 @@ async fn test_item_image_missing_file_returns_404_not_500() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
 
     let lib = rustyfin_model::library::Library {
         id: uuid::Uuid::new_v4(),
@@ -767,7 +776,9 @@ async fn test_series_folder_image_is_served_after_refresh() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
 
     // Jellyfin/Kodi layout: the series poster is a generic name in the series folder
     let tv_dir = state.data_dir.join("media").join("TV");
@@ -871,7 +882,9 @@ async fn test_get_libraries_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -902,7 +915,9 @@ async fn test_create_and_get_library() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state.clone());
 
     // Create a library
@@ -957,7 +972,9 @@ async fn test_get_user_views_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -990,7 +1007,9 @@ async fn test_get_user_views_with_library() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
 
     // Create a library
     let lib = rustyfin_model::library::Library {
@@ -1041,7 +1060,9 @@ async fn admin_session(state: &AppState) -> (String, uuid::Uuid) {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     (token, user.id)
 }
 
@@ -1479,7 +1500,9 @@ async fn test_search_hints_empty_term() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1511,7 +1534,9 @@ async fn test_full_search_empty_term() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1545,7 +1570,9 @@ async fn test_system_info_with_auth() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1576,7 +1603,9 @@ async fn test_system_storage_info() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1609,7 +1638,9 @@ async fn test_system_update_packages() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1689,7 +1720,9 @@ async fn test_get_items_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1721,7 +1754,9 @@ async fn test_get_item_not_found() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -1752,7 +1787,9 @@ async fn test_activity_log() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1783,7 +1820,9 @@ async fn test_get_sessions() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1816,7 +1855,9 @@ async fn test_playback_progress_not_found() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -1868,7 +1909,9 @@ async fn test_quick_connect_generate() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1900,7 +1943,9 @@ async fn test_environment_drives() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1934,7 +1979,9 @@ async fn test_scheduled_tasks_list() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -1970,7 +2017,9 @@ async fn test_localization_cultures() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2001,7 +2050,9 @@ async fn test_plugins_list() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2035,7 +2086,9 @@ async fn test_configuration() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2065,7 +2118,9 @@ async fn test_live_tv_channels_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2099,7 +2154,9 @@ async fn test_persons_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2129,7 +2186,9 @@ async fn test_shows_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2160,7 +2219,9 @@ async fn test_media_segments_empty() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2191,7 +2252,9 @@ async fn test_devices_list() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2222,7 +2285,9 @@ async fn test_subtitle_not_found() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -2253,7 +2318,9 @@ async fn test_transcode_not_started() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_session = uuid::Uuid::new_v4();
@@ -2284,7 +2351,9 @@ async fn test_backup_status() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     app.oneshot(
@@ -2313,7 +2382,9 @@ async fn test_sync_play_instances() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2344,7 +2415,9 @@ async fn test_encoding_manager_stats() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2375,7 +2448,9 @@ async fn test_library_options_not_found() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -2407,7 +2482,9 @@ async fn test_library_modified_volumes() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -2440,7 +2517,9 @@ async fn test_get_user_views_with_id() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -3057,7 +3136,9 @@ async fn test_packages_list() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -3087,7 +3168,9 @@ async fn test_display_preferences() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let resp = app
@@ -3117,7 +3200,9 @@ async fn test_additional_videos_not_found() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -3148,7 +3233,9 @@ async fn test_dynamic_hls_not_found() {
         .await
         .unwrap()
         .unwrap();
-    let token = rustyfin_auth::create_token(&user, "test-secret").unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
     let app = app(state);
 
     let random_id = uuid::Uuid::new_v4();
@@ -3164,4 +3251,632 @@ async fn test_dynamic_hls_not_found() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// G2: sessions, reset PIN, login limit (R1-01, R1-08, R1-09, M-15, M-16, M-17)
+// These drive the HTTP surface and so compile on the base build; they fail at
+// runtime there until the G2 fixes land.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Logs in with an explicit DeviceId (via X-Emby-Authorization); returns (token, user_id).
+async fn g2_login_device(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+    device_id: &str,
+) -> Option<(String, String)> {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                "MediaBrowser Client=\"G2\", Device=\"{device_id}\", DeviceId=\"{device_id}\", Version=\"1.0\""
+            ),
+        )
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, json) = send(app, req).await;
+    if status != StatusCode::OK {
+        return None;
+    }
+    Some((
+        json["AccessToken"].as_str().unwrap().to_string(),
+        json["User"]["Id"].as_str().unwrap().to_string(),
+    ))
+}
+
+/// A router whose connecting peer is the given IPv4 socket, for login-limit tests.
+fn g2_app_from_peer(state: AppState, ip: [u8; 4], port: u16) -> axum::Router {
+    build_router(state).layer(MockConnectInfo(SocketAddr::from((ip, port))))
+}
+
+/// A failed-login request carrying an optional X-Forwarded-For header.
+fn g2_bad_login(xff: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header("Content-Type", "application/json");
+    if let Some(v) = xff {
+        b = b.header("X-Forwarded-For", v);
+    }
+    b.body(Body::from(r#"{"Username":"nobody","Pw":"x"}"#))
+        .unwrap()
+}
+
+// ── G2: tokens and sessions (R1-08, R1-09) ──
+
+#[tokio::test]
+async fn g2_logout_ends_only_that_device_and_returns_204() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (ta, _) = g2_login_device(&app, "owner", "pw-owner", "dev-a")
+        .await
+        .expect("login A");
+    let (tb, _) = g2_login_device(&app, "owner", "pw-owner", "dev-b")
+        .await
+        .expect("login B");
+
+    let (status, _) = send(&app, request("POST", "/Sessions/Logout", Some(&ta), None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "logout returns 204");
+
+    let (a_after, _) = send(&app, request("GET", "/Users/Me", Some(&ta), None)).await;
+    assert_eq!(
+        a_after,
+        StatusCode::UNAUTHORIZED,
+        "device A token is revoked"
+    );
+    let (b_after, _) = send(&app, request("GET", "/Users/Me", Some(&tb), None)).await;
+    assert_eq!(b_after, StatusCode::OK, "device B token still works");
+}
+
+#[tokio::test]
+async fn g2_relogin_same_device_replaces_token() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (t1, _) = g2_login_device(&app, "owner", "pw-owner", "dev-x")
+        .await
+        .expect("login 1");
+    let (t2, _) = g2_login_device(&app, "owner", "pw-owner", "dev-x")
+        .await
+        .expect("login 2");
+
+    let (s1, _) = send(&app, request("GET", "/Users/Me", Some(&t1), None)).await;
+    assert_eq!(
+        s1,
+        StatusCode::UNAUTHORIZED,
+        "the previous token for the same device is revoked"
+    );
+    let (s2, _) = send(&app, request("GET", "/Users/Me", Some(&t2), None)).await;
+    assert_eq!(s2, StatusCode::OK, "the new token works");
+}
+
+#[tokio::test]
+async fn g2_self_password_change_keeps_caller_revokes_other_sessions() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (ta, oid) = g2_login_device(&app, "owner", "pw-owner", "dev-a")
+        .await
+        .expect("A");
+    let (tb, _) = g2_login_device(&app, "owner", "pw-owner", "dev-b")
+        .await
+        .expect("B");
+
+    let body = serde_json::json!({ "CurrentPw": "pw-owner", "NewPw": "pw-owner-2" });
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{oid}/Password"),
+            Some(&ta),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "password change succeeds");
+
+    let (a_after, _) = send(&app, request("GET", "/Users/Me", Some(&ta), None)).await;
+    assert_eq!(a_after, StatusCode::OK, "the caller's own session survives");
+    let (b_after, _) = send(&app, request("GET", "/Users/Me", Some(&tb), None)).await;
+    assert_eq!(
+        b_after,
+        StatusCode::UNAUTHORIZED,
+        "the user's other sessions end"
+    );
+}
+
+#[tokio::test]
+async fn g2_admin_changing_another_users_password_revokes_all_their_tokens() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner_t, _) = g2_login_device(&app, "owner", "pw-owner", "owner-dev")
+        .await
+        .expect("owner");
+    let (status, created) = send(
+        &app,
+        request(
+            "POST",
+            "/Users/New",
+            Some(&owner_t),
+            Some(serde_json::json!({ "Name": "bob", "Password": "pw-bob" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner creates bob");
+    let bob_id = created["Id"].as_str().expect("bob id").to_string();
+    let (bob_t, _) = g2_login_device(&app, "bob", "pw-bob", "bob-dev")
+        .await
+        .expect("bob");
+
+    let body = serde_json::json!({ "CurrentPw": "", "NewPw": "pw-bob-2" });
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{bob_id}/Password"),
+            Some(&owner_t),
+            Some(body),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin resets bob's password");
+
+    let (bob_after, _) = send(&app, request("GET", "/Users/Me", Some(&bob_t), None)).await;
+    assert_eq!(
+        bob_after,
+        StatusCode::UNAUTHORIZED,
+        "all of bob's tokens are revoked"
+    );
+}
+
+#[tokio::test]
+async fn g2_deleted_users_token_is_rejected() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner_t, _) = g2_login_device(&app, "owner", "pw-owner", "owner-dev")
+        .await
+        .expect("owner");
+    let (status, created) = send(
+        &app,
+        request(
+            "POST",
+            "/Users/New",
+            Some(&owner_t),
+            Some(serde_json::json!({ "Name": "bob", "Password": "pw-bob" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bob_id = created["Id"].as_str().expect("bob id").to_string();
+    let (bob_t, _) = g2_login_device(&app, "bob", "pw-bob", "bob-dev")
+        .await
+        .expect("bob");
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/Users/{bob_id}/Delete"),
+            Some(&owner_t),
+            None,
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "owner deletes bob: {status}");
+
+    let (bob_after, _) = send(&app, request("GET", "/Users/Me", Some(&bob_t), None)).await;
+    assert_eq!(
+        bob_after,
+        StatusCode::UNAUTHORIZED,
+        "a deleted user's token is rejected"
+    );
+}
+
+#[tokio::test]
+async fn g2_disabled_leftover_admin_token_is_rejected() {
+    let state = test_state().await;
+    add_user(&state, "admin", "admin", true).await;
+    let app = app(state.clone());
+    // The leftover admin logs in before the wizard runs.
+    let (admin_t, _) = g2_login_device(&app, "admin", "admin", "admin-dev")
+        .await
+        .expect("admin login");
+    // The wizard creates the real owner, disabling the leftover admin.
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        user_flags(&state, "admin").await,
+        Some((true, false, true)),
+        "the leftover admin is disabled"
+    );
+
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&admin_t), None)).await;
+    assert_eq!(
+        me,
+        StatusCode::UNAUTHORIZED,
+        "a disabled user's token is rejected on /Users/Me"
+    );
+    let (users, _) = send(&app, request("GET", "/Users", Some(&admin_t), None)).await;
+    assert_eq!(
+        users,
+        StatusCode::UNAUTHORIZED,
+        "a disabled user's token is rejected on an admin route"
+    );
+}
+
+#[tokio::test]
+async fn g2_login_response_has_fresh_last_login_date() {
+    // M-16: the login response must carry the login's own timestamp, not the prior value.
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let body = serde_json::json!({ "Username": "owner", "Pw": "pw-owner" });
+    let (status, json) = send(
+        &app,
+        request("POST", "/Users/AuthenticateByName", None, Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["User"]["LastLoginDate"].is_string(),
+        "the first login response carries the updated LastLoginDate, got {:?}",
+        json["User"]["LastLoginDate"]
+    );
+}
+
+// ── G2: reset PIN (R1-01, M-17) ──
+
+#[tokio::test]
+async fn g2_forgot_password_is_uniform_and_hides_the_pin() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+
+    let known = send(
+        &app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({"EnteredUsername":"owner"})),
+        ),
+    )
+    .await;
+    let unknown = send(
+        &app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({"EnteredUsername":"ghost"})),
+        ),
+    )
+    .await;
+    assert_eq!(known.0, StatusCode::OK, "known user");
+    assert_eq!(
+        unknown.0,
+        StatusCode::OK,
+        "an unknown user is indistinguishable from a known one"
+    );
+    assert_eq!(known.1["Action"], "PinCode");
+    assert_eq!(unknown.1["Action"], "PinCode");
+    assert!(
+        known.1["PinFile"].is_string(),
+        "the response names the PIN file, got {:?}",
+        known.1
+    );
+    assert!(
+        !known.1.to_string().to_lowercase().contains("\"pin\":"),
+        "the PIN itself never appears in the response body"
+    );
+}
+
+#[tokio::test]
+async fn g2_legitimate_reset_pin_flow_changes_password_and_revokes_tokens() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (old_t, _) = g2_login_device(&app, "owner", "pw-owner", "owner-dev")
+        .await
+        .expect("owner");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({"EnteredUsername":"owner"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let pin_file = body["PinFile"]
+        .as_str()
+        .expect("the response names a PinFile path");
+    let contents = std::fs::read_to_string(pin_file).expect("the PIN file exists on a LAN request");
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    let pin = parsed["Pin"]
+        .as_str()
+        .expect("a Pin in the file")
+        .to_string();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/Users/ForgotPassword/Pin",
+            None,
+            Some(serde_json::json!({ "Pin": pin })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "redeeming the PIN succeeds: {body:?}"
+    );
+    assert_eq!(body["Success"], true);
+
+    // The PIN string itself is now the password.
+    assert!(
+        g2_login_device(&app, "owner", &pin, "new-dev")
+            .await
+            .is_some(),
+        "login with the new PIN as the password"
+    );
+    // The original password no longer works.
+    assert!(
+        g2_login_device(&app, "owner", "pw-owner", "d")
+            .await
+            .is_none(),
+        "the old password is replaced"
+    );
+    // The old session is revoked.
+    let (old_after, _) = send(&app, request("GET", "/Users/Me", Some(&old_t), None)).await;
+    assert_eq!(
+        old_after,
+        StatusCode::UNAUTHORIZED,
+        "old tokens are revoked after a reset"
+    );
+}
+
+#[tokio::test]
+async fn g2_five_wrong_pin_attempts_void_the_reset() {
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({"EnteredUsername":"owner"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let pin_file = body["PinFile"].as_str().expect("a PinFile path");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pin_file).unwrap()).unwrap();
+    let real_pin = parsed["Pin"].as_str().unwrap().to_string();
+
+    for n in 1..=5 {
+        let (s, _) = send(
+            &app,
+            request(
+                "POST",
+                "/Users/ForgotPassword/Pin",
+                None,
+                Some(serde_json::json!({"Pin":"ZZ-ZZ-ZZ-ZZ"})),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "wrong PIN attempt {n} is 404");
+    }
+    let (s, _) = send(
+        &app,
+        request(
+            "POST",
+            "/Users/ForgotPassword/Pin",
+            None,
+            Some(serde_json::json!({ "Pin": real_pin })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "the PIN is void after 5 failed attempts"
+    );
+    assert!(
+        g2_login_device(&app, "owner", "pw-owner", "d")
+            .await
+            .is_some(),
+        "the original password is intact"
+    );
+}
+
+// ── G2: login limit and proxy trust (XFF) ──
+
+#[tokio::test]
+async fn g2_spoofed_loopback_xff_from_remote_peer_is_still_limited() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = g2_app_from_peer(state, [127, 0, 0, 2], 5000);
+
+    let mut statuses = Vec::new();
+    for _ in 0..5 {
+        statuses.push(
+            app.clone()
+                .oneshot(g2_bad_login(Some("127.0.0.1")))
+                .await
+                .unwrap()
+                .status(),
+        );
+    }
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "a spoofed loopback XFF must not exempt a non-loopback peer; got {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn g2_rotating_xff_shares_the_peer_budget() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = g2_app_from_peer(state, [127, 0, 0, 2], 5001);
+
+    let mut statuses = Vec::new();
+    for i in 0..6 {
+        statuses.push(
+            app.clone()
+                .oneshot(g2_bad_login(Some(&format!("10.9.9.{i}"))))
+                .await
+                .unwrap()
+                .status(),
+        );
+    }
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "rotating XFF values must share the peer's budget; got {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn g2_loopback_peer_exempt_but_127_0_0_2_limited() {
+    // Guard: this behaviour already holds on base and must be preserved.
+    let mut s1 = test_state().await;
+    s1.rate_limiter = RateLimiter::new(2, 60);
+    let app1 = g2_app_from_peer(s1, [127, 0, 0, 1], 6000);
+    for _ in 0..6 {
+        let st = app1
+            .clone()
+            .oneshot(g2_bad_login(None))
+            .await
+            .unwrap()
+            .status();
+        assert_ne!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a loopback peer is never limited"
+        );
+    }
+
+    let mut s2 = test_state().await;
+    s2.rate_limiter = RateLimiter::new(2, 60);
+    let app2 = g2_app_from_peer(s2, [127, 0, 0, 2], 6001);
+    let mut statuses = Vec::new();
+    for _ in 0..5 {
+        statuses.push(
+            app2.clone()
+                .oneshot(g2_bad_login(None))
+                .await
+                .unwrap()
+                .status(),
+        );
+    }
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "a 127.0.0.2 peer is limited; got {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn g2_trusted_proxy_limits_the_forwarded_client() {
+    // A request arriving through a configured trusted proxy is attributed to the forwarded client,
+    // so repeated logins from one real client behind the proxy share one budget and get limited.
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    state.known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies("10.0.0.0/8"));
+    let app = g2_app_from_peer(state, [10, 0, 0, 7], 7000);
+
+    let mut statuses = Vec::new();
+    for _ in 0..5 {
+        statuses.push(
+            app.clone()
+                .oneshot(g2_bad_login(Some("203.0.113.5")))
+                .await
+                .unwrap()
+                .status(),
+        );
+    }
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "the client forwarded by a trusted proxy is limited; got {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn g2_trusted_proxy_separates_budgets_per_forwarded_client() {
+    // The limiter keys on the resolved client, not the shared proxy, so a second real client behind
+    // the same trusted proxy keeps its own budget.
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(2, 60);
+    state.known_proxies = Arc::new(rustyfin_api::middleware::parse_known_proxies("10.0.0.0/8"));
+    let app = g2_app_from_peer(state, [10, 0, 0, 7], 7001);
+
+    for _ in 0..3 {
+        let _ = app
+            .clone()
+            .oneshot(g2_bad_login(Some("203.0.113.5")))
+            .await
+            .unwrap();
+    }
+    let other = app
+        .clone()
+        .oneshot(g2_bad_login(Some("203.0.113.6")))
+        .await
+        .unwrap()
+        .status();
+    assert_ne!(
+        other,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a different forwarded client keeps its own budget"
+    );
+}
+
+#[test]
+fn g2_parse_known_proxies_reads_cidrs_and_hosts_and_skips_junk() {
+    // Accepts CIDR blocks and bare host IPs; silently drops unparseable entries.
+    let nets = rustyfin_api::middleware::parse_known_proxies("10.0.0.0/8, 192.168.1.1 , not-an-ip");
+    assert_eq!(nets.len(), 2, "two valid entries, junk skipped: {nets:?}");
 }

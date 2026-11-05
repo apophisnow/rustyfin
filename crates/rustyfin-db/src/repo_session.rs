@@ -145,6 +145,19 @@ pub async fn delete_sessions_by_device(
     Ok(())
 }
 
+pub async fn delete_sessions_by_user_device(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = ? AND device_id = ?")
+        .bind(user_id.to_string())
+        .bind(device_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn cleanup_expired_sessions(
     pool: &SqlitePool,
     timeout_minutes: i64,

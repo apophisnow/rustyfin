@@ -74,7 +74,9 @@ async fn ws_handler(
         token == **api_key
     } else {
         // Otherwise validate as JWT
-        rustyfin_auth::validate_token(&token, &state.jwt_secret).is_ok()
+        rustyfin_auth::validate_token(&state.db_ro, &token)
+            .await
+            .is_ok()
     };
 
     if !authenticated {

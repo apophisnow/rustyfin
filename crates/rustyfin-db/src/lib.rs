@@ -20,6 +20,7 @@ pub mod repo_playlist;
 pub mod repo_search;
 pub mod repo_session;
 pub mod repo_sync_play;
+pub mod repo_token;
 pub mod repo_trickplay;
 pub mod repo_user;
 
