@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Intro and outro detection**: Detection now stores its segments. ffmpeg's arguments were built as one string and split on whitespace, so a path with a space or a quote reached ffmpeg in pieces, and every run then failed on two columns that no migration creates. Each argument is now passed on its own, and a new run replaces the item's earlier intro and outro segments.
 - **NAS folders and symlink loops in library scans**: Scans skip folders whose name starts with a dot or `@` (QNAP `.@__thumb`, Synology `@eaDir`), `#recycle`, `lost+found` and sample files, following Jellyfin's ignore rules. Before, the thumbnail videos in `.@__thumb` were imported as movies. A symlink that points back up the tree is no longer followed down to the kernel's limit, and the next scan removes the items an earlier scan made from such paths.
+- **Episode and season numbers**: Episodes get their numbers from their file names, so they sort by number instead of by name. Scans read `S01E02`, `s1e2`, `S01.E02`, `S01 E02`, `1x02`, `ep05` and `Episode 7`, and the first episode of multi-episode names like `S01E02E03` or `S01E02-E03`; a resolution such as 1080p or a year is not taken for an episode or season. A file directly in a series folder goes to the season its name gives instead of always Season 1.
 
 ## [0.14.0] - 2026-11-03
 

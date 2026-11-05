@@ -540,7 +540,8 @@ async fn scan_tv_library(
                         .and_then(|s| s.to_str())
                         .unwrap_or("Unknown")
                         .to_string();
-                    (sn, "Season 1".to_string(), ep)
+                    let season = naming::parse_episode(&ep).and_then(|n| n.season);
+                    (sn, format!("Season {}", season.unwrap_or(1)), ep)
                 }
                 // path/episode.mkv (flat)
                 _ => {
@@ -645,8 +646,10 @@ async fn scan_tv_library(
             }
 
             // Create episode item
-            let episode_index = parse_episode_number(&episode_name);
-            let season_index = parse_season_number(&season_name);
+            let parsed = naming::parse_episode(&episode_name);
+            let episode_index = parsed.map(|n| n.episode);
+            let season_index =
+                parse_season_number(&season_name).or_else(|| parsed.and_then(|n| n.season));
             let episode_item = MediaItem {
                 id: Uuid::new_v4(),
                 name: episode_name.clone(),
@@ -1230,36 +1233,6 @@ fn parse_season_number(name: &str) -> Option<i32> {
             && let Ok(n) = rest.trim().parse::<i32>()
         {
             return Some(n);
-        }
-    }
-    None
-}
-
-fn parse_episode_number(name: &str) -> Option<i32> {
-    let lower = name.to_lowercase();
-    // Try S01E02 pattern
-    if let Some(pos) = lower.find('e') {
-        if pos > 0
-            && lower
-                .as_bytes()
-                .get(pos - 1)
-                .is_some_and(|b| b.is_ascii_digit())
-        {
-            // likely SxxExx
-        }
-        let rest = &lower[pos + 1..];
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(n) = num_str.parse::<i32>() {
-            return Some(n);
-        }
-    }
-    // Try "Episode XX" or "E XX"
-    for prefix in &["episode ", "ep ", "ep"] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(n) = num_str.parse::<i32>() {
-                return Some(n);
-            }
         }
     }
     None

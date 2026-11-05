@@ -1,5 +1,5 @@
 //! Library scans of real files in a temp dir: ignored folders and files (R1-12), symlink
-//! loops (M-19), and removal of items that a scan no longer collects.
+//! loops (M-19), removal of items that a scan no longer collects, and episode numbers (R1-13).
 
 use std::path::{Path, PathBuf};
 
@@ -131,6 +131,38 @@ async fn insert_item(
     .await
     .unwrap();
     id
+}
+
+/// One episode: its path relative to the root, `index_number`, `parent_index_number`, and the
+/// name of its season item.
+type EpisodeRow = (String, Option<i64>, Option<i64>, String);
+
+/// The library's episodes, sorted by path.
+async fn episodes(pool: &SqlitePool, lib: &Library) -> Vec<EpisodeRow> {
+    let root = root_of(lib);
+    let rows: Vec<EpisodeRow> = sqlx::query_as(
+        "SELECT e.path, e.index_number, e.parent_index_number, s.name
+         FROM media_items AS e JOIN media_items AS s ON s.id = e.parent_id
+         WHERE e.library_id = ?1 AND e.media_type = 'Episode'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<EpisodeRow> = rows
+        .into_iter()
+        .map(|(path, index, season, season_name)| {
+            let rel = Path::new(&path).strip_prefix(&root).unwrap();
+            (
+                rel.to_str().unwrap().to_string(),
+                index,
+                season,
+                season_name,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 
 async fn insert_user(pool: &SqlitePool) -> String {
@@ -547,4 +579,68 @@ async fn rescan_removes_empty_tv_seasons_and_series() {
     assert_eq!(paths(pool, &lib, "Series").await, ["Show"]);
     assert_eq!(count(pool, "SELECT COUNT(*) FROM pinned_episodes").await, 0);
     assert_eq!(count(pool, "SELECT COUNT(*) FROM user_item_data").await, 0);
+}
+
+#[tokio::test]
+async fn tv_scan_sets_episode_and_season_numbers() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [
+        "Severance/Season 2/Severance - S02E01 - Hello, Ms. Cobel.mkv",
+        "Severance/Season 2/Severance - S02E02E03 - Goodbye.mkv",
+        // The season folder's number wins over the file's.
+        "Show/Season 1/Show S03E04.mkv",
+        // A season folder without a number: the file's season.
+        "Show/Specials/Show S00E01.mkv",
+        // Directly in the series folder: the season is the file's, else 1.
+        "Flat Show/Flat Show 3x07.mkv",
+        "Flat Show/Flat Show - Episode 9.mkv",
+        "Flat Show/Pilot.mkv",
+    ] {
+        touch(&root, rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    let row = |path: &str, index: Option<i64>, season: Option<i64>, season_name: &str| {
+        (path.to_string(), index, season, season_name.to_string())
+    };
+    assert_eq!(
+        episodes(&fx.pool, &lib).await,
+        [
+            row(
+                "Flat Show/Flat Show - Episode 9.mkv",
+                Some(9),
+                Some(1),
+                "Season 1"
+            ),
+            row("Flat Show/Flat Show 3x07.mkv", Some(7), Some(3), "Season 3"),
+            row("Flat Show/Pilot.mkv", None, Some(1), "Season 1"),
+            row(
+                "Severance/Season 2/Severance - S02E01 - Hello, Ms. Cobel.mkv",
+                Some(1),
+                Some(2),
+                "Season 2"
+            ),
+            row(
+                "Severance/Season 2/Severance - S02E02E03 - Goodbye.mkv",
+                Some(2),
+                Some(2),
+                "Season 2"
+            ),
+            row(
+                "Show/Season 1/Show S03E04.mkv",
+                Some(4),
+                Some(1),
+                "Season 1"
+            ),
+            row(
+                "Show/Specials/Show S00E01.mkv",
+                Some(1),
+                Some(0),
+                "Specials"
+            ),
+        ]
+    );
 }
