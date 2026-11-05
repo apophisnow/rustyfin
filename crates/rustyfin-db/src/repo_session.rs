@@ -225,8 +225,9 @@ pub async fn get_all_devices(pool: &SqlitePool) -> Result<Vec<DeviceInfo>, sqlx:
 }
 
 pub async fn delete_device(pool: &SqlitePool, device_id: &str) -> Result<(), sqlx::Error> {
-    // Also remove sessions for this device
+    // Remove the device's sessions and the tokens issued to it, so the device is signed out
     delete_sessions_by_device(pool, device_id).await?;
+    super::repo_token::delete_device_tokens(pool, device_id).await?;
     sqlx::query("DELETE FROM devices WHERE id = ?1")
         .bind(device_id)
         .execute(pool)

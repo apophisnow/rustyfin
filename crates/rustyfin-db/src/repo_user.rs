@@ -134,7 +134,8 @@ pub enum OwnerClaim {
 }
 
 /// Makes the user `name` the server owner, creating it if it does not exist. If `leftover` still has
-/// the password hash it had when it was read, it is disabled in the same transaction.
+/// the password hash it had when it was read, it is disabled in the same transaction. The claimed
+/// account's earlier tokens and a disabled leftover's tokens are deleted in that same transaction.
 /// The check and the writes run in one IMMEDIATE transaction, so only one caller can claim ownership.
 pub async fn claim_owner(
     pool: &SqlitePool,
@@ -177,6 +178,10 @@ async fn claim_owner_in_tx(
             .bind(&id)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("DELETE FROM access_tokens WHERE user_id = ?")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
         }
         None => {
             sqlx::query(
@@ -202,6 +207,12 @@ async fn claim_owner_in_tx(
         .execute(&mut *tx)
         .await?;
         leftover_disabled = result.rows_affected() == 1;
+        if leftover_disabled {
+            sqlx::query("DELETE FROM access_tokens WHERE user_id = ?")
+                .bind(user.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     tx.commit().await?;

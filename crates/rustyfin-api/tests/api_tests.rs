@@ -4333,3 +4333,93 @@ async fn g2f_reset_password_hides_unknown_users() {
         "an unknown user gets the same status and body as a wrong PIN"
     );
 }
+
+#[tokio::test]
+async fn g2f_wizard_claiming_admin_ends_its_sessions() {
+    // The wizard claims the leftover "admin" by name and sets a new password; the admin/admin
+    // tokens end in the same step. 90c99b5 kept them.
+    let state = test_state().await;
+    add_user(&state, "admin", "admin", true).await;
+    let app = app(state);
+    let (old_t, _) = g2_login_device(&app, "admin", "admin", "admin-dev")
+        .await
+        .expect("admin login");
+    assert_eq!(
+        post_startup_user(&app, None, "admin", "new-secret").await,
+        StatusCode::NO_CONTENT
+    );
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&old_t), None)).await;
+    assert_eq!(
+        me,
+        StatusCode::UNAUTHORIZED,
+        "the claimed account's earlier token is revoked"
+    );
+    assert!(
+        g2_login_device(&app, "admin", "new-secret", "d2")
+            .await
+            .is_some(),
+        "the new password works"
+    );
+}
+
+#[tokio::test]
+async fn g2f_disabled_leftover_admin_tokens_are_deleted() {
+    // The wizard creates a new owner and disables the leftover admin. Its tokens are deleted, not
+    // only rejected while disabled, so re-enabling the account does not revive them.
+    let state = test_state().await;
+    add_user(&state, "admin", "admin", true).await;
+    let app = app(state.clone());
+    let (old_t, _) = g2_login_device(&app, "admin", "admin", "admin-dev")
+        .await
+        .expect("admin login");
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "geheim").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        user_flags(&state, "admin").await,
+        Some((true, false, true)),
+        "the leftover admin is disabled"
+    );
+    sqlx::query("UPDATE users SET is_disabled = 0 WHERE name = 'admin'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&old_t), None)).await;
+    assert_eq!(
+        me,
+        StatusCode::UNAUTHORIZED,
+        "a re-enabled leftover's old token stays revoked"
+    );
+}
+
+#[tokio::test]
+async fn g2f_admin_device_delete_ends_that_devices_sessions() {
+    // DELETE /Devices?id= signs the device out, as in Jellyfin. 90c99b5 left its tokens valid.
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (victim_t, _) = g2_login_device(&app, "owner", "pw-owner", "victim-dev")
+        .await
+        .expect("login on the device to delete");
+    let (admin_t, _) = g2_login_device(&app, "owner", "pw-owner", "admin-dev")
+        .await
+        .expect("login on another device");
+    let (status, body) = send(
+        &app,
+        request("DELETE", "/Devices?id=victim-dev", Some(&admin_t), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "device delete: {body:?}");
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&victim_t), None)).await;
+    assert_eq!(
+        me,
+        StatusCode::UNAUTHORIZED,
+        "the deleted device's token is revoked"
+    );
+    let (me, _) = send(&app, request("GET", "/Users/Me", Some(&admin_t), None)).await;
+    assert_eq!(me, StatusCode::OK, "other devices stay signed in");
+}

@@ -93,3 +93,13 @@ pub async fn delete_user_device_tokens(
         .await?;
     Ok(())
 }
+
+/// Deletes every token issued to `device_id`, for every user, so removing a device signs it out.
+/// An empty device id matches nothing.
+pub async fn delete_device_tokens(pool: &SqlitePool, device_id: &str) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query("DELETE FROM access_tokens WHERE device_id = ?1 AND device_id != ''")
+        .bind(device_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
+}
