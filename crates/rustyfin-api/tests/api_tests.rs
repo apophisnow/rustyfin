@@ -5534,3 +5534,447 @@ async fn g1f_sessions_list_own_unless_admin() {
         }
     }
 }
+
+// ── G1c ──
+// One user's data stays theirs: GET /Items/Resume lists only the caller's items (or those of the
+// user a userId names, under path_user's rules), IsFavorite/IsPlayed/IsUnplayed match only the
+// caller's data, and every list item carries the caller's UserData.
+
+/// Removes a test's data dir when the test ends, pass or fail.
+struct G1cDataDir(std::path::PathBuf);
+
+impl Drop for G1cDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Stores a library with `n` movies, "G1c Movie 1" to "G1c Movie n", and returns their ids in order.
+async fn g1c_insert_movies(state: &AppState, n: usize) -> Vec<uuid::Uuid> {
+    let folder = media_folder(state, "g1c-movies");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "G1c Movies".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 1..=n {
+        let id = uuid::Uuid::new_v4();
+        let name = format!("G1c Movie {i}");
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(&name)
+        .bind(&name)
+        .bind("Movie")
+        .bind(format!("{folder}/{name}.mkv"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+/// Sends a GET and returns the status, the answer's `Items` and its `TotalRecordCount`.
+async fn g1c_list(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, Vec<serde_json::Value>, i64) {
+    let (status, json) = send(app, request("GET", uri, Some(token), None)).await;
+    let items = json["Items"].as_array().cloned().unwrap_or_default();
+    (
+        status,
+        items,
+        json["TotalRecordCount"].as_i64().unwrap_or(-1),
+    )
+}
+
+/// The item's id.
+fn g1c_id(item: &serde_json::Value) -> uuid::Uuid {
+    uuid::Uuid::parse_str(item["Id"].as_str().unwrap()).unwrap()
+}
+
+/// The items' ids, sorted.
+fn g1c_sorted_ids(items: &[serde_json::Value]) -> Vec<uuid::Uuid> {
+    let mut ids: Vec<uuid::Uuid> = items.iter().map(g1c_id).collect();
+    ids.sort();
+    ids
+}
+
+/// The ids of the movies with these numbers (1 is the first), sorted.
+fn g1c_movies(movies: &[uuid::Uuid], numbers: &[usize]) -> Vec<uuid::Uuid> {
+    let mut ids: Vec<uuid::Uuid> = numbers.iter().map(|n| movies[n - 1]).collect();
+    ids.sort();
+    ids
+}
+
+/// The item's `(Played, IsFavorite, PlaybackPositionTicks)`, or `None` without `UserData`.
+fn g1c_user_data(item: &serde_json::Value) -> Option<(bool, bool, i64)> {
+    let data = &item["UserData"];
+    data.is_object().then(|| {
+        (
+            data["Played"].as_bool().unwrap(),
+            data["IsFavorite"].as_bool().unwrap(),
+            data["PlaybackPositionTicks"].as_i64().unwrap(),
+        )
+    })
+}
+
+#[tokio::test]
+async fn g1c_resume_lists_only_the_callers_items_once() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let m = g1c_insert_movies(&state, 3).await;
+    // Both users are part-way through movie 2.
+    let positions = [
+        (&owner_id, m[0], 1000),
+        (&owner_id, m[1], 2000),
+        (&viewer_id, m[1], 3000),
+        (&viewer_id, m[2], 4000),
+    ];
+    for (user, item, ticks) in positions {
+        rustyfin_db::repo_playback::update_playback_position(
+            &state.db,
+            user.parse().unwrap(),
+            item,
+            ticks,
+        )
+        .await
+        .unwrap();
+    }
+    let cases = [
+        ("owner", &owner, vec![(m[0], 1000), (m[1], 2000)]),
+        ("viewer", &viewer, vec![(m[1], 3000), (m[2], 4000)]),
+    ];
+    for (who, token, mut expected) in cases {
+        let (status, items, total) = g1c_list(&app, "/Items/Resume", token).await;
+        assert_eq!(status, StatusCode::OK, "{who}");
+        let mut got: Vec<(uuid::Uuid, i64)> = items
+            .iter()
+            .map(|item| (g1c_id(item), g1c_user_data(item).map_or(-1, |data| data.2)))
+            .collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "{who}'s resume list and positions");
+        assert_eq!(total, expected.len() as i64, "{who}'s TotalRecordCount");
+    }
+}
+
+#[tokio::test]
+async fn g1c_resume_user_id_follows_query_user_rules() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let m = g1c_insert_movies(&state, 2).await;
+    for (user, item) in [(&owner_id, m[0]), (&viewer_id, m[1])] {
+        rustyfin_db::repo_playback::update_playback_position(
+            &state.db,
+            user.parse().unwrap(),
+            item,
+            1000,
+        )
+        .await
+        .unwrap();
+    }
+    let unknown = uuid::Uuid::new_v4();
+    let (ok, forbidden, not_found) = (StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::NOT_FOUND);
+    let key = "test-api-key";
+    // (caller, token, query, status, ids when the status is 200)
+    let cases = [
+        (
+            "viewer",
+            viewer.as_str(),
+            format!("userId={owner_id}"),
+            forbidden,
+            vec![],
+        ),
+        (
+            "viewer",
+            viewer.as_str(),
+            format!("UserId={owner_id}"),
+            forbidden,
+            vec![],
+        ),
+        (
+            "viewer",
+            viewer.as_str(),
+            format!("userId={unknown}"),
+            forbidden,
+            vec![],
+        ),
+        (
+            "viewer",
+            viewer.as_str(),
+            format!("userId={viewer_id}"),
+            ok,
+            vec![m[1]],
+        ),
+        (
+            "viewer",
+            viewer.as_str(),
+            format!("UserId={G1F_NIL}"),
+            ok,
+            vec![m[1]],
+        ),
+        ("viewer", viewer.as_str(), String::new(), ok, vec![m[1]]),
+        (
+            "owner",
+            owner.as_str(),
+            format!("userId={viewer_id}"),
+            ok,
+            vec![m[1]],
+        ),
+        (
+            "owner",
+            owner.as_str(),
+            format!("UserId={viewer_id}"),
+            ok,
+            vec![m[1]],
+        ),
+        (
+            "owner",
+            owner.as_str(),
+            format!("userId={owner_id}"),
+            ok,
+            vec![m[0]],
+        ),
+        (
+            "owner",
+            owner.as_str(),
+            format!("userId={G1F_NIL}"),
+            ok,
+            vec![m[0]],
+        ),
+        ("owner", owner.as_str(), String::new(), ok, vec![m[0]]),
+        (
+            "owner",
+            owner.as_str(),
+            format!("userId={unknown}"),
+            not_found,
+            vec![],
+        ),
+        ("API key", key, String::new(), not_found, vec![]),
+        (
+            "API key",
+            key,
+            format!("userId={G1F_NIL}"),
+            not_found,
+            vec![],
+        ),
+        (
+            "API key",
+            key,
+            format!("userId={viewer_id}"),
+            ok,
+            vec![m[1]],
+        ),
+        ("API key", key, format!("UserId={owner_id}"), ok, vec![m[0]]),
+    ];
+    for (who, token, query, expected_status, expected_ids) in cases {
+        let uri = format!("/Items/Resume?{query}");
+        let (status, items, total) = g1c_list(&app, &uri, token).await;
+        assert_eq!(status, expected_status, "{who} {uri}");
+        if expected_status == StatusCode::OK {
+            assert_eq!(g1c_sorted_ids(&items), expected_ids, "{who} {uri}");
+            assert_eq!(
+                total,
+                expected_ids.len() as i64,
+                "{who} {uri} TotalRecordCount"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn g1c_favorite_and_played_filters_match_only_the_callers_data() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let m = g1c_insert_movies(&state, 5).await;
+    // The owner's favorites are movies 1 and 2 and they played 2 and 3; the viewer's favorites are
+    // 2 and 4 and they played 1, 4 and 5.
+    let data = [
+        (&owner_id, vec![1, 2], vec![2, 3]),
+        (&viewer_id, vec![2, 4], vec![1, 4, 5]),
+    ];
+    for (user, favorites, played) in data {
+        let user: uuid::Uuid = user.parse().unwrap();
+        for n in favorites {
+            rustyfin_db::repo_playback::set_favorite(&state.db, user, m[n - 1], true)
+                .await
+                .unwrap();
+        }
+        for n in played {
+            rustyfin_db::repo_playback::mark_played(&state.db, user, m[n - 1])
+                .await
+                .unwrap();
+        }
+    }
+    let base = "/Items?Recursive=true&IncludeItemTypes=Movie&";
+    let all: &[usize] = &[1, 2, 3, 4, 5];
+    // The API key has no user, so it has no favorites and has played nothing.
+    // (filter, the movies it gives the owner, the viewer and the API key)
+    type Case = (
+        &'static str,
+        &'static [usize],
+        &'static [usize],
+        &'static [usize],
+    );
+    let cases: [Case; 12] = [
+        ("IsFavorite=true", &[1, 2], &[2, 4], &[]),
+        ("isFavorite=true", &[1, 2], &[2, 4], &[]),
+        ("IsFavorite=false", &[3, 4, 5], &[1, 3, 5], all),
+        ("IsPlayed=true", &[2, 3], &[1, 4, 5], &[]),
+        ("isPlayed=true", &[2, 3], &[1, 4, 5], &[]),
+        ("IsUnplayed=false", &[2, 3], &[1, 4, 5], &[]),
+        ("IsPlayed=false", &[1, 4, 5], &[2, 3], all),
+        ("IsUnplayed=true", &[1, 4, 5], &[2, 3], all),
+        ("isUnplayed=true", &[1, 4, 5], &[2, 3], all),
+        ("IsFavorite=true&IsPlayed=true", &[2], &[4], &[]),
+        ("IsFavorite=true&IsUnplayed=true", &[1], &[2], &[]),
+        (
+            "IsFavorite=false&IsPlayed=false&MediaTypes=Movie&Limit=10&StartIndex=0",
+            &[4, 5],
+            &[3],
+            all,
+        ),
+    ];
+    for (filter, owner_movies, viewer_movies, key_movies) in cases {
+        let callers = [
+            ("owner", owner.as_str(), owner_movies),
+            ("viewer", viewer.as_str(), viewer_movies),
+            ("API key", "test-api-key", key_movies),
+        ];
+        for (who, token, numbers) in callers {
+            let uri = format!("{base}{filter}");
+            let (status, items, total) = g1c_list(&app, &uri, token).await;
+            assert_eq!(status, StatusCode::OK, "{who} {uri}");
+            let expected = g1c_movies(&m, numbers);
+            assert_eq!(g1c_sorted_ids(&items), expected, "{who} {uri}");
+            assert_eq!(total, expected.len() as i64, "{who} {uri} TotalRecordCount");
+        }
+    }
+    // A page of favorites holds only the caller's, and the count counts only theirs.
+    for (who, token, second) in [("owner", &owner, m[1]), ("viewer", &viewer, m[3])] {
+        let uri = format!("{base}IsFavorite=true&Limit=1&StartIndex=1");
+        let (status, items, total) = g1c_list(&app, &uri, token).await;
+        assert_eq!(status, StatusCode::OK, "{who} {uri}");
+        assert_eq!(g1c_sorted_ids(&items), vec![second], "{who} {uri}");
+        assert_eq!(total, 2, "{who} {uri} TotalRecordCount");
+    }
+}
+
+#[tokio::test]
+async fn g1c_list_user_data_is_the_callers() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let m = g1c_insert_movies(&state, 4).await;
+    let db = &state.db;
+    let (o, v): (uuid::Uuid, uuid::Uuid) = (owner_id.parse().unwrap(), viewer_id.parse().unwrap());
+    // The owner: part-way through 1, favorite 2, played 3, favorite and part-way through 4.
+    rustyfin_db::repo_playback::update_playback_position(db, o, m[0], 1000)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::set_favorite(db, o, m[1], true)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::mark_played(db, o, m[2])
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::set_favorite(db, o, m[3], true)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::update_playback_position(db, o, m[3], 4000)
+        .await
+        .unwrap();
+    // The viewer: favorite 1, played 2, part-way through 3, played 4.
+    rustyfin_db::repo_playback::set_favorite(db, v, m[0], true)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::mark_played(db, v, m[1])
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::update_playback_position(db, v, m[2], 3000)
+        .await
+        .unwrap();
+    rustyfin_db::repo_playback::mark_played(db, v, m[3])
+        .await
+        .unwrap();
+    // (Played, IsFavorite, PlaybackPositionTicks) of movies 1 to 4.
+    let cases = [
+        (
+            "owner",
+            &owner,
+            &owner_id,
+            [
+                (false, false, 1000),
+                (false, true, 0),
+                (true, false, 0),
+                (false, true, 4000),
+            ],
+        ),
+        (
+            "viewer",
+            &viewer,
+            &viewer_id,
+            [
+                (false, true, 0),
+                (true, false, 0),
+                (false, false, 3000),
+                (true, false, 0),
+            ],
+        ),
+    ];
+    for (who, token, id, expected) in cases {
+        let number =
+            |item: &serde_json::Value| m.iter().position(|movie| *movie == g1c_id(item)).unwrap();
+        let lists = [
+            "/Items?Recursive=true&IncludeItemTypes=Movie".to_string(),
+            format!("/Users/{id}/Items?Recursive=true&IncludeItemTypes=Movie"),
+        ];
+        for uri in lists {
+            let (status, items, _) = g1c_list(&app, &uri, token).await;
+            assert_eq!(status, StatusCode::OK, "{who} {uri}");
+            assert_eq!(items.len(), 4, "{who} {uri}");
+            for item in &items {
+                let n = number(item);
+                assert_eq!(
+                    g1c_user_data(item),
+                    Some(expected[n]),
+                    "{who} {uri}: movie {}",
+                    n + 1
+                );
+            }
+        }
+        // A one-item page, where the item is also the last, carries the caller's data too.
+        for start in 0..4 {
+            let uri =
+                format!("/Items?Recursive=true&IncludeItemTypes=Movie&Limit=1&StartIndex={start}");
+            let (status, items, _) = g1c_list(&app, &uri, token).await;
+            assert_eq!(status, StatusCode::OK, "{who} {uri}");
+            assert_eq!(items.len(), 1, "{who} {uri}");
+            let n = number(&items[0]);
+            assert_eq!(
+                g1c_user_data(&items[0]),
+                Some(expected[n]),
+                "{who} {uri}: movie {}",
+                n + 1
+            );
+        }
+    }
+}
