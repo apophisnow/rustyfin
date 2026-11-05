@@ -6297,3 +6297,302 @@ async fn g1c_quick_connect_authorize_broadcasts_no_secret() {
         "connect"
     );
 }
+
+#[tokio::test]
+async fn g1c_now_playing_item_needs_the_sessions_owner_or_an_admin() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (owner_session, viewer_session) = g1f_sessions(&state, &owner_id, &viewer_id).await;
+    let m = g1c_insert_movies(&state, 2).await;
+    for (session, movie) in [(&owner_session, m[0]), (&viewer_session, m[1])] {
+        rustyfin_db::repo_session::update_session_now_playing(
+            &state.db,
+            session,
+            Some(movie),
+            Some(0),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let now_playing = |session: &str, token: Option<&str>| {
+        let uri = format!("/Sessions/Playing/NowPlayingItem?SessionId={session}");
+        request("GET", &uri, token, None)
+    };
+    let playing = |movie: uuid::Uuid| (StatusCode::OK, Some(movie));
+    let forbidden = (StatusCode::FORBIDDEN, None);
+    let not_found = (StatusCode::NOT_FOUND, None);
+
+    assert_eq!(
+        send(&app, now_playing(&viewer_session, None)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // (who, token, session, the status and the item's id)
+    let cases = [
+        ("viewer", viewer.as_str(), &viewer_session, playing(m[1])),
+        ("viewer", viewer.as_str(), &owner_session, forbidden),
+        ("viewer", viewer.as_str(), &unknown, forbidden),
+        (
+            "administrator",
+            owner.as_str(),
+            &owner_session,
+            playing(m[0]),
+        ),
+        (
+            "administrator",
+            owner.as_str(),
+            &viewer_session,
+            playing(m[1]),
+        ),
+        ("administrator", owner.as_str(), &unknown, not_found),
+        ("API key", "test-api-key", &viewer_session, playing(m[1])),
+        ("API key", "test-api-key", &unknown, not_found),
+    ];
+    for (who, token, session, answer) in cases {
+        let (status, json) = send(&app, now_playing(session, Some(token))).await;
+        let id = json["Id"]
+            .as_str()
+            .map(|id| id.parse::<uuid::Uuid>().unwrap());
+        assert_eq!((status, id), answer, "{who} on {session}");
+    }
+    // No SessionId: nothing, as before.
+    let req = request(
+        "GET",
+        "/Sessions/Playing/NowPlayingItem",
+        Some(&viewer),
+        None,
+    );
+    assert_eq!(
+        send(&app, req).await,
+        (StatusCode::OK, serde_json::Value::Null)
+    );
+}
+
+#[tokio::test]
+async fn g1c_set_rating_writes_the_path_users_rating() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let item = g1c_insert_movies(&state, 1).await[0];
+    let random = uuid::Uuid::new_v4().to_string();
+    let put = |user: &str, token: Option<&str>, likes: bool, rating: i32| {
+        let uri = format!("/Users/{user}/Items/{item}/Rating");
+        let body = serde_json::json!({ "Likes": likes, "UserRating": rating });
+        request("PUT", &uri, token, Some(body))
+    };
+    let unrated = (None, None);
+
+    assert_eq!(
+        send(&app, put(&viewer_id, None, true, 1)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A non-admin on another user, existing or not: 403, and nothing is written.
+    for target in [&owner_id, &random] {
+        assert_eq!(
+            send(&app, put(target, Some(&viewer), true, 2)).await.0,
+            StatusCode::FORBIDDEN,
+            "viewer on {target}"
+        );
+    }
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, unrated, "owner");
+    assert_eq!(
+        g1f_rating(&state, &viewer_id, item).await,
+        unrated,
+        "viewer"
+    );
+    // A user on themselves: their own rating only.
+    assert_eq!(
+        send(&app, put(&viewer_id, Some(&viewer), false, 3)).await.0,
+        StatusCode::OK,
+        "viewer on themselves"
+    );
+    assert_eq!(
+        g1f_rating(&state, &viewer_id, item).await,
+        (Some(false), Some(3))
+    );
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, unrated, "owner");
+    // An administrator or the API key on another user: that user's rating.
+    assert_eq!(
+        send(&app, put(&viewer_id, Some(&owner), true, 9)).await.0,
+        StatusCode::OK,
+        "administrator on the viewer"
+    );
+    assert_eq!(
+        g1f_rating(&state, &viewer_id, item).await,
+        (Some(true), Some(9))
+    );
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, unrated, "owner");
+    assert_eq!(
+        send(&app, put(&owner_id, Some("test-api-key"), true, 7))
+            .await
+            .0,
+        StatusCode::OK,
+        "API key on the owner"
+    );
+    assert_eq!(
+        g1f_rating(&state, &owner_id, item).await,
+        (Some(true), Some(7))
+    );
+    // An administrator on an unknown user: 404.
+    assert_eq!(
+        send(&app, put(&random, Some(&owner), true, 5)).await.0,
+        StatusCode::NOT_FOUND,
+        "administrator on an unknown user"
+    );
+}
+
+#[tokio::test]
+async fn g1c_delete_rating_unknown_item_is_404() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let item = g1c_insert_movies(&state, 1).await[0];
+    let unknown = uuid::Uuid::new_v4();
+    let delete = |user: &str, item: uuid::Uuid, token: &str| {
+        let uri = format!("/Users/{user}/Items/{item}/Rating");
+        request("DELETE", &uri, Some(token), None)
+    };
+    let rated = (Some(true), Some(8));
+    g1f_rate(&state, &owner_id, item).await;
+    g1f_rate(&state, &viewer_id, item).await;
+
+    // An unknown item: 404 for the user themselves, an administrator and the API key.
+    let callers = [
+        ("viewer", &viewer_id, viewer.as_str()),
+        ("administrator", &viewer_id, owner.as_str()),
+        ("API key", &owner_id, "test-api-key"),
+    ];
+    for (who, user, token) in callers {
+        assert_eq!(
+            send(&app, delete(user, unknown, token)).await.0,
+            StatusCode::NOT_FOUND,
+            "{who} on an unknown item"
+        );
+    }
+    // Another user's path is checked first: 403.
+    assert_eq!(
+        send(&app, delete(&owner_id, unknown, &viewer)).await.0,
+        StatusCode::FORBIDDEN,
+        "viewer on the owner and an unknown item"
+    );
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, rated, "owner");
+    assert_eq!(g1f_rating(&state, &viewer_id, item).await, rated, "viewer");
+    // A known item: only the path user's rating is cleared.
+    assert_eq!(
+        send(&app, delete(&viewer_id, item, &viewer)).await,
+        (StatusCode::OK, serde_json::json!({}))
+    );
+    assert_eq!(g1f_rating(&state, &viewer_id, item).await, (None, None));
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, rated, "owner");
+}
+
+/// The query with each parameter name's first letter in upper case: `startIndex=1&limit=1`
+/// becomes `StartIndex=1&Limit=1`.
+fn g1c_pascal(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| {
+            let mut chars = pair.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+#[tokio::test]
+async fn g1c_next_up_accepts_both_casings() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, owner_id.parse().unwrap(), e1)
+        .await
+        .unwrap();
+    let random = uuid::Uuid::new_v4();
+    let (owner, viewer) = (owner.as_str(), viewer.as_str());
+    let ok = |ids: &[uuid::Uuid]| (StatusCode::OK, ids.to_vec());
+    let forbidden = (StatusCode::FORBIDDEN, Vec::new());
+    // (path, token, camelCase query, answer). The owner has watched E1; E3 airs in 2999.
+    let cases = [
+        ("/Shows/NextUp", viewer, "limit=1".to_string(), ok(&[e1])),
+        (
+            "/Shows/NextUp",
+            viewer,
+            "startIndex=1&limit=1".to_string(),
+            ok(&[e2]),
+        ),
+        (
+            "/Shows/NextUp",
+            viewer,
+            format!("seriesId={random}"),
+            ok(&[]),
+        ),
+        (
+            "/Shows/NextUp",
+            viewer,
+            format!("seriesId={series}"),
+            ok(&[e1, e2, e3]),
+        ),
+        (
+            "/Shows/NextUp",
+            viewer,
+            format!("userId={owner_id}"),
+            forbidden.clone(),
+        ),
+        (
+            "/Shows/NextUp",
+            owner,
+            format!("userId={viewer_id}"),
+            ok(&[e1, e2, e3]),
+        ),
+        (
+            "/Shows/NextUp",
+            "test-api-key",
+            format!("userId={owner_id}"),
+            ok(&[e2, e3]),
+        ),
+        ("/Shows/Upcoming", viewer, "limit=0".to_string(), ok(&[])),
+        (
+            "/Shows/Upcoming",
+            viewer,
+            "startIndex=1".to_string(),
+            ok(&[]),
+        ),
+        (
+            "/Shows/Upcoming",
+            viewer,
+            format!("seriesId={random}"),
+            ok(&[]),
+        ),
+        (
+            "/Shows/Upcoming",
+            viewer,
+            format!("seriesId={series}"),
+            ok(&[e3]),
+        ),
+        (
+            "/Shows/Upcoming",
+            viewer,
+            format!("userId={owner_id}"),
+            forbidden.clone(),
+        ),
+    ];
+    for (path, token, query, answer) in cases {
+        for query in [query.clone(), g1c_pascal(&query)] {
+            assert_eq!(
+                g1f_ids(&app, format!("{path}?{query}"), Some(token)).await,
+                answer,
+                "{path}?{query}"
+            );
+        }
+    }
+}

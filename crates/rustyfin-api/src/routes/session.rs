@@ -77,8 +77,12 @@ struct NowPlayingItemQuery {
 async fn get_now_playing_item(
     State(state): State<AppState>,
     Query(query): Query<NowPlayingItemQuery>,
+    Extension(claims): Extension<Claims>,
 ) -> Result<Json<Option<MediaItem>>, ApiError> {
     if let Some(session_id) = query.session_id {
+        let owner =
+            rustyfin_db::repo_session::get_session_user_id(&state.db_ro, &session_id).await?;
+        check_control(&claims, owner, "Session")?;
         let now_playing =
             rustyfin_db::repo_session::get_now_playing_item(&state.db_ro, &session_id).await?;
         Ok(Json(now_playing))

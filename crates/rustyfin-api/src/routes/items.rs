@@ -2217,6 +2217,9 @@ async fn delete_rating(
     Extension(claims): Extension<Claims>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
+        .await?
+        .ok_or(ApiError::NotFound("item not found".into()))?;
     rustyfin_db::repo_playback::clear_user_rating(&state.db, user_id, item_id)
         .await
         .ok();
