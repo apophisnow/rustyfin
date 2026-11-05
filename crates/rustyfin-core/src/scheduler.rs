@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 
+use crate::library_monitor::ChangeQueue;
 use crate::scan_progress::ScanRegistry;
 
 /// Known task IDs
@@ -38,6 +39,7 @@ pub struct TaskScheduler {
     db: SqlitePool,
     data_dir: Arc<PathBuf>,
     scans: ScanRegistry,
+    changes: ChangeQueue,
 }
 
 impl TaskScheduler {
@@ -159,17 +161,24 @@ impl TaskScheduler {
             },
         );
 
+        let changes = ChangeQueue::new(db.clone());
         Self {
             tasks: Arc::new(RwLock::new(tasks)),
             db,
             data_dir,
             scans: ScanRegistry::new(),
+            changes,
         }
     }
 
     /// The library scans in progress.
     pub fn scans(&self) -> &ScanRegistry {
         &self.scans
+    }
+
+    /// The queue of changed library paths, which the library monitor rescans.
+    pub fn changes(&self) -> &ChangeQueue {
+        &self.changes
     }
 
     pub async fn get_all_tasks(&self) -> Vec<ScheduledTaskInfo> {

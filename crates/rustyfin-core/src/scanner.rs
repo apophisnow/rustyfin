@@ -16,10 +16,11 @@ use crate::scan_progress::ScanTicket;
 use crate::scan_sync;
 use crate::tmdb_client::TmdbApi;
 
-const VIDEO_EXTENSIONS: &[&str] = &[
+pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg",
 ];
-const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "wav", "aac", "wma", "m4a", "opus"];
+pub(crate) const AUDIO_EXTENSIONS: &[&str] =
+    &["mp3", "flac", "ogg", "wav", "aac", "wma", "m4a", "opus"];
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
 
 pub async fn scan_library(pool: &SqlitePool, library: &Library) -> Result<u32, sqlx::Error> {

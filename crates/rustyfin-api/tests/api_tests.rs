@@ -8904,6 +8904,166 @@ async fn b18_scan_all_clears_the_caches_before_each_library_changed() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+// ── B18: the library monitor's rescans, and LibraryMonitorDelay ──
+// A rescan from the change queue clears the API caches and the image cache, then sends
+// LibraryChanged with the library's id and name, and sends no scan progress or task events. A
+// rescan that changes nothing sends nothing. LibraryMonitorDelay sets the queue's settle delay.
+
+/// Waits up to 60 s for the next LibraryChanged. Returns its data and the variant names of the
+/// events that came before it.
+async fn b18_next_library_changed(
+    events: &mut broadcast::Receiver<WsEvent>,
+) -> (serde_json::Value, Vec<String>) {
+    let mut before = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no LibraryChanged within 60 s, after {before:?}"));
+        match event {
+            Ok(WsEvent::LibraryChanged { data }) => return (data, before),
+            Ok(event) => before.push(
+                format!("{event:?}")
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect(),
+            ),
+            Err(broadcast::error::RecvError::Lagged(n)) => before.push(format!("Lagged {n}")),
+            Err(broadcast::error::RecvError::Closed) => panic!("the event channel closed"),
+        }
+    }
+}
+
+/// Creates `<folder>/<name>/<name>.mkv` and returns the movie's folder.
+fn b18_movie(folder: &str, name: &str) -> std::path::PathBuf {
+    let movie = std::path::Path::new(folder).join(name);
+    std::fs::create_dir_all(&movie).unwrap();
+    std::fs::write(movie.join(format!("{name}.mkv")), b"").unwrap();
+    movie
+}
+
+#[tokio::test]
+async fn b18_monitor_rescan_clears_the_caches_then_sends_library_changed() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let library = create_library_via_api(&app, &state, &token, "B18 Monitor", "Movies").await;
+    let movie = b18_movie(&media_folder(&state, "b18 monitor"), "B18 Monitored (2003)");
+    let uri = format!("/Items/Filters?ParentId={library}");
+    let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["Years"],
+        serde_json::json!([]),
+        "the empty library's filters are cached"
+    );
+    state
+        .image_cache
+        .insert("b18-monitor".to_string(), vec![1, 2, 3]);
+    assert!(state.image_cache.get("b18-monitor").is_some());
+
+    let mut events = state.ws_broadcast.subscribe();
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::ZERO);
+    assert!(changes.report(&movie).await, "the movie is in the library");
+    let (data, before) = b18_next_library_changed(&mut events).await;
+    assert_eq!(data["LibraryId"], library.to_string(), "{data}");
+    assert_eq!(data["LibraryName"], "B18 Monitor", "{data}");
+    let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["Years"],
+        serde_json::json!([2003]),
+        "the API caches were cleared before LibraryChanged"
+    );
+    assert!(
+        state.image_cache.get("b18-monitor").is_none(),
+        "the image cache was cleared before LibraryChanged"
+    );
+
+    rustyfin_core::scanner::wait_for_idle().await;
+    let mut sent = before;
+    while let Ok(event) = events.try_recv() {
+        sent.push(format!("{event:?}"));
+    }
+    assert!(
+        !sent
+            .iter()
+            .any(|event| event.starts_with("RefreshProgress") || event.starts_with("ScheduledTask")),
+        "a monitor rescan sends no scan progress or task events: {sent:#?}"
+    );
+}
+
+#[tokio::test]
+async fn b18_monitor_rescan_that_changes_nothing_sends_no_library_changed() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let quiet = create_library_via_api(&app, &state, &token, "B18 Quiet", "Movies").await;
+    create_library_via_api(&app, &state, &token, "B18 Busy", "Movies").await;
+    let quiet_movie = b18_movie(&media_folder(&state, "b18 quiet"), "B18 Quiet (2004)");
+    let uri = format!("/Library/VirtualFolders/{quiet}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    rustyfin_core::scanner::wait_for_idle().await;
+    let busy_movie = b18_movie(&media_folder(&state, "b18 busy"), "B18 Busy (2005)");
+
+    let mut events = state.ws_broadcast.subscribe();
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::ZERO);
+    assert!(changes.report(&quiet_movie).await);
+    // Rescans run one at a time, so the busy library's rescan starts after the quiet one's ends.
+    let start = std::time::Instant::now();
+    while !changes.pending().is_empty() {
+        assert!(start.elapsed().as_secs() < 20, "{:?}", changes.pending());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(changes.report(&busy_movie).await);
+    let (data, before) = b18_next_library_changed(&mut events).await;
+    assert_eq!(
+        data["LibraryName"], "B18 Busy",
+        "the quiet library's rescan changed nothing and sent nothing: {data}, after {before:?}"
+    );
+    rustyfin_core::scanner::wait_for_idle().await;
+}
+
+#[tokio::test]
+async fn b18_library_monitor_delay_round_trips_and_sets_the_queue_delay() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let changes = state.task_scheduler.changes();
+    let (status, config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["LibraryMonitorDelay"], 60, "{config}");
+    assert_eq!(changes.delay(), std::time::Duration::from_secs(60));
+
+    for delay in [7u64, 0] {
+        let mut config = config.clone();
+        config["LibraryMonitorDelay"] = delay.into();
+        let body = config.to_string();
+        let (status, body) =
+            send_authed(&app, "POST", "/System/Configuration", &token, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (_, body) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+        assert_eq!(body["LibraryMonitorDelay"], delay, "{body}");
+        assert_eq!(changes.delay(), std::time::Duration::from_secs(delay));
+    }
+
+    let uri = "/System/Configuration/LibraryMonitorDelay";
+    let (status, body) = send_authed(&app, "POST", uri, &token, Some("9")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, body) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(body, 9);
+    assert_eq!(changes.delay(), std::time::Duration::from_secs(9));
+
+    // A config.json from before the setting existed gets the default.
+    let mut old = serde_json::to_value(ServerConfiguration::default()).unwrap();
+    assert_eq!(old["LibraryMonitorDelay"], 60, "{old}");
+    old.as_object_mut().unwrap().remove("LibraryMonitorDelay");
+    let old: ServerConfiguration = serde_json::from_value(old).unwrap();
+    assert_eq!(old.library_monitor_delay, 60);
+}
+
 // ── G4: transcode pipeline and byte ranges ──
 //
 // Unsatisfiable ranges get 416 instead of a panic or the whole file. Tests that need ffmpeg skip
