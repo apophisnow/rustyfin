@@ -223,6 +223,9 @@ async function wizComplete() {
             try {
                 await API.login(wizCredentials.name, wizCredentials.password);
                 wizProgress.loggedIn = true;
+                // Replace a socket or retry left from an earlier session, so the new token is used now
+                stopScanProgressWebSocket();
+                initScanProgressWebSocket();
             } catch (e) {
                 showFinishError(t('wizard.login_failed', { name: wizCredentials.name, message: e.message }));
                 return;
@@ -1842,6 +1845,9 @@ async function handleLogin(e) {
     try {
         await API.login($('login-user').value, $('login-pass').value);
         updateAuthUI();
+        // Replace a socket or retry left from an earlier session, so the new token is used now
+        stopScanProgressWebSocket();
+        initScanProgressWebSocket();
         await loadSidebar();
         navigate('home');
         toast(t('login.welcome_back', { name: API.userName }));
@@ -1852,6 +1858,7 @@ async function handleLogin(e) {
 }
 
 function doLogout() {
+    stopScanProgressWebSocket();
     API.logout();
     updateAuthUI();
     navigate('home');
@@ -2766,73 +2773,101 @@ function hideScanProgress() {
 }
 
 // --- WebSocket for scan progress ---
+// The scan progress socket while it connects or is open, or null
+let scanSocket = null;
+// The pending retry timer, or null when no retry is scheduled
+let scanSocketRetry = null;
+// Delay before the next retry in ms; doubles up to 30 s and returns to 1 s when a socket opens
+let scanSocketDelay = 1000;
+// True once the current outage has been logged, so the warning is printed only once
+let scanSocketWarned = false;
+
 function initScanProgressWebSocket() {
     if (typeof WebSocket === 'undefined') return;
-    
+    if (!API.isLoggedIn() || scanSocket || scanSocketRetry) return;
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/websocket?api_key=${API.accessToken}`;
-    
+    const wsUrl = `${protocol}//${window.location.host}/socket?api_key=${encodeURIComponent(API.token)}`;
+
     let ws;
-    let reconnectDelay = 1000;
-    
-    function connect() {
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch (e) {
+        console.error('Opening the scan progress socket failed:', e);
+        return;
+    }
+    scanSocket = ws;
+
+    ws.onopen = () => {
+        scanSocketDelay = 1000;
+        scanSocketWarned = false;
+    };
+
+    ws.onmessage = (event) => {
         try {
-            ws = new WebSocket(wsUrl);
-            
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.MessageType === 'ScheduledTaskStarted') {
-                        showScanProgress(data.data.Name || t('library.processing'));
-                        // Track per-library scan status
-                        const libId = data.data.ItemId;
-                        if (libId) scanStatuses[libId] = true;
-                        // Refresh tasks tab if visible
-                        if (currentPage === 'admin') refreshTasks();
-                    } else if (data.MessageType === 'ScheduledTaskCompleted') {
-                        // Clear per-library scan status
-                        const libId = data.data.ItemId;
-                        if (libId) delete scanStatuses[libId];
-                        if (data.data.State === 'Completed') {
-                            hideScanProgress();
-                        } else if (data.data.State === 'Failed') {
-                            hideScanProgress();
-                            toast(t('admin.task_failed', { name: data.data.Name || t('admin.task'), error: data.data.Error || t('common.unknown_error') }), 'error');
-                        }
-                        // Refresh tasks tab if visible
-                        if (currentPage === 'admin') refreshTasks();
-                    } else if (data.MessageType === 'LibraryChanged') {
-                        // Library changed - refresh current view if on library page
-                        if (currentPage === 'library' && currentLibraryId) {
-                            setTimeout(() => renderLibrary(currentLibraryId), 500);
-                        } else if (currentPage === 'home') {
-                            setTimeout(() => renderHome(), 500);
-                        }
-                    }
-                } catch (e) {
-                    // Ignore parse errors
+            const data = JSON.parse(event.data);
+            if (data.MessageType === 'ScheduledTaskStarted') {
+                showScanProgress(data.Name || t('library.processing'));
+                // Track per-library scan status
+                const libId = data.ItemId;
+                if (libId) scanStatuses[libId] = true;
+                // Refresh tasks tab if visible
+                if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'ScheduledTaskCompleted') {
+                // Clear per-library scan status
+                const libId = data.ItemId;
+                if (libId) delete scanStatuses[libId];
+                if (data.State === 'Completed') {
+                    hideScanProgress();
+                } else if (data.State === 'Failed') {
+                    hideScanProgress();
+                    toast(t('admin.task_failed', { name: data.Name || t('admin.task'), error: data.Error || t('common.unknown_error') }), 'error');
                 }
-            };
-            
-            ws.onclose = () => {
-                // Reconnect with exponential backoff
-                setTimeout(connect, reconnectDelay);
-                reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-            };
-            
-            ws.onerror = () => {
-                ws.close();
-            };
-            
-            reconnectDelay = 1000;
+                // Refresh tasks tab if visible
+                if (currentPage === 'admin') refreshTasks();
+            } else if (data.MessageType === 'LibraryChanged') {
+                // Library changed - refresh current view if on library page
+                // Drop the cached lists first, so the re-render is not served from the 30 s cache
+                API.invalidateCache('/Items');
+                API.invalidateCache('/Shows');
+                if (currentPage === 'library' && currentLibraryId) {
+                    setTimeout(() => renderLibrary(currentLibraryId), 500);
+                } else if (currentPage === 'home') {
+                    setTimeout(() => renderHome(), 500);
+                }
+            }
         } catch (e) {
-            // WebSocket not available, silently fail
+            console.error('Handling a server event failed:', e);
         }
-    }
-    
-    if (API.isLoggedIn()) {
-        connect();
-    }
+    };
+
+    ws.onclose = () => {
+        // A socket stopped on purpose is no longer the current one
+        if (scanSocket !== ws) return;
+        scanSocket = null;
+        if (!API.isLoggedIn()) return;
+        if (!scanSocketWarned) {
+            console.warn('Scan progress socket closed, retrying with backoff');
+            scanSocketWarned = true;
+        }
+        // Reconnect with exponential backoff
+        scanSocketRetry = setTimeout(() => {
+            scanSocketRetry = null;
+            initScanProgressWebSocket();
+        }, scanSocketDelay);
+        scanSocketDelay = Math.min(scanSocketDelay * 2, 30000);
+    };
+}
+
+// Called on logout and before a login starts a new socket: closes the socket and cancels any pending retry
+function stopScanProgressWebSocket() {
+    clearTimeout(scanSocketRetry);
+    scanSocketRetry = null;
+    scanSocketDelay = 1000;
+    scanSocketWarned = false;
+    const ws = scanSocket;
+    scanSocket = null;
+    if (ws) ws.close();
 }
 
 // --- Add User Modal Handlers ---
