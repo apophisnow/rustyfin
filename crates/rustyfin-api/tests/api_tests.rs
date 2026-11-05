@@ -11388,3 +11388,436 @@ async fn b20_import_run_leaves_the_source_and_its_secrets_alone() {
         );
     }
 }
+
+// B20 3: one-time codes and first sign-in.
+
+type B20Answer = (StatusCode, Option<String>, serde_json::Value);
+
+/// Runs an import that creates bob and returns his id and one-time code.
+async fn b20_pending_bob(w: &B20World) -> (uuid::Uuid, String) {
+    let install = b20_install(w, "jf", jf::Layout::New).await;
+    let report = b20_run(w, serde_json::json!({ "SourcePath": install })).await;
+    let bob = b20_entry(&report, "bob");
+    match (bob.user_id, bob.code) {
+        (Some(id), Some(code)) => (id, code),
+        _ => panic!("the run created no bob with a code"),
+    }
+}
+
+/// Sends `req`; returns the status, the `X-Rustyfin-Setup-Required` header and the JSON body.
+async fn b20_send(app: &axum::Router, req: Request<Body>) -> B20Answer {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let header = resp
+        .headers()
+        .get("X-Rustyfin-Setup-Required")
+        .map(|value| value.to_str().unwrap().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, header, json)
+}
+
+/// `POST /Users/AuthenticateByName` with `name` and `password`.
+async fn b20_sign_in(app: &axum::Router, name: &str, password: &str) -> B20Answer {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    b20_send(app, req).await
+}
+
+/// `POST /Users/AuthenticateWithSetupCode` with `name`, `code` and the new password.
+async fn b20_redeem(app: &axum::Router, name: &str, code: &str, new_password: &str) -> B20Answer {
+    let body = serde_json::json!({ "Username": name, "Code": code, "NewPw": new_password });
+    let req = request("POST", "/Users/AuthenticateWithSetupCode", None, Some(body));
+    b20_send(app, req).await
+}
+
+/// `POST /JellyfinImport/Users/{user}/SetupCode` as the admin.
+async fn b20_reissue(w: &B20World, user: uuid::Uuid) -> (StatusCode, serde_json::Value) {
+    let uri = format!("/JellyfinImport/Users/{user}/SetupCode");
+    send(&w.app, request("POST", &uri, Some(&w.token), None)).await
+}
+
+/// `GET /JellyfinImport/PendingUsers` as the admin; expects 200 and a JSON array.
+async fn b20_pending(w: &B20World) -> Vec<serde_json::Value> {
+    let uri = "/JellyfinImport/PendingUsers";
+    let (status, answer) = send(&w.app, request("GET", uri, Some(&w.token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer.as_array().expect("PendingUsers is no array").clone()
+}
+
+/// A pending user's entry: its id, name and date.
+fn b20_pending_entry(
+    entry: &serde_json::Value,
+) -> (uuid::Uuid, String, chrono::DateTime<chrono::Utc>) {
+    assert_eq!(entry.as_object().map(|o| o.len()), Some(3), "{entry}");
+    let id = uuid::Uuid::parse_str(entry["UserId"].as_str().unwrap()).unwrap();
+    let name = entry["Name"].as_str().unwrap().to_string();
+    let at = chrono::DateTime::parse_from_rfc3339(entry["CreatedAt"].as_str().unwrap()).unwrap();
+    (id, name, at.with_timezone(&chrono::Utc))
+}
+
+/// How many tokens and sessions `user` has.
+async fn b20_sessions(state: &AppState, user: uuid::Uuid) -> (i64, i64) {
+    let mut counts = Vec::new();
+    for sql in [
+        "SELECT COUNT(*) FROM access_tokens WHERE user_id = ?",
+        "SELECT COUNT(*) FROM sessions WHERE user_id = ?",
+    ] {
+        let n: i64 = sqlx::query_scalar(sql)
+            .bind(user.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        counts.push(n);
+    }
+    (counts[0], counts[1])
+}
+
+/// Whether `text` holds `code` in any form a client may send.
+fn b20_holds_code(text: &str, code: &str) -> bool {
+    let bare = code.replace('-', "");
+    [
+        code.to_string(),
+        code.to_lowercase(),
+        bare.clone(),
+        bare.to_lowercase(),
+    ]
+    .iter()
+    .any(|form| text.contains(form.as_str()))
+}
+
+#[tokio::test]
+async fn b20_code_sign_in_asks_for_a_new_password() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let (failed, header, failed_body) = b20_sign_in(&w.app, "bob", "wrong password").await;
+    assert_eq!(failed, StatusCode::UNAUTHORIZED);
+    assert_eq!(header, None, "a wrong password asks for a new password");
+
+    let log = jf::LogCapture::start();
+    let lower = code.to_lowercase();
+    let bare = code.replace('-', "");
+    let spaced = format!(" {} ", code.replace('-', " "));
+    for (form, typed) in [
+        ("as shown", code.as_str()),
+        ("lowercase", lower.as_str()),
+        ("without dashes", bare.as_str()),
+        ("with spaces", spaced.as_str()),
+    ] {
+        let (status, header, body) = b20_sign_in(&w.app, "bob", typed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{form}");
+        assert_eq!(header.as_deref(), Some("true"), "{form}: no setup header");
+        assert_eq!(body, failed_body, "{form}: not a failed sign-in's body");
+    }
+    let text = log.text();
+    drop(log);
+    assert!(!b20_holds_code(&text, &code), "the code is in the log");
+
+    // Only bob's own code asks for a new password, and it gives no session.
+    let other = rustyfin_auth::generate_setup_code();
+    for (case, name, typed) in [
+        ("another code", "bob", other.as_str()),
+        ("unknown user", "nobody", code.as_str()),
+        ("a user without a code", "alice", code.as_str()),
+    ] {
+        let (status, header, body) = b20_sign_in(&w.app, name, typed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(header, None, "{case}: setup header");
+        assert_eq!(body, failed_body, "{case}");
+    }
+    assert_eq!(
+        b20_sessions(&w.state, bob).await,
+        (0, 0),
+        "bob got a session"
+    );
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a sign-in used the code"
+    );
+    assert!(login(&w.app, "alice", "alicepass").await.is_some());
+}
+
+#[tokio::test]
+async fn b20_setup_code_sets_the_password_and_signs_in() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let log = jf::LogCapture::start();
+    let (status, header, answer) =
+        b20_redeem(&w.app, "bob", &code.to_lowercase(), "new pass").await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(header, None);
+    let id = answer["User"]["Id"].as_str().expect("no User.Id");
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap(), bob, "{answer}");
+    assert_eq!(answer["User"]["Name"], "bob", "{answer}");
+    assert!(answer["SessionInfo"]["Id"].is_string(), "{answer}");
+    assert!(answer["ServerId"].is_string(), "{answer}");
+    let token = answer["AccessToken"].as_str().expect("no AccessToken");
+    assert!(
+        !b20_holds_code(&answer.to_string(), &code),
+        "the code is in the answer"
+    );
+    assert!(!b20_holds_code(&text, &code), "the code is in the log");
+    assert!(!text.contains("new pass"), "the password is in the log");
+
+    let (status, me) = send_authed(&w.app, "GET", "/Users/Me", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["Name"], "bob");
+    assert_eq!(b20_sessions(&w.state, bob).await, (1, 1));
+
+    // The new password signs in; the code is used up everywhere.
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "another").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the code worked twice");
+    assert!(login(&w.app, "bob", "another").await.is_none());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+    assert!(b20_pending(&w).await.is_empty(), "bob is still pending");
+}
+
+#[tokio::test]
+async fn b20_setup_code_refuses_bad_requests() {
+    let w = b20_world().await;
+    let (_, code) = b20_pending_bob(&w).await;
+    let (_, _, failed_body) = b20_sign_in(&w.app, "bob", "wrong password").await;
+    let (status, _, answer) = b20_redeem(&w.app, "bob", &code, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty NewPw: {answer}");
+
+    let other = rustyfin_auth::generate_setup_code();
+    for (case, name, typed) in [
+        ("another code", "bob", other.as_str()),
+        ("not a code", "bob", "letmein"),
+        ("unknown user", "nobody", code.as_str()),
+        ("a user without a code", "alice", code.as_str()),
+    ] {
+        let (status, header, body) = b20_redeem(&w.app, name, typed, "new pass").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(header, None, "{case}");
+        assert_eq!(body, failed_body, "{case}");
+    }
+    assert!(
+        login(&w.app, "alice", "alicepass").await.is_some(),
+        "alice's password changed"
+    );
+    assert!(login(&w.app, "alice", "new pass").await.is_none());
+    assert!(login(&w.app, "bob", "new pass").await.is_none());
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a refusal used the code"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "the code no longer works");
+}
+
+#[tokio::test]
+async fn b20_disabled_pending_user_cannot_use_the_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(bob.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "redeem");
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a disabled user used the code"
+    );
+    assert_eq!(b20_sessions(&w.state, bob).await, (0, 0));
+}
+
+#[tokio::test]
+async fn b20_setup_code_sign_in_is_rate_limited() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = remote_app(state);
+    let body = serde_json::json!({ "Username": "nobody", "Code": "AAAA-AAAA-AAAA", "NewPw": "x" });
+    let attempt = || {
+        request(
+            "POST",
+            "/Users/AuthenticateWithSetupCode",
+            None,
+            Some(body.clone()),
+        )
+    };
+    for n in 1..=3 {
+        let status = send(&app, attempt()).await.0;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {n}");
+    }
+    let status = send(&app, attempt()).await.0;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn b20_pending_users_and_reissue_are_admin_only() {
+    let w = b20_world().await;
+    let (bob, _) = b20_pending_bob(&w).await;
+    let codes = b20_code_rows(&w.state).await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let pending = "/JellyfinImport/PendingUsers";
+    g1_assert_admin_only(&w.app, "GET", pending, &None, &viewer).await;
+    let reissue = format!("/JellyfinImport/Users/{bob}/SetupCode");
+    g1_assert_admin_only(&w.app, "POST", &reissue, &None, &viewer).await;
+    assert_eq!(
+        b20_code_rows(&w.state).await,
+        codes,
+        "a refused reissue wrote"
+    );
+}
+
+#[tokio::test]
+async fn b20_pending_users_lists_users_with_a_code() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let started = chrono::Utc::now();
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let ended = chrono::Utc::now();
+    let bob = b20_entry(&report, "bob").user_id.unwrap();
+    let carol = b20_entry(&report, "Carol").user_id.unwrap();
+
+    // Sorted by name, case-insensitively; alice (matched) and the admin are not pending.
+    let listed: Vec<_> = b20_pending(&w)
+        .await
+        .iter()
+        .map(b20_pending_entry)
+        .collect();
+    let names: Vec<(uuid::Uuid, &str)> = listed
+        .iter()
+        .map(|(id, name, _)| (*id, name.as_str()))
+        .collect();
+    assert_eq!(names, vec![(bob, "bob"), (carol, "Carol")]);
+    for (_, name, at) in &listed {
+        let window = started - chrono::Duration::seconds(1)..=ended + chrono::Duration::seconds(1);
+        assert!(window.contains(at), "{name}: CreatedAt {at}");
+    }
+}
+
+#[tokio::test]
+async fn b20_reissue_replaces_the_code() {
+    let w = b20_world().await;
+    let (bob, old) = b20_pending_bob(&w).await;
+    let before = b20_pending_entry(&b20_pending(&w).await[0]);
+    let log = jf::LogCapture::start();
+    let (status, answer) = b20_reissue(&w, bob).await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        answer.as_object().map(|o| o.len()),
+        Some(3),
+        "not UserId, Name and Code"
+    );
+    let id = uuid::Uuid::parse_str(answer["UserId"].as_str().unwrap()).unwrap();
+    assert_eq!(id, bob);
+    assert_eq!(answer["Name"], "bob");
+    let new = answer["Code"].as_str().expect("no Code").to_string();
+    assert!(b20_is_code(&new), "not a code");
+    assert_ne!(new, old);
+    assert!(!b20_holds_code(&text, &new), "the code is in the log");
+    let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import: new setup code");
+    assert!(text.lines().any(info), "no INFO line");
+
+    let hash: String =
+        sqlx::query_scalar("SELECT code_hash FROM user_setup_codes WHERE user_id = ?")
+            .bind(bob.to_string())
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert!(!b20_holds_code(&hash, &new), "the code is stored");
+    let verified = rustyfin_auth::verify_setup_code(&new, &hash).await.unwrap();
+    assert!(verified, "the hash is not the new code's");
+    assert!(
+        !b20_holds_code(&b20_status(&w).await.to_string(), &new),
+        "in the status"
+    );
+    let after = b20_pending_entry(&b20_pending(&w).await[0]);
+    assert_eq!((after.0, &after.1), (before.0, &before.1));
+    assert!(after.2 >= before.2, "CreatedAt went back");
+
+    // The old code is dead; the new one asks for a new password and redeems.
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &old).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "old code"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &old, "new pass").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the old code redeemed");
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &new).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(header.as_deref(), Some("true"), "new code");
+    let (status, _, _) = b20_redeem(&w.app, "bob", &new, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "the new code");
+}
+
+#[tokio::test]
+async fn b20_reissue_refuses_users_without_a_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let (status, answer) = b20_reissue(&w, uuid::Uuid::new_v4()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown user: {answer}");
+    let (status, answer) = b20_reissue(&w, w.alice).await;
+    assert_eq!(status, StatusCode::CONFLICT, "alice: {answer}");
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, answer) = b20_reissue(&w, bob).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "bob after his sign-in: {answer}"
+    );
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "a refused reissue wrote"
+    );
+    assert!(b20_pending(&w).await.is_empty());
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(login(&w.app, "alice", "alicepass").await.is_some());
+}
+
+#[tokio::test]
+async fn b20_setting_a_password_ends_the_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let uri = format!("/Users/{bob}/Password");
+    let body = serde_json::json!({ "CurrentPw": "", "NewPw": "set by admin" });
+    let (status, answer) = send(&w.app, request("POST", &uri, Some(&w.token), Some(body))).await;
+    assert!(status.is_success(), "{status} {answer}");
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+    assert!(b20_pending(&w).await.is_empty(), "bob is still pending");
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "mine").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "redeem");
+    let (status, _) = b20_reissue(&w, bob).await;
+    assert_eq!(status, StatusCode::CONFLICT, "reissue");
+    assert!(login(&w.app, "bob", "set by admin").await.is_some());
+}

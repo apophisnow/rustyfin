@@ -166,7 +166,8 @@ async fn main() {
     plugin_manager.load_all().await;
 
     // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
-    // endpoints only (AuthenticateByName, ForgotPassword, ForgotPassword/Pin, ResetPassword).
+    // endpoints only (AuthenticateByName, AuthenticateWithSetupCode, ForgotPassword,
+    // ForgotPassword/Pin, ResetPassword).
     // Configurable via env; 0 disables.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()

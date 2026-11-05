@@ -7,8 +7,9 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::UNIX_EPOCH;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
@@ -564,24 +565,48 @@ pub fn files_hold_canary(files: &[PathBuf]) -> bool {
     })
 }
 
+type LogBuf = Arc<Mutex<Vec<u8>>>;
+
+thread_local! {
+    /// The buffer of this thread's innermost live `LogCapture`.
+    static CAPTURE: RefCell<Option<LogBuf>> = const { RefCell::new(None) };
+}
+
 /// Captures every log event of the current thread (TRACE and up) while it lives. Tests on
 /// tokio's default current-thread runtime see the events of the tasks they spawn too.
+///
+/// One global subscriber, installed by the first capture, writes each event to its thread's
+/// capture. A scoped subscriber per capture (`set_default`) would be flaky: tracing caches each
+/// callsite's interest globally, so a callsite first hit while another test installs its
+/// subscriber can stay disabled for every subscriber. The global subscriber's filter is dynamic:
+/// every callsite stays "sometimes", and each event checks for a capture on its own thread (a
+/// `filter_fn` would cache its first answer per callsite).
 pub struct LogCapture {
-    buf: Arc<Mutex<Vec<u8>>>,
-    _guard: tracing::subscriber::DefaultGuard,
+    buf: LogBuf,
+    outer: Option<LogBuf>,
 }
 
 impl LogCapture {
     pub fn start() -> Self {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || LogSink(sink.clone()))
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        Self { buf, _guard: guard }
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(|| ThreadSink)
+                .with_filter(tracing_subscriber::filter::dynamic_filter_fn(|_, _| {
+                    CAPTURE.with(|c| c.borrow().is_some())
+                }));
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+                .expect("no other global subscriber in the API tests");
+        });
+        // Callsites first hit before or during the install are enabled again.
+        tracing::callsite::rebuild_interest_cache();
+        let buf = LogBuf::default();
+        let outer = CAPTURE.with(|c| c.replace(Some(buf.clone())));
+        Self { buf, outer }
     }
 
     pub fn text(&self) -> String {
@@ -589,11 +614,23 @@ impl LogCapture {
     }
 }
 
-struct LogSink(Arc<Mutex<Vec<u8>>>);
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        let outer = self.outer.take();
+        CAPTURE.with(|c| *c.borrow_mut() = outer);
+    }
+}
 
-impl std::io::Write for LogSink {
+/// Writes to the current thread's capture.
+struct ThreadSink;
+
+impl std::io::Write for ThreadSink {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        CAPTURE.with(|c| {
+            if let Some(buf) = c.borrow().as_ref() {
+                buf.lock().unwrap().extend_from_slice(bytes);
+            }
+        });
         Ok(bytes.len())
     }
 

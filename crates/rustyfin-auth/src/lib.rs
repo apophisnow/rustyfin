@@ -2,7 +2,7 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use chrono::Utc;
 use rand_core::{OsRng, RngCore};
-use rustyfin_db::{repo_session, repo_token, repo_user};
+use rustyfin_db::{repo_session, repo_setup_code, repo_token, repo_user};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::User;
 use sha2::{Digest, Sha256};
@@ -317,8 +317,67 @@ pub async fn authenticate(
         return Err(AuthError::InvalidCredentials);
     }
 
-    repo_user::update_last_login(pool, user.id).await?;
+    finish_sign_in(pool, &user, device).await
+}
+
+/// Sets the password of a pending user and signs in (B20 3.3, 3.8). `code` must be the user's
+/// current setup code. `new_password` replaces the unusable password, and the code is used up, so
+/// it fails from then on. A wrong code, a disabled user or a code that another request used first
+/// gives `InvalidCredentials`.
+pub async fn authenticate_with_setup_code(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+    new_password: &str,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
     let user = repo_user::get_user_by_name(pool, username)
+        .await?
+        .ok_or(AuthError::UserNotFound)?;
+
+    let Some(hash) = repo_setup_code::code_hash(pool, user.id).await? else {
+        return Err(AuthError::InvalidCredentials);
+    };
+    if repo_user::is_disabled(pool, user.id).await? || !verify_setup_code(code, &hash).await? {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    let password_hash = hash_password(new_password).await?;
+    if !repo_setup_code::redeem(pool, user.id, &hash, &password_hash).await? {
+        return Err(AuthError::InvalidCredentials);
+    }
+    finish_sign_in(pool, &user, device).await
+}
+
+/// Whether `code` is the current setup code of the enabled user `username` (B20 3.2, 3.8). Nothing
+/// is written; an unknown user, a disabled user or a user without a code gives `false`.
+pub async fn setup_code_pending(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+) -> Result<bool, AuthError> {
+    let Some(user) = repo_user::get_user_by_name(pool, username).await? else {
+        return Ok(false);
+    };
+    if repo_user::is_disabled(pool, user.id).await? {
+        return Ok(false);
+    }
+    match repo_setup_code::code_hash(pool, user.id).await? {
+        Some(hash) => verify_setup_code(code, &hash).await,
+        None => Ok(false),
+    }
+}
+
+/// The steps of a sign-in after its checks: the last login is recorded, the user is re-read so the
+/// returned LastLoginDate is the new one (M-16), the device's previous token is replaced, and a new
+/// token is issued.
+async fn finish_sign_in(
+    pool: &SqlitePool,
+    user: &User,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
+    repo_user::update_last_login(pool, user.id).await?;
+    let user = repo_user::get_user_by_name(pool, &user.name)
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
