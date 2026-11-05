@@ -90,11 +90,15 @@ async fn ws_handler(
 /// Seconds between re-checks of an open websocket's user token.
 const WS_TOKEN_RECHECK_SECS: u64 = 5;
 
+/// True only when an API key is configured and the token is that key.
+fn is_api_key(api_key: Option<&str>, token: &str) -> bool {
+    api_key.is_some_and(|key| token == key)
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
-    // A token that validates is a user token; anything else (the API key) is never re-checked
-    let user_token = rustyfin_auth::validate_token(&state.db_ro, &token)
-        .await
-        .is_ok();
+    // Every token but the configured API key is re-checked, also one revoked since the upgrade
+    // check; only an invalid token closes the socket.
+    let user_token = !is_api_key(state.api_key.as_deref().map(String::as_str), &token);
 
     let (mut sender, mut receiver) = socket.split();
 
@@ -277,4 +281,21 @@ pub async fn broadcast_event(state: &AppState, event: rustyfin_model::ws_event::
     // Silently ignore broadcast failures - this is normal when no WebSocket clients are connected.
     // The browser player does not require WebSocket for playback; it's only used for notifications.
     let _ = state.ws_broadcast.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_api_key;
+
+    #[test]
+    fn g2c_only_the_api_key_skips_the_token_recheck() {
+        // handle_socket re-checks every socket whose token is not the configured API key, also one
+        // revoked since the upgrade check. 9dd5a44 validated the token again at the start and never
+        // re-checked a socket whose token failed there.
+        assert!(is_api_key(Some("the-key"), "the-key"));
+        assert!(!is_api_key(Some("the-key"), "a-revoked-user-token"));
+        assert!(!is_api_key(Some("the-key"), ""));
+        assert!(!is_api_key(None, "a-user-token"));
+        assert!(!is_api_key(None, ""));
+    }
 }
