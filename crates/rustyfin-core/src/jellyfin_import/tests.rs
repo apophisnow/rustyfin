@@ -2,16 +2,23 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
+use rustyfin_db::repo_jellyfin_import::{SourceStreams, StreamRow, UserDataRow};
 use uuid::Uuid;
 
 use super::job::{ImportJob, ImportStage, ImportStatus, JobState};
+use super::merge::{MappedTracks, convert_rating, harmonize, merge};
 use super::paths::{PathMapping, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
-    ProviderIds, guid_from_blob, guid_from_text, locate, parse_jellyfin_date, parse_provider_ids,
+    JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob, guid_from_text, locate,
+    parse_jellyfin_date, parse_provider_ids,
 };
-use super::{ImportError, ImportReport, ItemReport, Layout, UserAction, UserRow};
+use super::tracks::{choose_source, map_track, normalize_codec};
+use super::{
+    ImportError, ImportReport, ItemReport, Layout, TrackReport, UserAction, UserRow,
+    WatchDataReport,
+};
 
 /// A temp folder removed when the test ends.
 struct TempDir(PathBuf);
@@ -277,6 +284,8 @@ fn b20_report_with_code(code: &str) -> ImportReport {
             unmatched: 0,
             unmatched_samples: Vec::new(),
         },
+        watch_data: WatchDataReport::default(),
+        tracks: TrackReport::default(),
     }
 }
 
@@ -360,4 +369,730 @@ fn b20_job_reports_failures() {
         Some("the import stopped before it finished")
     );
     assert!(job.try_start().is_some());
+}
+
+// ── 2c: watch data and track choices (spec 2.12-2.16, 2.28-2.30) ──
+
+/// Noon of January `day`, 2025.
+fn at(day: u32) -> Option<DateTime<Utc>> {
+    Some(Utc.with_ymd_and_hms(2025, 1, day, 12, 0, 0).unwrap())
+}
+
+/// A Jellyfin row of `user` for `item` with nothing set.
+fn jf_row(user: u128, item: u128) -> JfUserData {
+    JfUserData {
+        item: Uuid::from_u128(item),
+        user: Uuid::from_u128(user),
+        played: false,
+        play_count: 0,
+        position_ticks: 0,
+        last_played: None,
+        is_favorite: false,
+        rating: None,
+        likes: None,
+        audio: None,
+        subtitle: None,
+    }
+}
+
+/// User 1's row of item 10: played twice, last on January 5, stopped at 600 ticks.
+fn jf_watched() -> JfUserData {
+    JfUserData {
+        played: true,
+        play_count: 2,
+        position_ticks: 600,
+        last_played: at(5),
+        is_favorite: true,
+        rating: Some(7.6),
+        likes: Some(true),
+        audio: Some(1),
+        subtitle: Some(3),
+        ..jf_row(1, 10)
+    }
+}
+
+/// The Rustyfin indexes of `jf_watched`'s track choices.
+const MAPPED: MappedTracks = MappedTracks {
+    audio: Some(2),
+    subtitle: Some(4),
+};
+
+#[test]
+fn b20_normalize_codecs() {
+    for (codec, normal) in [
+        ("PGSSUB", "hdmv_pgs_subtitle"),
+        ("hdmv_pgs_subtitle", "hdmv_pgs_subtitle"),
+        ("dvdsub", "dvd_subtitle"),
+        ("DVBSUB", "dvb_subtitle"),
+        ("srt", "subrip"),
+        ("SubRip", "subrip"),
+        ("AAC", "aac"),
+        ("eac3", "eac3"),
+    ] {
+        assert_eq!(normalize_codec(codec), normal, "{codec}");
+    }
+}
+
+#[test]
+fn b20_convert_ratings() {
+    for (rating, converted) in [
+        (7.6, Some(8)),
+        (7.5, Some(8)),
+        (7.4, Some(7)),
+        (9.5, Some(10)),
+        (0.0, Some(0)),
+        (10.0, Some(10)),
+        (-1.0, Some(0)),
+        (11.2, Some(10)),
+        (f64::INFINITY, Some(10)),
+        (f64::NEG_INFINITY, Some(0)),
+        (f64::NAN, None),
+    ] {
+        assert_eq!(convert_rating(rating), converted, "{rating}");
+    }
+}
+
+#[test]
+fn b20_harmonize_keeps_the_newest_row() {
+    // The latest date wins over a higher count; no date is the oldest.
+    let older = JfUserData {
+        last_played: at(1),
+        play_count: 9,
+        position_ticks: 900,
+        ..jf_row(1, 10)
+    };
+    let newer = JfUserData {
+        last_played: at(2),
+        play_count: 1,
+        ..jf_row(1, 10)
+    };
+    let undated = JfUserData {
+        play_count: 50,
+        position_ticks: 5000,
+        ..jf_row(1, 10)
+    };
+    let other_user = JfUserData {
+        last_played: at(1),
+        ..jf_row(2, 10)
+    };
+    let other_item = JfUserData {
+        played: true,
+        ..jf_row(1, 5)
+    };
+    let rows = harmonize(vec![
+        older,
+        undated.clone(),
+        other_user.clone(),
+        newer.clone(),
+        other_item.clone(),
+    ]);
+    assert_eq!(
+        rows,
+        vec![other_item, newer, other_user],
+        "one row per user and item, sorted by user, then item"
+    );
+    assert_eq!(harmonize(vec![undated.clone()]), vec![undated]);
+    assert!(harmonize(Vec::new()).is_empty());
+}
+
+#[test]
+fn b20_harmonize_breaks_ties_by_count_then_position() {
+    let base = JfUserData {
+        last_played: at(3),
+        play_count: 2,
+        position_ticks: 10,
+        ..jf_row(1, 10)
+    };
+    let more_plays = JfUserData {
+        play_count: 3,
+        position_ticks: 5,
+        ..base.clone()
+    };
+    let further = JfUserData {
+        position_ticks: 20,
+        ..base.clone()
+    };
+    let favorite = JfUserData {
+        is_favorite: true,
+        ..base.clone()
+    };
+    assert_eq!(
+        harmonize(vec![base.clone(), more_plays.clone()]),
+        vec![more_plays]
+    );
+    assert_eq!(
+        harmonize(vec![further.clone(), base.clone()]),
+        vec![further]
+    );
+    assert_eq!(
+        harmonize(vec![base.clone(), favorite.clone()]),
+        vec![base.clone()],
+        "a full tie keeps the first"
+    );
+    assert_eq!(harmonize(vec![favorite.clone(), base]), vec![favorite]);
+}
+
+#[test]
+fn b20_merge_without_a_rustyfin_row() {
+    let expected = UserDataRow {
+        played: true,
+        play_count: 2,
+        position_ticks: 600,
+        last_played: at(5),
+        is_favorite: true,
+        user_rating: Some(8),
+        likes: Some(true),
+        audio: Some(2),
+        subtitle: Some(4),
+    };
+    assert_eq!(
+        merge(None, &jf_watched(), MAPPED),
+        expected,
+        "tracks are the mapped indexes"
+    );
+    // Without a Rustyfin row even an undated Jellyfin row is newer; unmapped tracks stay unset.
+    let undated = JfUserData {
+        position_ticks: 900,
+        audio: Some(1),
+        ..jf_row(1, 10)
+    };
+    let expected = UserDataRow {
+        position_ticks: 900,
+        ..UserDataRow::default()
+    };
+    assert_eq!(merge(None, &undated, MappedTracks::default()), expected);
+}
+
+#[test]
+fn b20_merge_keeps_newer_rustyfin_progress() {
+    let stored = UserDataRow {
+        played: false,
+        play_count: 5,
+        position_ticks: 100,
+        last_played: at(9),
+        is_favorite: false,
+        user_rating: Some(3),
+        likes: Some(false),
+        audio: Some(7),
+        subtitle: None,
+    };
+    // Played and favorite if either; the larger count, the later date, Rustyfin's rating,
+    // likes, position and tracks.
+    let expected = UserDataRow {
+        played: true,
+        is_favorite: true,
+        ..stored.clone()
+    };
+    assert_eq!(merge(Some(&stored), &jf_watched(), MAPPED), expected);
+    let undated = JfUserData {
+        last_played: None,
+        ..jf_watched()
+    };
+    assert_eq!(
+        merge(Some(&stored), &undated, MAPPED),
+        expected,
+        "an undated Jellyfin row is older than a dated Rustyfin row"
+    );
+}
+
+#[test]
+fn b20_merge_takes_newer_jellyfin_progress() {
+    let stored = UserDataRow {
+        play_count: 1,
+        position_ticks: 50,
+        last_played: at(1),
+        audio: Some(7),
+        subtitle: Some(0),
+        ..UserDataRow::default()
+    };
+    // A track without a mapped value keeps Rustyfin's; subtitle -1 (off) is a value.
+    let tracks = MappedTracks {
+        audio: None,
+        subtitle: Some(-1),
+    };
+    let expected = UserDataRow {
+        played: true,
+        play_count: 2,
+        position_ticks: 600,
+        last_played: at(5),
+        is_favorite: true,
+        user_rating: Some(8),
+        likes: Some(true),
+        audio: Some(7),
+        subtitle: Some(-1),
+    };
+    assert_eq!(merge(Some(&stored), &jf_watched(), tracks), expected);
+
+    // A Rustyfin row without a date is older than a dated Jellyfin row.
+    let undated = UserDataRow {
+        last_played: None,
+        play_count: 4,
+        ..stored
+    };
+    let merged = merge(Some(&undated), &jf_watched(), MAPPED);
+    assert_eq!(
+        (merged.position_ticks, merged.last_played, merged.play_count),
+        (600, at(5), 4)
+    );
+    assert_eq!((merged.audio, merged.subtitle), (Some(2), Some(4)));
+}
+
+#[test]
+fn b20_merge_on_a_tie_keeps_rustyfin_progress() {
+    let stored = UserDataRow {
+        position_ticks: 70,
+        last_played: at(5),
+        audio: Some(1),
+        ..UserDataRow::default()
+    };
+    let expected = UserDataRow {
+        played: true,
+        play_count: 2,
+        is_favorite: true,
+        user_rating: Some(8),
+        likes: Some(true),
+        ..stored.clone()
+    };
+    assert_eq!(
+        merge(Some(&stored), &jf_watched(), MAPPED),
+        expected,
+        "the same date"
+    );
+
+    let stored = UserDataRow {
+        position_ticks: 70,
+        ..UserDataRow::default()
+    };
+    let undated = JfUserData {
+        position_ticks: 900,
+        audio: Some(1),
+        ..jf_row(1, 10)
+    };
+    let tracks = MappedTracks {
+        audio: Some(2),
+        subtitle: None,
+    };
+    assert_eq!(
+        merge(Some(&stored), &undated, tracks),
+        stored,
+        "neither side has a date"
+    );
+}
+
+#[test]
+fn b20_merge_ratings_and_likes() {
+    let unrated = UserDataRow {
+        last_played: at(9),
+        ..UserDataRow::default()
+    };
+    let merged = merge(Some(&unrated), &jf_watched(), MAPPED);
+    assert_eq!(
+        (merged.user_rating, merged.likes),
+        (Some(8), Some(true)),
+        "Jellyfin's when Rustyfin has none"
+    );
+    let rated = UserDataRow {
+        user_rating: Some(0),
+        likes: Some(false),
+        ..unrated.clone()
+    };
+    let merged = merge(Some(&rated), &jf_watched(), MAPPED);
+    assert_eq!(
+        (merged.user_rating, merged.likes),
+        (Some(0), Some(false)),
+        "Rustyfin's own when set"
+    );
+    let not_a_number = JfUserData {
+        rating: Some(f64::NAN),
+        likes: None,
+        ..jf_watched()
+    };
+    let merged = merge(Some(&unrated), &not_a_number, MAPPED);
+    assert_eq!((merged.user_rating, merged.likes), (None, None));
+    let high = JfUserData {
+        rating: Some(9.5),
+        likes: Some(false),
+        ..jf_watched()
+    };
+    let merged = merge(None, &high, MAPPED);
+    assert_eq!((merged.user_rating, merged.likes), (Some(10), Some(false)));
+}
+
+#[test]
+fn b20_merge_is_idempotent() {
+    let stored = [
+        None,
+        Some(UserDataRow {
+            play_count: 5,
+            position_ticks: 100,
+            last_played: at(9),
+            user_rating: Some(3),
+            audio: Some(7),
+            ..UserDataRow::default()
+        }),
+        Some(UserDataRow {
+            position_ticks: 50,
+            last_played: at(1),
+            subtitle: Some(0),
+            ..UserDataRow::default()
+        }),
+        Some(UserDataRow {
+            position_ticks: 70,
+            last_played: at(5),
+            ..UserDataRow::default()
+        }),
+        Some(UserDataRow {
+            position_ticks: 70,
+            ..UserDataRow::default()
+        }),
+    ];
+    let undated = JfUserData {
+        last_played: None,
+        rating: None,
+        ..jf_watched()
+    };
+    let off = MappedTracks {
+        audio: None,
+        subtitle: Some(-1),
+    };
+    for existing in &stored {
+        for jf in [jf_watched(), undated.clone()] {
+            for tracks in [MAPPED, MappedTracks::default(), off] {
+                let once = merge(existing.as_ref(), &jf, tracks);
+                assert_eq!(
+                    merge(Some(&once), &jf, tracks),
+                    once,
+                    "{existing:?} {jf:?} {tracks:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A Rustyfin stream as the probe stores it: no language, title or flags.
+fn rf_stream(index: i64, codec_type: &str, codec: &str) -> StreamRow {
+    StreamRow {
+        index,
+        codec_type: codec_type.to_string(),
+        codec: Some(codec.to_string()),
+        language: None,
+        title: None,
+        is_external: false,
+        path: None,
+        is_default: false,
+        is_forced: false,
+    }
+}
+
+/// An embedded Jellyfin stream of item 10 without language, title or flags.
+fn jf_stream(index: i64, kind: StreamKind, codec: &str) -> JfStream {
+    JfStream {
+        item: Uuid::from_u128(10),
+        index,
+        kind,
+        codec: Some(codec.to_string()),
+        language: None,
+        title: None,
+        is_external: false,
+        path: None,
+        is_default: false,
+        is_forced: false,
+    }
+}
+
+fn text(value: &str) -> Option<String> {
+    Some(value.to_string())
+}
+
+#[test]
+fn b20_choose_source() {
+    let first = SourceStreams {
+        path: "/m/A/a.mkv".to_string(),
+        streams: vec![rf_stream(0, "video", "h264")],
+    };
+    let second = SourceStreams {
+        path: "/m/A/b.mkv".to_string(),
+        streams: Vec::new(),
+    };
+    let sources = [first.clone(), second.clone()];
+    assert_eq!(choose_source(&sources, Some("/m/A/b.mkv")), Some(&second));
+    assert_eq!(
+        choose_source(&sources, Some("/m/A/c.mkv")),
+        Some(&first),
+        "no source has the path: the first"
+    );
+    assert_eq!(choose_source(&sources, None), Some(&first));
+    assert_eq!(choose_source(&[], Some("/m/A/a.mkv")), None);
+}
+
+#[test]
+fn b20_map_unique_tracks() {
+    use StreamKind::{Audio, Subtitle, Video};
+    let jf = [
+        jf_stream(0, Video, "h264"),
+        JfStream {
+            language: text("eng"),
+            ..jf_stream(1, Audio, "aac")
+        },
+        JfStream {
+            language: text("ger"),
+            ..jf_stream(2, Audio, "ac3")
+        },
+        JfStream {
+            language: text("eng"),
+            ..jf_stream(3, Subtitle, "srt")
+        },
+        JfStream {
+            language: text("ger"),
+            ..jf_stream(4, Subtitle, "PGSSUB")
+        },
+    ];
+    // Rustyfin numbers the streams its own way and knows no languages.
+    let rf = [
+        rf_stream(0, "video", "h264"),
+        rf_stream(1, "subtitle", "hdmv_pgs_subtitle"),
+        rf_stream(2, "audio", "ac3"),
+        rf_stream(3, "audio", "aac"),
+        rf_stream(4, "subtitle", "subrip"),
+    ];
+    assert_eq!(map_track(1, Audio, &jf, &rf), Some(3));
+    assert_eq!(map_track(2, Audio, &jf, &rf), Some(2));
+    assert_eq!(map_track(3, Subtitle, &jf, &rf), Some(4), "srt = subrip");
+    assert_eq!(map_track(4, Subtitle, &jf, &rf), Some(1), "pgssub");
+    assert_eq!(map_track(9, Audio, &jf, &rf), None, "no Jellyfin stream 9");
+    assert_eq!(map_track(0, Audio, &jf, &rf), None, "stream 0 is video");
+    assert_eq!(map_track(1, Subtitle, &jf, &rf), None, "stream 1 is audio");
+    assert_eq!(map_track(1, Audio, &jf, &[]), None, "no Rustyfin streams");
+    let ac3_only = [rf_stream(2, "audio", "ac3")];
+    assert_eq!(map_track(1, Audio, &jf, &ac3_only), None, "no aac stream");
+    let upper = [rf_stream(5, "Audio", "AAC")];
+    assert_eq!(
+        map_track(1, Audio, &jf, &upper),
+        Some(5),
+        "codec types and codecs compare case-insensitively"
+    );
+}
+
+#[test]
+fn b20_map_tracks_by_ordinal() {
+    use StreamKind::{Audio, Video};
+    // Three AAC tracks Rustyfin can't tell apart: the ordinal among embedded audio decides.
+    let jf = [
+        jf_stream(0, Video, "h264"),
+        JfStream {
+            language: text("eng"),
+            ..jf_stream(1, Audio, "aac")
+        },
+        JfStream {
+            language: text("ger"),
+            ..jf_stream(2, Audio, "aac")
+        },
+        JfStream {
+            language: text("fre"),
+            ..jf_stream(3, Audio, "aac")
+        },
+    ];
+    let rf = [
+        rf_stream(0, "video", "h264"),
+        rf_stream(1, "audio", "aac"),
+        rf_stream(2, "audio", "aac"),
+        rf_stream(3, "audio", "aac"),
+    ];
+    assert_eq!(map_track(1, Audio, &jf, &rf), Some(1));
+    assert_eq!(map_track(2, Audio, &jf, &rf), Some(2));
+    assert_eq!(map_track(3, Audio, &jf, &rf), Some(3));
+
+    let jf = [
+        jf_stream(1, Audio, "aac"),
+        jf_stream(2, Audio, "ac3"),
+        jf_stream(3, Audio, "aac"),
+    ];
+    let rf = [
+        rf_stream(1, "audio", "aac"),
+        rf_stream(2, "audio", "aac"),
+        rf_stream(3, "audio", "ac3"),
+    ];
+    assert_eq!(map_track(1, Audio, &jf, &rf), Some(1));
+    assert_eq!(
+        map_track(3, Audio, &jf, &rf),
+        None,
+        "the stream at the ordinal is no candidate"
+    );
+    assert_eq!(map_track(2, Audio, &jf, &rf), Some(3), "one candidate");
+    let two = [rf_stream(1, "audio", "aac"), rf_stream(2, "audio", "aac")];
+    assert_eq!(
+        map_track(3, Audio, &jf, &two),
+        None,
+        "no stream at the ordinal"
+    );
+}
+
+#[test]
+fn b20_map_tracks_by_flags_language_and_title() {
+    use StreamKind::{Audio, Subtitle};
+    let jf = [
+        JfStream {
+            is_forced: true,
+            ..jf_stream(3, Subtitle, "subrip")
+        },
+        JfStream {
+            is_default: true,
+            ..jf_stream(4, Subtitle, "subrip")
+        },
+        jf_stream(5, Subtitle, "subrip"),
+    ];
+    let rf = [
+        rf_stream(3, "subtitle", "subrip"),
+        StreamRow {
+            is_default: true,
+            ..rf_stream(4, "subtitle", "subrip")
+        },
+        StreamRow {
+            is_forced: true,
+            ..rf_stream(5, "subtitle", "subrip")
+        },
+    ];
+    assert_eq!(map_track(3, Subtitle, &jf, &rf), Some(5), "forced");
+    assert_eq!(map_track(4, Subtitle, &jf, &rf), Some(4), "default");
+    assert_eq!(map_track(5, Subtitle, &jf, &rf), Some(3), "neither");
+    let unflagged = [rf_stream(3, "subtitle", "subrip")];
+    assert_eq!(
+        map_track(3, Subtitle, &jf, &unflagged),
+        None,
+        "no forced stream"
+    );
+
+    // Languages and titles narrow the candidates when both sides know them.
+    let jf = [
+        JfStream {
+            language: text("ENG"),
+            ..jf_stream(1, Audio, "aac")
+        },
+        JfStream {
+            language: text("ger"),
+            title: text("Commentary"),
+            ..jf_stream(2, Audio, "aac")
+        },
+        JfStream {
+            language: text("ger"),
+            title: text("Stereo"),
+            ..jf_stream(3, Audio, "aac")
+        },
+    ];
+    let rf = [
+        StreamRow {
+            language: text("ger"),
+            title: text("stereo"),
+            ..rf_stream(1, "audio", "aac")
+        },
+        StreamRow {
+            language: text("eng"),
+            ..rf_stream(2, "audio", "aac")
+        },
+        StreamRow {
+            language: text("ger"),
+            title: text("commentary"),
+            ..rf_stream(3, "audio", "aac")
+        },
+    ];
+    assert_eq!(map_track(1, Audio, &jf, &rf), Some(2), "language");
+    assert_eq!(map_track(2, Audio, &jf, &rf), Some(3), "title");
+    assert_eq!(map_track(3, Audio, &jf, &rf), Some(1), "language and title");
+
+    // An unknown language (none, empty or `und`) rules nothing out.
+    let jf = [
+        JfStream {
+            language: text("und"),
+            ..jf_stream(1, Audio, "aac")
+        },
+        JfStream {
+            language: text("eng"),
+            ..jf_stream(2, Audio, "aac")
+        },
+    ];
+    let rf = [
+        StreamRow {
+            language: text("ger"),
+            ..rf_stream(1, "audio", "aac")
+        },
+        StreamRow {
+            language: text(""),
+            ..rf_stream(2, "audio", "aac")
+        },
+    ];
+    assert_eq!(
+        map_track(1, Audio, &jf, &rf),
+        Some(1),
+        "two candidates, ordinal 0"
+    );
+    assert_eq!(
+        map_track(2, Audio, &jf, &rf),
+        Some(2),
+        "eng rules out ger only"
+    );
+}
+
+#[test]
+fn b20_map_external_tracks() {
+    use StreamKind::{Audio, Subtitle, Video};
+    let jf_ext = |index: i64, path: &str| JfStream {
+        is_external: true,
+        path: text(path),
+        ..jf_stream(index, Subtitle, "srt")
+    };
+    // Jellyfin numbers external streams first; the slice need not be sorted.
+    let jf = [
+        jf_stream(2, Video, "h264"),
+        jf_stream(3, Audio, "aac"),
+        JfStream {
+            language: text("ger"),
+            ..jf_stream(5, Subtitle, "subrip")
+        },
+        JfStream {
+            language: text("eng"),
+            ..jf_stream(4, Subtitle, "subrip")
+        },
+        jf_ext(0, "/data/movies/Alpha (2001)/Alpha.en.srt"),
+        jf_ext(1, "/data/movies/Alpha (2001)/Alpha.de.srt"),
+    ];
+    let rf_ext = |index: i64, path: &str| StreamRow {
+        is_external: true,
+        path: text(path),
+        ..rf_stream(index, "subtitle", "subrip")
+    };
+    let rf = [
+        rf_stream(0, "video", "h264"),
+        rf_stream(1, "audio", "aac"),
+        rf_stream(2, "subtitle", "subrip"),
+        rf_stream(3, "subtitle", "subrip"),
+        rf_ext(4, "/srv/movies/Alpha (2001)/Alpha.de.srt"),
+    ];
+    assert_eq!(
+        map_track(4, Subtitle, &jf, &rf),
+        Some(2),
+        "embedded ordinal 0"
+    );
+    assert_eq!(
+        map_track(5, Subtitle, &jf, &rf),
+        Some(3),
+        "embedded ordinal 1"
+    );
+    assert_eq!(map_track(3, Audio, &jf, &rf), Some(1));
+    assert_eq!(map_track(1, Subtitle, &jf, &rf), Some(4), "by file name");
+    assert_eq!(map_track(0, Subtitle, &jf, &rf), None, "no Alpha.en.srt");
+    let twice = [
+        rf_ext(4, "/srv/a/Alpha.de.srt"),
+        rf_ext(5, "/srv/b/Alpha.de.srt"),
+    ];
+    assert_eq!(
+        map_track(1, Subtitle, &jf, &twice),
+        None,
+        "several external candidates"
+    );
+    let other_case = [rf_ext(4, "/srv/movies/Alpha (2001)/ALPHA.de.srt")];
+    assert_eq!(
+        map_track(1, Subtitle, &jf, &other_case),
+        None,
+        "file names compare exactly"
+    );
 }

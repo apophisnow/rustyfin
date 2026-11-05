@@ -2,22 +2,28 @@
 //! read read-only. Spec: the B20 brief and spec, Stage 2.
 
 pub mod job;
+pub mod merge;
 pub mod paths;
 pub mod plan;
 pub mod source;
+pub mod tracks;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 
 use chrono::Utc;
 pub use job::{ImportJob, ImportStage, ImportStatus, JobHandle, JobState};
 use paths::PathMapping;
 use rustyfin_auth::{generate_setup_code, hash_setup_code, unusable_password_hash};
+use rustyfin_db::repo_jellyfin_import::{
+    ImportTarget, SourceStreams, UserDataRow, item_sources, user_data_rows, write_user_data,
+};
 use rustyfin_model::user::User;
 use serde::{Deserialize, Serialize};
+use source::{JfItem, JfStream, JfUserData, StreamKind};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -65,7 +71,7 @@ pub struct ImportRequest {
     pub user_ids: Option<Vec<Uuid>>,
 }
 
-/// The preview's answer (spec 2.20). `WatchData`, `Tracks` and `Metadata` come in later stages.
+/// The preview's answer (spec 2.20). `Metadata` comes in a later stage.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImportReport {
@@ -76,6 +82,36 @@ pub struct ImportReport {
     pub unpaired_library_paths: Vec<String>,
     pub users: Vec<UserRow>,
     pub items: ItemReport,
+    pub watch_data: WatchDataReport,
+    pub tracks: TrackReport,
+}
+
+/// The watch data of the report (spec 2.20, 2.32): `imported + unchanged + unmatched` is `rows`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct WatchDataReport {
+    /// The rows of the importing users, one per user and item.
+    pub rows: usize,
+    /// The rows that change a Rustyfin row (a run writes them).
+    pub imported: usize,
+    /// The rows that leave a Rustyfin row as it is.
+    pub unchanged: usize,
+    /// The rows whose Jellyfin item matches no Rustyfin item.
+    pub unmatched: usize,
+}
+
+/// The track choices of the report (spec 2.20, 2.32).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TrackReport {
+    /// Audio choices mapped to a Rustyfin stream.
+    pub audio: usize,
+    /// Subtitle choices mapped to a Rustyfin stream.
+    pub subtitle: usize,
+    /// Subtitle choices that switch subtitles off.
+    pub subtitle_off: usize,
+    /// Choices with no Rustyfin stream.
+    pub unmapped: usize,
 }
 
 /// One Jellyfin user and what the import does with them (spec 2.5, 2.6, 2.20).
@@ -144,8 +180,14 @@ pub async fn preview(db: &SqlitePool, req: &ImportRequest) -> Result<ImportRepor
         report.items.matched_by_id,
         report.items.unmatched,
     );
+    let (rows, imported, unchanged, watch_unmatched) = (
+        report.watch_data.rows,
+        report.watch_data.imported,
+        report.watch_data.unchanged,
+        report.watch_data.unmatched,
+    );
     tracing::info!(
-        "jellyfin import preview: source {source}, layout {layout:?}, {user_count} users, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched)"
+        "jellyfin import preview: source {source}, layout {layout:?}, {user_count} users, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched), {rows} watch rows ({imported} imported, {unchanged} unchanged, {watch_unmatched} unmatched)"
     );
     Ok(report)
 }
@@ -216,15 +258,17 @@ async fn plan_report(
         .collect();
     let watched: HashSet<Uuid> = prepared
         .snapshot
-        .user_rows
+        .user_data
         .iter()
-        .filter(|(_, user)| importing.contains(user))
-        .map(|(item, _)| *item)
+        .filter(|row| importing.contains(&row.user))
+        .map(|row| row.item)
         .collect();
     if let Some(handle) = handle {
         handle.stage(ImportStage::Matching, 0);
     }
     let items = plan::match_items(&prepared.snapshot.items, &targets, &path_mappings, &watched);
+    let (watch_data, track_counts) =
+        plan_watch_data(db, prepared, &targets, &users, &path_mappings, handle).await?;
 
     Ok(ImportReport {
         layout: prepared.snapshot.layout,
@@ -234,7 +278,200 @@ async fn plan_report(
         unpaired_library_paths: suggested.unpaired,
         users,
         items,
+        watch_data,
+        tracks: track_counts,
     })
+}
+
+/// The watch-data step of the planning (spec 2.32): merges each importing user's rows into the
+/// Rustyfin user's rows and counts the rows and the track choices. A run writes the changed rows;
+/// a preview writes nothing.
+async fn plan_watch_data(
+    db: &SqlitePool,
+    prepared: &Prepared,
+    targets: &[ImportTarget],
+    users: &[UserRow],
+    pairs: &[PathMapping],
+    handle: Option<&JobHandle>,
+) -> Result<(WatchDataReport, TrackReport), ImportError> {
+    let snapshot = &prepared.snapshot;
+    let matched = plan::matched_items(&snapshot.items, targets, pairs);
+    // Each importing Jellyfin user's Rustyfin user; None for a preview's Create.
+    let owners: HashMap<Uuid, Option<Uuid>> = users
+        .iter()
+        .filter(|user| matches!(user.action, UserAction::Match | UserAction::Create))
+        .map(|user| (user.jellyfin_id, user.user_id))
+        .collect();
+    let imported: Vec<JfUserData> = snapshot
+        .user_data
+        .iter()
+        .filter(|row| owners.contains_key(&row.user))
+        .cloned()
+        .collect();
+    let rows = merge::harmonize(imported);
+    let mut report = WatchDataReport {
+        rows: rows.len(),
+        ..WatchDataReport::default()
+    };
+    let mut track_counts = TrackReport::default();
+    if let Some(handle) = handle {
+        handle.stage(ImportStage::WatchData, report.rows);
+    }
+
+    // Groups in order of first appearance. The rows of one Rustyfin user share a group, even when
+    // two Jellyfin users match it; a preview's Create groups by its Jellyfin id.
+    let mut groups: Vec<(Uuid, Option<Uuid>, Vec<JfUserData>)> = Vec::new();
+    for row in rows {
+        let owner = owners[&row.user];
+        let key = owner.unwrap_or(row.user);
+        let found = groups.iter().position(|group| group.0 == key);
+        match found {
+            Some(n) => groups[n].2.push(row),
+            None => groups.push((key, owner, vec![row])),
+        }
+    }
+
+    let mut mapper = TrackMapper {
+        pairs,
+        items: snapshot.items.iter().map(|item| (item.id, item)).collect(),
+        streams: HashMap::new(),
+        sources: HashMap::new(),
+    };
+    for stream in &snapshot.streams {
+        mapper
+            .streams
+            .entry(stream.item)
+            .or_default()
+            .push(stream.clone());
+    }
+
+    let mut done = 0;
+    for (_, owner, group_rows) in groups {
+        let mut current = match owner {
+            Some(user) => user_data_rows(db, user).await.map_err(ImportError::Db)?,
+            None => HashMap::new(),
+        };
+        let mut changed: HashSet<Uuid> = HashSet::new();
+        for row in &group_rows {
+            done += 1;
+            if let Some(handle) = handle {
+                handle.progress(done);
+            }
+            let Some(&rf_item) = matched.get(&row.item) else {
+                report.unmatched += 1;
+                continue;
+            };
+            let mapped = mapper
+                .map_tracks(db, rf_item, row, &mut track_counts)
+                .await?;
+            let merged = merge::merge(current.get(&rf_item), row, mapped);
+            if current.get(&rf_item) == Some(&merged) {
+                report.unchanged += 1;
+            } else {
+                report.imported += 1;
+                current.insert(rf_item, merged);
+                changed.insert(rf_item);
+            }
+        }
+        if let (Some(_), Some(user)) = (handle, owner) {
+            let writes: Vec<(Uuid, UserDataRow)> = changed
+                .iter()
+                .filter_map(|item| current.get(item).map(|row| (*item, row.clone())))
+                .collect();
+            if !writes.is_empty() {
+                write_user_data(db, user, &writes)
+                    .await
+                    .map_err(ImportError::Db)?;
+            }
+        }
+    }
+    Ok((report, track_counts))
+}
+
+/// The Jellyfin side of the track mapping (spec 2.30, 2.32), read once: the items and streams by
+/// Jellyfin id, and each Rustyfin item's sources as a choice first needs them.
+struct TrackMapper<'a> {
+    pairs: &'a [PathMapping],
+    items: HashMap<Uuid, &'a JfItem>,
+    streams: HashMap<Uuid, Vec<JfStream>>,
+    sources: HashMap<Uuid, Vec<SourceStreams>>,
+}
+
+impl TrackMapper<'_> {
+    /// The mapped track choices of a matched row (spec 2.32), counted into `counts`. A subtitle of
+    /// -1 switches subtitles off; an audio of -1 is no choice.
+    async fn map_tracks(
+        &mut self,
+        db: &SqlitePool,
+        rf_item: Uuid,
+        row: &JfUserData,
+        counts: &mut TrackReport,
+    ) -> Result<merge::MappedTracks, ImportError> {
+        let mut mapped = merge::MappedTracks::default();
+        match row.subtitle {
+            Some(-1) => {
+                counts.subtitle_off += 1;
+                mapped.subtitle = Some(-1);
+            }
+            Some(choice) => {
+                let index = self
+                    .choice_index(db, rf_item, row.item, choice, StreamKind::Subtitle)
+                    .await?;
+                match index {
+                    Some(index) => {
+                        counts.subtitle += 1;
+                        mapped.subtitle = Some(index);
+                    }
+                    None => counts.unmapped += 1,
+                }
+            }
+            None => {}
+        }
+        if let Some(choice) = row.audio.filter(|&choice| choice != -1) {
+            let index = self
+                .choice_index(db, rf_item, row.item, choice, StreamKind::Audio)
+                .await?;
+            match index {
+                Some(index) => {
+                    counts.audio += 1;
+                    mapped.audio = Some(index);
+                }
+                None => counts.unmapped += 1,
+            }
+        }
+        Ok(mapped)
+    }
+
+    /// The Rustyfin stream index a Jellyfin track choice maps to (spec 2.30, 2.32), or None. The
+    /// source is the one at the Jellyfin item's translated path (spec 2.16), else the first.
+    async fn choice_index(
+        &mut self,
+        db: &SqlitePool,
+        rf_item: Uuid,
+        jf_item: Uuid,
+        choice: i64,
+        kind: StreamKind,
+    ) -> Result<Option<i64>, ImportError> {
+        let Some(jf) = self.items.get(&jf_item) else {
+            return Ok(None);
+        };
+        let translated = jf
+            .path
+            .as_deref()
+            .and_then(|path| paths::translate_path(path, self.pairs));
+        let sources = match self.sources.entry(rf_item) {
+            Entry::Occupied(found) => found.into_mut(),
+            Entry::Vacant(vacant) => {
+                let found = item_sources(db, rf_item).await.map_err(ImportError::Db)?;
+                vacant.insert(found)
+            }
+        };
+        let Some(source) = tracks::choose_source(sources, translated.as_deref()) else {
+            return Ok(None);
+        };
+        let streams = self.streams.get(&jf_item).map(Vec::as_slice).unwrap_or(&[]);
+        Ok(tracks::map_track(choice, kind, streams, &source.streams))
+    }
 }
 
 /// The Users stage of a run (spec 2.7, 2.26): each row to create is matched again against
@@ -312,8 +549,14 @@ pub async fn run(db: SqlitePool, req: ImportRequest, prepared: Prepared, handle:
                 report.items.matched_by_id,
                 report.items.unmatched,
             );
+            let (rows, imported, unchanged, watch_unmatched) = (
+                report.watch_data.rows,
+                report.watch_data.imported,
+                report.watch_data.unchanged,
+                report.watch_data.unmatched,
+            );
             tracing::info!(
-                "jellyfin import run: source {source}, layout {layout:?}, {user_count} users, {created} created, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched)"
+                "jellyfin import run: source {source}, layout {layout:?}, {user_count} users, {created} created, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched), {rows} watch rows ({imported} imported, {unchanged} unchanged, {watch_unmatched} unmatched)"
             );
             handle.complete(report);
         }

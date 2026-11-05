@@ -155,15 +155,14 @@ fn only(hits: Option<&Vec<usize>>) -> Option<usize> {
     }
 }
 
-/// Matches the Jellyfin items to Rustyfin's targets (spec 2.10), in four passes: by path; Movies
+/// Each Jellyfin item's hit (spec 2.10), in the order of `items`, by four passes: by path; Movies
 /// and Series by TMDB, then TVDB; Seasons through their series; Episodes through their series.
 /// Each pass only sees the items the passes before it left unmatched.
-pub fn match_items(
+fn match_found(
     items: &[JfItem],
     targets: &[ImportTarget],
     pairs: &[PathMapping],
-    watched: &HashSet<Uuid>,
-) -> ItemReport {
+) -> Vec<Option<Hit>> {
     let index = TargetIndex::new(targets);
     let mut found: Vec<Option<Hit>> = vec![None; items.len()];
 
@@ -237,6 +236,18 @@ pub fn match_items(
         *slot = only(wanted.and_then(|key| index.by_episode.get(&key))).map(|n| (Found::ById, n));
     }
 
+    found
+}
+
+/// Matches the Jellyfin items to Rustyfin's targets (spec 2.10) and counts the matches for the
+/// report.
+pub fn match_items(
+    items: &[JfItem],
+    targets: &[ImportTarget],
+    pairs: &[PathMapping],
+    watched: &HashSet<Uuid>,
+) -> ItemReport {
+    let found = match_found(items, targets, pairs);
     let count = |how: Found| found.iter().flatten().filter(|hit| hit.0 == how).count();
     let matched_by_path = count(Found::ByPath);
     let matched_by_id = count(Found::ById);
@@ -267,6 +278,24 @@ pub fn match_items(
         unmatched,
         unmatched_samples,
     }
+}
+
+/// Each matched Jellyfin item's Rustyfin item (spec 2.32): Jellyfin item id to target id, by the
+/// same passes as `match_items`.
+pub fn matched_items(
+    items: &[JfItem],
+    targets: &[ImportTarget],
+    pairs: &[PathMapping],
+) -> HashMap<Uuid, Uuid> {
+    let found = match_found(items, targets, pairs);
+    items
+        .iter()
+        .zip(&found)
+        .filter_map(|(item, hit)| {
+            let (_, n) = (*hit)?;
+            Some((item.id, targets[n].id))
+        })
+        .collect()
 }
 
 /// The sample order: by path, then by name. A missing path or name sorts as "".

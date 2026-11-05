@@ -171,14 +171,60 @@ pub struct JfItem {
     pub providers: ProviderIds,
 }
 
-/// What the preview reads from a source.
+/// One user's watch data for one item (spec 2.28): a `UserData` row, or a `UserDatas` row of the
+/// old layout (which has no `likes`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JfUserData {
+    pub item: Uuid,
+    pub user: Uuid,
+    pub played: bool,
+    pub play_count: i64,
+    pub position_ticks: i64,
+    pub last_played: Option<DateTime<Utc>>,
+    pub is_favorite: bool,
+    /// Jellyfin's rating, 0 to 10 with decimals.
+    pub rating: Option<f64>,
+    pub likes: Option<bool>,
+    /// The chosen audio stream index, in Jellyfin's numbering.
+    pub audio: Option<i64>,
+    /// The chosen subtitle stream index, in Jellyfin's numbering; -1 means subtitles off.
+    pub subtitle: Option<i64>,
+}
+
+/// The kind of a media stream (spec 2.28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Audio,
+    Video,
+    Subtitle,
+    Other,
+}
+
+/// One media stream of a Jellyfin item (spec 2.28).
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JfStream {
+    pub item: Uuid,
+    pub index: i64,
+    pub kind: StreamKind,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub is_external: bool,
+    pub path: Option<String>,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
+/// What the preview reads from a source.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub layout: Layout,
     pub users: Vec<JfUser>,
     pub items: Vec<JfItem>,
-    /// Every user-data row as (item, user).
-    pub user_rows: Vec<(Uuid, Uuid)>,
+    /// Every user-data row (spec 2.28).
+    pub user_data: Vec<JfUserData>,
+    /// The media streams of the items that have a track choice (spec 2.28).
+    pub streams: Vec<JfStream>,
 }
 
 /// A Jellyfin library folder `root/default/<name>/` (spec 2.8): the type its `<type>.collection`
@@ -208,8 +254,21 @@ type ItemDbRow = (
 );
 /// `BaseItemProviders`: ItemId, ProviderId, ProviderValue.
 type ProviderDbRow = (Option<Vec<u8>>, String, String);
-/// `UserData`: ItemId, UserId.
-type UserDataDbRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+/// `UserData`: ItemId, UserId, Played, PlayCount, PlaybackPositionTicks, LastPlayedDate, IsFavorite,
+/// Rating, Likes, AudioStreamIndex, SubtitleStreamIndex.
+type UserDataDbRow = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<bool>,
+    Option<f64>,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+);
 /// `TypedBaseItems`: guid, type, Name, Path, ParentId, SeriesId, SeasonId, IndexNumber,
 /// ParentIndexNumber, UserDataKey, ProviderIds.
 type LibraryItemDbRow = (
@@ -225,10 +284,42 @@ type LibraryItemDbRow = (
     Option<String>,
     Option<String>,
 );
-/// `UserDatas`: key, userId.
-type LibraryDataDbRow = (String, i64);
-/// Items and (item, user) rows of one layout.
-type ItemRows = (Vec<JfItem>, Vec<(Uuid, Uuid)>);
+/// `UserDatas`: key, userId, played, playCount, playbackPositionTicks, lastPlayedDate, isFavorite,
+/// rating, AudioStreamIndex, SubtitleStreamIndex.
+type LibraryDataDbRow = (
+    String,
+    i64,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<bool>,
+    Option<f64>,
+    Option<i64>,
+    Option<i64>,
+);
+/// `MediaStreamInfos` (new) or `mediastreams` (old): ItemId, StreamIndex, StreamType, Codec,
+/// Language, Title, IsExternal, Path, IsDefault, IsForced. `Kind` is the layout's `StreamType` type.
+type StreamDbRow<Kind> = (
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Kind>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+    Option<bool>,
+    Option<bool>,
+);
+/// The old layout's `library.db` rows: `TypedBaseItems`, `UserDatas` and `mediastreams`.
+type LibraryRows = (
+    Vec<LibraryItemDbRow>,
+    Vec<LibraryDataDbRow>,
+    Vec<StreamDbRow<String>>,
+);
+/// Items, user-data rows and streams of one layout.
+type ItemRows = (Vec<JfItem>, Vec<JfUserData>, Vec<JfStream>);
 
 /// Reads the source's users and importable items (spec 2.2, 2.3). The new layout comes from
 /// `jellyfin.db`; the old one from `library.db`, else `library.db.old`. Users always come from
@@ -245,25 +336,27 @@ pub async fn read_snapshot(
         .map_err(|e| unreadable(&file, &e))?;
     tx.rollback().await.map_err(|e| unreadable(&file, &e))?;
 
-    let (items, user_rows) = match db.layout {
-        Layout::New => (db.items, db.user_rows),
+    let (items, user_data, streams) = match db.layout {
+        Layout::New => (db.items, db.user_data, db.streams),
         Layout::Old => read_old_layout(&location.data_path, &db.users).await?,
     };
     Ok(Snapshot {
         layout: db.layout,
         users: db.users,
         items,
-        user_rows,
+        user_data,
+        streams,
     })
 }
 
 /// What `jellyfin.db` gives: its users, the layout the request resolves to, and for the new layout
-/// its items and user-data rows.
+/// its items, user-data rows and streams.
 struct JellyfinDb {
     layout: Layout,
     users: Vec<JfUser>,
     items: Vec<JfItem>,
-    user_rows: Vec<(Uuid, Uuid)>,
+    user_data: Vec<JfUserData>,
+    streams: Vec<JfStream>,
 }
 
 async fn read_jellyfin_db(
@@ -304,19 +397,20 @@ async fn read_jellyfin_db(
         LayoutChoice::Auto | LayoutChoice::Old => Layout::Old,
         LayoutChoice::New => Layout::New,
     };
-    let (items, user_rows) = match layout {
+    let (items, user_data, streams) = match layout {
         Layout::New => read_new_layout(conn).await?,
-        Layout::Old => (Vec::new(), Vec::new()),
+        Layout::Old => (Vec::new(), Vec::new(), Vec::new()),
     };
     Ok(JellyfinDb {
         layout,
         users,
         items,
-        user_rows,
+        user_data,
+        streams,
     })
 }
 
-/// The new layout's items, provider ids and user-data rows (spec 2.3a, 2.12).
+/// The new layout's items, provider ids, user-data rows and streams (spec 2.3a, 2.12, 2.28).
 async fn read_new_layout(conn: &mut SqliteConnection) -> Result<ItemRows, sqlx::Error> {
     let provider_rows: Vec<ProviderDbRow> =
         sqlx::query_as("SELECT ItemId, ProviderId, ProviderValue FROM BaseItemProviders")
@@ -358,25 +452,65 @@ async fn read_new_layout(conn: &mut SqliteConnection) -> Result<ItemRows, sqlx::
         });
     }
 
-    let data_rows: Vec<UserDataDbRow> = sqlx::query_as("SELECT ItemId, UserId FROM UserData")
-        .fetch_all(&mut *conn)
-        .await?;
-    let user_rows: Vec<(Uuid, Uuid)> = data_rows
+    let data_rows: Vec<UserDataDbRow> = sqlx::query_as(
+        "SELECT ItemId, UserId, Played, PlayCount, PlaybackPositionTicks, LastPlayedDate, \
+         IsFavorite, Rating, Likes, AudioStreamIndex, SubtitleStreamIndex FROM UserData",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let user_data: Vec<JfUserData> = data_rows
         .into_iter()
-        .filter_map(|(item, user)| {
-            Some((guid_column(item.as_deref())?, guid_column(user.as_deref())?))
-        })
+        .filter_map(
+            |(
+                item,
+                user,
+                played,
+                plays,
+                position,
+                last,
+                favorite,
+                rating,
+                likes,
+                audio,
+                subtitle,
+            )| {
+                Some(JfUserData {
+                    item: guid_column(item.as_deref())?,
+                    user: guid_column(user.as_deref())?,
+                    played: played.unwrap_or(false),
+                    play_count: plays.unwrap_or(0),
+                    position_ticks: position.unwrap_or(0),
+                    last_played: last.as_deref().and_then(parse_jellyfin_date),
+                    is_favorite: favorite.unwrap_or(false),
+                    rating,
+                    likes,
+                    audio,
+                    subtitle,
+                })
+            },
+        )
         .collect();
-    Ok((items, user_rows))
+    let stream_rows: Vec<StreamDbRow<i64>> = sqlx::query_as(
+        "SELECT ItemId, StreamIndex, StreamType, Codec, Language, Title, IsExternal, Path, \
+         IsDefault, IsForced FROM MediaStreamInfos WHERE ItemId IN (SELECT ItemId FROM UserData \
+         WHERE AudioStreamIndex IS NOT NULL OR SubtitleStreamIndex IS NOT NULL)",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok((
+        items,
+        user_data,
+        streams_of(stream_rows, stream_kind_number),
+    ))
 }
 
-/// The old layout's items and user-data rows, from `library.db` (else `library.db.old`). A row
-/// reaches every importable item that has its `key` (`UserDataKey`).
+/// The old layout's items, user-data rows and streams, from `library.db` (else
+/// `library.db.old`). A row reaches every importable item that has its `key` (`UserDataKey`).
 async fn read_old_layout(data_path: &Path, users: &[JfUser]) -> Result<ItemRows, ImportError> {
     let file = library_file(data_path)?;
     let mut conn = open_read_only(&file).await?;
     let mut tx = conn.begin().await.map_err(|e| unreadable(&file, &e))?;
-    let (item_rows, data_rows) = read_library_db(&mut tx)
+    let (item_rows, data_rows, stream_rows) = read_library_db(&mut tx)
         .await
         .map_err(|e| unreadable(&file, &e))?;
     tx.rollback().await.map_err(|e| unreadable(&file, &e))?;
@@ -425,31 +559,111 @@ async fn read_old_layout(data_path: &Path, users: &[JfUser]) -> Result<ItemRows,
         .iter()
         .map(|user| (user.internal_id, user.id))
         .collect();
-    let mut user_rows = Vec::new();
-    for (key, internal_id) in data_rows {
+    let mut user_data = Vec::new();
+    for (key, internal_id, played, plays, position, last, favorite, rating, audio, subtitle) in
+        data_rows
+    {
         let Some(&user) = internal_ids.get(&internal_id) else {
             continue;
         };
         for &item in keyed.get(&key).into_iter().flatten() {
-            user_rows.push((item, user));
+            user_data.push(JfUserData {
+                item,
+                user,
+                played: played.unwrap_or(false),
+                play_count: plays.unwrap_or(0),
+                position_ticks: position.unwrap_or(0),
+                last_played: last.as_deref().and_then(parse_jellyfin_date),
+                is_favorite: favorite.unwrap_or(false),
+                rating,
+                likes: None,
+                audio,
+                subtitle,
+            });
         }
     }
-    Ok((items, user_rows))
+    Ok((items, user_data, streams_of(stream_rows, stream_kind_text)))
 }
 
-async fn read_library_db(
-    conn: &mut SqliteConnection,
-) -> Result<(Vec<LibraryItemDbRow>, Vec<LibraryDataDbRow>), sqlx::Error> {
+async fn read_library_db(conn: &mut SqliteConnection) -> Result<LibraryRows, sqlx::Error> {
     let items: Vec<LibraryItemDbRow> = sqlx::query_as(
         "SELECT guid, type, Name, Path, ParentId, SeriesId, SeasonId, IndexNumber, \
          ParentIndexNumber, UserDataKey, ProviderIds FROM TypedBaseItems",
     )
     .fetch_all(&mut *conn)
     .await?;
-    let data: Vec<LibraryDataDbRow> = sqlx::query_as("SELECT key, userId FROM UserDatas")
-        .fetch_all(&mut *conn)
-        .await?;
-    Ok((items, data))
+    let data: Vec<LibraryDataDbRow> = sqlx::query_as(
+        "SELECT key, userId, played, playCount, playbackPositionTicks, lastPlayedDate, isFavorite, \
+         rating, AudioStreamIndex, SubtitleStreamIndex FROM UserDatas",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let streams: Vec<StreamDbRow<String>> = sqlx::query_as(
+        "SELECT ItemId, StreamIndex, StreamType, Codec, Language, Title, IsExternal, Path, \
+         IsDefault, IsForced FROM mediastreams WHERE ItemId IN (SELECT guid FROM TypedBaseItems \
+         WHERE UserDataKey IN (SELECT key FROM UserDatas WHERE AudioStreamIndex IS NOT NULL \
+         OR SubtitleStreamIndex IS NOT NULL))",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok((items, data, streams))
+}
+
+/// `StreamType` of the new layout: an INTEGER, 0 Audio, 1 Video, 2 Subtitle, else Other.
+fn stream_kind_number(value: Option<i64>) -> StreamKind {
+    match value {
+        Some(0) => StreamKind::Audio,
+        Some(1) => StreamKind::Video,
+        Some(2) => StreamKind::Subtitle,
+        _ => StreamKind::Other,
+    }
+}
+
+/// `StreamType` of the old layout: TEXT `Audio`, `Video` or `Subtitle`, else Other.
+fn stream_kind_text(value: Option<String>) -> StreamKind {
+    match value.as_deref() {
+        Some("Audio") => StreamKind::Audio,
+        Some("Video") => StreamKind::Video,
+        Some("Subtitle") => StreamKind::Subtitle,
+        _ => StreamKind::Other,
+    }
+}
+
+/// Turns stream rows into `JfStream`s (spec 2.28). A row without a valid item id or index is
+/// skipped; NULL flags read as false.
+fn streams_of<Kind>(
+    rows: Vec<StreamDbRow<Kind>>,
+    kind_of: fn(Option<Kind>) -> StreamKind,
+) -> Vec<JfStream> {
+    rows.into_iter()
+        .filter_map(
+            |(
+                item,
+                index,
+                kind,
+                codec,
+                language,
+                title,
+                is_external,
+                path,
+                is_default,
+                is_forced,
+            )| {
+                Some(JfStream {
+                    item: guid_column(item.as_deref())?,
+                    index: index?,
+                    kind: kind_of(kind),
+                    codec,
+                    language,
+                    title,
+                    is_external: is_external.unwrap_or(false),
+                    path,
+                    is_default: is_default.unwrap_or(false),
+                    is_forced: is_forced.unwrap_or(false),
+                })
+            },
+        )
+        .collect()
 }
 
 /// The old layout's database: `library.db`, else the `library.db.old` an upgrade leaves.

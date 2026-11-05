@@ -10876,3 +10876,515 @@ async fn b20_import_run_conflicts_while_running() {
     let report = b20_run(&w, body).await;
     assert_eq!(b20_entry(&report, "bob").action, "Create");
 }
+
+// B20 2c: watch data and track choices.
+
+/// A `user_item_data` row as the B20 import tests read and write it.
+#[derive(Debug, Default, PartialEq)]
+struct B20Data {
+    played: bool,
+    play_count: i64,
+    position: i64,
+    last_played: Option<chrono::DateTime<chrono::Utc>>,
+    favorite: bool,
+    rating: Option<i64>,
+    likes: Option<bool>,
+    audio: Option<i64>,
+    subtitle: Option<i64>,
+}
+
+type B20DataRow = (
+    bool,
+    i64,
+    i64,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// The instant `rfc3339`.
+fn b20_at(rfc3339: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let instant =
+        chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap_or_else(|e| panic!("{rfc3339}: {e}"));
+    Some(instant.with_timezone(&chrono::Utc))
+}
+
+/// The id of the Rustyfin item `name`.
+async fn b20_item(state: &AppState, name: &str) -> uuid::Uuid {
+    let id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    uuid::Uuid::parse_str(&id).unwrap()
+}
+
+/// The stored row of `user` for `item`; a stored date must be RFC 3339.
+async fn b20_data(state: &AppState, user: uuid::Uuid, item: uuid::Uuid) -> Option<B20Data> {
+    let row: Option<B20DataRow> = sqlx::query_as(
+        "SELECT played, play_count, playback_position_ticks, last_played_date, is_favorite, \
+         user_rating, likes, audio_stream_index, subtitle_stream_index FROM user_item_data \
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .fetch_optional(&state.db)
+    .await
+    .unwrap();
+    row.map(|r| B20Data {
+        played: r.0,
+        play_count: r.1,
+        position: r.2,
+        last_played: r.3.and_then(|date| b20_at(&date)),
+        favorite: r.4,
+        rating: r.5,
+        likes: r.6,
+        audio: r.7,
+        subtitle: r.8,
+    })
+}
+
+/// Stores `data` as the row of `user` for `item`, its date written with `Z`.
+async fn b20_put_data(state: &AppState, user: uuid::Uuid, item: uuid::Uuid, data: &B20Data) {
+    let date = data
+        .last_played
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
+         playback_position_ticks, last_played_date, is_favorite, user_rating, likes, \
+         audio_stream_index, subtitle_stream_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .bind(data.played)
+    .bind(data.play_count)
+    .bind(data.position)
+    .bind(date)
+    .bind(data.favorite)
+    .bind(data.rating)
+    .bind(data.likes)
+    .bind(data.audio)
+    .bind(data.subtitle)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// A report's `WatchData` as (Rows, Imported, Unchanged, Unmatched).
+fn b20_watch_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["WatchData"][key].as_i64().unwrap_or(-1);
+    (
+        count("Rows"),
+        count("Imported"),
+        count("Unchanged"),
+        count("Unmatched"),
+    )
+}
+
+/// A report's `Tracks` as (Audio, Subtitle, SubtitleOff, Unmapped).
+fn b20_track_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["Tracks"][key].as_i64().unwrap_or(-1);
+    (
+        count("Audio"),
+        count("Subtitle"),
+        count("SubtitleOff"),
+        count("Unmapped"),
+    )
+}
+
+/// The watch-data part of the INFO lines for `counts` (Rows, Imported, Unchanged, Unmatched).
+fn b20_watch_line(counts: (i64, i64, i64, i64)) -> String {
+    let (rows, imported, unchanged, unmatched) = counts;
+    format!("{rows} watch rows ({imported} imported, {unchanged} unchanged, {unmatched} unmatched)")
+}
+
+#[tokio::test]
+async fn b20_import_preview_counts_watch_data() {
+    // Alice: Alpha and S01E01 match; Gamma and the new layout's detached row don't (the old
+    // layout's detached row has a key no item has, so it is no row). bob: Beta and 1x03 match.
+    for (name, layout, all, alice_only) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2), (4, 2, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1), (3, 2, 0, 1)),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let before = b20_db_digest(&w.state).await;
+        let log = jf::LogCapture::start();
+        let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(b20_watch_counts(&report), all, "{name}: {report}");
+        assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
+        let line = b20_watch_line(all);
+        let info = |l: &str| {
+            l.contains("INFO") && l.contains("jellyfin import preview") && l.contains(&line)
+        };
+        assert!(
+            text.lines().any(info),
+            "{name}: no INFO line with {line} in {text}"
+        );
+
+        let alice = w.source.user("Alice").id;
+        let body = serde_json::json!({ "SourcePath": install, "UserIds": [alice] });
+        let report = b20_preview(&w, body).await;
+        assert_eq!(
+            b20_watch_counts(&report),
+            alice_only,
+            "{name}: only the picked users' rows: {report}"
+        );
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            before,
+            "{name}: a preview writes nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_writes_watch_data() {
+    for (name, layout, counts) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1)),
+    ] {
+        let mut w = b20_world().await;
+        // Alice likes Alpha; only the new layout has likes.
+        w.source.user_data[0].likes = Some(true);
+        let install = b20_install(&w, name, layout).await;
+        let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+        assert_eq!(b20_watch_counts(&report), counts, "{name}: {report}");
+        assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
+
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let expected = B20Data {
+            played: true,
+            play_count: 2,
+            last_played: b20_at("2025-01-02T03:04:05.1234567Z"),
+            favorite: true,
+            rating: Some(8),
+            likes: (layout == jf::Layout::New).then_some(true),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, w.alice, alpha).await;
+        assert_eq!(stored, Some(expected), "{name}: Alpha");
+        let e1 = b20_item(&w.state, "Show S01E01").await;
+        let expected = B20Data {
+            position: 6_000_000_000,
+            last_played: b20_at("2025-02-01T10:00:00Z"),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, w.alice, e1).await;
+        assert_eq!(stored, Some(expected), "{name}: S01E01");
+
+        let bob = b20_entry(&report, "bob").user_id.unwrap();
+        let played = |date: &str| B20Data {
+            played: true,
+            play_count: 1,
+            last_played: b20_at(date),
+            ..Default::default()
+        };
+        let beta = b20_item(&w.state, "Beta").await;
+        let expected = B20Data {
+            rating: Some(10),
+            ..played("2025-03-01T20:00:00Z")
+        };
+        let stored = b20_data(&w.state, bob, beta).await;
+        assert_eq!(stored, Some(expected), "{name}: Beta, rated 9.5");
+        let e3 = b20_item(&w.state, "Show S01E03").await;
+        let stored = b20_data(&w.state, bob, e3).await;
+        assert_eq!(stored, Some(played("2025-03-02T21:00:00Z")), "{name}: 1x03");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data")
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+        assert_eq!(rows, 4, "{name}: only the matched rows are written");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_merges_with_rustyfin_watch_data() {
+    let w = b20_world().await;
+    let bob = b20_plain_user(&w.state, "bob").await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    // Alpha: Rustyfin's row is newer. S01E01: Jellyfin's is. Beta: the same instant, and
+    // already what the import makes of Jellyfin's row.
+    let alpha_row = B20Data {
+        play_count: 5,
+        position: 100,
+        last_played: b20_at("2025-06-01T00:00:00Z"),
+        rating: Some(3),
+        likes: Some(true),
+        audio: Some(7),
+        ..Default::default()
+    };
+    let e1_row = B20Data {
+        play_count: 1,
+        position: 50,
+        last_played: b20_at("2025-01-01T00:00:00Z"),
+        audio: Some(7),
+        ..Default::default()
+    };
+    let beta_row = B20Data {
+        played: true,
+        play_count: 1,
+        last_played: b20_at("2025-03-01T20:00:00Z"),
+        rating: Some(10),
+        ..Default::default()
+    };
+    b20_put_data(&w.state, w.alice, alpha, &alpha_row).await;
+    b20_put_data(&w.state, w.alice, e1, &e1_row).await;
+    b20_put_data(&w.state, bob, beta, &beta_row).await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": install });
+
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&preview), (6, 3, 1, 2), "{preview}");
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&report), (6, 3, 1, 2), "{report}");
+    assert_eq!(b20_entry(&report, "bob").user_id, Some(bob));
+
+    // Played and favorite if either side; Rustyfin's count, date, position, rating, likes and
+    // track stay on Alpha. S01E01 takes Jellyfin's date and position and keeps its track.
+    let expected = B20Data {
+        played: true,
+        favorite: true,
+        ..alpha_row
+    };
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, Some(expected));
+    let expected = B20Data {
+        position: 6_000_000_000,
+        last_played: b20_at("2025-02-01T10:00:00Z"),
+        ..e1_row
+    };
+    assert_eq!(b20_data(&w.state, w.alice, e1).await, Some(expected));
+    let beta_date: Option<String> = sqlx::query_scalar(
+        "SELECT last_played_date FROM user_item_data WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(bob.to_string())
+    .bind(beta.to_string())
+    .fetch_one(&w.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        beta_date.as_deref(),
+        Some("2025-03-01T20:00:00Z"),
+        "an unchanged row is not written"
+    );
+    assert!(b20_data(&w.state, bob, e3).await.is_some(), "1x03");
+
+    let digest = b20_db_digest(&w.state).await;
+    let again = b20_run(&w, body).await;
+    assert_eq!(b20_watch_counts(&again), (6, 0, 4, 2), "{again}");
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        digest,
+        "the second run wrote"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_keeps_the_newest_of_several_rows() {
+    // The new layout: a second, older row of Alice's Alpha (another CustomDataKey) with more
+    // plays loses to the newer one.
+    let mut w = b20_world().await;
+    let alice = w.source.user("Alice").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: alice,
+        item: w.source.item("Alpha").id,
+        custom_key: Some("b20-older-key".to_string()),
+        played: true,
+        play_count: 7,
+        position: 1234,
+        last_played: Some("2024-01-01 00:00:00"),
+        ..Default::default()
+    });
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert_eq!(b20_watch_counts(&report), (6, 4, 0, 2), "{report}");
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let stored = b20_data(&w.state, w.alice, alpha).await.unwrap();
+    assert_eq!((stored.play_count, stored.position), (2, 0));
+    assert_eq!(stored.last_played, b20_at("2025-01-02T03:04:05.1234567Z"));
+}
+
+#[tokio::test]
+async fn b20_import_old_rows_apply_to_each_item_of_their_key() {
+    // The old layout keys rows by UserDataKey: S01E02 shares S01E01's key, so Alice's S01E01
+    // row is S01E02's too.
+    let mut w = b20_world().await;
+    let key = w.source.item("Show S01E01").user_data_key.clone();
+    let e2 = w
+        .source
+        .items
+        .iter_mut()
+        .find(|item| item.name == "Show S01E02");
+    e2.unwrap().user_data_key = key;
+    let install = b20_install(&w, "jf", jf::Layout::Old).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert_eq!(b20_watch_counts(&report), (6, 5, 0, 1), "{report}");
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    let stored = b20_data(&w.state, w.alice, e2).await.unwrap();
+    assert_eq!(stored.position, 6_000_000_000);
+}
+
+#[tokio::test]
+async fn b20_import_maps_track_choices() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let mut w = b20_world().await;
+        let jf_alpha = w.source.item("Alpha").id;
+        let jf_beta = w.source.item("Beta").id;
+        let jf_e1 = w.source.item("Show S01E01").id;
+        let jf_e3 = w.source.item("Show 1x03").id;
+        let stream = jf::JfStream::new;
+        w.source.streams = vec![
+            stream(jf_alpha, 0, "Video", "h264"),
+            stream(jf_alpha, 1, "Audio", "aac").language("eng"),
+            stream(jf_alpha, 2, "Audio", "ac3").language("ger"),
+            stream(jf_alpha, 3, "Subtitle", "srt").language("eng"),
+            stream(jf_alpha, 4, "Subtitle", "PGSSUB")
+                .language("ger")
+                .flags(false, true),
+            stream(jf_beta, 0, "Video", "mpeg4"),
+            stream(jf_beta, 1, "Audio", "mp3"),
+            stream(jf_e1, 0, "Video", "h264"),
+            stream(jf_e1, 1, "Audio", "aac"),
+            stream(jf_e1, 2, "Audio", "ac3"),
+            stream(jf_e3, 0, "Video", "h264"),
+            stream(jf_e3, 1, "Audio", "aac"),
+        ];
+        // Alice: Alpha's aac and forced PGS subtitles, S01E01's ac3. bob: Beta with subtitles
+        // off and an audio stream Jellyfin doesn't have; 1x03's aac, which has no Rustyfin source.
+        for row in &mut w.source.user_data {
+            let choice = [
+                (jf_alpha, (Some(1), Some(4))),
+                (jf_e1, (Some(2), None)),
+                (jf_beta, (Some(9), Some(-1))),
+                (jf_e3, (Some(1), None)),
+            ]
+            .into_iter()
+            .find(|(item, _)| *item == row.item);
+            if let Some((_, (audio, subtitle))) = choice {
+                row.audio = audio;
+                row.subtitle = subtitle;
+            }
+        }
+
+        // Rustyfin numbers Alpha's streams its own way.
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alpha_file = std::path::PathBuf::from(format!("{}/Alpha (2001)/Alpha.mkv", w.movies));
+        std::fs::create_dir_all(alpha_file.parent().unwrap()).unwrap();
+        std::fs::write(&alpha_file, b"b20").unwrap();
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "hdmv_pgs_subtitle", "CodecType": "Subtitle", "IsForced": true },
+            { "Index": 2, "Codec": "ac3", "CodecType": "Audio" },
+            { "Index": 3, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle" },
+        ]);
+        b20_insert_source(&w.state, alpha, &alpha_file, streams).await;
+        let beta = b20_item(&w.state, "Beta").await;
+        let beta_file = std::path::PathBuf::from(format!("{}/Beta (2002)/Beta.mkv", w.movies));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "mpeg4", "CodecType": "Video" },
+            { "Index": 1, "Codec": "mp3", "CodecType": "Audio" },
+        ]);
+        b20_insert_source(&w.state, beta, &beta_file, streams).await;
+        // S01E01's first source is an older file; the import uses the one at the translated path.
+        let e1 = b20_item(&w.state, "Show S01E01").await;
+        let season = format!("{}/Show/Season 01", w.tv);
+        let old_file = std::path::PathBuf::from(format!("{season}/Show S01E01.old.mkv"));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "ac3", "CodecType": "Audio" },
+        ]);
+        let old_source = b20_insert_source(&w.state, e1, &old_file, streams).await;
+        sqlx::query("UPDATE media_sources SET created_at = '2000-01-01 00:00:00' WHERE id = ?")
+            .bind(old_source.to_string())
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        let e1_file = std::path::PathBuf::from(format!("{season}/Show S01E01.mkv"));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 2, "Codec": "ac3", "CodecType": "Audio" },
+        ]);
+        b20_insert_source(&w.state, e1, &e1_file, streams).await;
+
+        let install = b20_install(&w, name, layout).await;
+        let body = serde_json::json!({ "SourcePath": install });
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body).await;
+        // Audio: Alpha and S01E01. Subtitle: Alpha. Off: Beta. Unmapped: Beta's audio 9 and
+        // 1x03's audio.
+        assert_eq!(b20_track_counts(&report), (2, 1, 1, 2), "{name}: {report}");
+        assert_eq!(
+            b20_track_counts(&preview),
+            (2, 1, 1, 2),
+            "{name}: the preview: {preview}"
+        );
+        let alice = w.alice.to_string();
+        let tracks = b20_stored_tracks(&w.state, &alice, alpha).await;
+        assert_eq!(tracks, (Some(3), Some(1)), "{name}: Alpha");
+        let tracks = b20_stored_tracks(&w.state, &alice, e1).await;
+        assert_eq!(tracks, (Some(2), None), "{name}: S01E01");
+        let bob = b20_entry(&report, "bob").user_id.unwrap().to_string();
+        let tracks = b20_stored_tracks(&w.state, &bob, beta).await;
+        assert_eq!(tracks, (None, Some(-1)), "{name}: Beta");
+        let e3 = b20_item(&w.state, "Show S01E03").await;
+        let tracks = b20_stored_tracks(&w.state, &bob, e3).await;
+        assert_eq!(tracks, (None, None), "{name}: 1x03");
+
+        // Alice's player offers the imported tracks first.
+        let (token, _) = login(&w.app, "alice", "alicepass").await.unwrap();
+        let defaults = b20_only_defaults(&w.app, &token, alpha).await;
+        assert_eq!(defaults, b20_both(3, 1), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_leaves_the_source_and_its_secrets_alone() {
+    for (name, layout, counts) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1)),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let before = jf::listing(&install);
+        let log = jf::LogCapture::start();
+        let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+        let status = b20_status(&w).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(jf::listing(&install), before, "{name}: the source changed");
+        for answer in [&report, &status] {
+            assert!(
+                !answer.to_string().contains(jf::CANARY),
+                "{name}: secret in an answer"
+            );
+        }
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let line = b20_watch_line(counts);
+        let info =
+            |l: &str| l.contains("INFO") && l.contains("jellyfin import run") && l.contains(&line);
+        assert!(
+            text.lines().any(info),
+            "{name}: no INFO line with {line} in {text}"
+        );
+        let db = w.state.data_dir.join("test.db");
+        let files = [
+            db.clone(),
+            db.with_extension("db-wal"),
+            db.with_extension("db-shm"),
+        ];
+        assert!(
+            !jf::files_hold_canary(&files),
+            "{name}: secret in Rustyfin's database"
+        );
+    }
+}
