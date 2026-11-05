@@ -8,7 +8,9 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::local_images;
+use crate::naming;
 use crate::probe;
+use crate::scan_sync;
 
 // ---------------------------------------------------------------------------
 // Multiple version detection
@@ -261,6 +263,11 @@ async fn scan_flat_library(
     // Collect new items for batch insert in a single transaction
     let mut new_items: Vec<MediaItem> = Vec::new();
 
+    // Every file that the walks returned, and every folder they could not list. The removal at
+    // the end of the scan needs both.
+    let mut collected: HashSet<String> = HashSet::new();
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
         if !path.exists() {
@@ -269,7 +276,9 @@ async fn scan_flat_library(
         }
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let files = collect_files(path).await;
+        let (files, unreadable_dirs) = collect_files(path).await;
+        collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
+        unreadable.extend(unreadable_dirs);
 
         for file_path_buf in files {
             let ext = file_path_buf
@@ -404,6 +413,19 @@ async fn scan_flat_library(
         count,
         existing_count
     );
+
+    // Remove the items that this scan no longer collects. A failure is logged, not returned.
+    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable).await {
+        Ok(removed) => tracing::info!(
+            "removed {removed} items no longer collected from library '{}'",
+            library.name
+        ),
+        Err(e) => tracing::warn!(
+            "removing items no longer collected from library '{}' failed: {}",
+            library.name,
+            e
+        ),
+    }
     Ok((count, new_item_ids))
 }
 
@@ -433,6 +455,11 @@ async fn scan_tv_library(
     let episode_version_map: HashMap<(String, String, Uuid), Uuid> =
         build_episode_version_map(pool, library.id).await?;
 
+    // Every file that the walks returned, and every folder they could not list. The removal at
+    // the end of the scan needs both.
+    let mut collected: HashSet<String> = HashSet::new();
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
         if !path.exists() {
@@ -449,7 +476,9 @@ async fn scan_tv_library(
         let mut new_items: Vec<MediaItem> = Vec::new();
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let files = collect_files(path).await;
+        let (files, unreadable_dirs) = collect_files(path).await;
+        collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
+        unreadable.extend(unreadable_dirs);
         tracing::info!(
             "TV library '{}': found {} files in path {}",
             library.name,
@@ -700,6 +729,19 @@ async fn scan_tv_library(
         count,
         existing_count
     );
+
+    // Remove the items that this scan no longer collects. A failure is logged, not returned.
+    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable).await {
+        Ok(removed) => tracing::info!(
+            "removed {removed} items no longer collected from library '{}'",
+            library.name
+        ),
+        Err(e) => tracing::warn!(
+            "removing items no longer collected from library '{}' failed: {}",
+            library.name,
+            e
+        ),
+    }
     Ok((count, new_item_ids))
 }
 
@@ -741,7 +783,7 @@ async fn scan_music_library(
         let mut new_items: Vec<MediaItem> = Vec::new();
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let files = collect_files(path).await;
+        let (files, _) = collect_files(path).await;
         tracing::info!(
             "music library '{}': found {} files in path {}",
             library.name,
@@ -1058,52 +1100,119 @@ fn parse_year(name: &str) -> Option<i32> {
 // Async directory traversal
 // ---------------------------------------------------------------------------
 
-/// Recursively collect all file paths under `dir` using async I/O.
-/// Uses an iterative work-queue approach to avoid recursive async fn issues.
-/// Returns a `Vec` of absolute paths, skipping directories that cannot be read.
-async fn collect_files(root: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    let mut work_queue = vec![root.to_path_buf()];
+/// Identity of a directory, for symlink loop detection: its (device, inode) on unix.
+#[cfg(unix)]
+type DirId = (u64, u64);
 
-    while let Some(current) = work_queue.pop() {
+/// Identity of a directory, for symlink loop detection: its canonical path off unix.
+#[cfg(not(unix))]
+type DirId = PathBuf;
+
+/// The identity of the directory at `path`. `fs::metadata` follows symlinks, so a link and its
+/// target have the same identity.
+#[cfg(unix)]
+async fn dir_id(path: &Path) -> std::io::Result<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).await?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The identity of the directory at `path`: its canonical path, since there are no inodes off unix.
+#[cfg(not(unix))]
+async fn dir_id(path: &Path) -> std::io::Result<DirId> {
+    fs::canonicalize(path).await
+}
+
+/// Recursively collects the file paths under `root`, using async I/O and an iterative work queue.
+///
+/// Returns the files, sorted by path, and the directories that could not be listed completely: a
+/// failed `read_dir`, or an error part way through one. Entries that `naming` ignores are skipped.
+/// A subdirectory whose identity is already among its ancestors is skipped as a symlink loop. Two
+/// links to one folder are both followed. The root's own name is never checked.
+async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut result = Vec::new();
+    let mut unreadable = Vec::new();
+
+    let root_id = match dir_id(root).await {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!("cannot read directory {}: {}", root.display(), err);
+            return (result, vec![root.to_path_buf()]);
+        }
+    };
+    // Each queued directory carries the identities of itself and its ancestors, root included.
+    let mut work_queue = vec![(root.to_path_buf(), vec![root_id])];
+
+    while let Some((current, chain)) = work_queue.pop() {
         let mut entries = match fs::read_dir(&current).await {
             Ok(e) => e,
             Err(err) => {
                 tracing::warn!("cannot read directory {}: {}", current.display(), err);
+                unreadable.push(current);
                 continue;
             }
         };
 
         let mut children = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let is_dir = if let Ok(ft) = entry.file_type().await {
-                if ft.is_dir() {
-                    true
-                } else if ft.is_symlink() {
-                    fs::metadata(&path)
-                        .await
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            } else {
-                path.is_dir()
-            };
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    let file_name = entry.file_name();
+                    let name = file_name.to_string_lossy();
+                    let is_dir = if let Ok(ft) = entry.file_type().await {
+                        if ft.is_dir() {
+                            true
+                        } else if ft.is_symlink() {
+                            fs::metadata(&path)
+                                .await
+                                .map(|m| m.is_dir())
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    } else {
+                        path.is_dir()
+                    };
 
-            if is_dir {
-                children.push(path);
-            } else {
-                result.push(path);
+                    if is_dir {
+                        if !naming::is_ignored_dir(&name) {
+                            children.push(path);
+                        }
+                    } else if !naming::is_ignored_file(&name) {
+                        result.push(path);
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!("cannot read directory {}: {}", current.display(), err);
+                    unreadable.push(current);
+                    break;
+                }
             }
         }
 
-        // Add subdirectories to the work queue
-        work_queue.extend(children);
+        // Queue the subdirectories, skipping any that loop back to an ancestor.
+        for child in children {
+            match dir_id(&child).await {
+                Ok(id) if chain.contains(&id) => {
+                    tracing::warn!("skipping symlink loop at {}", child.display());
+                }
+                Ok(id) => {
+                    let mut child_chain = chain.clone();
+                    child_chain.push(id);
+                    work_queue.push((child, child_chain));
+                }
+                Err(err) => {
+                    tracing::warn!("cannot read directory {}: {}", child.display(), err);
+                    unreadable.push(child);
+                }
+            }
+        }
     }
 
-    result
+    result.sort();
+    (result, unreadable)
 }
 
 fn parse_season_number(name: &str) -> Option<i32> {
