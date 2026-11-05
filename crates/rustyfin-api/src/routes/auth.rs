@@ -54,7 +54,7 @@ async fn quick_connect_sign_in(
 }
 
 /// The device of a sign-in, from its `X-Emby-Authorization` header.
-fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
+pub(crate) fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
     let (client, version, device, device_id) = parse_emby_auth(headers);
     rustyfin_auth::TokenDevice {
         device_id,
@@ -65,7 +65,7 @@ fn token_device(headers: &HeaderMap) -> rustyfin_auth::TokenDevice {
 }
 
 /// Starts the session of a sign-in on `device` and builds the answer that every sign-in returns.
-async fn start_session(
+pub(crate) async fn start_session(
     state: &AppState,
     device: &rustyfin_auth::TokenDevice,
     user: User,

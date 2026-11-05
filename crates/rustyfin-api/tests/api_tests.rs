@@ -3861,7 +3861,6 @@ fn b21_login_error(code: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_start_needs_oidc_on() {
     let t = b21().await;
     let (status, headers, _) = t.start_raw().await;
@@ -3877,7 +3876,6 @@ async fn b21_start_needs_oidc_on() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_start_builds_the_authorization_request() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     let flow = t.start().await;
@@ -3930,7 +3928,6 @@ async fn b21_start_builds_the_authorization_request() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_start_under_an_https_path_prefix() {
     let t = b21_on(serde_json::json!({ "PublicUrl": "https://media.example/jf/" })).await;
     let settings = t.settings().await;
@@ -3957,7 +3954,6 @@ async fn b21_start_under_an_https_path_prefix() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_start_reports_a_provider_that_is_down() {
     let t = b21_on(serde_json::json!({})).await;
     t.op.with(|st| st.down = true);
@@ -3974,7 +3970,6 @@ async fn b21_start_reports_a_provider_that_is_down() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_discovery_is_cached_until_the_settings_change() {
     let t = b21_on(serde_json::json!({})).await;
     let fetches = || t.op.with(|st| (st.discovery_fetches, st.jwks_fetches));
@@ -3997,7 +3992,6 @@ async fn b21_discovery_is_cached_until_the_settings_change() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_sign_in_creates_a_user() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "plain", "pw-plain", false).await;
@@ -4054,7 +4048,6 @@ async fn b21_sign_in_creates_a_user() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_sign_in_again_follows_the_link() {
     let t = b21_on(serde_json::json!({})).await;
     let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
@@ -4079,7 +4072,6 @@ async fn b21_sign_in_again_follows_the_link() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_sign_in_links_a_user_with_the_same_name() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "Alice", "pw-alice", false).await;
@@ -4102,7 +4094,6 @@ async fn b21_sign_in_links_a_user_with_the_same_name() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_sign_in_refuses_unsafe_name_matches() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "ada", "pw-ada", true).await;
@@ -4154,7 +4145,6 @@ async fn b21_sign_in_refuses_unsafe_name_matches() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_linked_user_that_is_disabled_is_refused() {
     let t = b21_on(serde_json::json!({})).await;
     t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
@@ -4169,7 +4159,6 @@ async fn b21_linked_user_that_is_disabled_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_deleting_a_user_removes_the_link() {
     let t = b21_on(serde_json::json!({})).await;
     let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
@@ -4183,7 +4172,6 @@ async fn b21_deleting_a_user_removes_the_link() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_userinfo_fills_missing_claims() {
     let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
     let info =
@@ -4221,7 +4209,6 @@ async fn b21_userinfo_fills_missing_claims() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_callback_checks_the_browser_binding() {
     let t = b21_on(serde_json::json!({})).await;
     let pat = || b21_user("pat-sub", "pat");
@@ -4290,7 +4277,6 @@ async fn b21_callback_checks_the_browser_binding() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_callback_maps_provider_answers() {
     let t = b21_on(serde_json::json!({})).await;
     let pat = || b21_user("pat-sub", "pat");
@@ -4348,7 +4334,6 @@ async fn b21_callback_maps_provider_answers() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_id_token_checks() {
     let t = b21_on(serde_json::json!({})).await;
     let now = chrono::Utc::now().timestamp();
@@ -4424,7 +4409,6 @@ async fn b21_id_token_checks() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_unknown_kid_triggers_one_jwks_refetch() {
     let t = b21_on(serde_json::json!({})).await;
     t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
@@ -4441,7 +4425,6 @@ async fn b21_unknown_kid_triggers_one_jwks_refetch() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_rotated_keys_are_refetched_once() {
     let t = b21_on(serde_json::json!({})).await;
     t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
@@ -4462,7 +4445,6 @@ async fn b21_rotated_keys_are_refetched_once() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_token_request_authenticates_the_client() {
     let t = b21_on(serde_json::json!({})).await;
     t.sign_in(b21_user("pat-sub", "pat"))
@@ -4524,7 +4506,6 @@ async fn b21_token_request_authenticates_the_client() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_complete_hands_out_the_token_once() {
     let t = b21_on(serde_json::json!({})).await;
     let flow = t.start().await;
@@ -4557,7 +4538,6 @@ async fn b21_complete_hands_out_the_token_once() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_allowed_group_gates_every_sign_in() {
     let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
     let count = t.user_count().await;
@@ -4593,7 +4573,6 @@ async fn b21_allowed_group_gates_every_sign_in() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_oidc_endpoints_share_the_login_limit() {
     let t = b21_on(serde_json::json!({})).await;
     let mut limited = t.state.clone();
@@ -4633,7 +4612,6 @@ async fn b21_oidc_endpoints_share_the_login_limit() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_flows_are_capped() {
     let t = b21_on(serde_json::json!({})).await;
     let first = t.start().await;
@@ -4660,7 +4638,6 @@ async fn b21_flows_are_capped() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 3"]
 async fn b21_secrets_stay_out_of_answers_and_logs() {
     use base64::Engine as _;
     let (log, _guard) = b21_capture();

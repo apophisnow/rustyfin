@@ -125,6 +125,7 @@ pub fn build_router(state: AppState) -> Router {
     let login = Router::new()
         .merge(auth::routes())
         .merge(users::login_routes())
+        .merge(oidc::login_routes())
         .route_layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
 
     #[allow(unused_mut)]

@@ -3,7 +3,11 @@ use rustyfin_model::user::{User, UserPreferences};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-pub async fn create_user(pool: &SqlitePool, user: &User) -> Result<(), sqlx::Error> {
+/// Writes a user row. The executor is a pool, or a transaction the caller holds.
+pub async fn create_user<'e, E>(executor: E, user: &User) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let id = user.id.to_string();
     let created = user.created_at.to_rfc3339();
     let is_admin = user.is_administrator as i32;
@@ -18,7 +22,7 @@ pub async fn create_user(pool: &SqlitePool, user: &User) -> Result<(), sqlx::Err
     .bind(is_admin)
     .bind(&created)
     .bind(&config)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())

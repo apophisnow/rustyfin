@@ -1,12 +1,17 @@
 //! OpenID Connect sign-in (B21): the pure helpers the routes and the sign-in flow share (spec §5),
 //! the provider check and its cache (AC3, AC6), and the settings the admin sees (spec §3).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use flow::FlowStore;
+use openidconnect::core::{CoreJsonWebKeySet, CoreProviderMetadata};
 use rustyfin_model::oidc::{OidcConfig, OidcSettings};
 use serde_json::Value;
 use tokio::sync::RwLock;
+
+pub mod flow;
+pub mod signin;
 
 #[cfg(test)]
 mod tests;
@@ -133,18 +138,22 @@ pub fn settings_answer(config: &OidcConfig) -> OidcSettings {
     }
 }
 
+/// How long a fetched discovery document is kept before a sign-in fetches it again.
+const PROVIDER_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// The provider's discovery document and keys, once they have passed the checks of AC3.
 #[derive(Debug)]
 pub struct Provider {
-    pub issuer: String,
-    pub authorization_endpoint: String,
-    pub token_endpoint: String,
-    pub userinfo_endpoint: Option<String>,
+    /// The issuer URL the document was fetched for.
+    issuer: String,
+    /// The discovery document, with the key set in it.
+    pub metadata: CoreProviderMetadata,
     pub jwks_uri: String,
-    /// The key set as the provider served it.
-    pub jwks: Value,
+    pub userinfo_endpoint: Option<String>,
     /// The signing algorithms Rustyfin accepts from this provider (AC9).
     pub algs: Vec<String>,
+    /// When the discovery document was fetched.
+    fetched_at: Instant,
 }
 
 /// Fetches the provider at `issuer_url` and checks its discovery document and keys (AC3). The
@@ -159,8 +168,9 @@ pub async fn discover(http: &reqwest::Client, issuer_url: &str) -> Result<Provid
     if doc.get("issuer").and_then(Value::as_str) != Some(issuer_url) {
         return Err("The provider's issuer is not the issuer URL.".to_string());
     }
-    let authorization_endpoint = endpoint(&doc, "authorization_endpoint")?;
-    let token_endpoint = endpoint(&doc, "token_endpoint")?;
+    // The flow needs these two endpoints too; the metadata parse below reads them again.
+    endpoint(&doc, "authorization_endpoint")?;
+    endpoint(&doc, "token_endpoint")?;
     let jwks_uri = endpoint(&doc, "jwks_uri")?;
     let userinfo_endpoint = doc
         .get("userinfo_endpoint")
@@ -181,7 +191,24 @@ pub async fn discover(http: &reqwest::Client, issuer_url: &str) -> Result<Provid
         return Err("The provider offers no signing algorithm Rustyfin accepts.".to_string());
     }
 
-    let jwks = fetch_json(http, &jwks_uri, "key set").await?;
+    let keys = fetch_keys(http, &jwks_uri).await?;
+    let metadata: CoreProviderMetadata = serde_json::from_value(doc)
+        .map_err(|_| "The provider's discovery document is not valid.".to_string())?;
+    let metadata = metadata.set_jwks(keys);
+
+    Ok(Provider {
+        issuer: issuer_url.to_string(),
+        metadata,
+        jwks_uri,
+        userinfo_endpoint,
+        algs,
+        fetched_at: Instant::now(),
+    })
+}
+
+/// Fetches the key set at `jwks_uri`. A set with no keys is refused (AC3).
+async fn fetch_keys(http: &reqwest::Client, jwks_uri: &str) -> Result<CoreJsonWebKeySet, String> {
+    let jwks = fetch_json(http, jwks_uri, "key set").await?;
     let has_keys = jwks
         .get("keys")
         .and_then(Value::as_array)
@@ -189,16 +216,7 @@ pub async fn discover(http: &reqwest::Client, issuer_url: &str) -> Result<Provid
     if !has_keys {
         return Err("The provider publishes no signing keys.".to_string());
     }
-
-    Ok(Provider {
-        issuer: issuer_url.to_string(),
-        authorization_endpoint,
-        token_endpoint,
-        userinfo_endpoint,
-        jwks_uri,
-        jwks,
-        algs,
-    })
+    serde_json::from_value(jwks).map_err(|_| "The provider's key set is not valid.".to_string())
 }
 
 /// GETs a JSON document from the provider. Redirects are not followed and the error names only
@@ -243,6 +261,8 @@ pub struct OidcState {
     pub http: reqwest::Client,
     /// The checked provider. Saving the settings empties it.
     provider: Arc<RwLock<Option<Arc<Provider>>>>,
+    /// The sign-in flows in progress (see `flow`).
+    flows: Arc<Mutex<FlowStore>>,
 }
 
 impl OidcState {
@@ -255,12 +275,46 @@ impl OidcState {
         Self {
             http,
             provider: Arc::new(RwLock::new(None)),
+            flows: Arc::new(Mutex::new(FlowStore::default())),
         }
     }
 
     /// Empties the cache, so the next sign-in fetches the provider again.
     pub async fn forget(&self) {
         *self.provider.write().await = None;
+    }
+
+    /// The checked provider for `issuer_url`: the cached one while it is fresh, else fetched now.
+    pub async fn provider(&self, issuer_url: &str) -> Result<Arc<Provider>, String> {
+        let cached = self.provider.read().await.clone();
+        if let Some(found) = cached
+            .filter(|found| found.issuer == issuer_url && found.fetched_at.elapsed() < PROVIDER_TTL)
+        {
+            return Ok(found);
+        }
+        let fresh = Arc::new(discover(&self.http, issuer_url).await?);
+        *self.provider.write().await = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// Fetches the key set again, for a token that names a key the cache lacks (AC9). The new set
+    /// replaces the cached provider only while the cache still holds `stale`.
+    pub async fn refresh_keys(&self, stale: &Arc<Provider>) -> Result<Arc<Provider>, String> {
+        let keys = fetch_keys(&self.http, &stale.jwks_uri).await?;
+        let metadata = stale.metadata.clone().set_jwks(keys);
+        let fresh = Arc::new(Provider {
+            issuer: stale.issuer.clone(),
+            metadata,
+            jwks_uri: stale.jwks_uri.clone(),
+            userinfo_endpoint: stale.userinfo_endpoint.clone(),
+            algs: stale.algs.clone(),
+            fetched_at: stale.fetched_at,
+        });
+        let mut cached = self.provider.write().await;
+        if cached.as_ref().is_some_and(|held| Arc::ptr_eq(held, stale)) {
+            *cached = Some(fresh.clone());
+        }
+        Ok(fresh)
     }
 }
 
