@@ -8395,8 +8395,8 @@ async fn b17_serve(app: &axum::Router) -> SocketAddr {
     addr
 }
 
-/// The library id and the percent of the socket's next `RefreshProgress` frame.
-async fn b17_next_progress(socket: &mut G1cSocket) -> (String, String) {
+/// The library id, the percent and the state of the socket's next `RefreshProgress` frame.
+async fn b17_next_progress(socket: &mut G1cSocket) -> (String, String, String) {
     loop {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
             .await
@@ -8404,9 +8404,12 @@ async fn b17_next_progress(socket: &mut G1cSocket) -> (String, String) {
         if frame["MessageType"] == "RefreshProgress" {
             let progress = frame["Data"]["Progress"].as_str();
             let progress = progress.expect("Progress is a string").to_string();
+            let state = frame["Data"]["State"].as_str();
+            let state = state.expect("State is a string").to_string();
             return (
                 frame["Data"]["ItemId"].as_str().unwrap().to_string(),
                 progress,
+                state,
             );
         }
     }
@@ -8551,31 +8554,40 @@ async fn b17_new_socket_lists_the_scans_in_progress() {
     let id = lib.to_string();
     let addr = b17_serve(&app).await;
     let scans = state.task_scheduler.scans();
-    let at = |percent: &str| (id.clone(), percent.to_string());
+    let at = |percent: &str, state: &str| (id.clone(), percent.to_string(), state.to_string());
 
     let ticket = scans.queue(lib);
     let mut first = G1cSocket::open(addr, &viewer).await;
     assert_eq!(
         b17_next_progress(&mut first).await,
-        at("0"),
+        at("0", "Queued"),
         "a queued scan is listed at 0"
     );
 
     ticket.start();
     ticket.add_total(4);
     ticket.advance(1);
-    assert_eq!(b17_next_progress(&mut first).await, at("25"));
+    assert_eq!(
+        b17_next_progress(&mut first).await,
+        at("0", "Active"),
+        "B18: the start is sent"
+    );
+    assert_eq!(b17_next_progress(&mut first).await, at("25", "Active"));
     for (who, token) in [
         ("viewer", viewer.as_str()),
         ("owner", owner.as_str()),
         ("API key", "test-api-key"),
     ] {
         let mut socket = G1cSocket::open(addr, token).await;
-        assert_eq!(b17_next_progress(&mut socket).await, at("25"), "{who}");
+        assert_eq!(
+            b17_next_progress(&mut socket).await,
+            at("25", "Active"),
+            "{who}"
+        );
     }
 
     drop(ticket);
-    assert_eq!(b17_next_progress(&mut first).await, at("100"));
+    assert_eq!(b17_next_progress(&mut first).await, at("100", "Idle"));
     let mut after = G1cSocket::open(addr, &viewer).await;
     let marker = WsEvent::LibraryChanged {
         data: serde_json::json!({ "LibraryName": "g1c-end" }),
@@ -8586,6 +8598,310 @@ async fn b17_new_socket_lists_the_scans_in_progress() {
         Vec::<String>::new(),
         "no scan is in progress"
     );
+}
+
+// ── B18: one scan per run, and Scan all's order ──
+// A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
+// leaves that library to it, so its ring follows one scan and one Completed comes after the 100.
+// A second manual scan of a waiting library joins it. Scan all clears the caches before each
+// library's LibraryChanged, and its own Completed comes after every library's scan has ended.
+
+/// A scan frame as one line: `<name> <percent> <State>` for RefreshProgress, with the library
+/// named from `names`; `Started <Name>`, `Completed <Name> <State>`, `Changed <LibraryName>`.
+fn b18_line(frame: &serde_json::Value, names: &[(uuid::Uuid, &str)]) -> Option<String> {
+    match frame["MessageType"].as_str()? {
+        "RefreshProgress" => {
+            let id = frame["Data"]["ItemId"].as_str()?;
+            let name = names
+                .iter()
+                .find(|(lib, _)| lib.to_string() == id)
+                .map_or(id, |(_, name)| *name);
+            let progress = frame["Data"]["Progress"].as_str()?;
+            let state = frame["Data"]["State"].as_str().unwrap_or("-");
+            Some(format!("{name} {progress} {state}"))
+        }
+        "ScheduledTaskStarted" => Some(format!("Started {}", frame["Name"].as_str()?)),
+        "ScheduledTaskCompleted" => Some(format!(
+            "Completed {} {}",
+            frame["Name"].as_str()?,
+            frame["State"].as_str()?
+        )),
+        "LibraryChanged" => Some(format!("Changed {}", frame["LibraryName"].as_str()?)),
+        _ => None,
+    }
+}
+
+/// Reads the socket's scan frames into `lines` up to and including `last`.
+async fn b18_read_until(
+    socket: &mut G1cSocket,
+    names: &[(uuid::Uuid, &str)],
+    lines: &mut Vec<String>,
+    last: &str,
+) {
+    while lines.last().map(String::as_str) != Some(last) {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(60), socket.next())
+            .await
+            .unwrap_or_else(|_| panic!("no {last:?} within 60 s: {lines:#?}"));
+        lines.extend(b18_line(&frame, names));
+    }
+}
+
+/// Asserts that `lines` hold one scan of the library "B18 <name>": its frames go `0 Queued`,
+/// `0 Active`, rising Active percents, `100 Idle`, with one Started, one LibraryChanged, and one
+/// Completed after both the LibraryChanged and the 100.
+fn b18_assert_one_run(lines: &[String], name: &str) {
+    let prefix = format!("{name} ");
+    let frames: Vec<&str> = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect();
+    assert!(frames.len() >= 3, "{name}: {lines:#?}");
+    assert_eq!(frames[0], "0 Queued", "{name}: {lines:#?}");
+    assert_eq!(frames[1], "0 Active", "{name}: {lines:#?}");
+    assert_eq!(frames[frames.len() - 1], "100 Idle", "{name}: {lines:#?}");
+    let percents: Vec<u8> = frames[1..frames.len() - 1]
+        .iter()
+        .map(|frame| {
+            let (percent, state) = frame.split_once(' ').unwrap();
+            assert_eq!(state, "Active", "{name}: {lines:#?}");
+            percent.parse().unwrap()
+        })
+        .collect();
+    assert!(
+        percents.windows(2).all(|w| w[0] < w[1]) && percents.iter().all(|&p| p <= 99),
+        "{name}: {lines:#?}"
+    );
+    let position = |line: String| {
+        let found: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == line).collect();
+        assert_eq!(found.len(), 1, "{line:?} once: {lines:#?}");
+        found[0]
+    };
+    let end = position(format!("{name} 100 Idle"));
+    position(format!("Started Library scan: B18 {name}"));
+    let changed = position(format!("Changed B18 {name}"));
+    let completed = position(format!("Completed Library scan: B18 {name} Completed"));
+    assert!(changed < completed && end < completed, "{name}: {lines:#?}");
+}
+
+/// Sends the "g1c-end" marker and asserts that no scan frame came before it.
+async fn b18_assert_no_more_scan_frames(state: &AppState, socket: &mut G1cSocket) {
+    let marker = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(marker).unwrap();
+    let later = socket.until_end().await;
+    assert!(
+        !later
+            .iter()
+            .any(|f| f.starts_with("RefreshProgress") || f.starts_with("ScheduledTask")),
+        "{later:?}"
+    );
+}
+
+/// Sends `method uri` as `token` in a task of its own.
+fn b18_spawn_request(
+    app: &axum::Router,
+    method: &'static str,
+    uri: String,
+    token: &str,
+) -> tokio::task::JoinHandle<(StatusCode, serde_json::Value)> {
+    let (app, token) = (app.clone(), token.to_string());
+    tokio::spawn(async move { send_authed(&app, method, &uri, &token, None).await })
+}
+
+#[tokio::test]
+async fn b18_manual_scan_of_a_library_scan_all_has_queued_runs_once() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let first = create_library_via_api(&app, &state, &owner, "B18 First", "Movies").await;
+    let second = create_library_via_api(&app, &state, &owner, "B18 Second", "Movies").await;
+    b17_movies(&media_folder(&state, "b18 first"), 2);
+    b17_movies(&media_folder(&state, "b18 second"), 3);
+    let names = [(first, "First"), (second, "Second")];
+    let addr = b17_serve(&app).await;
+    let mut socket = G1cSocket::open(addr, &viewer).await;
+    let mut lines = Vec::new();
+
+    // Scan all waits for the scan lock in its first library while the second one is queued.
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let all = b18_spawn_request(&app, "POST", "/Library/Refresh".into(), &owner);
+    b18_read_until(
+        &mut socket,
+        &names,
+        &mut lines,
+        "Started Library scan: B18 First",
+    )
+    .await;
+    let uri = format!("/Library/VirtualFolders/{second}/Refresh");
+    let manual = b18_spawn_request(&app, "POST", uri, &owner);
+    b18_read_until(
+        &mut socket,
+        &names,
+        &mut lines,
+        "Started Library scan: B18 Second",
+    )
+    .await;
+    drop(lock);
+
+    let (status, body) = manual.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items_scanned"], 3, "the manual request scanned");
+    let (status, body) = all.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["items_scanned"], 2,
+        "Scan all left the second library to the manual scan"
+    );
+    let last = "Completed Scan all libraries Completed";
+    b18_read_until(&mut socket, &names, &mut lines, last).await;
+    b18_assert_no_more_scan_frames(&state, &mut socket).await;
+    b18_assert_one_run(&lines, "First");
+    b18_assert_one_run(&lines, "Second");
+}
+
+#[tokio::test]
+async fn b18_second_manual_scan_of_a_waiting_library_joins_the_first() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "B18 Twice", "Movies").await;
+    b17_movies(&media_folder(&state, "b18 twice"), 2);
+    let names = [(lib, "Twice")];
+    let addr = b17_serve(&app).await;
+    let mut socket = G1cSocket::open(addr, &viewer).await;
+    let scans = state.task_scheduler.scans();
+    let uri = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let mut lines = Vec::new();
+
+    let lock = rustyfin_core::scanner::SCAN_LOCK.lock().await;
+    let first = b18_spawn_request(&app, "POST", uri.clone(), &owner);
+    b18_read_until(
+        &mut socket,
+        &names,
+        &mut lines,
+        "Started Library scan: B18 Twice",
+    )
+    .await;
+    let second = b18_spawn_request(&app, "POST", uri, &owner);
+    // The second request waits for the end of the run the first one claimed.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while scans.waiting(lib) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second request did not wait within 30 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(lock);
+
+    let (status, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items_scanned"], 2);
+    let (status, body) = second.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["items_scanned"], 0,
+        "the second request waited for the first one's scan"
+    );
+    assert_eq!(
+        scans.state(lib),
+        None,
+        "it answered once the scan had ended"
+    );
+    let last = "Completed Library scan: B18 Twice Completed";
+    b18_read_until(&mut socket, &names, &mut lines, last).await;
+    b18_assert_no_more_scan_frames(&state, &mut socket).await;
+    b18_assert_one_run(&lines, "Twice");
+}
+
+#[tokio::test]
+async fn b18_scan_all_completes_after_a_library_another_caller_claimed() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let held = create_library_via_api(&app, &state, &owner, "B18 Held", "Movies").await;
+    let free = create_library_via_api(&app, &state, &owner, "B18 Free", "Movies").await;
+    b17_movies(&media_folder(&state, "b18 held"), 1);
+    b17_movies(&media_folder(&state, "b18 free"), 2);
+    let names = [(held, "Held"), (free, "Free")];
+    let addr = b17_serve(&app).await;
+    let mut socket = G1cSocket::open(addr, &viewer).await;
+    let ticket = state.task_scheduler.scans().queue(held);
+    assert!(ticket.claim());
+
+    let (status, body) = send_authed(&app, "POST", "/Library/Refresh", &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["items_scanned"], 2,
+        "Scan all scanned only the library nobody else had claimed"
+    );
+    let mut lines = Vec::new();
+    let free_done = "Completed Library scan: B18 Free Completed";
+    b18_read_until(&mut socket, &names, &mut lines, free_done).await;
+    // The held library's run has not ended, so Scan all has not completed.
+    b18_assert_no_more_scan_frames(&state, &mut socket).await;
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("Scan all libraries Completed")),
+        "{lines:#?}"
+    );
+
+    drop(ticket);
+    let last = "Completed Scan all libraries Completed";
+    b18_read_until(&mut socket, &names, &mut lines, last).await;
+    let held_end = lines.iter().position(|line| line == "Held 100 Idle");
+    assert_eq!(held_end, Some(lines.len() - 2), "{lines:#?}");
+    assert!(
+        !lines.iter().any(|line| line.contains("B18 Held")),
+        "Scan all neither scanned nor announced the held library: {lines:#?}"
+    );
+}
+
+#[tokio::test]
+async fn b18_scan_all_clears_the_caches_before_each_library_changed() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, _, _) = g1_owner_and_viewer(&state, &app).await;
+    let one = create_library_via_api(&app, &state, &owner, "B18 Cache One", "Movies").await;
+    create_library_via_api(&app, &state, &owner, "B18 Cache Two", "Movies").await;
+    let movie =
+        std::path::Path::new(&media_folder(&state, "b18 cache one")).join("B18 Cached (2001)");
+    std::fs::create_dir_all(&movie).unwrap();
+    std::fs::write(movie.join("B18 Cached (2001).mkv"), b"").unwrap();
+    // The second library keeps Scan all busy after the first one's LibraryChanged.
+    b17_movies(&media_folder(&state, "b18 cache two"), 40);
+    let uri = format!("/Items/Filters?ParentId={one}");
+    let (status, body) = send_authed(&app, "GET", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["Years"],
+        serde_json::json!([]),
+        "the empty library's filters are cached"
+    );
+
+    let mut events = state.ws_broadcast.subscribe();
+    let all = b18_spawn_request(&app, "POST", "/Library/Refresh".into(), &owner);
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), events.recv())
+            .await
+            .expect("no LibraryChanged for the first library within 60 s");
+        match event {
+            Ok(WsEvent::LibraryChanged { data }) if data["LibraryId"] == one.to_string() => break,
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => panic!("the event channel closed"),
+        }
+    }
+    let (status, body) = send_authed(&app, "GET", &uri, &owner, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["Years"],
+        serde_json::json!([2001]),
+        "the caches were cleared before LibraryChanged"
+    );
+    let (status, body) = all.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 // ── G4: transcode pipeline and byte ranges ──

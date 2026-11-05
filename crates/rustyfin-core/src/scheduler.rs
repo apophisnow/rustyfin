@@ -302,6 +302,10 @@ impl TaskScheduler {
                 let client = reqwest::Client::new();
                 let mut errors = Vec::new();
                 for (lib, ticket) in libraries.iter().zip(tickets) {
+                    // Only the caller that claimed the library's run scans it.
+                    if !ticket.claim() {
+                        continue;
+                    }
                     if let Err(e) = crate::scanner::scan_library_with_metadata(
                         &self.db, lib, &client, None, None, None, &ticket,
                     )

@@ -119,9 +119,8 @@ pub async fn scan_library_with_metadata(
     Ok(count)
 }
 
-/// Serializes the scans that write items and queue probes. A scan takes it first and holds it
-/// until the probes it queued have finished (see `spawn_plans_under_lock`).
-static SCAN_LOCK: Mutex<()> = Mutex::const_new(());
+/// Serializes the scans that write items. Held until the probes they queued have finished.
+pub static SCAN_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Waits until no scan is running and the probes of the last scan have finished.
 pub async fn wait_for_idle() {

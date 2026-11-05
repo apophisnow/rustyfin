@@ -2677,13 +2677,14 @@ async fn new_items_skip_known_failures() {
 }
 
 // B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
-// its updates go 0, then up to at most 99, then 100 once its probes have finished.
+// its updates go 0, then up to at most 99, then 100 once its probes have finished. B18 adds the
+// state to each update: Queued, Active from the start, and Idle with the 100.
 
 /// The updates sent so far, in order.
-fn b17_sent(rx: &mut tokio::sync::broadcast::Receiver<ScanUpdate>) -> Vec<(Uuid, u8)> {
+fn b17_sent(rx: &mut tokio::sync::broadcast::Receiver<ScanUpdate>) -> Vec<(Uuid, u8, ScanStatus)> {
     let mut updates = Vec::new();
     while let Ok(update) = rx.try_recv() {
-        updates.push((update.library_id, update.progress));
+        updates.push((update.library_id, update.progress, update.status));
     }
     updates
 }
@@ -2734,9 +2735,17 @@ async fn b17_registry_follows_a_scan_from_queue_to_end() {
     drop(ticket);
     assert_eq!(scans.state(lib), None);
     assert!(scans.snapshot().is_empty());
+    use ScanStatus::{Active, Idle, Queued};
     assert_eq!(
         b17_sent(&mut rx),
-        [(lib, 0), (lib, 25), (lib, 50), (lib, 99), (lib, 100)]
+        [
+            (lib, 0, Queued),
+            (lib, 0, Active),
+            (lib, 25, Active),
+            (lib, 50, Active),
+            (lib, 99, Active),
+            (lib, 100, Idle)
+        ]
     );
 }
 
@@ -2764,9 +2773,17 @@ async fn b17_tickets_of_one_library_share_its_scan() {
     assert_eq!(scans.state(lib), None);
     assert_eq!(scans.state(other), b17_state(ScanStatus::Queued, None));
     drop(other_ticket);
+    use ScanStatus::{Active, Idle, Queued};
     assert_eq!(
         b17_sent(&mut rx),
-        [(lib, 0), (other, 0), (lib, 50), (lib, 100), (other, 100)]
+        [
+            (lib, 0, Queued),
+            (other, 0, Queued),
+            (lib, 0, Active),
+            (lib, 50, Active),
+            (lib, 100, Idle),
+            (other, 100, Idle)
+        ]
     );
 }
 
@@ -2853,4 +2870,196 @@ async fn b17_scheduler_scan_reports_progress_until_its_probes_finish() {
     } else {
         println!("ffmpeg not found; skipping the probe check");
     }
+}
+
+// B18: a library's scans are runs. A scan queued while a run of the library waits joins that run,
+// and one of the run's tickets claims it, so that only one caller scans; a scan queued while the
+// run is going makes a new run. The registry and its updates follow the library's oldest run.
+
+#[tokio::test]
+async fn b18_one_ticket_claims_a_run() {
+    let scans = ScanRegistry::new();
+    let mut rx = scans.subscribe();
+    let lib = Uuid::new_v4();
+    let first = scans.queue(lib);
+    let second = scans.queue(lib);
+    assert!(first.claim(), "the first claim of a run wins");
+    assert!(first.claim(), "the claimer keeps its claim");
+    assert!(
+        first.clone().claim(),
+        "a clone of the claimer holds the run too"
+    );
+    assert!(!second.claim(), "the run has been claimed");
+    assert!(!second.clone().claim(), "a clone of a waiter waits too");
+    assert!(
+        ScanTicket::untracked().claim(),
+        "an untracked ticket always scans"
+    );
+
+    assert_eq!(scans.waiting(lib), 0);
+    let waiter = tokio::spawn(second.wait_end());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "the claimer still holds the run");
+    assert_eq!(scans.waiting(lib), 1, "one wait_end waits for the run");
+    drop(first);
+    assert_eq!(
+        scans.state(lib),
+        None,
+        "the run ends with its claimer's tickets"
+    );
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("a waiter's wait ends with the run")
+        .unwrap();
+    use ScanStatus::{Idle, Queued};
+    assert_eq!(b17_sent(&mut rx), [(lib, 0, Queued), (lib, 100, Idle)]);
+}
+
+#[tokio::test]
+async fn b18_an_unclaimed_run_ends_when_its_last_ticket_drops() {
+    let scans = ScanRegistry::new();
+    let lib = Uuid::new_v4();
+    let first = scans.queue(lib);
+    let second = scans.queue(lib);
+    drop(first);
+    assert_eq!(
+        scans.state(lib),
+        b17_state(ScanStatus::Queued, None),
+        "the second ticket keeps the run"
+    );
+    drop(second);
+    assert_eq!(scans.state(lib), None);
+}
+
+#[tokio::test]
+async fn b18_a_scan_queued_during_a_run_makes_a_new_run() {
+    use ScanStatus::{Active, Idle, Queued};
+    let scans = ScanRegistry::new();
+    let mut rx = scans.subscribe();
+    let lib = Uuid::new_v4();
+    let running = scans.queue(lib);
+    assert!(running.claim());
+    running.start();
+    running.add_total(2);
+    running.advance(1);
+
+    let next = scans.queue(lib);
+    let joined = scans.queue(lib);
+    assert!(next.claim(), "a run that has started is not joined");
+    assert!(!joined.claim(), "a waiting run is joined");
+    assert_eq!(
+        scans.state(lib),
+        b17_state(Active, Some(50)),
+        "the oldest run is listed"
+    );
+    assert_eq!(
+        scans.snapshot(),
+        [(
+            lib,
+            ScanState {
+                status: Active,
+                progress: Some(50)
+            }
+        )]
+    );
+
+    let next_end = tokio::spawn(next.clone().wait_end());
+    let running_end = tokio::spawn(running.clone().wait_end());
+    drop(running);
+    tokio::time::timeout(Duration::from_secs(5), running_end)
+        .await
+        .expect("the first run has ended")
+        .unwrap();
+    assert!(!next_end.is_finished(), "the second run has not");
+    assert_eq!(
+        scans.state(lib),
+        b17_state(Queued, None),
+        "the second run is listed once the first ends"
+    );
+
+    next.start();
+    next.add_total(4);
+    next.advance(1);
+    drop(joined);
+    assert_eq!(
+        scans.state(lib),
+        b17_state(Active, Some(25)),
+        "a waiter does not hold a claimed run"
+    );
+    drop(next);
+    tokio::time::timeout(Duration::from_secs(5), next_end)
+        .await
+        .expect("the second run has ended")
+        .unwrap();
+    assert_eq!(scans.state(lib), None);
+    assert_eq!(
+        b17_sent(&mut rx),
+        [
+            (lib, 0, Queued),
+            (lib, 0, Active),
+            (lib, 50, Active),
+            (lib, 0, Queued),
+            (lib, 0, Active),
+            (lib, 25, Active),
+            (lib, 100, Idle)
+        ],
+        "the updates follow the first run, then the second"
+    );
+}
+
+#[tokio::test]
+async fn b18_a_stale_ticket_leaves_a_later_run_alone() {
+    let scans = ScanRegistry::new();
+    let lib = Uuid::new_v4();
+    let holder = scans.queue(lib);
+    let stale = scans.queue(lib);
+    assert!(holder.claim());
+    holder.start();
+    drop(holder);
+    assert_eq!(scans.state(lib), None, "the claimed run has ended");
+
+    let later = scans.queue(lib);
+    assert!(!stale.claim(), "the stale ticket's run has ended");
+    drop(stale);
+    assert_eq!(
+        scans.state(lib),
+        b17_state(ScanStatus::Queued, None),
+        "dropping the stale ticket leaves the later run"
+    );
+    assert!(later.claim(), "the later run is still unclaimed");
+}
+
+#[tokio::test]
+async fn b18_scheduler_skips_a_library_another_caller_claimed() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("B18 Claimed", LibraryContentType::Movies).await;
+    touch(&root_of(&lib), "B18 Movie (2001)/B18 Movie (2001).mkv");
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let web = sched.scans().queue(lib.id);
+    assert!(web.claim());
+
+    assert!(sched.start_task(TASK_LIBRARY_SCAN).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let task = sched.get_task(TASK_LIBRARY_SCAN).await.unwrap();
+        if task.last_execution_result.is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the scheduled scan did not finish within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        count(&fx.pool, "SELECT COUNT(*) FROM media_items").await,
+        0,
+        "the scheduler left the claimed library to its claimer"
+    );
+    assert_eq!(
+        sched.scans().state(lib.id),
+        b17_state(ScanStatus::Queued, None)
+    );
+    drop(web);
+    assert_eq!(sched.scans().state(lib.id), None);
 }
