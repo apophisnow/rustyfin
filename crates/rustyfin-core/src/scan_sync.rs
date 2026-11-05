@@ -12,7 +12,7 @@ use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
-use crate::naming::VersionGroup;
+use crate::naming::{VersionGroup, is_ignored_dir, is_ignored_file};
 use crate::probe::ProbeStep;
 use crate::scanner::parse_year;
 
@@ -67,12 +67,15 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
 /// Deletes the items of `library` that the scan did not collect, and returns how many were deleted.
 ///
 /// Step 1 covers the media types that the library's content type scans. An item is deleted only
-/// when all of these hold: its path is under a library root; `fs::metadata` says it is a regular
-/// file, or its path is under a folder the scan skipped as a symlink loop (such a path is never
-/// collected again and may not resolve); its path is not in `collected`; and no folder in
-/// `unreadable` contains it. So a missing or unreadable file is kept, unless it is under such a
-/// loop. Step 2, for TV libraries only, then deletes the Seasons and then the Series that have no
-/// children.
+/// when all of these hold: its path is under a library root; its path is not in `collected`; no
+/// folder in `unreadable` contains it; and either its path is under a folder the scan skipped as a
+/// symlink loop (such a path is never collected again and may not resolve), or its file is a
+/// regular file, or its file is missing. A missing file is deleted only while its root lists
+/// something that naming does not ignore: a root that lists nothing may be unmounted, so nothing
+/// missing under it is deleted, and a warning is logged once for each such root.
+/// Step 2 then deletes the containers with no children: the Seasons and Series of a TV library, and
+/// the MusicAlbums of a music library, which hold both albums and artists. It repeats until a pass
+/// deletes nothing, because a deleted container can leave its parent without children.
 pub async fn remove_not_collected(
     pool: &SqlitePool,
     library: &Library,
@@ -82,6 +85,9 @@ pub async fn remove_not_collected(
 ) -> Result<u32, sqlx::Error> {
     let library_id = library.id.to_string();
     let roots: Vec<PathBuf> = library.paths.iter().map(PathBuf::from).collect();
+    // Whether each root lists something, looked up once per root, and the roots already warned about.
+    let mut listed: HashMap<usize, bool> = HashMap::new();
+    let mut warned: HashSet<usize> = HashSet::new();
     let mut removed = 0;
 
     for &media_type in scanned_types(&library.content_type) {
@@ -94,14 +100,40 @@ pub async fn remove_not_collected(
         .await?;
         for (id, path) in rows {
             let item = Path::new(&path);
-            let under_root = roots.iter().any(|root| item.starts_with(root));
+            let Some(root) = roots
+                .iter()
+                .position(|candidate| item.starts_with(candidate))
+            else {
+                continue;
+            };
             let unlisted = unreadable.iter().any(|dir| item.starts_with(dir));
-            if !under_root || unlisted || collected.contains(&path) {
+            if unlisted || collected.contains(&path) {
                 continue;
             }
             let in_loop = loops.iter().any(|dir| item.starts_with(dir));
+            // A path that is neither a regular file nor under a loop stays, unless its file is
+            // missing and its root lists something.
             if !in_loop && !is_regular_file(item).await {
-                continue;
+                if !is_gone(item).await {
+                    continue;
+                }
+                let root_listed = match listed.get(&root) {
+                    Some(&known) => known,
+                    None => {
+                        let known = root_is_listed(&roots[root]).await;
+                        listed.insert(root, known);
+                        known
+                    }
+                };
+                if !root_listed {
+                    if warned.insert(root) {
+                        tracing::warn!(
+                            "not removing the missing items under {}: the folder lists nothing, so it may not be mounted",
+                            roots[root].display()
+                        );
+                    }
+                    continue;
+                }
             }
             if delete_item(pool, &id).await? {
                 removed += 1;
@@ -109,9 +141,15 @@ pub async fn remove_not_collected(
         }
     }
 
-    if matches!(library.content_type, LibraryContentType::TvShows) {
-        // Seasons first: deleting one can leave its series with no children.
-        for media_type in ["Season", "Series"] {
+    // Seasons come before their series, and albums before their artists, which are MusicAlbums too.
+    let containers: &[&str] = match library.content_type {
+        LibraryContentType::TvShows => &["Season", "Series"],
+        LibraryContentType::Music => &["MusicAlbum"],
+        _ => &[],
+    };
+    loop {
+        let mut deleted_in_pass: u32 = 0;
+        for &media_type in containers {
             let ids: Vec<String> = sqlx::query_scalar(
                 "SELECT id FROM media_items AS m
                  WHERE m.library_id = ?1 AND m.media_type = ?2
@@ -123,24 +161,27 @@ pub async fn remove_not_collected(
             .await?;
             for id in ids {
                 if delete_item(pool, &id).await? {
-                    removed += 1;
+                    deleted_in_pass += 1;
                 }
             }
         }
+        if deleted_in_pass == 0 {
+            break;
+        }
+        removed += deleted_in_pass;
     }
 
     Ok(removed)
 }
 
 /// The media types that a scan of a library with this content type collects.
-/// Music is not listed, because its scan removes nothing.
 fn scanned_types(content_type: &LibraryContentType) -> &'static [&'static str] {
     match content_type {
         LibraryContentType::Movies => &["Movie"],
         LibraryContentType::Photos => &["Photo"],
         LibraryContentType::Mixed => &["Movie", "Audio", "Photo"],
         LibraryContentType::TvShows => &["Episode"],
-        LibraryContentType::Music => &[],
+        LibraryContentType::Music => &["Audio"],
     }
 }
 
@@ -151,15 +192,45 @@ async fn is_regular_file(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file())
 }
 
+/// Whether the file at `path` is gone: `fs::metadata` says that it does not exist. A dangling link
+/// is gone too. Any other error leaves the file in place.
+async fn is_gone(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether the library folder `root` looks mounted: it lists at least one entry that naming does not
+/// ignore. A missing or unreadable folder does not, and nor does a folder with only ignored entries.
+async fn root_is_listed(root: &Path) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_ignored_dir(&name) && !is_ignored_file(&name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The size and modification time of the file at `path`, the modification time in whole seconds
 /// since the Unix epoch. `std::fs::metadata` follows symlinks. `None` when either cannot be read.
-fn file_stamp(path: &str) -> Option<(i64, i64)> {
+pub(crate) fn file_stamp(path: &str) -> Option<(i64, i64)> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some((
         i64::try_from(meta.len()).ok()?,
         i64::try_from(modified.as_secs()).ok()?,
     ))
+}
+
+/// Whether the file at `path` no longer has the size and modification time stored with its source.
+/// A source with no stored modification time is not changed: it is stamped without a probe.
+pub(crate) fn source_changed(path: &str, size: Option<i64>, modified: Option<i64>) -> bool {
+    modified.is_some_and(|modified| size.map(|size| (size, modified)) != file_stamp(path))
 }
 
 /// Whether `file` is a known failure: it has a probe failure on record, and it is still the file
@@ -170,10 +241,15 @@ fn is_known_failure(file: &str, failures: &HashMap<String, (i64, i64)>) -> bool 
         .is_some_and(|&stamp| file_stamp(file) == Some(stamp))
 }
 
-/// Records that the probe of `path` failed, with the file's size and modification time now. Does
-/// nothing when the file's metadata cannot be read.
-pub(crate) async fn record_probe_failure(pool: &SqlitePool, path: &str) -> Result<(), sqlx::Error> {
-    let Some((size, modified)) = file_stamp(path) else {
+/// Records that the probe of `path` failed, with `stamp`: the file's size and modification time from
+/// before the probe, so that a file that changed during the probe is probed again. Does nothing when
+/// `stamp` is `None`, that is when the file's metadata could not be read.
+pub(crate) async fn record_probe_failure(
+    pool: &SqlitePool,
+    path: &str,
+    stamp: Option<(i64, i64)>,
+) -> Result<(), sqlx::Error> {
+    let Some((size, modified)) = stamp else {
         return Ok(());
     };
     sqlx::query(
@@ -201,6 +277,29 @@ pub(crate) async fn clear_probe_failure(pool: &SqlitePool, path: &str) -> Result
     Ok(())
 }
 
+/// Stores `stamp`, the size and modification time of the file at `path`, on the source of `item_id`
+/// for that path. Does nothing when `stamp` is `None`, that is when the file could not be read.
+pub(crate) async fn store_stamp(
+    pool: &SqlitePool,
+    item_id: &str,
+    path: &str,
+    stamp: Option<(i64, i64)>,
+) -> Result<(), sqlx::Error> {
+    let Some((size, modified)) = stamp else {
+        return Ok(());
+    };
+    sqlx::query(
+        "UPDATE media_sources SET size = ?1, modified = ?2 WHERE item_id = ?3 AND path = ?4",
+    )
+    .bind(size)
+    .bind(modified)
+    .bind(item_id)
+    .bind(path)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// An item of the library, as [`reconcile_groups`] reads it.
 #[derive(sqlx::FromRow)]
 struct ItemRow {
@@ -222,6 +321,9 @@ struct SourceRow {
     item_id: String,
     path: String,
     run_time_ticks: Option<i64>,
+    /// The size and modification time of the file when the source was stamped.
+    size: Option<i64>,
+    modified: Option<i64>,
 }
 
 /// The fields that a group gives its item, by media type.
@@ -335,7 +437,7 @@ async fn reconcile_groups(
     .fetch_all(pool)
     .await?;
     let sources: Vec<SourceRow> = sqlx::query_as(
-        "SELECT s.item_id, s.path, s.run_time_ticks
+        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified
          FROM media_sources AS s
          JOIN media_items AS m ON m.id = s.item_id
          WHERE m.library_id = ?1 AND m.media_type = ?2
@@ -461,8 +563,8 @@ fn owners_of<'a>(
 }
 
 /// Settles one group whose owners are known. Merges the other owners into the survivor, writes the
-/// survivor's fields that changed (its path becomes `primary`), and works out what to probe: the
-/// `probeable` files.
+/// survivor's fields that changed (its path becomes `primary`), stamps the sources that have no
+/// stamp yet, and works out what to probe: the `probeable` files, when the group is not steady.
 async fn settle_group(
     pool: &SqlitePool,
     group: &WantedGroup,
@@ -565,9 +667,20 @@ async fn settle_group(
         tx.commit().await?;
     }
 
-    // Steady state: nothing else owns the group, the survivor is at the primary, and its sources
-    // are the probeable files, in order, with the right duration. Otherwise they are probed again.
-    // A primary with no duration cannot be fixed by probing, so it counts as right.
+    // A source with no stored stamp is stamped now, without a probe: its probed data is kept.
+    for source in sources.iter().filter(|source| source.modified.is_none()) {
+        store_stamp(
+            pool,
+            &source.item_id,
+            &source.path,
+            file_stamp(&source.path),
+        )
+        .await?;
+    }
+    // Steady state: nothing else owns the group, the survivor is at the primary, its sources are the
+    // probeable files, in order, with the right duration, and none of their files changed. Otherwise
+    // they are probed again. A changed file makes the whole group probe again, so that its versions
+    // stay in step. A primary with no duration cannot be fixed by probing, so it counts as right.
     let source_paths_match = sources
         .iter()
         .map(|source| source.path.as_str())
@@ -575,9 +688,13 @@ async fn settle_group(
     let runtime_match = sources.first().is_some_and(|first| {
         first.run_time_ticks.is_none() || first.run_time_ticks == survivor.runtime_ticks
     });
+    let changed = sources
+        .iter()
+        .any(|source| source_changed(&source.path, source.size, source.modified));
     let steady = others.is_empty()
         && survivor.path == primary
         && source_paths_match
+        && !changed
         && (probeable.is_empty() || runtime_match);
     let steps = if steady {
         Vec::new()

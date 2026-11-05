@@ -1266,6 +1266,32 @@ pub async fn get_library_paths(
     Ok(rows)
 }
 
+/// Fetch the source of each audio item of a library, as (item id, path, size, modified). The size and
+/// modification time are the stamp that the source stores, and are `None` when it has none.
+pub async fn get_library_audio_sources(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> Result<Vec<(Uuid, String, Option<i64>, Option<i64>)>, sqlx::Error> {
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT m.id, s.path, s.size, s.modified
+         FROM media_sources AS s
+         JOIN media_items AS m ON m.id = s.item_id
+         WHERE m.library_id = ? AND m.media_type = 'Audio'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let sources = rows
+        .into_iter()
+        .filter_map(|(id, path, size, modified)| {
+            Uuid::parse_str(&id)
+                .ok()
+                .map(|uid| (uid, path, size, modified))
+        })
+        .collect();
+    Ok(sources)
+}
+
 /// Fetch all items of a specific media type for a library, returning path -> id mapping.
 /// Used by the scanner to pre-load series/season/artist/album IDs before directory traversal,
 /// avoiding per-item database queries during scanning.

@@ -732,6 +732,14 @@ async fn scan_music_library(
             .into_iter()
             .collect();
 
+    // The source of each known track, by path: its item, and the stamp that it stores.
+    let known_tracks: HashMap<String, (Uuid, Option<i64>, Option<i64>)> =
+        rustyfin_db::repo_media::get_library_audio_sources(pool, library.id)
+            .await?
+            .into_iter()
+            .map(|(id, path, size, modified)| (path, (id, size, modified)))
+            .collect();
+
     // Pre-load the music album rows once for the whole scan, for O(1) ID lookup.
     // Artists and albums both use MediaType::MusicAlbum in the DB, so artist paths are here too.
     // album_path -> album_id
@@ -752,8 +760,12 @@ async fn scan_music_library(
             })
             .collect();
 
-    // Walk every root before the first file, so that the total covers all of them.
+    // Walk every root before the first file, so that the total covers all of them. The walks also
+    // give the removal at the end what it needs: every file seen, the unlisted folders and the loops.
     let mut roots: Vec<(&Path, Vec<PathBuf>)> = Vec::new();
+    let mut collected: HashSet<String> = HashSet::new();
+    let mut unreadable: Vec<PathBuf> = Vec::new();
+    let mut loops: Vec<PathBuf> = Vec::new();
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
         if !path.exists() {
@@ -762,13 +774,16 @@ async fn scan_music_library(
         }
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, _, _) = collect_files(path).await;
+        let (files, unreadable_dirs, loop_dirs) = collect_files(path).await;
         tracing::info!(
             "music library '{}': found {} files in path {}",
             library.name,
             files.len(),
             lib_path
         );
+        collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
+        unreadable.extend(unreadable_dirs);
+        loops.extend(loop_dirs);
         roots.push((path, files));
     }
     ticket.add_total(roots.iter().map(|(_, files)| files.len()).sum());
@@ -799,6 +814,17 @@ async fn scan_music_library(
             // Skip if already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
+                // A track whose file changed since it was stamped is probed again, under the same item.
+                // A track that was never stamped is stamped now, without a probe.
+                if let Some(&(item_id, size, modified)) = known_tracks.get(&file_path) {
+                    if modified.is_none() {
+                        let stamp = scan_sync::file_stamp(&file_path);
+                        scan_sync::store_stamp(pool, &item_id.to_string(), &file_path, stamp)
+                            .await?;
+                    } else if scan_sync::source_changed(&file_path, size, modified) {
+                        probe::spawn_probe_and_save(pool.clone(), item_id, file_path.clone());
+                    }
+                }
                 continue;
             }
 
@@ -1056,6 +1082,18 @@ async fn scan_music_library(
         }
     }
 
+    // Remove the items that this scan no longer collects. A failure is logged, not returned.
+    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable, &loops).await {
+        Ok(removed) => tracing::info!(
+            "removed {removed} items no longer collected from library '{}'",
+            library.name
+        ),
+        Err(e) => tracing::warn!(
+            "removing items no longer collected from library '{}' failed: {}",
+            library.name,
+            e
+        ),
+    }
     tracing::info!(
         "scanned music library '{}': {} new items added ({} existing items unchanged)",
         library.name,
@@ -1133,8 +1171,9 @@ async fn dir_id(path: &Path) -> std::io::Result<DirId> {
 /// Returns three lists. The first is the files, sorted by path. The second is the directories that
 /// could not be listed completely, from a failed `read_dir` or an error part way through one. The
 /// third is the subdirectories skipped as symlink loops: a subdirectory whose identity is already
-/// among its ancestors. Entries that `naming` ignores are skipped. Two links to one folder are both
-/// followed. The root's own name is never checked.
+/// among its ancestors. Entries that `naming` ignores are skipped, and so are dangling symlinks,
+/// which name no file or folder. Two links to one folder are both followed. The root's own name is
+/// never checked.
 async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut result = Vec::new();
     let mut unreadable = Vec::new();
@@ -1171,10 +1210,12 @@ async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>
                         if ft.is_dir() {
                             true
                         } else if ft.is_symlink() {
-                            fs::metadata(&path)
-                                .await
-                                .map(|m| m.is_dir())
-                                .unwrap_or(false)
+                            match fs::metadata(&path).await {
+                                Ok(meta) => meta.is_dir(),
+                                // A dangling link names nothing, so it is skipped and its item is gone.
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                                Err(_) => false,
+                            }
                         } else {
                             false
                         }
