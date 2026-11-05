@@ -140,6 +140,7 @@ async fn send_command(
             data: serde_json::json!({
                 "Id": session_id,
                 "Command": cmd.command,
+                "UserId": owner,
             }),
         },
     )
@@ -217,6 +218,7 @@ async fn send_device_command(
             data: serde_json::json!({
                 "Id": device_id,
                 "Command": cmd.command,
+                "UserId": owner,
             }),
         },
     )
@@ -236,7 +238,7 @@ async fn send_command_by_name(
     let _ = crate::routes::websocket::broadcast_event(
         &state,
         rustyfin_model::ws_event::WsEvent::SessionChanged {
-            data: serde_json::json!({"Id": session_id, "Command": _command}),
+            data: serde_json::json!({"Id": session_id, "Command": _command, "UserId": owner}),
         },
     )
     .await;
@@ -255,7 +257,7 @@ async fn send_message(
     let _ = crate::routes::websocket::broadcast_event(
         &state,
         rustyfin_model::ws_event::WsEvent::SessionChanged {
-            data: serde_json::json!({"Id": session_id, "MessageType": "Notification"}),
+            data: serde_json::json!({"Id": session_id, "MessageType": "Notification", "UserId": owner}),
         },
     )
     .await;

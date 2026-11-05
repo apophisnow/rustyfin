@@ -6160,3 +6160,140 @@ async fn g1c_session_events_reach_only_their_owner_and_admins() {
         "the viewer's socket"
     );
 }
+
+#[tokio::test]
+async fn g1c_session_command_events_name_the_sessions_owner() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (owner_session, viewer_session) = g1f_sessions(&state, &owner_id, &viewer_id).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    let mut owner_socket = G1cSocket::open(addr, &owner).await;
+    let mut viewer_socket = G1cSocket::open(addr, &viewer).await;
+    let mut events = state.ws_broadcast.subscribe();
+
+    let command = serde_json::json!({
+        "Command": "DisplayMessage",
+        "Arguments": { "Header": "g1c", "Text": "test" }
+    });
+    // The viewer and the administrator on the viewer's session, then the administrator on their
+    // own session and device.
+    let requests = [
+        (
+            viewer.as_str(),
+            format!("/Sessions/{viewer_session}/Command"),
+            Some(command.clone()),
+        ),
+        (
+            owner.as_str(),
+            format!("/Sessions/{viewer_session}/Command/GoHome"),
+            None,
+        ),
+        (
+            owner.as_str(),
+            format!("/Sessions/{owner_session}/Command/GoHome"),
+            None,
+        ),
+        (
+            owner.as_str(),
+            "/Devices/g1f-owner-device/Command".to_string(),
+            Some(command),
+        ),
+    ];
+    for (token, uri, body) in requests {
+        let req = request("POST", &uri, Some(token), body);
+        assert_eq!(send(&app, req).await.0, StatusCode::OK, "{uri}");
+    }
+    let end = WsEvent::LibraryChanged {
+        data: serde_json::json!({ "LibraryName": "g1c-end" }),
+    };
+    state.ws_broadcast.send(end).unwrap();
+    // A message's payload has its own MessageType, which hides the frame's, so it comes after the
+    // sockets' end marker and is checked on the channel only.
+    let message = serde_json::json!({ "Header": "g1c", "Text": "test" });
+    let uri = format!("/Sessions/{viewer_session}/Message");
+    let req = request("POST", &uri, Some(&owner), Some(message));
+    assert_eq!(send(&app, req).await.0, StatusCode::OK, "{uri}");
+
+    // Each event names the user whose session or device it is.
+    let mut named = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let WsEvent::SessionChanged { data } = event {
+            let field = |key: &str| data[key].as_str().unwrap_or_default().to_string();
+            named.push((field("Id"), field("UserId")));
+        }
+    }
+    let pair = |id: &str, user: &str| (id.to_string(), user.to_string());
+    assert_eq!(
+        named,
+        [
+            pair(&viewer_session, &viewer_id),
+            pair(&viewer_session, &viewer_id),
+            pair(&owner_session, &owner_id),
+            pair("g1f-owner-device", &owner_id),
+            pair(&viewer_session, &viewer_id),
+        ],
+        "each SessionChanged's (Id, UserId)"
+    );
+
+    // The viewer's socket gets the events for their own session, not the administrator's.
+    let session_owner = format!("SessionChanged {owner_id}");
+    let session_viewer = format!("SessionChanged {viewer_id}");
+    assert_eq!(
+        owner_socket.until_end().await,
+        g1c_sorted(&[
+            &session_owner,
+            &session_owner,
+            &session_viewer,
+            &session_viewer
+        ]),
+        "the administrator's socket"
+    );
+    assert_eq!(
+        viewer_socket.until_end().await,
+        g1c_sorted(&[&session_viewer, &session_viewer]),
+        "the viewer's socket"
+    );
+}
+
+#[tokio::test]
+async fn g1c_quick_connect_authorize_broadcasts_no_secret() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (_, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let initiate = request("POST", "/QuickConnect/Initiate", None, None);
+    let (status, started) = send(&app, initiate).await;
+    assert_eq!(status, StatusCode::OK, "initiate");
+    let secret = started["Secret"].as_str().unwrap().to_string();
+    let code = started["Code"].as_str().unwrap();
+    let mut events = state.ws_broadcast.subscribe();
+
+    let uri = format!("/QuickConnect/Authorize?code={code}");
+    let answer = send(&app, request("POST", &uri, Some(&viewer), None)).await;
+    assert_eq!(
+        answer,
+        (StatusCode::OK, serde_json::json!(true)),
+        "authorize"
+    );
+    // The secret is the new device's claim on the user who authorized it: no socket may see it.
+    while let Ok(event) = events.try_recv() {
+        let text = serde_json::to_string(&event).unwrap();
+        assert!(
+            !text.contains(&secret),
+            "a broadcast event carries the Quick Connect secret"
+        );
+    }
+    // The device still sees the authorization.
+    let uri = format!("/QuickConnect/Connect?secret={secret}");
+    let (status, polled) = send(&app, request("GET", &uri, None, None)).await;
+    assert_eq!(
+        (status, &polled["Authenticated"]),
+        (StatusCode::OK, &serde_json::json!(true)),
+        "connect"
+    );
+}
