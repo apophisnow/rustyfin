@@ -304,7 +304,7 @@ document.addEventListener('click', e => {
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
-    play: el => playItem(el.dataset.id, el.dataset.streamType, el.dataset.title),
+    play: el => playItem(el.dataset.id, el.dataset.streamType, el.dataset.title, { fromStart: el.dataset.fromStart === 'true' }),
     'scan-library': el => API.scanLibrary(el.dataset.id).then(() => toast(t('library.scan_started_for', { name: el.dataset.name }))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
     'scan-library-page': el => API.scanLibrary(el.dataset.id).then(() => { toast(t('library.media_scan_started_for', { name: el.dataset.name })); scanStatuses[el.dataset.id] = true; }).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
     'scan-library-admin': el => API.scanLibrary(el.dataset.id).then(() => toast(t('admin.scan_started'))).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error')),
@@ -1155,6 +1155,7 @@ async function renderDetail(itemId) {
         const backdropSrc = API.imageUrl(id, 'Backdrop', { maxWidth: 1920 });
         const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
         const streamType = type === 'Audio' ? 'Audio' : 'Videos';
+        const resumeTicks = streamType === 'Videos' ? resumePositionTicks(item) : 0;
 
         // Parallel fetch: Children/Seasons/Episodes AND Similar media
         // Previously these were sequential, causing a waterfall effect
@@ -1295,8 +1296,12 @@ async function renderDetail(itemId) {
                             ${canPlay ? `
                             <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                                ${t('common.play')}
-                            </button>` : ''}
+                                ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
+                            </button>
+                            ${resumeTicks > 0 ? `
+                            <button class="jf-btn-ghost !py-3 !px-4 text-sm" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}" data-from-start="true">
+                                ${t('detail.play_from_beginning')}
+                            </button>` : ''}` : ''}
 
                             <button class="jf-btn-ghost !py-3 !px-4 text-sm" title="${escapeHtml(t('detail.toggle_favorite'))}" data-action="toggle-favorite" data-id="${escapeHtml(id)}" data-favorite="${fav}">
                                 <span class="${fav ? 'text-rose-500 font-bold' : 'text-white/60'} text-base">♥</span>
@@ -1443,12 +1448,37 @@ function doSearch(term) {
 
 // HLS.js instance for adaptive streaming
 let hlsInstance = null;
+// The playback session in progress, or null when nothing is playing
+let activePlayback = null;
+// Promise of the last Stopped report; playItem waits for it before reading the resume point
+let pendingStop = Promise.resolve();
+// Incremented by each playItem call, so a call that finishes loading after a newer one gives up
+let playRequest = 0;
+
+// Ticks to resume from. Items at or past 90 % of their runtime count as watched and start over.
+function resumePositionTicks(item) {
+    const pos = item?.UserData?.PlaybackPositionTicks || 0;
+    if (!(pos > 0)) return 0;
+    const runtime = item.RunTimeTicks || 0;
+    if (runtime > 0 && pos >= runtime * 0.9) return 0;
+    return pos;
+}
+
+// Stops the session that is still playing, if any. Returns the promise of its Stopped report.
+function stopPlayback() {
+    if (activePlayback) activePlayback.stop();
+    return pendingStop;
+}
 
 // --- Video Player (Cinema Mode) ---
-async function playItem(itemId, streamType = 'Videos', title = '') {
+async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
     const video = $('video-player');
     const modal = $('player-modal');
     if (!video || !modal) return;
+    const request = ++playRequest;
+
+    // Report a session that is still playing as stopped before starting another
+    stopPlayback();
 
     // Destroy any existing HLS instance
     if (hlsInstance) {
@@ -1460,8 +1490,24 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
     $('player-subtitle').textContent = t('player.loading');
 
     // Show modal immediately while loading
-    if (typeof modal.showModal === 'function') modal.showModal();
-    else modal.setAttribute('open', '');
+    if (!modal.open) {
+        if (typeof modal.showModal === 'function') modal.showModal();
+        else modal.setAttribute('open', '');
+    }
+
+    // Read the resume point only after the Stopped report, so it includes the position just saved
+    await pendingStop;
+    let item = null;
+    try {
+        item = await API.get('/Items/' + itemId);
+    } catch (e) {
+        console.warn('Could not load item for resume point:', e);
+    }
+    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+    if (!title && item?.Name) $('player-title').textContent = item.Name;
+
+    const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
+    const startSeconds = startTicks / 1e7;
 
     let url;
     let isHls = false;
@@ -1504,6 +1550,8 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         $('player-subtitle').textContent = t('player.stream');
     }
 
+    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
+
     video.onerror = () => {
         console.error('Video playback error:', video.error);
         const errMsg = video.error ? video.error.message : t('common.unknown_error');
@@ -1515,13 +1563,16 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         hlsInstance = new Hls({
             enableWorker: true,
             lowLatencyMode: false,
+            startPosition: startTicks > 0 ? startSeconds : -1,
         });
         hlsInstance.loadSource(url);
         hlsInstance.attachMedia(video);
         hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (activePlayback !== session) return;
             video.play().catch(e => console.warn('Autoplay block:', e));
         });
         hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+            if (activePlayback !== session) return;
             console.error('HLS error:', data);
             if (data.fatal) {
                 $('player-subtitle').textContent = t('player.hls_error');
@@ -1538,16 +1589,58 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         // Safari native HLS support
         video.src = url;
         video.addEventListener('loadedmetadata', () => {
+            if (activePlayback !== session) return;
+            if (startTicks > 0) video.currentTime = startSeconds;
             video.play().catch(e => console.warn('Autoplay block:', e));
         }, { once: true });
     } else {
         // Direct play/stream
         video.src = url;
-        video.currentTime = 0;
+        if (startTicks > 0) {
+            video.addEventListener('loadedmetadata', () => {
+                if (activePlayback === session) video.currentTime = startSeconds;
+            }, { once: true });
+        }
         video.play().catch(e => console.warn('Autoplay block:', e));
     }
 
-    API.reportPlaying(itemId).catch(() => {});
+    API.reportPlaying(itemId, startTicks).catch(() => {});
+
+    // The session owns this playback: stop() reports the position once and tears the player down
+    let stopped = false;
+    const session = {
+        stop() {
+            if (stopped) return pendingStop;
+            stopped = true;
+            // Before metadata has loaded currentTime reads 0 even when resuming, so report the start position then
+            const ticks = video.readyState >= HTMLMediaElement.HAVE_METADATA
+                ? Math.round(video.currentTime * 10000000)
+                : startTicks;
+            if (playerReportInterval) {
+                clearInterval(playerReportInterval);
+                playerReportInterval = null;
+            }
+            if (activePlayback === session) activePlayback = null;
+            const reported = API.reportStopped(itemId, ticks).catch(e => console.warn('Reporting playback stop failed:', e));
+            pendingStop = reported;
+            // Once the Stopped report is in, refresh the open view so it shows the new resume point
+            reported.then(() => {
+                API.invalidateCache('/Items');
+                API.invalidateCache('/Shows');
+                if (currentPage === 'home') return renderHome();
+                if (currentPage === 'detail') return renderDetail(currentDetailId);
+            }).catch(e => console.warn('Refreshing views after playback failed:', e));
+            video.pause();
+            if (hlsInstance) {
+                hlsInstance.destroy();
+                hlsInstance = null;
+            }
+            video.removeAttribute('src');
+            video.load();
+            return reported;
+        },
+    };
+    activePlayback = session;
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
@@ -1577,26 +1670,9 @@ async function playItem(itemId, streamType = 'Videos', title = '') {
         if (slider) slider.value = video.volume;
     };
 
-    const cleanup = () => {
-        if (playerReportInterval) {
-            clearInterval(playerReportInterval);
-            playerReportInterval = null;
-        }
-        const ticks = Math.round((video.currentTime || 0) * 10000000);
-        API.reportStopped(itemId, ticks).catch(() => {});
+    video.onended = () => {
+        if (activePlayback === session) session.stop();
     };
-
-    video.onended = cleanup;
-    modal.addEventListener('close', () => {
-        video.pause();
-        // Destroy HLS instance if playing HLS
-        if (hlsInstance) {
-            hlsInstance.destroy();
-            hlsInstance = null;
-        }
-        video.src = '';
-        cleanup();
-    }, { once: true });
 }
 
 function closePlayer() {
@@ -2961,6 +3037,8 @@ function handleHash() {
 window.addEventListener('hashchange', handleHash);
 
 document.addEventListener('DOMContentLoaded', async () => {
+    // Every way of closing the player goes through here, so the session is stopped and its position reported once
+    $('player-modal')?.addEventListener('close', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
     if (!wizardActive) {
