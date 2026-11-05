@@ -13,126 +13,6 @@ use crate::naming;
 use crate::probe;
 use crate::scan_sync;
 
-// ---------------------------------------------------------------------------
-// Multiple version detection
-// ---------------------------------------------------------------------------
-
-/// Quality/resolution tags that commonly appear in file names to distinguish
-/// different versions of the same title.  Order matters: longer patterns first
-/// so "2160p" matches before "1080p".
-const VERSION_TAGS: &[&str] = &[
-    "4k",
-    "2160p",
-    "uhd",
-    "8k",
-    "4320p",
-    "1080p",
-    "fhd",
-    "720p",
-    "480p",
-    "sd",
-    "hdr10plus",
-    "hdr10",
-    "dolbyvision",
-    "hdr",
-    "imax",
-    "remaster",
-    "extended",
-    "uncut",
-    "director'scut",
-    "bluray",
-    "blu-ray",
-    "brrip",
-    "webrip",
-    "web-dl",
-    "webdl",
-    "hdtv",
-    "dvdrip",
-];
-
-/// Normalize a file name by stripping quality/resolution tags so that different
-/// versions of the same title produce the same normalized key.
-///
-/// Examples:
-///   "Inception (2010) 4K HDR.mkv"       -> "inception"
-///   "Inception (2010) 1080p BluRay.mkv" -> "inception"
-///   "Breaking Bad S01E01 720p.mkv"      -> "breaking bad s01e01"
-///
-/// Optimized: uses a single buffer and processes tags in one pass per word,
-/// reducing allocations from ~60 per call to ~2.
-fn normalize_name(file_stem: &str) -> String {
-    // Step 1: Remove bracketed content and lowercase in a single pass
-    let mut cleaned = String::with_capacity(file_stem.len());
-    let mut depth = 0i32;
-    for ch in file_stem.chars() {
-        match ch {
-            '[' | '(' | '{' => depth += 1,
-            ']' | ')' | '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            _ => {
-                if depth == 0 {
-                    cleaned.push(ch.to_ascii_lowercase());
-                }
-            }
-        }
-    }
-
-    // Step 2: Split into words and filter out tags and years in one pass
-    let words: Vec<&str> = cleaned.split_whitespace().collect();
-    let mut result = String::with_capacity(cleaned.len());
-    let mut first = true;
-    for word in words {
-        // Skip VERSION_TAGS
-        if VERSION_TAGS.contains(&word) {
-            continue;
-        }
-        // Skip standalone 4-digit years (1900-2100)
-        if let Ok(y) = word.parse::<i32>()
-            && (1900..=2100).contains(&y)
-        {
-            continue;
-        }
-        if !first {
-            result.push(' ');
-        }
-        result.push_str(word);
-        first = false;
-    }
-
-    result
-}
-
-/// Build a HashMap for O(1) episode version detection lookups.
-/// Key: (normalized_name, series_dir, season_id) -> Value: episode_id
-/// Pre-loading all episodes eliminates the N+1 query pattern during TV scanning.
-async fn build_episode_version_map(
-    pool: &SqlitePool,
-    library_id: Uuid,
-) -> Result<HashMap<(String, String, Uuid), Uuid>, sqlx::Error> {
-    let episodes = rustyfin_db::repo_media::get_library_episodes(pool, library_id).await?;
-    let mut map = HashMap::new();
-    for (path, id_str, parent_id_str) in episodes {
-        if let Ok(id) = Uuid::parse_str(&id_str)
-            && let Ok(season_id) = Uuid::parse_str(&parent_id_str)
-        {
-            let path_buf = Path::new(&path);
-            if let Some(stem) = path_buf.file_stem().and_then(|s| s.to_str()) {
-                let normalized = normalize_name(stem);
-                let series_dir = path_buf
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                map.insert((normalized, series_dir, season_id), id);
-            }
-        }
-    }
-    Ok(map)
-}
-
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg",
 ];
@@ -480,15 +360,15 @@ async fn scan_tv_library(
             .into_iter()
             .collect();
 
-    // Pre-load all existing series, season, and episode paths into HashMaps for O(1) ID lookup.
-    // Eliminates per-series/season/episode database queries during directory traversal.
+    // Pre-load all existing series and season paths into HashMaps for O(1) ID lookup.
+    // Eliminates per-series/season database queries during directory traversal.
     let existing_series: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Series").await?;
     let existing_seasons: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season").await?;
-    // Pre-load all episodes for version detection — eliminates N+1 query pattern.
-    let episode_version_map: HashMap<(String, String, Uuid), Uuid> =
-        build_episode_version_map(pool, library.id).await?;
+    // The episode files of each season, by season id: the season's name, then its files in walk
+    // order. The episodes are reconciled once every path has been walked.
+    let mut episode_files: BTreeMap<Uuid, (String, Vec<PathBuf>)> = BTreeMap::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -540,10 +420,9 @@ async fn scan_tv_library(
 
             let file_path = file_path_buf.to_string_lossy().to_string();
 
-            // Skip if already exists (in-memory check)
+            // An existing file is counted, then placed like a new one.
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
-                continue;
             }
 
             // Determine hierarchy from path components relative to lib_path
@@ -553,17 +432,12 @@ async fn scan_tv_library(
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect();
 
-            let (series_name, season_name, episode_name) = match components.len() {
+            let (series_name, season_name) = match components.len() {
                 // path/ShowName/Season/episode.mkv
                 3.. => {
                     let sn = components[0].to_string();
                     let sea = components[1].to_string();
-                    let ep = file_path_buf
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    (sn, sea, ep)
+                    (sn, sea)
                 }
                 // path/ShowName/episode.mkv (no season folder)
                 2 => {
@@ -574,17 +448,10 @@ async fn scan_tv_library(
                         .unwrap_or("Unknown")
                         .to_string();
                     let season = naming::parse_episode(&ep).and_then(|n| n.season);
-                    (sn, format!("Season {}", season.unwrap_or(1)), ep)
+                    (sn, format!("Season {}", season.unwrap_or(1)))
                 }
                 // path/episode.mkv (flat)
-                _ => {
-                    let ep = file_path_buf
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    ("Unknown Series".to_string(), "Season 1".to_string(), ep)
-                }
+                _ => ("Unknown Series".to_string(), "Season 1".to_string()),
             };
 
             let series_dir = path.join(&series_name).to_string_lossy().to_string();
@@ -653,113 +520,124 @@ async fn scan_tv_library(
                 id
             };
 
-            // Check if this is a version of an existing episode using pre-loaded HashMap.
-            // O(1) lookup instead of N+1 database queries.
-            let normalized = normalize_name(&episode_name);
-            let is_version = if let Some(&existing_id) =
-                episode_version_map.get(&(normalized.clone(), series_dir.clone(), season_id))
-            {
-                tracing::info!(
-                    "detected version of episode {}: {} -> {}",
-                    existing_id,
-                    file_path,
-                    normalized
-                );
-                plans.push((
-                    existing_id,
-                    vec![probe::ProbeStep::Alternate(file_path.clone())],
-                ));
-                count += 1;
-                true
-            } else {
-                false
-            };
-
-            if is_version {
-                continue;
-            }
-
-            // Create episode item
-            let parsed = naming::parse_episode(&episode_name);
-            let episode_index = parsed.map(|n| n.episode);
-            let season_index =
-                parse_season_number(&season_name).or_else(|| parsed.and_then(|n| n.season));
-            let episode_item = MediaItem {
-                id: Uuid::new_v4(),
-                name: episode_name.clone(),
-                sort_name: Some(episode_name.to_lowercase()),
-                overview: None,
-                media_type: MediaType::Episode,
-                path: file_path.clone(),
-                parent_id: Some(season_id),
-                library_id: library.id,
-                production_year: None,
-                community_rating: None,
-                official_rating: None,
-                genres: vec![],
-                date_created: Utc::now(),
-                premiere_date: None,
-                runtime_ticks: None,
-                index_number: episode_index,
-                parent_index_number: season_index,
-                media_sources: Vec::new(),
-                ..MediaItem::default_dto_fields()
-            };
-
-            new_items.push(episode_item);
+            episode_files
+                .entry(season_id)
+                .or_insert_with(|| (season_name, Vec::new()))
+                .1
+                .push(file_path_buf);
         }
 
         tracing::info!(
-            "TV library '{}': scanned {} files, skipped {} (non-video extension), created {} new items (series/seasons/episodes)",
+            "TV library '{}': scanned {} files, skipped {} (non-video extension), created {} new series and seasons",
             library.name,
             scanned_files,
             skipped_ext,
             new_items.len()
         );
 
-        // Batch-insert all new items (series, seasons, episodes) in a single transaction
+        // Batch-insert the new series and seasons in a single transaction. The episodes of the
+        // library need their seasons, so this runs before any episode is reconciled.
         if !new_items.is_empty() {
-            if let Err(e) =
-                rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_items).await
-            {
-                tracing::error!("failed to batch insert TV items: {}", e);
-            } else {
-                // Find and save local images for series and seasons
-                let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
-                for item in &new_items {
-                    if item.media_type == MediaType::Series || item.media_type == MediaType::Season
-                    {
-                        let item_path = std::path::Path::new(&item.path);
-                        let images = local_images::find_local_images(item_path, item.id);
-                        if !images.is_empty() {
-                            tracing::debug!(
-                                "found {} local images for '{}'",
-                                images.len(),
-                                item.name
-                            );
-                        }
-                        all_images.extend(images);
+            rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_items).await?;
+            // Find and save local images for series and seasons
+            let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
+            for item in &new_items {
+                if item.media_type == MediaType::Series || item.media_type == MediaType::Season {
+                    let item_path = std::path::Path::new(&item.path);
+                    let images = local_images::find_local_images(item_path, item.id);
+                    if !images.is_empty() {
+                        tracing::debug!("found {} local images for '{}'", images.len(), item.name);
                     }
+                    all_images.extend(images);
                 }
-                if !all_images.is_empty() {
-                    if let Err(e) =
-                        rustyfin_db::repo_image::batch_upsert_images(pool, &all_images).await
-                    {
-                        tracing::error!("failed to batch insert local images: {}", e);
-                    } else {
-                        tracing::info!("saved {} local images for TV library", all_images.len());
-                    }
-                }
-
-                // The new episodes are probed when the scan has finished.
-                for item in &new_items {
-                    if item.media_type == MediaType::Episode {
-                        plans.push((item.id, vec![probe::ProbeStep::Primary(item.path.clone())]));
-                    }
-                }
-                count += new_items.len() as u32;
-                new_item_ids = new_items.iter().map(|item| item.id).collect();
             }
+            if !all_images.is_empty() {
+                if let Err(e) =
+                    rustyfin_db::repo_image::batch_upsert_images(pool, &all_images).await
+                {
+                    tracing::error!("failed to batch insert local images: {}", e);
+                } else {
+                    tracing::info!("saved {} local images for TV library", all_images.len());
+                }
+            }
+            count += new_items.len() as u32;
+            new_item_ids.extend(new_items.iter().map(|item| item.id));
+        }
+    }
+
+    // Group the files of each season into episodes, then reconcile the episodes with the items.
+    // The numbers of an episode come from its primary file, the first of its versions.
+    let mut episode_groups: Vec<scan_sync::EpisodeGroup> = Vec::new();
+    for (&season_id, (season_name, season_files)) in &episode_files {
+        for versions in naming::group_episode_files(season_files, parse_season_number(season_name))
+        {
+            let stem = versions[0]
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Unknown");
+            let parsed = naming::parse_episode(stem);
+            episode_groups.push(scan_sync::EpisodeGroup {
+                files: versions,
+                season_id,
+                index_number: parsed.map(|n| n.episode),
+                parent_index_number: parse_season_number(season_name)
+                    .or_else(|| parsed.and_then(|n| n.season)),
+            });
+        }
+    }
+    let outcomes = scan_sync::reconcile_episode_groups(pool, library.id, &episode_groups).await?;
+    let mut new_episodes: Vec<MediaItem> = Vec::new();
+    let mut new_episode_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
+    for (group, outcome) in episode_groups.iter().zip(outcomes) {
+        match outcome {
+            scan_sync::GroupOutcome::Existing { item_id, steps } => {
+                if !steps.is_empty() {
+                    plans.push((item_id, steps));
+                }
+            }
+            scan_sync::GroupOutcome::New { steps } => {
+                let name = group.files[0]
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let item = MediaItem {
+                    id: Uuid::new_v4(),
+                    name: name.clone(),
+                    sort_name: Some(name.to_lowercase()),
+                    overview: None,
+                    media_type: MediaType::Episode,
+                    path: group.files[0].to_string_lossy().into_owned(),
+                    parent_id: Some(group.season_id),
+                    library_id: library.id,
+                    production_year: None,
+                    community_rating: None,
+                    official_rating: None,
+                    genres: vec![],
+                    date_created: Utc::now(),
+                    premiere_date: None,
+                    runtime_ticks: None,
+                    index_number: group.index_number,
+                    parent_index_number: group.parent_index_number,
+                    media_sources: Vec::new(),
+                    ..MediaItem::default_dto_fields()
+                };
+                new_episode_plans.push((item.id, steps));
+                new_episodes.push(item);
+            }
+        }
+    }
+
+    // Batch-insert the new episodes in a single transaction. As in the movie scan, their plans
+    // are queued only when the insert succeeds.
+    if !new_episodes.is_empty() {
+        if let Err(e) = rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_episodes).await
+        {
+            tracing::error!("failed to batch insert episodes: {}", e);
+        } else {
+            plans.append(&mut new_episode_plans);
+            count += new_episodes.len() as u32;
+            new_item_ids.extend(new_episodes.iter().map(|item| item.id));
         }
     }
 
@@ -1271,57 +1149,4 @@ fn parse_season_number(name: &str) -> Option<i32> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_normalize_name_strips_quality_tags() {
-        // Movie with 4K HDR
-        assert_eq!(normalize_name("Inception (2010) 4K HDR"), "inception");
-
-        // Movie with 1080p BluRay
-        assert_eq!(normalize_name("Inception (2010) 1080p BluRay"), "inception");
-
-        // Both should match
-        assert_eq!(
-            normalize_name("Inception (2010) 4K HDR"),
-            normalize_name("Inception (2010) 1080p BluRay")
-        );
-
-        // Episode with resolution tag
-        assert_eq!(
-            normalize_name("Breaking Bad S01E01 720p"),
-            "breaking bad s01e01"
-        );
-
-        // Episode with different resolution
-        assert_eq!(
-            normalize_name("Breaking Bad S01E01 1080p"),
-            "breaking bad s01e01"
-        );
-
-        // Both should match
-        assert_eq!(
-            normalize_name("Breaking Bad S01E01 720p"),
-            normalize_name("Breaking Bad S01E01 1080p")
-        );
-
-        // Movie with brackets
-        assert_eq!(
-            normalize_name("The Matrix [2023] [4K] [HDR10]"),
-            "the matrix"
-        );
-
-        // Movie with web-dl tag
-        assert_eq!(normalize_name("Movie Name (2023) Web-DL HDR"), "movie name");
-
-        // No tags — name preserved
-        assert_eq!(normalize_name("Simple Movie"), "simple movie");
-
-        // IMAX version
-        assert_eq!(normalize_name("Oppenheimer 2023 IMAX 4K"), "oppenheimer");
-    }
 }

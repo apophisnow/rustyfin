@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Movie titles**: Movie titles no longer keep the year and release tags of the file name. Scans clean the name with Jellyfin's rules and store the year as the movie's year. Existing movies are renamed on the next scan, unless metadata set the title.
 - **Movie versions**: The files of one film in a folder, such as a 1080p and a 2160p copy, are now one movie with a source for each file: the file named like the folder first, then the highest resolution. Before, a fresh scan made a movie per file, and every rescan added the alternate files as sources again. The next scan merges an existing library's copies into one movie and keeps their watch history, favorites, collections and playlists. The runtime and chapters come from the first source; an alternate no longer overwrites them.
 - **Concurrent scans**: Scans run one at a time, so two scans started together, such as a manual scan during the scheduled one, no longer create the same movie twice.
+- **Episode versions**: The files of one episode in a season, such as a 1080p and a 2160p copy, are now one episode with a source for each file, the highest resolution first. Before, every file was an episode of its own. The next scan merges an existing library's copies into one episode and keeps their watch history, favorites and playlists. A file directly in a series folder joins the same episode in its season's folder.
 
 ## [0.14.0] - 2026-11-03
 

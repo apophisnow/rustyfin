@@ -1,6 +1,6 @@
 //! Library scans of real files in a temp dir: ignored folders and files (R1-12), symlink
 //! loops (M-19), removal of items that a scan no longer collects, episode numbers (R1-13),
-//! movie titles (R1-27), and the versions of a movie as one item (R1-20).
+//! movie titles (R1-27), and the versions of a movie or an episode as one item (R1-20).
 //!
 //! The tests marked "ffmpeg" write real clips and need ffmpeg and ffprobe; without them they
 //! print a line and pass.
@@ -310,10 +310,14 @@ async fn snapshot(pool: &SqlitePool, lib: &Library) -> Vec<ItemState> {
     items
 }
 
-/// Asserts that the library's items are exactly `groups`, as (item path, source paths in
-/// rowid order), and that each item's runtime is that of its first source (AC 10).
+/// Asserts that the library's movies and episodes are exactly `groups`, as (item path, source
+/// paths in rowid order), and that each one's runtime is that of its first source (AC 10).
 async fn assert_groups(pool: &SqlitePool, lib: &Library, groups: &[(&str, &[&str])]) {
-    let items = snapshot(pool, lib).await;
+    let items: Vec<ItemState> = snapshot(pool, lib)
+        .await
+        .into_iter()
+        .filter(|i| matches!(i.media_type.as_str(), "Movie" | "Episode"))
+        .collect();
     let got: Vec<(&str, Vec<&str>)> = items
         .iter()
         .map(|i| {
@@ -330,7 +334,8 @@ async fn assert_groups(pool: &SqlitePool, lib: &Library, groups: &[(&str, &[&str
     let firsts: Vec<(String, Option<i64>)> = sqlx::query_as(
         "SELECT i.path, (SELECT s.run_time_ticks FROM media_sources AS s
                          WHERE s.item_id = i.id ORDER BY s.rowid LIMIT 1)
-         FROM media_items AS i WHERE i.library_id = ?1",
+         FROM media_items AS i
+         WHERE i.library_id = ?1 AND i.media_type IN ('Movie', 'Episode')",
     )
     .bind(lib.id.to_string())
     .fetch_all(pool)
@@ -486,6 +491,183 @@ const FILM_GROUPS: &[(&str, &[&str])] = &[
     ),
     ("The Room.mkv", &["The Room.mkv"]),
 ];
+
+/// Every (path, id) of the library's items, by path.
+async fn item_ids(pool: &SqlitePool, lib: &Library) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT path, id FROM media_items WHERE library_id = ?1 ORDER BY path")
+        .bind(lib.id.to_string())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+const SEV_E1_SD: &str = "Severance/Season 1/Severance S01E01 720p.mkv";
+const SEV_E1_HD: &str = "Severance/Season 1/Severance S01E01 1080p.mkv";
+const SEV_E2: &str = "Severance/Season 1/Severance S01E02.mkv";
+const SEV_E5: &str = "Severance/Season 1/Severance S01E05.mkv";
+const SEV_E5_SD: &str = "Severance/Season 1/Severance S01E05 720p.mkv";
+/// The fifth episode of season 2, filed in Season 1.
+const SEV_MISFILED: &str = "Severance/Season 1/Severance S02E05.mkv";
+const SEV_BONUS: &str = "Severance/Season 1/Bonus.mkv";
+const SEV_S2E1: &str = "Severance/Season 2/Severance S02E01.mkv";
+/// Directly in the series folder.
+const OTHER_E1: &str = "Other/S03E01.mkv";
+
+/// Writes the episodes of `episode_versions_are_one_item` and `tv_upgrade_matches_fresh_scan`.
+/// Each version is longer or shorter than its primary, so a runtime taken from the wrong file
+/// shows.
+fn write_tv(fx: &Fixture, root: &Path) {
+    for (file, secs) in [
+        (SEV_E1_SD, 2),
+        (SEV_E1_HD, 3),
+        (SEV_E2, 2),
+        (SEV_E5, 3),
+        (SEV_E5_SD, 2),
+        (SEV_MISFILED, 2),
+        (SEV_BONUS, 2),
+        (SEV_S2E1, 2),
+        (OTHER_E1, 2),
+    ] {
+        clip(fx, root, file, secs);
+    }
+}
+
+/// The episodes that `write_tv` must give: one per (season, episode) of a season, the file
+/// with the highest resolution first. The misfiled episode's key has its own season, so it is
+/// not merged with the fifth episode of Season 1.
+const TV_GROUPS: &[(&str, &[&str])] = &[
+    (OTHER_E1, &[OTHER_E1]),
+    (SEV_BONUS, &[SEV_BONUS]),
+    (SEV_E1_HD, &[SEV_E1_HD, SEV_E1_SD]),
+    (SEV_E2, &[SEV_E2]),
+    (SEV_E5_SD, &[SEV_E5_SD, SEV_E5]),
+    (SEV_MISFILED, &[SEV_MISFILED]),
+    (SEV_S2E1, &[SEV_S2E1]),
+];
+
+/// (media type, path, name, sort_name, index, parent index, parent path) of an item.
+type TvFields = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+fn tv_fields(items: &[ItemState]) -> Vec<TvFields> {
+    items
+        .iter()
+        .map(|i| {
+            (
+                i.media_type.clone(),
+                i.path.clone(),
+                i.name.clone(),
+                i.sort_name.clone(),
+                i.index,
+                i.parent_index,
+                i.parent_path.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The Series at `path`, as a scan names it.
+fn series_row(path: &str) -> TvFields {
+    let name = path.to_string();
+    let sort_name = Some(path.to_lowercase());
+    (
+        "Series".into(),
+        path.into(),
+        name,
+        sort_name,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Season `index` of `series`, as a scan names it.
+fn season_row(series: &str, index: i64) -> TvFields {
+    (
+        "Season".into(),
+        format!("{series}/Season {index}"),
+        format!("Season {index}"),
+        Some(format!("season {index:04}")),
+        Some(index),
+        None,
+        Some(series.into()),
+    )
+}
+
+/// The Episode at `path`, named after its file stem, in season `season` at `season_path`.
+fn episode_row(path: &str, index: Option<i64>, season: i64, season_path: &str) -> TvFields {
+    let stem = Path::new(path).file_stem().unwrap().to_str().unwrap();
+    (
+        "Episode".into(),
+        path.into(),
+        stem.into(),
+        Some(stem.to_lowercase()),
+        index,
+        Some(season),
+        Some(season_path.into()),
+    )
+}
+
+/// A TV item as a test inserts it. Names left `None` take the last path component (the file
+/// stem, for an episode) and its lowercase form.
+#[derive(Default)]
+struct Tv<'a> {
+    name: Option<&'a str>,
+    sort_name: Option<&'a str>,
+    index: Option<i64>,
+    parent_index: Option<i64>,
+    /// RFC 3339, the way the scanner stores it.
+    date_created: Option<&'a str>,
+}
+
+/// Inserts the item at `<root>/<rel>`, and returns its id.
+async fn insert_tv(
+    pool: &SqlitePool,
+    lib: &Library,
+    media_type: &str,
+    rel: &str,
+    parent: Option<Uuid>,
+    tv: Tv<'_>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let path = root_of(lib).join(rel);
+    let last = if media_type == "Episode" {
+        path.file_stem()
+    } else {
+        path.file_name()
+    };
+    let name = tv.name.unwrap_or(last.unwrap().to_str().unwrap());
+    let sort_name = tv
+        .sort_name
+        .map_or_else(|| name.to_lowercase(), str::to_string);
+    sqlx::query(
+        "INSERT INTO media_items
+           (id, name, sort_name, media_type, path, library_id, parent_id, index_number,
+            parent_index_number, date_created)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )
+    .bind(id.to_string())
+    .bind(name)
+    .bind(sort_name)
+    .bind(media_type)
+    .bind(path.to_str().unwrap())
+    .bind(lib.id.to_string())
+    .bind(parent.map(|p| p.to_string()))
+    .bind(tv.index)
+    .bind(tv.parent_index)
+    .bind(tv.date_created.unwrap_or("2024-01-01T00:00:00+00:00"))
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
 
 #[tokio::test]
 async fn scan_skips_ignored_dirs_and_files() {
@@ -1342,5 +1524,288 @@ async fn rescan_keeps_names_from_metadata() {
             titled("Heat (1995)/Heat (1995).mkv", "Heat", Some(1995)),
             titled("Se7en (1995)/Se7en (1995).mkv", "Se7en", Some(1996)),
         ]
+    );
+}
+
+/// ffmpeg. The versions of an episode are one item, numbered from its primary, and rescans
+/// change nothing (AC 13, AC 11, AC 15).
+#[tokio::test]
+async fn episode_versions_are_one_item() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    write_tv(&fx, &root);
+    let before = tree(&root);
+
+    scan_idle(&fx.pool, &lib).await;
+
+    assert_groups(&fx.pool, &lib, TV_GROUPS).await;
+    let season_1 = "Severance/Season 1";
+    assert_eq!(
+        tv_fields(&snapshot(&fx.pool, &lib).await),
+        [
+            series_row("Other"),
+            episode_row(OTHER_E1, Some(1), 3, "Other/Season 3"),
+            season_row("Other", 3),
+            series_row("Severance"),
+            season_row("Severance", 1),
+            episode_row(SEV_BONUS, None, 1, season_1),
+            episode_row(SEV_E1_HD, Some(1), 1, season_1),
+            episode_row(SEV_E2, Some(2), 1, season_1),
+            episode_row(SEV_E5_SD, Some(5), 1, season_1),
+            // The season folder's number wins over the file's.
+            episode_row(SEV_MISFILED, Some(5), 1, season_1),
+            season_row("Severance", 2),
+            episode_row(SEV_S2E1, Some(1), 2, "Severance/Season 2"),
+        ]
+    );
+
+    let ids = source_ids(&fx.pool, &lib).await;
+    let items = item_ids(&fx.pool, &lib).await;
+    let state = snapshot(&fx.pool, &lib).await;
+    for _ in 0..2 {
+        scan_idle(&fx.pool, &lib).await;
+        assert_eq!(
+            source_ids(&fx.pool, &lib).await,
+            ids,
+            "a rescan probed again"
+        );
+        assert_eq!(
+            item_ids(&fx.pool, &lib).await,
+            items,
+            "a rescan replaced an item"
+        );
+        assert_eq!(snapshot(&fx.pool, &lib).await, state);
+    }
+    // AC 15: the scans wrote nothing inside the library.
+    assert_eq!(tree(&root), before);
+}
+
+/// ffmpeg. A TV library as the old scanner left it, with split versions, a duplicate source,
+/// no episode numbers and the episodes of a series folder in Season 1, ends the same as a
+/// fresh scan of the same files, and keeps the items that users know (AC 12).
+#[tokio::test]
+async fn tv_upgrade_matches_fresh_scan() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    write_tv(&fx, &root);
+
+    // The same files as the old scanner left them, in a second database.
+    let old = fx.second_db("old.db", &lib).await;
+    let user = insert_user(&old).await;
+    let season = |index, sort_name| Tv {
+        sort_name: Some(sort_name),
+        index: Some(index),
+        ..Tv::default()
+    };
+    let in_season = |parent_index| Tv {
+        parent_index: Some(parent_index),
+        ..Tv::default()
+    };
+    let sev = insert_tv(&old, &lib, "Series", "Severance", None, Tv::default()).await;
+    let s1 = insert_tv(
+        &old,
+        &lib,
+        "Season",
+        "Severance/Season 1",
+        Some(sev),
+        season(1, "season 0001"),
+    )
+    .await;
+    let s2 = insert_tv(
+        &old,
+        &lib,
+        "Season",
+        "Severance/Season 2",
+        Some(sev),
+        season(2, "season 0002"),
+    )
+    .await;
+    let other = insert_tv(&old, &lib, "Series", "Other", None, Tv::default()).await;
+    let other_s1 = insert_tv(
+        &old,
+        &lib,
+        "Season",
+        "Other/Season 1",
+        Some(other),
+        season(1, "season 0001"),
+    )
+    .await;
+
+    // S01E01: the versions were split into two items. The older one, which is not the
+    // primary, was played and is pinned as the series' next episode.
+    let e1_sd = insert_tv(
+        &old,
+        &lib,
+        "Episode",
+        SEV_E1_SD,
+        Some(s1),
+        Tv {
+            parent_index: Some(1),
+            date_created: Some("2020-01-01T00:00:00+00:00"),
+            ..Tv::default()
+        },
+    )
+    .await;
+    old_probe(&old, &lib, e1_sd, &[SEV_E1_SD]).await;
+    let e1_hd = insert_tv(
+        &old,
+        &lib,
+        "Episode",
+        SEV_E1_HD,
+        Some(s1),
+        Tv {
+            parent_index: Some(1),
+            date_created: Some("2021-01-01T00:00:00+00:00"),
+            ..Tv::default()
+        },
+    )
+    .await;
+    old_probe(&old, &lib, e1_hd, &[SEV_E1_HD]).await;
+    exec(
+        &old,
+        "INSERT INTO user_item_data (user_id, item_id, played) VALUES (?1, ?2, 1)",
+        &[&user, &e1_sd.to_string()],
+    )
+    .await;
+    const PIN: &str = "INSERT INTO pinned_episodes
+                         (user_id, series_id, episode_id, season_id, created_date)
+                       VALUES (?1, ?2, ?3, ?4, datetime('now'))";
+    exec(
+        &old,
+        PIN,
+        &[&user, &sev.to_string(), &e1_sd.to_string(), &s1.to_string()],
+    )
+    .await;
+
+    // S01E02: its name came from metadata.
+    let e2 = insert_tv(
+        &old,
+        &lib,
+        "Episode",
+        SEV_E2,
+        Some(s1),
+        Tv {
+            name: Some("Good News About Hell"),
+            sort_name: Some("good news about hell"),
+            parent_index: Some(1),
+            ..Tv::default()
+        },
+    )
+    .await;
+    old_probe(&old, &lib, e2, &[SEV_E2]).await;
+
+    // S01E05: the 720p version was added again by each rescan, and its runtime replaced the
+    // item's.
+    let e5 = insert_tv(&old, &lib, "Episode", SEV_E5, Some(s1), in_season(1)).await;
+    old_probe(&old, &lib, e5, &[SEV_E5, SEV_E5_SD, SEV_E5_SD]).await;
+
+    // Right but for their numbers, so they must not be probed again. The episode in the series
+    // folder went into Season 1, whatever its name said.
+    let misfiled = insert_tv(&old, &lib, "Episode", SEV_MISFILED, Some(s1), in_season(1)).await;
+    old_probe(&old, &lib, misfiled, &[SEV_MISFILED]).await;
+    let bonus = insert_tv(&old, &lib, "Episode", SEV_BONUS, Some(s1), in_season(1)).await;
+    old_probe(&old, &lib, bonus, &[SEV_BONUS]).await;
+    let s2e1 = insert_tv(&old, &lib, "Episode", SEV_S2E1, Some(s2), in_season(2)).await;
+    old_probe(&old, &lib, s2e1, &[SEV_S2E1]).await;
+    let o1 = insert_tv(
+        &old,
+        &lib,
+        "Episode",
+        OTHER_E1,
+        Some(other_s1),
+        in_season(1),
+    )
+    .await;
+    old_probe(&old, &lib, o1, &[OTHER_E1]).await;
+    // Pinned as the next episode of its series. Its old season goes, and the pin must not.
+    exec(
+        &old,
+        PIN,
+        &[
+            &user,
+            &other.to_string(),
+            &o1.to_string(),
+            &other_s1.to_string(),
+        ],
+    )
+    .await;
+
+    let kept = [e2, misfiled, bonus, s2e1, o1].map(|id| id.to_string());
+    let sources_of_kept = |ids: Vec<(String, String)>| -> Vec<(String, String)> {
+        ids.into_iter()
+            .filter(|(item, _)| kept.contains(item))
+            .collect()
+    };
+    let kept_before = sources_of_kept(source_ids(&old, &lib).await);
+
+    scan_idle(&fx.pool, &lib).await;
+    assert_groups(&fx.pool, &lib, TV_GROUPS).await;
+    // The rescan keeps the name that metadata gave S01E02.
+    let mut want = snapshot(&fx.pool, &lib).await;
+    let named = want.iter_mut().find(|i| i.path == SEV_E2).unwrap();
+    named.name = "Good News About Hell".into();
+    named.sort_name = Some("good news about hell".into());
+
+    scan_idle(&old, &lib).await;
+
+    assert_eq!(snapshot(&old, &lib).await, want);
+    for (rel, id) in [
+        ("Other", other),
+        ("Severance", sev),
+        ("Severance/Season 1", s1),
+        ("Severance/Season 2", s2),
+        (SEV_E1_HD, e1_hd),
+        (SEV_E2, e2),
+        (SEV_E5_SD, e5),
+        (SEV_MISFILED, misfiled),
+        (SEV_BONUS, bonus),
+        (SEV_S2E1, s2e1),
+        (OTHER_E1, o1),
+    ] {
+        assert_eq!(item_at(&old, &lib, rel).await, id, "the item at {rel}");
+    }
+    let played: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT user_id, item_id, played FROM user_item_data")
+            .fetch_all(&old)
+            .await
+            .unwrap();
+    assert_eq!(played, [(user, e1_hd.to_string(), 1)]);
+    // Each pin moves to the surviving episode, and to the season it is in now.
+    let season_3 = item_at(&old, &lib, "Other/Season 3").await;
+    let mut want_pins =
+        [(sev, e1_hd, s1), (other, o1, season_3)].map(|(series, episode, season)| {
+            (series.to_string(), episode.to_string(), season.to_string())
+        });
+    want_pins.sort();
+    let pins: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT series_id, episode_id, season_id FROM pinned_episodes ORDER BY series_id",
+    )
+    .fetch_all(&old)
+    .await
+    .unwrap();
+    assert_eq!(pins, want_pins);
+    assert_eq!(
+        sources_of_kept(source_ids(&old, &lib).await),
+        kept_before,
+        "an episode whose sources were right was probed again"
+    );
+
+    // A second rescan changes nothing.
+    let ids = source_ids(&old, &lib).await;
+    scan_idle(&old, &lib).await;
+    assert_eq!(
+        source_ids(&old, &lib).await,
+        ids,
+        "the second rescan probed again"
     );
 }

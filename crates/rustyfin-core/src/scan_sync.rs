@@ -1,5 +1,5 @@
 //! Removal of items that a library scan no longer collects, the helper that deletes an item, and the
-//! reconciliation of movie version groups with the database.
+//! reconciliation of movie and episode version groups with the database.
 //! All SQL that a scan uses to write items lives here.
 
 use std::collections::{HashMap, HashSet};
@@ -149,9 +149,9 @@ async fn is_regular_file(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file())
 }
 
-/// A movie item of the library, as [`reconcile_movie_groups`] reads it.
+/// An item of the library, as [`reconcile_groups`] reads it.
 #[derive(sqlx::FromRow)]
-struct MovieRow {
+struct ItemRow {
     id: String,
     path: String,
     name: String,
@@ -159,9 +159,12 @@ struct MovieRow {
     production_year: Option<i32>,
     runtime_ticks: Option<i64>,
     date_created: String,
+    index_number: Option<i32>,
+    parent_index_number: Option<i32>,
+    parent_id: Option<String>,
 }
 
-/// A source of a movie item, as [`reconcile_movie_groups`] reads it.
+/// A source of an item, as [`reconcile_groups`] reads it.
 #[derive(sqlx::FromRow)]
 struct SourceRow {
     item_id: String,
@@ -169,7 +172,27 @@ struct SourceRow {
     run_time_ticks: Option<i64>,
 }
 
-/// What a scan does with one movie version group, as decided by [`reconcile_movie_groups`].
+/// The fields that a group gives its item, by media type.
+enum Wanted {
+    /// A movie: its title and year.
+    Movie { title: String, year: Option<i32> },
+    /// An episode: the stem of its primary file, its numbers, and its season.
+    Episode {
+        name: String,
+        index_number: Option<i32>,
+        parent_index_number: Option<i32>,
+        parent_id: Uuid,
+    },
+}
+
+/// A group that [`reconcile_groups`] settles: its files, primary first, and the fields it gives.
+struct WantedGroup {
+    files: Vec<String>,
+    wanted: Wanted,
+}
+
+/// What a scan does with one version group, as decided by [`reconcile_movie_groups`] and
+/// [`reconcile_episode_groups`].
 #[derive(Debug)]
 pub enum GroupOutcome {
     /// The group's item exists. `steps` is empty when the item needs no probing.
@@ -183,49 +206,99 @@ pub enum GroupOutcome {
 
 /// Matches each movie version group with its item, merges the other owners of a group into the
 /// survivor, updates the survivor's path and names, and says what to probe. The outcomes are in the
-/// order of `groups`.
-///
-/// Groups are handled in order of primary path, and the writes for one group run in one
-/// transaction. Call this before the removal of items that are no longer collected.
+/// order of `groups`. Call this before the removal of items that are no longer collected.
 pub async fn reconcile_movie_groups(
     pool: &SqlitePool,
     library_id: Uuid,
     groups: &[VersionGroup],
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
-    let group_files: Vec<Vec<String>> = groups
+    let wanted: Vec<WantedGroup> = groups
         .iter()
-        .map(|g| {
-            g.files
-                .iter()
-                .map(|f| f.to_string_lossy().into_owned())
-                .collect()
+        .map(|group| WantedGroup {
+            files: strings_of(&group.files),
+            wanted: Wanted::Movie {
+                title: group.title.clone(),
+                year: group.year,
+            },
         })
         .collect();
+    reconcile_groups(pool, library_id, "Movie", &wanted).await
+}
+
+/// One episode's files, primary first, and the fields that its primary gives the item.
+pub struct EpisodeGroup {
+    pub files: Vec<PathBuf>,
+    pub season_id: Uuid,
+    pub index_number: Option<i32>,
+    pub parent_index_number: Option<i32>,
+}
+
+/// Matches each episode group with its item, as [`reconcile_movie_groups`] does for movies. The
+/// outcomes are in the order of `groups`. The name and sort name of an episode come from the stem
+/// of its primary file. Call this before the removal of items that are no longer collected.
+pub async fn reconcile_episode_groups(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    groups: &[EpisodeGroup],
+) -> Result<Vec<GroupOutcome>, sqlx::Error> {
+    let wanted: Vec<WantedGroup> = groups
+        .iter()
+        .map(|group| WantedGroup {
+            files: strings_of(&group.files),
+            wanted: Wanted::Episode {
+                name: group
+                    .files
+                    .first()
+                    .and_then(|file| file.file_stem())
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                index_number: group.index_number,
+                parent_index_number: group.parent_index_number,
+                parent_id: group.season_id,
+            },
+        })
+        .collect();
+    reconcile_groups(pool, library_id, "Episode", &wanted).await
+}
+
+/// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
+///
+/// Groups are handled in order of primary path, and the writes for one group run in one
+/// transaction.
+async fn reconcile_groups(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    media_type: &str,
+    groups: &[WantedGroup],
+) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let library = library_id.to_string();
-    let items: Vec<MovieRow> = sqlx::query_as(
-        "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created
-         FROM media_items WHERE library_id = ?1 AND media_type = 'Movie'",
+    let items: Vec<ItemRow> = sqlx::query_as(
+        "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created,
+                index_number, parent_index_number, parent_id
+         FROM media_items WHERE library_id = ?1 AND media_type = ?2",
     )
     .bind(library.as_str())
+    .bind(media_type)
     .fetch_all(pool)
     .await?;
     let sources: Vec<SourceRow> = sqlx::query_as(
         "SELECT s.item_id, s.path, s.run_time_ticks
          FROM media_sources AS s
          JOIN media_items AS m ON m.id = s.item_id
-         WHERE m.library_id = ?1 AND m.media_type = 'Movie'
+         WHERE m.library_id = ?1 AND m.media_type = ?2
          ORDER BY s.rowid",
     )
     .bind(library.as_str())
+    .bind(media_type)
     .fetch_all(pool)
     .await?;
 
-    let item_by_id: HashMap<&str, &MovieRow> = items.iter().map(|i| (i.id.as_str(), i)).collect();
-    let mut by_path: HashMap<&str, Vec<&MovieRow>> = HashMap::new();
+    let item_by_id: HashMap<&str, &ItemRow> = items.iter().map(|i| (i.id.as_str(), i)).collect();
+    let mut by_path: HashMap<&str, Vec<&ItemRow>> = HashMap::new();
     for item in &items {
         by_path.entry(item.path.as_str()).or_default().push(item);
     }
-    let mut by_source: HashMap<&str, Vec<&MovieRow>> = HashMap::new();
+    let mut by_source: HashMap<&str, Vec<&ItemRow>> = HashMap::new();
     let mut sources_of: HashMap<&str, Vec<&SourceRow>> = HashMap::new();
     for row in &sources {
         sources_of
@@ -236,18 +309,22 @@ pub async fn reconcile_movie_groups(
             by_source.entry(row.path.as_str()).or_default().push(item);
         }
     }
-    let group_paths: HashSet<&str> = group_files.iter().flatten().map(String::as_str).collect();
+    let group_paths: HashSet<&str> = groups
+        .iter()
+        .flat_map(|group| group.files.iter())
+        .map(String::as_str)
+        .collect();
 
     let mut order: Vec<usize> = (0..groups.len()).collect();
-    order.sort_by_key(|&idx| group_files[idx].first());
+    order.sort_by_key(|&idx| groups[idx].files.first());
     let mut claimed: HashSet<&str> = HashSet::new();
     let mut outcomes: Vec<(usize, GroupOutcome)> = Vec::with_capacity(groups.len());
     for idx in order {
-        let files = &group_files[idx];
-        let owners = owners_of(files, &by_path, &by_source, &group_paths, &claimed);
+        let group = &groups[idx];
+        let owners = owners_of(&group.files, &by_path, &by_source, &group_paths, &claimed);
         let outcome = match owners.split_first() {
             None => GroupOutcome::New {
-                steps: group_steps(files),
+                steps: group_steps(&group.files),
             },
             Some((&survivor, others)) => {
                 claimed.extend(owners.iter().map(|owner| owner.id.as_str()));
@@ -255,8 +332,7 @@ pub async fn reconcile_movie_groups(
                     .get(survivor.id.as_str())
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                let group = &groups[idx];
-                settle_group(pool, group, files, survivor, others, survivor_sources).await?
+                settle_group(pool, group, survivor, others, survivor_sources).await?
             }
         };
         outcomes.push((idx, outcome));
@@ -270,12 +346,12 @@ pub async fn reconcile_movie_groups(
 /// and that has a source among `files`.
 fn owners_of<'a>(
     files: &[String],
-    by_path: &HashMap<&str, Vec<&'a MovieRow>>,
-    by_source: &HashMap<&str, Vec<&'a MovieRow>>,
+    by_path: &HashMap<&str, Vec<&'a ItemRow>>,
+    by_source: &HashMap<&str, Vec<&'a ItemRow>>,
     group_paths: &HashSet<&str>,
     claimed: &HashSet<&str>,
-) -> Vec<&'a MovieRow> {
-    let mut owners: Vec<&'a MovieRow> = Vec::new();
+) -> Vec<&'a ItemRow> {
+    let mut owners: Vec<&'a ItemRow> = Vec::new();
     for file in files {
         owners.extend(by_path.get(file.as_str()).into_iter().flatten().copied());
         for &item in by_source.get(file.as_str()).into_iter().flatten() {
@@ -300,15 +376,13 @@ fn owners_of<'a>(
 /// survivor's fields that changed, and works out what to probe.
 async fn settle_group(
     pool: &SqlitePool,
-    group: &VersionGroup,
-    files: &[String],
-    survivor: &MovieRow,
-    others: &[&MovieRow],
+    group: &WantedGroup,
+    survivor: &ItemRow,
+    others: &[&ItemRow],
     sources: &[&SourceRow],
 ) -> Result<GroupOutcome, sqlx::Error> {
-    // The owners come from `files`, so it is not empty.
-    let primary = files[0].as_str();
-    let title = group.title.as_str();
+    // The owners come from the group's files, so there is a primary.
+    let primary = group.files[0].as_str();
     // The survivor's path and names before this scan. A name that the old code made from the file
     // stem is rewritten; a name that metadata set is kept.
     let old_stem = Path::new(&survivor.path)
@@ -317,26 +391,52 @@ async fn settle_group(
     let old_stem_lower = old_stem.as_ref().map(|stem| stem.to_lowercase());
     let old_year = old_stem.as_deref().and_then(parse_year);
 
+    let given_name = match &group.wanted {
+        Wanted::Movie { title, .. } => title.as_str(),
+        Wanted::Episode { name, .. } => name.as_str(),
+    };
     let name = if old_stem.as_deref() == Some(survivor.name.as_str()) {
-        title.to_string()
+        given_name.to_string()
     } else {
         survivor.name.clone()
     };
     let sort_name = if survivor.sort_name.is_none() || survivor.sort_name == old_stem_lower {
-        Some(title.to_lowercase())
+        Some(given_name.to_lowercase())
     } else {
         survivor.sort_name.clone()
     };
-    let production_year =
-        if survivor.production_year.is_none() || survivor.production_year == old_year {
-            group.year
-        } else {
-            survivor.production_year
-        };
+    // A movie takes its year and keeps its episode fields. An episode keeps its year and takes the
+    // group's numbers and season.
+    let (production_year, index_number, parent_index_number, parent_id) = match &group.wanted {
+        Wanted::Movie { year, .. } => (
+            if survivor.production_year.is_none() || survivor.production_year == old_year {
+                *year
+            } else {
+                survivor.production_year
+            },
+            survivor.index_number,
+            survivor.parent_index_number,
+            survivor.parent_id.clone(),
+        ),
+        Wanted::Episode {
+            index_number,
+            parent_index_number,
+            parent_id: season,
+            ..
+        } => (
+            survivor.production_year,
+            *index_number,
+            *parent_index_number,
+            Some(season.to_string()),
+        ),
+    };
     let fields_changed = survivor.path != primary
         || name != survivor.name
         || sort_name != survivor.sort_name
-        || production_year != survivor.production_year;
+        || production_year != survivor.production_year
+        || index_number != survivor.index_number
+        || parent_index_number != survivor.parent_index_number
+        || parent_id != survivor.parent_id;
 
     if !others.is_empty() || fields_changed {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -346,16 +446,32 @@ async fn settle_group(
         }
         if fields_changed {
             sqlx::query(
-                "UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3, production_year = ?4
-                 WHERE id = ?5",
+                "UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3, production_year = ?4,
+                 index_number = ?5, parent_index_number = ?6, parent_id = ?7
+                 WHERE id = ?8",
             )
             .bind(primary)
             .bind(name.as_str())
             .bind(sort_name.as_deref())
             .bind(production_year)
+            .bind(index_number)
+            .bind(parent_index_number)
+            .bind(parent_id.as_deref())
             .bind(survivor.id.as_str())
             .execute(&mut *tx)
             .await?;
+        }
+        // The pins of an episode follow its season. This runs after the merges, which have moved the
+        // pins of the other owners onto the survivor.
+        if let Wanted::Episode {
+            parent_id: season, ..
+        } = &group.wanted
+        {
+            sqlx::query("UPDATE pinned_episodes SET season_id = ?1 WHERE episode_id = ?2")
+                .bind(season.to_string())
+                .bind(survivor.id.as_str())
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
     }
@@ -366,7 +482,7 @@ async fn settle_group(
     let source_paths_match = sources
         .iter()
         .map(|source| source.path.as_str())
-        .eq(files.iter().map(String::as_str));
+        .eq(group.files.iter().map(String::as_str));
     let runtime_match = sources.first().is_some_and(|first| {
         first.run_time_ticks.is_none() || first.run_time_ticks == survivor.runtime_ticks
     });
@@ -375,7 +491,7 @@ async fn settle_group(
     let steps = if steady {
         Vec::new()
     } else {
-        group_steps(files)
+        group_steps(&group.files)
     };
     Ok(GroupOutcome::Existing {
         item_id: parse_id(&survivor.id)?,
@@ -403,6 +519,14 @@ async fn merge_references(
             .await?;
     }
     Ok(())
+}
+
+/// The files of a group as strings, in order.
+fn strings_of(files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .map(|file| file.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The full probe plan for a group: the primary file, then each other file as an alternate version.
