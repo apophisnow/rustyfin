@@ -263,10 +263,11 @@ async fn scan_flat_library(
     // Collect new items for batch insert in a single transaction
     let mut new_items: Vec<MediaItem> = Vec::new();
 
-    // Every file that the walks returned, and every folder they could not list. The removal at
-    // the end of the scan needs both.
+    // Every file that the walks returned, every folder they could not list, and every symlink
+    // loop they skipped. The removal at the end of the scan needs all three.
     let mut collected: HashSet<String> = HashSet::new();
     let mut unreadable: Vec<PathBuf> = Vec::new();
+    let mut loops: Vec<PathBuf> = Vec::new();
 
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
@@ -276,9 +277,10 @@ async fn scan_flat_library(
         }
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, unreadable_dirs) = collect_files(path).await;
+        let (files, unreadable_dirs, loop_dirs) = collect_files(path).await;
         collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
         unreadable.extend(unreadable_dirs);
+        loops.extend(loop_dirs);
 
         for file_path_buf in files {
             let ext = file_path_buf
@@ -415,7 +417,7 @@ async fn scan_flat_library(
     );
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable).await {
+    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable, &loops).await {
         Ok(removed) => tracing::info!(
             "removed {removed} items no longer collected from library '{}'",
             library.name
@@ -455,10 +457,11 @@ async fn scan_tv_library(
     let episode_version_map: HashMap<(String, String, Uuid), Uuid> =
         build_episode_version_map(pool, library.id).await?;
 
-    // Every file that the walks returned, and every folder they could not list. The removal at
-    // the end of the scan needs both.
+    // Every file that the walks returned, every folder they could not list, and every symlink
+    // loop they skipped. The removal at the end of the scan needs all three.
     let mut collected: HashSet<String> = HashSet::new();
     let mut unreadable: Vec<PathBuf> = Vec::new();
+    let mut loops: Vec<PathBuf> = Vec::new();
 
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
@@ -476,9 +479,10 @@ async fn scan_tv_library(
         let mut new_items: Vec<MediaItem> = Vec::new();
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, unreadable_dirs) = collect_files(path).await;
+        let (files, unreadable_dirs, loop_dirs) = collect_files(path).await;
         collected.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
         unreadable.extend(unreadable_dirs);
+        loops.extend(loop_dirs);
         tracing::info!(
             "TV library '{}': found {} files in path {}",
             library.name,
@@ -731,7 +735,7 @@ async fn scan_tv_library(
     );
 
     // Remove the items that this scan no longer collects. A failure is logged, not returned.
-    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable).await {
+    match scan_sync::remove_not_collected(pool, library, &collected, &unreadable, &loops).await {
         Ok(removed) => tracing::info!(
             "removed {removed} items no longer collected from library '{}'",
             library.name
@@ -783,7 +787,7 @@ async fn scan_music_library(
         let mut new_items: Vec<MediaItem> = Vec::new();
 
         // Async directory traversal — non-blocking on Tokio runtime
-        let (files, _) = collect_files(path).await;
+        let (files, _, _) = collect_files(path).await;
         tracing::info!(
             "music library '{}': found {} files in path {}",
             library.name,
@@ -1125,19 +1129,21 @@ async fn dir_id(path: &Path) -> std::io::Result<DirId> {
 
 /// Recursively collects the file paths under `root`, using async I/O and an iterative work queue.
 ///
-/// Returns the files, sorted by path, and the directories that could not be listed completely: a
-/// failed `read_dir`, or an error part way through one. Entries that `naming` ignores are skipped.
-/// A subdirectory whose identity is already among its ancestors is skipped as a symlink loop. Two
-/// links to one folder are both followed. The root's own name is never checked.
-async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+/// Returns three lists. The first is the files, sorted by path. The second is the directories that
+/// could not be listed completely, from a failed `read_dir` or an error part way through one. The
+/// third is the subdirectories skipped as symlink loops: a subdirectory whose identity is already
+/// among its ancestors. Entries that `naming` ignores are skipped. Two links to one folder are both
+/// followed. The root's own name is never checked.
+async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut result = Vec::new();
     let mut unreadable = Vec::new();
+    let mut loops = Vec::new();
 
     let root_id = match dir_id(root).await {
         Ok(id) => id,
         Err(err) => {
             tracing::warn!("cannot read directory {}: {}", root.display(), err);
-            return (result, vec![root.to_path_buf()]);
+            return (result, vec![root.to_path_buf()], Vec::new());
         }
     };
     // Each queued directory carries the identities of itself and its ancestors, root included.
@@ -1197,6 +1203,7 @@ async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
             match dir_id(&child).await {
                 Ok(id) if chain.contains(&id) => {
                     tracing::warn!("skipping symlink loop at {}", child.display());
+                    loops.push(child);
                 }
                 Ok(id) => {
                     let mut child_chain = chain.clone();
@@ -1212,7 +1219,7 @@ async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     }
 
     result.sort();
-    (result, unreadable)
+    (result, unreadable, loops)
 }
 
 fn parse_season_number(name: &str) -> Option<i32> {

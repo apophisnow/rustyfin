@@ -52,14 +52,17 @@ pub async fn delete_item(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Erro
 ///
 /// Step 1 covers the media types that the library's content type scans. An item is deleted only
 /// when all of these hold: its path is under a library root; `fs::metadata` says it is a regular
-/// file, so a missing or unreadable file keeps it; its path is not in `collected`; and no folder
-/// in `unreadable` contains it. Step 2, for TV libraries only, then deletes the Seasons and then
-/// the Series that have no children.
+/// file, or its path is under a folder the scan skipped as a symlink loop (such a path is never
+/// collected again and may not resolve); its path is not in `collected`; and no folder in
+/// `unreadable` contains it. So a missing or unreadable file is kept, unless it is under such a
+/// loop. Step 2, for TV libraries only, then deletes the Seasons and then the Series that have no
+/// children.
 pub async fn remove_not_collected(
     pool: &SqlitePool,
     library: &Library,
     collected: &HashSet<String>,
     unreadable: &[PathBuf],
+    loops: &[PathBuf],
 ) -> Result<u32, sqlx::Error> {
     let library_id = library.id.to_string();
     let roots: Vec<PathBuf> = library.paths.iter().map(PathBuf::from).collect();
@@ -80,7 +83,8 @@ pub async fn remove_not_collected(
             if !under_root || unlisted || collected.contains(&path) {
                 continue;
             }
-            if !is_regular_file(item).await {
+            let in_loop = loops.iter().any(|dir| item.starts_with(dir));
+            if !in_loop && !is_regular_file(item).await {
                 continue;
             }
             if delete_item(pool, &id).await? {

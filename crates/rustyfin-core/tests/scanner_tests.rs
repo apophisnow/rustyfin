@@ -260,6 +260,35 @@ async fn scan_skips_symlink_loop() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn rescan_removes_items_deep_in_symlink_loop() {
+    use std::os::unix::fs::symlink;
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "Loop Test (2020)/Loop Test (2020).mkv");
+    symlink(".", root.join("Loop Test (2020)/loop")).unwrap();
+    // A copy stored through the loop so many times that the path no longer resolves.
+    let deep = root
+        .join("Loop Test (2020)")
+        .join("loop/".repeat(45))
+        .join("Loop Test (2020).mkv");
+    assert!(
+        std::fs::metadata(&deep).is_err(),
+        "the test needs a path that does not resolve: {}",
+        deep.display()
+    );
+    insert_item(&fx.pool, &lib, "Movie", &deep, None).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        paths(&fx.pool, &lib, "Movie").await,
+        ["Loop Test (2020)/Loop Test (2020).mkv"]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn scan_follows_two_links_to_one_dir() {
     use std::os::unix::fs::symlink;
     let fx = Fixture::new().await;
