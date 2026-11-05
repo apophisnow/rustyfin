@@ -51,6 +51,15 @@ async fn playing(
     )
     .await?;
 
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        claims.sub,
+        req.item_id,
+        req.audio_stream_index,
+        req.subtitle_stream_index,
+    )
+    .await?;
+
     // Broadcast SessionChanged event so clients see the now-playing item update
     broadcast_event(
         &state,
@@ -84,6 +93,15 @@ async fn playing_progress(
         .await?;
     }
 
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        claims.sub,
+        req.item_id,
+        req.audio_stream_index,
+        req.subtitle_stream_index,
+    )
+    .await?;
+
     // Broadcast SessionChanged event with updated playback position
     broadcast_event(
         &state,
@@ -114,6 +132,15 @@ async fn playing_stopped(
         claims.sub,
         req.item_id,
         req.position_ticks,
+    )
+    .await?;
+
+    rustyfin_db::repo_playback::save_stream_choice(
+        &state.db,
+        claims.sub,
+        req.item_id,
+        req.audio_stream_index,
+        req.subtitle_stream_index,
     )
     .await?;
 

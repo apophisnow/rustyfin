@@ -77,6 +77,60 @@ pub async fn update_playback_position(
     Ok(())
 }
 
+/// Remember the audio and subtitle stream a user chose for an item. A `None` leaves the stored
+/// value as it is; a subtitle of -1 means subtitles were turned off.
+pub async fn save_stream_choice(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+    audio: Option<i32>,
+    subtitle: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    if audio.is_none() && subtitle.is_none() {
+        return Ok(());
+    }
+    let uid = user_id.to_string();
+    let iid = item_id.to_string();
+
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, audio_stream_index, subtitle_stream_index) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(user_id, item_id) DO UPDATE SET \
+         audio_stream_index = COALESCE(excluded.audio_stream_index, user_item_data.audio_stream_index), \
+         subtitle_stream_index = COALESCE(excluded.subtitle_stream_index, user_item_data.subtitle_stream_index)",
+    )
+    .bind(&uid)
+    .bind(&iid)
+    .bind(audio)
+    .bind(subtitle)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// The audio and subtitle stream a user last chose for an item, `(None, None)` when nothing is
+/// remembered.
+pub async fn get_stream_choice(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<(Option<i32>, Option<i32>), sqlx::Error> {
+    let uid = user_id.to_string();
+    let iid = item_id.to_string();
+
+    let row = sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
+        "SELECT audio_stream_index, subtitle_stream_index FROM user_item_data \
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(&uid)
+    .bind(&iid)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.unwrap_or((None, None)))
+}
+
 pub async fn mark_played(
     pool: &SqlitePool,
     user_id: Uuid,

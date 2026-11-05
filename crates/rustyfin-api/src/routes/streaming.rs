@@ -1,8 +1,10 @@
+use axum::Extension;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use rustyfin_model::auth::Claims;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path as FilePath;
@@ -804,9 +806,11 @@ async fn video_universal(
 }
 
 /// `GET /Videos/{id}/PlaybackInfo` — Returns playback info for a video item.
-/// Includes direct play detection based on client codec support.
+/// Includes direct play detection based on client codec support. Each source's default tracks
+/// are the caller's remembered tracks, where the source has them.
 async fn video_playback_info(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
@@ -853,6 +857,24 @@ async fn video_playback_info(
         source.supports_direct_stream = i == index && supports_direct_stream;
         source.supports_transcoding = i == index && supports_transcoding;
     }
+
+    // The caller's remembered tracks become each source's defaults, where the source has them
+    let (remembered_audio, remembered_subtitle) =
+        rustyfin_db::repo_playback::get_stream_choice(&state.db_ro, claims.sub, id).await?;
+    let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
+        .into_iter()
+        .map(|source| {
+            let default_audio_stream_index =
+                remembered_audio.filter(|&index| has_stream_at(&source, "Audio", index));
+            let default_subtitle_stream_index = remembered_subtitle
+                .filter(|&index| index == -1 || has_stream_at(&source, "Subtitle", index));
+            rustyfin_model::playback_info::PlaybackMediaSource {
+                source,
+                default_audio_stream_index,
+                default_subtitle_stream_index,
+            }
+        })
+        .collect();
 
     let response = rustyfin_model::playback_info::VideoPlaybackInfoResponse {
         media_sources,
@@ -928,6 +950,18 @@ fn codecs_playable(
 /// Whether `stream` is of `kind` ("Video", "Audio"). The probe stores ffprobe's lowercase types.
 fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str) -> bool {
     stream.codec_type.eq_ignore_ascii_case(kind)
+}
+
+/// Whether `source` has a stream of `kind` ("Audio", "Subtitle") at `index`.
+fn has_stream_at(
+    source: &rustyfin_model::media_source::MediaSourceResponse,
+    kind: &str,
+    index: i32,
+) -> bool {
+    source
+        .media_streams
+        .iter()
+        .any(|s| s.index == index && is_stream_type(s, kind))
 }
 
 /// Check if a media source can be directly played by the client.

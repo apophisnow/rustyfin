@@ -9570,3 +9570,314 @@ async fn b16_hls_transcodes_the_requested_version() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{transcode}");
     }
 }
+
+// ── B20: Jellyfin import ──
+// Remembered tracks: the playback reports store the reported audio and subtitle stream indexes
+// per user and item, and the video PlaybackInfo offers them as each media source's
+// DefaultAudioStreamIndex and DefaultSubtitleStreamIndex while that stream exists.
+
+/// Video 0, audio 1 (eng) and 2 (ger), subtitles 3 (eng) and 4 (ger).
+fn b20_full_streams() -> serde_json::Value {
+    serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng" },
+        { "Index": 2, "Codec": "ac3", "CodecType": "Audio", "Language": "ger" },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+        { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle", "Language": "ger" },
+    ])
+}
+
+/// Stores a Matroska source with `streams` for `item` at `file` and returns its id.
+async fn b20_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    file: &std::path::Path,
+    streams: serde_json::Value,
+) -> uuid::Uuid {
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mkv",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap()
+}
+
+/// A movie in folder `name` with one source carrying `streams`; returns its id.
+async fn b20_movie(state: &AppState, name: &str, streams: serde_json::Value) -> uuid::Uuid {
+    let folder = media_folder(state, name);
+    let file = std::path::Path::new(&folder).join(format!("{name}.mkv"));
+    std::fs::write(&file, b"b20").unwrap();
+    let item = g4_insert_item(state, "Movie", &file).await;
+    b20_insert_source(state, item, &file, streams).await;
+    item
+}
+
+/// Sends a playback report to `/Sessions/Playing{route}` and expects success.
+async fn b20_report(app: &axum::Router, token: &str, route: &str, body: serde_json::Value) {
+    let uri = format!("/Sessions/Playing{route}");
+    let (status, _) = send_authed(app, "POST", &uri, token, Some(&body.to_string())).await;
+    assert!(status.is_success(), "{uri}: {status}");
+}
+
+type B20Defaults = (Option<serde_json::Value>, Option<serde_json::Value>);
+
+/// Each media source's stream count with its `DefaultAudioStreamIndex` and
+/// `DefaultSubtitleStreamIndex` from the video PlaybackInfo, `None` where the field is absent.
+async fn b20_track_defaults(
+    app: &axum::Router,
+    token: &str,
+    item: uuid::Uuid,
+) -> Vec<(usize, B20Defaults)> {
+    let uri = format!("/Videos/{item}/PlaybackInfo");
+    let (status, body) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["MediaSources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| {
+            let streams = source["MediaStreams"].as_array().unwrap().len();
+            let audio = source.get("DefaultAudioStreamIndex").cloned();
+            let subtitle = source.get("DefaultSubtitleStreamIndex").cloned();
+            (streams, (audio, subtitle))
+        })
+        .collect()
+}
+
+/// The defaults of the item's only media source.
+async fn b20_only_defaults(app: &axum::Router, token: &str, item: uuid::Uuid) -> B20Defaults {
+    let sources = b20_track_defaults(app, token, item).await;
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    sources[0].1.clone()
+}
+
+/// `(Some(audio), Some(subtitle))` as JSON numbers.
+fn b20_both(audio: i64, subtitle: i64) -> B20Defaults {
+    (
+        Some(serde_json::json!(audio)),
+        Some(serde_json::json!(subtitle)),
+    )
+}
+
+/// The stored `(audio_stream_index, subtitle_stream_index)` of `user` for `item`.
+async fn b20_stored_tracks(
+    state: &AppState,
+    user: &str,
+    item: uuid::Uuid,
+) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT audio_stream_index, subtitle_stream_index FROM user_item_data
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user)
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn b20_playback_info_defaults_from_progress_report() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Progress", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(2), Some(4)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+#[tokio::test]
+async fn b20_playback_info_without_choice_omits_defaults() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Nothing", b20_full_streams()).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // A report without track indexes remembers none
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 50 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+}
+
+#[tokio::test]
+async fn b20_start_and_stop_reports_save_tracks() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Start Stop", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 3));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 10_000_000, "AudioStreamIndex": 2,
+        "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Stopped", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+#[tokio::test]
+async fn b20_report_without_tracks_keeps_choice() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Keep", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    // Absent and null indexes leave the stored ones alone
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 100 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 200, "AudioStreamIndex": null,
+        "SubtitleStreamIndex": null,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+
+    // One index changes only that one
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 300, "AudioStreamIndex": 1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 4));
+
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 400 });
+    b20_report(&app, &token, "/Stopped", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 4));
+}
+
+#[tokio::test]
+async fn b20_subtitle_off_is_remembered() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Off", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(1), Some(-1)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, -1));
+
+    // "Off" needs no subtitle stream to exist
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+    ]);
+    let bare = b20_movie(&state, "B20 Off Bare", streams).await;
+    let body = serde_json::json!({ "ItemId": bare, "PositionTicks": 0, "SubtitleStreamIndex": -1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    let defaults = b20_only_defaults(&app, &token, bare).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(-1))));
+}
+
+#[tokio::test]
+async fn b20_stale_track_index_is_ignored() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Stale", b20_full_streams()).await;
+
+    // Indexes the file doesn't have are stored but not offered
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 7, "SubtitleStreamIndex": 9,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(7), Some(9)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // An index naming a stream of the other kind is not offered either
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 3, "SubtitleStreamIndex": 1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // Audio -1 names no stream
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": -1, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(4))));
+}
+
+#[tokio::test]
+async fn b20_track_choice_is_per_user() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = b20_movie(&state, "B20 Users", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &owner, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &viewer, item).await, (None, None));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &viewer, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &owner, item).await, b20_both(2, 4));
+    assert_eq!(b20_only_defaults(&app, &viewer, item).await, b20_both(1, 3));
+}
+
+#[tokio::test]
+async fn b20_track_defaults_per_media_source() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Versions", b20_full_streams()).await;
+    let folder = media_folder(&state, "B20 Versions");
+    let file = std::path::Path::new(&folder).join("B20 Versions - 720p.mkv");
+    std::fs::write(&file, b"b20").unwrap();
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng" },
+    ]);
+    b20_insert_source(&state, item, &file, streams).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    // Each version offers what it has: the second has no subtitle 3
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    let expected = vec![(2, (Some(serde_json::json!(1)), None)), (5, b20_both(1, 3))];
+    assert_eq!(sources, expected);
+}
