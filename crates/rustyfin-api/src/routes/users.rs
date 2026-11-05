@@ -1,17 +1,20 @@
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use chrono::Utc;
 use rustyfin_model::auth::Claims;
 use rustyfin_model::user::{
-    ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordRequest,
-    ForgotPasswordResult, PublicUserDto, ResetPasswordRequest, UpdatePolicyRequest,
-    UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo, UserPreferences,
-    UserSecurityInfo,
+    ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordPinRequest,
+    ForgotPasswordRequest, ForgotPasswordResult, PublicUserDto, ResetPasswordRequest,
+    UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo,
+    UserPreferences, UserSecurityInfo,
 };
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::middleware::resolve_client;
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -22,6 +25,7 @@ pub fn public_routes() -> Router<AppState> {
 pub fn login_routes() -> Router<AppState> {
     Router::new()
         .route("/Users/ForgotPassword", post(forgot_password))
+        .route("/Users/ForgotPassword/Pin", post(reset_password_pin))
         .route("/Users/ResetPassword", post(reset_password))
 }
 
@@ -117,6 +121,7 @@ async fn create_user(
     }
 
     let hash = rustyfin_auth::hash_password(&req.password)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let user = rustyfin_model::user::User {
@@ -166,6 +171,7 @@ async fn change_password(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
+    token: Option<Extension<rustyfin_auth::RequestToken>>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // users can change their own password, admins can change any
@@ -180,19 +186,32 @@ async fn change_password(
             .ok_or(ApiError::NotFound("user not found".into()))?;
 
         let valid = rustyfin_auth::verify_password(&req.current_pw, &user.password_hash)
+            .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         if !valid {
             return Err(ApiError::Unauthorized);
         }
     }
 
-    let hash =
-        rustyfin_auth::hash_password(&req.new_pw).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let hash = rustyfin_auth::hash_password(&req.new_pw)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let updated = rustyfin_db::repo_user::update_password(&state.db, id, &hash).await?;
     if !updated {
         return Err(ApiError::NotFound("user not found".into()));
     }
+
+    // Revoke the user's other tokens. A self-change keeps the caller's own session; an admin
+    // changing another user's password revokes all of that user's tokens.
+    let keep: Option<String> = if claims.sub == id {
+        token.map(|Extension(rt)| rt.0)
+    } else {
+        None
+    };
+    rustyfin_auth::revoke_user_tokens(&state.db, id, keep.as_deref())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -246,50 +265,120 @@ async fn update_configuration(
     Ok(Json(serde_json::json!({})))
 }
 
+/// Start a password reset. The response is uniform whether or not the user exists, so it never
+/// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
+/// to a file under the data dir ONLY when the user exists AND the resolved client (see
+/// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
+/// new request never replaces an open reset. Every other request gets the same 200 with a file path
+/// that is not created.
 async fn forgot_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    // Look up the user by username
-    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+    let pin_path = state
+        .data_dir
+        .join(rustyfin_auth::reset_pin_filename(&req.entered_username));
+    let expires_at = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
 
-    // Generate a PIN code
-    let pin = rustyfin_db::repo_user::generate_password_reset_pin(&state.db, user.id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Log the PIN (in production with SMTP configured, email would be sent)
-    tracing::info!(
-        user = %user.name,
-        pin = %pin,
-        "Password reset PIN generated for user"
-    );
+    if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local()
+        && let Some(user) =
+            rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username).await?
+        && let Some(pin) = rustyfin_auth::create_reset_pin(&state.db, user.id, &expires_at)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+    {
+        // The PIN lives only in this file. Never log it.
+        let contents = serde_json::json!({
+            "Pin": pin,
+            "ExpirationDate": expires_at,
+            "UserName": user.name,
+        })
+        .to_string();
+        write_reset_file(&pin_path, &contents)?;
+    }
 
     Ok(Json(ForgotPasswordResult {
         action: "PinCode".to_string(),
+        pin_file: pin_path.to_string_lossy().into_owned(),
+        pin_expiration_date: expires_at,
     }))
+}
+
+/// Write the reset file, truncating any prior file. On Unix it is created owner-only (mode 0600).
+fn write_reset_file(path: &std::path::Path, contents: &str) -> Result<(), ApiError> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    f.write_all(contents.as_bytes())
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+/// Redeem a reset PIN (no username). Success: set the user's password to the PIN itself, revoke all
+/// their tokens, delete the reset file, return `{Success:true, UsersReset:[name]}`. No match → 404.
+async fn reset_password_pin(
+    State(state): State<AppState>,
+    Json(req): Json<ForgotPasswordPinRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let uid = rustyfin_auth::redeem_reset_pin(&state.db, &req.pin)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("invalid or expired PIN".to_string()))?;
+
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, uid)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
+
+    let norm = rustyfin_auth::normalize_reset_pin(&req.pin);
+    let hash = rustyfin_auth::hash_password(&norm)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    rustyfin_db::repo_user::update_password(&state.db, uid, &hash).await?;
+    rustyfin_auth::revoke_user_tokens(&state.db, uid, None)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let _ = std::fs::remove_file(
+        state
+            .data_dir
+            .join(rustyfin_auth::reset_pin_filename(&user.name)),
+    );
+
+    Ok(Json(serde_json::json!({
+        "Success": true,
+        "UsersReset": [user.name],
+    })))
 }
 
 async fn reset_password(
     State(state): State<AppState>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Look up the user by username
+    // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
+    // not reveal whether the account exists.
     let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.username)
         .await?
-        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+        .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
     // Validate the PIN
-    let validated =
-        rustyfin_db::repo_user::validate_password_reset_pin(&state.db, user.id, &req.pin)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
+    let validated = rustyfin_auth::validate_reset_pin(&state.db, user.id, &req.pin)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
     // Hash the new password
     let hash = rustyfin_auth::hash_password(&req.temp_password)
+        .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Update the user's password
@@ -300,6 +389,10 @@ async fn reset_password(
     if !updated {
         return Err(ApiError::NotFound("user not found".into()));
     }
+
+    rustyfin_auth::revoke_user_tokens(&state.db, validated, None)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -416,6 +509,7 @@ async fn set_easy_password(
     } else {
         Some(
             rustyfin_auth::hash_password(&req.easy_password)
+                .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?,
         )
     };

@@ -74,7 +74,9 @@ async fn ws_handler(
 
     // The configured API key or a valid user token opens the socket
     let authenticated = state.api_key.as_ref().is_some_and(|key| token == **key)
-        || rustyfin_auth::validate_token(&token, &state.jwt_secret).is_ok();
+        || rustyfin_auth::validate_token(&state.db_ro, &token)
+            .await
+            .is_ok();
 
     if !authenticated {
         tracing::warn!("WebSocket: unauthenticated connection attempt");
@@ -82,10 +84,18 @@ async fn ws_handler(
     }
 
     tracing::info!("WebSocket: authenticated connection");
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state)))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, token)))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+/// Seconds between re-checks of an open websocket's user token.
+const WS_TOKEN_RECHECK_SECS: u64 = 5;
+
+async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
+    // A token that validates is a user token; anything else (the API key) is never re-checked
+    let user_token = rustyfin_auth::validate_token(&state.db_ro, &token)
+        .await
+        .is_ok();
+
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to the global broadcast channel for server events
@@ -118,6 +128,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     if let Ok(json) = serde_json::to_string(&time_sync) {
         let _ = sender.send(Message::Text(json.into())).await;
     }
+
+    let period = std::time::Duration::from_secs(WS_TOKEN_RECHECK_SECS);
+    let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
 
     loop {
         tokio::select! {
@@ -194,6 +207,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Err(broadcast::error::RecvError::Closed) => {
                         // Command sender dropped, ignore
                     }
+                }
+            }
+
+            // Close the socket once its user token stops validating
+            _ = recheck.tick(), if user_token => {
+                if let Err(rustyfin_auth::AuthError::InvalidToken) =
+                    rustyfin_auth::validate_token(&state.db_ro, &token).await
+                {
+                    tracing::info!("WebSocket: session {} closed: its token is no longer valid", session_id);
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
                 }
             }
         }

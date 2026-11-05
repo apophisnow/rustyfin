@@ -286,19 +286,21 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_BIND` | Bind address:port | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Data directory (DB, cache, config, logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite connection string | `sqlite://<data>/rustyfin.db?mode=rwc` |
-| `RUSTYFIN_SECRET` | JWT signing secret (an empty value counts as unset) | Random UUID (regenerated each start!) |
-| `RUSTYFIN_SERVER_ID` | Unique server identifier | Random UUID |
+| `RUSTYFIN_SECRET` | Deprecated and ignored — access tokens are stored server-side and survive restarts | *(unused)* |
+| `RUSTYFIN_SERVER_ID` | Unique server identifier | Stable; persisted to `<data>/server_id` |
 | `RUSTYFIN_API_KEY` | Static API key for integrations, for example from `openssl rand -hex 32` (an empty value disables it) | Disabled |
 | `RUSTYFIN_TMDB_API_KEY` | TMDb API key (v3 key or v4 read access token). Takes precedence over the key in the server config and is never saved there | Config key, else TMDb off |
 | `RUSTYFIN_TMDB_BASE_URL` | TMDb API base URL (absolute http(s) URL; an invalid value stops startup) | `https://api.themoviedb.org/3` |
 | `RUSTYFIN_TMDB_IMAGE_BASE_URL` | TMDb image base URL (absolute http(s) URL; an invalid value stops startup) | `https://image.tmdb.org/t/p/original` |
+| `RUSTYFIN_KNOWN_PROXIES` | Reverse proxies trusted to set `X-Forwarded-For`, comma-separated IPs or CIDRs. Loopback is trusted only when listed. Behind a reverse proxy, list it: otherwise every client counts as the proxy's address | *(none)* |
+| `RUSTYFIN_RATE_LIMIT` | Login and password-reset attempts per window, per client IP (`0` disables) | `10` |
+| `RUSTYFIN_RATE_WINDOW` | Rate-limit window, in seconds | `60` |
 | `RUST_LOG` | Log level (`debug`, `info`, `rustyfin=trace`) | `info` |
 
 **Example (production):**
 ```bash
 RUSTYFIN_BIND=127.0.0.1:8096 \
 RUSTYFIN_DATA=/srv/rustyfin \
-RUSTYFIN_SECRET="$(openssl rand -base64 32)" \
 RUSTYFIN_API_KEY="<output of openssl rand -hex 32>" \
 ./target/release/rustyfin
 ```
