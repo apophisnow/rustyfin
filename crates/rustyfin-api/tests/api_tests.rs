@@ -4738,7 +4738,6 @@ fn b21_gus(groups: serde_json::Value) -> serde_json::Value {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_admin_group_grants_and_takes_back_admin() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     let result = t
@@ -4796,7 +4795,6 @@ async fn b21_admin_group_grants_and_takes_back_admin() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_admin_group_keeps_hand_granted_admins() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     add_user(&t.state, "ada", "pw-ada", true).await;
@@ -4826,7 +4824,6 @@ async fn b21_admin_group_keeps_hand_granted_admins() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_admin_group_keeps_the_last_admin() {
     let (log, _guard) = b21_capture();
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
@@ -4853,7 +4850,6 @@ async fn b21_admin_group_keeps_the_last_admin() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_hand_changes_clear_the_group_flag() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     let result = t
@@ -4894,7 +4890,6 @@ async fn b21_hand_changes_clear_the_group_flag() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_link_from_the_profile() {
     let t = b21().await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -4969,7 +4964,6 @@ async fn b21_link_from_the_profile() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_accounts_show_the_link_status() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -5091,7 +5085,6 @@ async fn b21_accounts_show_the_link_status() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 4"]
 async fn b21_unlink_needs_another_way_in() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "bob", "pw-bob", false).await;

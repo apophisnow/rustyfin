@@ -3,7 +3,9 @@
 
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// The saved settings of the one provider. The client secret is kept as it is and never leaves
 /// the server.
@@ -144,4 +146,21 @@ fn trimmed(sent: Option<String>, current: String) -> String {
 pub struct OidcInfo {
     pub enabled: bool,
     pub button_label: String,
+}
+
+/// One account's link to the provider (AC30). The keys are PascalCase and none is left out: a
+/// missing value is null.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AccountStatus {
+    pub user_id: Uuid,
+    pub user_name: String,
+    pub is_administrator: bool,
+    pub admin_from_group: bool,
+    pub has_password: bool,
+    pub linked: bool,
+    pub provider_username: Option<String>,
+    pub linked_at: Option<DateTime<Utc>>,
+    pub last_sign_in_at: Option<DateTime<Utc>>,
+    pub can_unlink: bool,
 }

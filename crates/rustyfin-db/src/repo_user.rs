@@ -220,17 +220,58 @@ pub async fn update_password(
     Ok(result.rows_affected() > 0)
 }
 
+/// Sets the administrator flag by hand. A hand change clears the flag the admin group set (AC19).
 pub async fn update_policy(
     pool: &SqlitePool,
     id: Uuid,
     is_administrator: bool,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE users SET is_administrator = ? WHERE id = ?")
-        .bind(is_administrator as i32)
-        .bind(id.to_string())
-        .execute(pool)
-        .await?;
+    let result =
+        sqlx::query("UPDATE users SET is_administrator = ?, admin_from_group = 0 WHERE id = ?")
+            .bind(is_administrator as i32)
+            .bind(id.to_string())
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Makes the user an administrator through the admin group (AC17). The flag records that the group
+/// gave the rights. An existing administrator is left as it is, flag and all.
+pub async fn grant_group_admin(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET is_administrator = 1, admin_from_group = 1 \
+         WHERE id = ? AND is_administrator = 0",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Takes back the administrator rights the admin group gave the user (AC18). They stay when the user
+/// is the owner, or when no other enabled administrator would be left. Returns whether they went.
+pub async fn revoke_group_admin(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE users SET is_administrator = 0, admin_from_group = 0 \
+         WHERE id = ?1 AND admin_from_group = 1 AND is_owner = 0 \
+         AND EXISTS (SELECT 1 FROM users AS other \
+         WHERE other.is_administrator = 1 AND other.is_disabled = 0 AND other.id <> ?1)",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Whether the admin group gave the user its administrator rights (AC17).
+pub async fn admin_from_group(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let flagged: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND admin_from_group = 1)",
+    )
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(flagged)
 }
 
 pub async fn update_configuration(

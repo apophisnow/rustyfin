@@ -16,6 +16,26 @@ pub(crate) const FLOW_LIFETIME: Duration = Duration::from_secs(10 * 60);
 /// The most flows held at once.
 const FLOW_CAP: usize = 1000;
 
+/// What a flow is for: a sign-in from the sign-in page, or the link of the caller's account from the
+/// profile (B21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlowKind {
+    /// A sign-in. Its answers go to the sign-in page.
+    SignIn,
+    /// The link of the account with this id. Its answers go to the settings page.
+    Link(Uuid),
+}
+
+impl FlowKind {
+    /// The page the flow's answers go to: `login` or `settings`.
+    pub(crate) fn page(self) -> &'static str {
+        match self {
+            Self::SignIn => "login",
+            Self::Link(_) => "settings",
+        }
+    }
+}
+
 /// One sign-in in progress: what the callback must match, and the user a good callback signed in.
 pub(crate) struct Flow {
     /// The state sent to the provider. The callback must return it.
@@ -27,6 +47,8 @@ pub(crate) struct Flow {
     pub(crate) created: Instant,
     /// The user a good callback signed in. Complete takes the flow and this user.
     pub(crate) signed_in: Option<Uuid>,
+    /// What the flow is for. Its answers go to the page of that kind.
+    pub(crate) kind: FlowKind,
 }
 
 impl Flow {

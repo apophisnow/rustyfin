@@ -2,7 +2,7 @@
 //! is stored as it is (spec §4).
 
 use chrono::{DateTime, Utc};
-use rustyfin_model::oidc::OidcConfig;
+use rustyfin_model::oidc::{AccountStatus, OidcConfig};
 use rustyfin_model::user::User;
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -98,7 +98,9 @@ pub async fn user_has_link(pool: &SqlitePool, user_id: Uuid) -> Result<bool, sql
     Ok(linked)
 }
 
-/// Links a user to a provider account. The executor is a pool, or a transaction the caller holds.
+/// Links a user to a provider account. `linked_at` is `now`. `last_sign_in_at` is the sign-in that
+/// made the link, or None for a profile link that has not signed in. The executor is a pool, or a
+/// transaction the caller holds.
 pub async fn create_link<'e, E>(
     executor: E,
     user_id: Uuid,
@@ -106,11 +108,12 @@ pub async fn create_link<'e, E>(
     subject: &str,
     username: &str,
     now: DateTime<Utc>,
+    last_sign_in_at: Option<DateTime<Utc>>,
 ) -> Result<(), sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let at = now.to_rfc3339();
+    let linked_at = now.to_rfc3339();
     sqlx::query(
         "INSERT INTO user_oidc_links (user_id, issuer, subject, username, linked_at, last_sign_in_at) \
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -119,8 +122,8 @@ where
     .bind(issuer)
     .bind(subject)
     .bind(username)
-    .bind(&at)
-    .bind(&at)
+    .bind(&linked_at)
+    .bind(last_sign_in_at.map(|at| at.to_rfc3339()))
     .execute(executor)
     .await?;
     Ok(())
@@ -157,6 +160,74 @@ pub async fn create_linked_user(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::repo_user::create_user(&mut *tx, user).await?;
-    create_link(&mut *tx, user.id, issuer, subject, username, now).await?;
+    create_link(&mut *tx, user.id, issuer, subject, username, now, Some(now)).await?;
     tx.commit().await
+}
+
+/// Removes the link of a user. Returns whether there was one.
+pub async fn delete_link(pool: &SqlitePool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query("DELETE FROM user_oidc_links WHERE user_id = ?")
+        .bind(user_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The link status of every account, by name, or of the one account `only` names (AC30).
+/// `allow_password_sign_in` is the setting the CanUnlink rule reads.
+pub async fn account_statuses(
+    pool: &SqlitePool,
+    allow_password_sign_in: bool,
+    only: Option<Uuid>,
+) -> Result<Vec<AccountStatus>, sqlx::Error> {
+    let rows: Vec<AccountRow> = sqlx::query_as(
+        "SELECT u.id, u.name, u.is_administrator, u.admin_from_group, \
+         (u.password_hash <> '') AS has_password, l.username, l.linked_at, l.last_sign_in_at \
+         FROM users u LEFT JOIN user_oidc_links l ON l.user_id = u.id \
+         WHERE ?1 IS NULL OR u.id = ?1 ORDER BY u.name",
+    )
+    .bind(only.map(|id| id.to_string()))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.into_status(allow_password_sign_in))
+        .collect())
+}
+
+/// A row of `account_statuses`. SQLite gives the flags as integers.
+#[derive(sqlx::FromRow)]
+struct AccountRow {
+    id: String,
+    name: String,
+    is_administrator: i32,
+    admin_from_group: i32,
+    has_password: i32,
+    username: Option<String>,
+    linked_at: Option<String>,
+    last_sign_in_at: Option<String>,
+}
+
+impl AccountRow {
+    fn into_status(self, allow_password_sign_in: bool) -> AccountStatus {
+        let linked = self.username.is_some();
+        let is_administrator = self.is_administrator != 0;
+        let has_password = self.has_password != 0;
+        AccountStatus {
+            user_id: Uuid::parse_str(&self.id).unwrap_or_default(),
+            user_name: self.name,
+            is_administrator,
+            admin_from_group: self.admin_from_group != 0,
+            has_password,
+            linked,
+            provider_username: self.username,
+            linked_at: self
+                .linked_at
+                .and_then(|at| at.parse::<DateTime<Utc>>().ok()),
+            last_sign_in_at: self
+                .last_sign_in_at
+                .and_then(|at| at.parse::<DateTime<Utc>>().ok()),
+            can_unlink: linked && has_password && (allow_password_sign_in || is_administrator),
+        }
+    }
 }

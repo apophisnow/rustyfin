@@ -3,19 +3,21 @@
 
 use std::time::Instant;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::{delete, get, post};
+use axum::{Extension, Json, Router};
 use openidconnect::core::CoreAuthenticationFlow;
 use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge, RedirectUrl, Scope};
-use rustyfin_model::oidc::{OidcConfig, OidcInfo, OidcSettings, OidcSettingsUpdate};
+use rustyfin_model::auth::Claims;
+use rustyfin_model::oidc::{AccountStatus, OidcConfig, OidcInfo, OidcSettings, OidcSettingsUpdate};
 use serde::Deserialize;
+use uuid::Uuid;
 
 use super::auth::{start_session, token_device};
 use crate::error::ApiError;
-use crate::oidc::flow::{FLOW_LIFETIME, Flow};
+use crate::oidc::flow::{FLOW_LIFETIME, Flow, FlowKind};
 use crate::oidc::signin::{self, SignInError};
 use crate::oidc::{callback_url, cookie_path, discover, effective_scopes, settings_answer};
 use crate::state::AppState;
@@ -25,10 +27,12 @@ pub fn public_routes() -> Router<AppState> {
 }
 
 pub fn admin_routes() -> Router<AppState> {
-    Router::new().route(
-        "/Auth/Oidc/Settings",
-        get(read_settings).post(save_settings),
-    )
+    Router::new()
+        .route(
+            "/Auth/Oidc/Settings",
+            get(read_settings).post(save_settings),
+        )
+        .route("/Auth/Oidc/Accounts", get(list_accounts))
 }
 
 /// The sign-in endpoints (B21). The login router applies the login rate limit to them (routes/mod.rs).
@@ -37,6 +41,15 @@ pub fn login_routes() -> Router<AppState> {
         .route("/Auth/Oidc/Start", post(start))
         .route("/Auth/Oidc/Callback", get(callback))
         .route("/Auth/Oidc/Complete", post(complete))
+}
+
+/// The account endpoints of a signed-in user (B21): the link of their own account, and the link
+/// status of accounts. The protected router applies the auth layer (routes/mod.rs).
+pub fn protected_routes() -> Router<AppState> {
+    Router::new()
+        .route("/Auth/Oidc/Link", post(link_start))
+        .route("/Auth/Oidc/Accounts/{userId}", get(get_account))
+        .route("/Auth/Oidc/Accounts/{userId}/Link", delete(unlink))
 }
 
 async fn info(State(state): State<AppState>) -> Result<Json<OidcInfo>, ApiError> {
@@ -124,11 +137,38 @@ struct CallbackQuery {
 /// `POST /Auth/Oidc/Start` – starts a sign-in: the provider's authorization URL, and the flow cookie.
 async fn start(State(state): State<AppState>) -> Result<Response, ApiError> {
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
-    if !config.enabled {
-        return Err(ApiError::BadRequest(
-            "OIDC sign-in is turned off.".to_string(),
+    ensure_on(&config)?;
+    begin(&state, config, FlowKind::SignIn).await
+}
+
+/// `POST /Auth/Oidc/Link` – starts the link of the caller's account to the provider (AC29). The
+/// answer is Start's; the flow it starts links the caller when the browser comes back.
+async fn link_start(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, ApiError> {
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    ensure_on(&config)?;
+    if rustyfin_db::repo_oidc::user_has_link(&state.db, claims.sub).await? {
+        return Err(ApiError::Conflict(
+            "This account is already linked to the provider.".to_string(),
         ));
     }
+    begin(&state, config, FlowKind::Link(claims.sub)).await
+}
+
+/// Refuses while OIDC is off.
+fn ensure_on(config: &OidcConfig) -> Result<(), ApiError> {
+    if config.enabled {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(
+        "OIDC sign-in is turned off.".to_string(),
+    ))
+}
+
+/// Starts a flow of `kind`: the provider's authorization URL, and the flow cookie.
+async fn begin(state: &AppState, config: OidcConfig, kind: FlowKind) -> Result<Response, ApiError> {
     let provider = state
         .oidc
         .provider(&config.issuer_url)
@@ -160,6 +200,7 @@ async fn start(State(state): State<AppState>) -> Result<Response, ApiError> {
         verifier: verifier.secret().clone(),
         created: Instant::now(),
         signed_in: None,
+        kind,
     };
     let id = state.oidc.insert_flow(flow);
     Ok((
@@ -170,28 +211,30 @@ async fn start(State(state): State<AppState>) -> Result<Response, ApiError> {
 }
 
 /// `GET /Auth/Oidc/Callback` – the browser comes back from the provider. Always a redirect: to the
-/// sign-in page, signed in or with an error code (AC9-AC11).
+/// page the flow is for, signed in or with an error code (AC9-AC11).
 async fn callback(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    // Until the flow is known, a refusal can only go to the sign-in page.
     let Some(flow_id) = flow_cookie_value(&headers) else {
-        return Ok(refused(&config, "state_mismatch"));
+        return Ok(refused(&config, "login", "state_mismatch"));
     };
-    // Taking the flow ends it: a refusal leaves none behind, and a good callback puts it back.
+    // Taking the flow ends it: a refusal leaves none behind, and a good sign-in puts it back.
     let Some(flow) = state.oidc.take_flow(&flow_id) else {
-        return Ok(refused(&config, "expired"));
+        return Ok(refused(&config, "login", "expired"));
     };
+    let page = flow.kind.page();
     if flow.signed_in.is_some() {
-        return Ok(refused(&config, "expired"));
+        return Ok(refused(&config, page, "expired"));
     }
     if query.state.as_deref() != Some(flow.state.as_str()) {
-        return Ok(refused(&config, "state_mismatch"));
+        return Ok(refused(&config, page, "state_mismatch"));
     }
     if !config.enabled {
-        return Ok(refused(&config, "disabled"));
+        return Ok(refused(&config, page, "disabled"));
     }
     if let Some(error) = query.error.as_deref() {
         let reason = if error == "access_denied" {
@@ -199,27 +242,34 @@ async fn callback(
         } else {
             "provider_error"
         };
-        return Ok(refused(&config, reason));
+        return Ok(refused(&config, page, reason));
     }
     let Some(code) = query.code.as_deref() else {
-        return Ok(refused(&config, "provider_error"));
+        return Ok(refused(&config, page, "provider_error"));
     };
     match signin::sign_in(&state.oidc, &state.db, &config, &flow, code).await {
-        Ok(user_id) => {
-            state.oidc.put_flow(
-                flow_id,
-                Flow {
-                    signed_in: Some(user_id),
-                    ..flow
-                },
-            );
-            Ok(redirect(
-                format!("{}/web/#login/oidc", config.public_url),
-                None,
-            ))
-        }
-        Err(SignInError::Refused(reason)) => Ok(refused(&config, reason)),
-        Err(SignInError::Server) => Ok(refused(&config, "server_error")),
+        Ok(user_id) => match flow.kind {
+            FlowKind::SignIn => {
+                state.oidc.put_flow(
+                    flow_id,
+                    Flow {
+                        signed_in: Some(user_id),
+                        ..flow
+                    },
+                );
+                Ok(redirect(
+                    format!("{}/web/#login/oidc", config.public_url),
+                    None,
+                ))
+            }
+            // A link hands out no session: the account is linked, and the flow is over.
+            FlowKind::Link(_) => Ok(redirect(
+                format!("{}/web/#settings/oidc-linked", config.public_url),
+                Some(clear_flow_cookie(&config)),
+            )),
+        },
+        Err(SignInError::Refused(reason)) => Ok(refused(&config, page, reason)),
+        Err(SignInError::Server) => Ok(refused(&config, page, "server_error")),
     }
 }
 
@@ -241,6 +291,77 @@ async fn complete(State(state): State<AppState>, headers: HeaderMap) -> Result<R
         Json(answer),
     )
         .into_response())
+}
+
+/// `GET /Auth/Oidc/Accounts` – every account's link status (AC30). Only admins reach it: the admin
+/// router applies the admin layer.
+async fn list_accounts(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AccountStatus>>, ApiError> {
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    let accounts =
+        rustyfin_db::repo_oidc::account_statuses(&state.db, config.allow_password_sign_in, None)
+            .await?;
+    Ok(Json(accounts))
+}
+
+/// `GET /Auth/Oidc/Accounts/{userId}` – one account's link status (AC30). Its owner and admins may
+/// read it. Anyone else gets a 403, even for an account that does not exist.
+async fn get_account(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<AccountStatus>, ApiError> {
+    if user_id != claims.sub && !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Only the account's owner or an administrator may see its link.".to_string(),
+        ));
+    }
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    let account = rustyfin_db::repo_oidc::account_statuses(
+        &state.db,
+        config.allow_password_sign_in,
+        Some(user_id),
+    )
+    .await?
+    .pop()
+    .ok_or_else(|| ApiError::NotFound("No such account.".to_string()))?;
+    Ok(Json(account))
+}
+
+/// `DELETE /Auth/Oidc/Accounts/{userId}/Link` – unlinks an account (AC31). Another user's link is the
+/// admin's to remove. An owner removes their own link only when they can still sign in.
+async fn unlink(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let own = user_id == claims.sub;
+    if !own && !claims.is_admin {
+        return Err(ApiError::Forbidden(
+            "Only an administrator may remove another account's link.".to_string(),
+        ));
+    }
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    let account = rustyfin_db::repo_oidc::account_statuses(
+        &state.db,
+        config.allow_password_sign_in,
+        Some(user_id),
+    )
+    .await?
+    .pop()
+    .filter(|account| account.linked)
+    .ok_or_else(|| ApiError::NotFound("This account has no link to remove.".to_string()))?;
+    if own && !account.can_unlink {
+        let reason = if account.has_password {
+            "Password sign-in is turned off, so unlinking would leave this account no way in."
+        } else {
+            "This account has no password, so unlinking would leave it no way in."
+        };
+        return Err(ApiError::Conflict(reason.to_string()));
+    }
+    rustyfin_db::repo_oidc::delete_link(&state.db, user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The flow cookie's value in the request, if the browser sent one.
@@ -284,9 +405,10 @@ fn secure_attr(config: &OidcConfig) -> &'static str {
     }
 }
 
-/// The redirect that ends a sign-in with `reason`, and clears the flow cookie (AC9).
-fn refused(config: &OidcConfig, reason: &str) -> Response {
-    let location = format!("{}/web/#login/oidc-error/{reason}", config.public_url);
+/// The redirect that ends a flow with `reason` on `page` (`login` or `settings`), and clears the flow
+/// cookie (AC9).
+fn refused(config: &OidcConfig, page: &str, reason: &str) -> Response {
+    let location = format!("{}/web/#{page}/oidc-error/{reason}", config.public_url);
     redirect(location, Some(clear_flow_cookie(config)))
 }
 

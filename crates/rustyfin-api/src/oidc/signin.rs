@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use super::flow::Flow;
+use super::flow::{Flow, FlowKind};
 use super::{OidcState, Provider, callback_url, claim_username, in_group, names_match};
 
 /// How a sign-in ended without a user: the code the browser is sent, or a database failure.
@@ -75,8 +75,9 @@ fn auth_type_of(provider: &Provider) -> AuthType {
     }
 }
 
-/// Signs in the user the code is for. `flow` is the flow the callback matched, and `code` is the
-/// code from the provider's redirect. Returns the id of the user.
+/// Signs in the user the code is for, or links the caller's account to the identity when the flow
+/// is a link. `flow` is the flow the callback matched, and `code` is the code from the provider's
+/// redirect. Returns the id of the account the sign-in or the link settled on.
 pub(crate) async fn sign_in(
     oidc: &OidcState,
     pool: &SqlitePool,
@@ -175,16 +176,36 @@ pub(crate) async fn sign_in(
         return Err(SignInError::Refused("not_allowed"));
     }
 
+    let user_id = match flow.kind {
+        FlowKind::SignIn => sign_in_account(pool, config, linked, &subject, &claims).await?,
+        FlowKind::Link(caller) => {
+            link_profile(pool, config, caller, linked, &subject, &claims).await?
+        }
+    };
+    settle_admin_group(pool, config, user_id, &claims).await?;
+    Ok(user_id)
+}
+
+/// The account a sign-in is for (AC7, AC8): the user the identity is linked to, else the one user
+/// with the same name, else a new user. A name match never takes an administrator's account, and a
+/// user who has a link never takes a second one.
+async fn sign_in_account(
+    pool: &SqlitePool,
+    config: &OidcConfig,
+    linked: Option<Uuid>,
+    subject: &str,
+    claims: &Value,
+) -> Result<Uuid, SignInError> {
     if let Some(user_id) = linked {
         if repo_user::is_disabled(pool, user_id).await? {
             return Err(SignInError::Refused("account_disabled"));
         }
-        let username = claim_username(&claims, &config.username_claim);
+        let username = claim_username(claims, &config.username_claim);
         repo_oidc::touch_link(pool, user_id, username.as_deref(), Utc::now()).await?;
         return Ok(user_id);
     }
 
-    let username = claim_username(&claims, &config.username_claim)
+    let username = claim_username(claims, &config.username_claim)
         .ok_or(SignInError::Refused("no_username"))?;
     let now = Utc::now();
     let same_name: Vec<User> = repo_user::get_all_users(pool)
@@ -203,15 +224,8 @@ pub(crate) async fn sign_in(
                 last_login_date: None,
                 configuration: Value::Object(Map::new()),
             };
-            repo_oidc::create_linked_user(
-                pool,
-                &user,
-                &config.issuer_url,
-                &subject,
-                &username,
-                now,
-            )
-            .await?;
+            repo_oidc::create_linked_user(pool, &user, &config.issuer_url, subject, &username, now)
+                .await?;
             Ok(user.id)
         }
         [existing] => {
@@ -229,15 +243,70 @@ pub(crate) async fn sign_in(
                 pool,
                 existing.id,
                 &config.issuer_url,
-                &subject,
+                subject,
                 &username,
                 now,
+                Some(now),
             )
             .await?;
             Ok(existing.id)
         }
         _ => Err(SignInError::Refused("ambiguous_user")),
     }
+}
+
+/// A profile link (AC29, AC8, AC12): the identity goes to the caller's own account. There is no name
+/// matching and no new user. The identity must be linked to nobody, and the caller must have no link.
+async fn link_profile(
+    pool: &SqlitePool,
+    config: &OidcConfig,
+    caller: Uuid,
+    linked: Option<Uuid>,
+    subject: &str,
+    claims: &Value,
+) -> Result<Uuid, SignInError> {
+    if linked.is_some() || repo_oidc::user_has_link(pool, caller).await? {
+        return Err(SignInError::Refused("already_linked"));
+    }
+    if repo_user::is_disabled(pool, caller).await? {
+        return Err(SignInError::Refused("account_disabled"));
+    }
+    let username = claim_username(claims, &config.username_claim)
+        .ok_or(SignInError::Refused("no_username"))?;
+    repo_oidc::create_link(
+        pool,
+        caller,
+        &config.issuer_url,
+        subject,
+        &username,
+        Utc::now(),
+        None,
+    )
+    .await?;
+    Ok(caller)
+}
+
+/// Applies the admin group to a settled account (AC17-AC19). A member who is not an administrator is
+/// made one, and the flag records that the group gave the rights. A flagged account that is no
+/// longer a member loses them, unless it is the owner or the last enabled administrator: then the
+/// rights stay and a warning says so. Rights given by hand (no flag) are never taken back here.
+async fn settle_admin_group(
+    pool: &SqlitePool,
+    config: &OidcConfig,
+    user_id: Uuid,
+    claims: &Value,
+) -> Result<(), sqlx::Error> {
+    if in_group(claims, &config.group_claim, &config.admin_group) {
+        repo_user::grant_group_admin(pool, user_id).await?;
+    } else if repo_user::admin_from_group(pool, user_id).await?
+        && !repo_user::revoke_group_admin(pool, user_id).await?
+    {
+        tracing::warn!(
+            user_id = %user_id,
+            "admin rights kept: the admin group no longer grants them, and this user is the owner or the last enabled administrator"
+        );
+    }
+    Ok(())
 }
 
 /// Whether the body of a failed token request holds an ID token: the provider answered, but the

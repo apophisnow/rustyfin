@@ -117,6 +117,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(dynamic_hls::routes())
         .merge(localization::routes())
         .merge(sync_play::routes())
+        .merge(oidc::protected_routes())
         .merge(admin)
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
