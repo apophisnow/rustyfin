@@ -4659,3 +4659,452 @@ async fn test_dynamic_hls_not_found() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── G1 follow-up ──
+// Another user's ratings, resume list, Next Up, Upcoming and notifications need that user or an
+// administrator, and a query without userId means the caller (Jellyfin's
+// RequestHelpers.GetUserId).
+
+const G1F_NIL: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Inserts a TV library with one series, one season and three episodes: E1 and E2 have aired, E3
+/// airs in 2999. Returns `(series_id, [e1, e2, e3])`.
+async fn g1f_insert_show(state: &AppState) -> (uuid::Uuid, [uuid::Uuid; 3]) {
+    let folder = media_folder(state, "g1f-shows");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "G1 Shows".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::TvShows,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let series = uuid::Uuid::new_v4();
+    let season = uuid::Uuid::new_v4();
+    let episodes = [
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    ];
+    // (id, name, type, parent, index, season number, premiere date)
+    let rows = [
+        (series, "G1 Show", "Series", None, None, None, None),
+        (
+            season,
+            "Season 1",
+            "Season",
+            Some(series),
+            Some(1),
+            None,
+            None,
+        ),
+        (
+            episodes[0],
+            "E1",
+            "Episode",
+            Some(season),
+            Some(1),
+            Some(1),
+            Some("2001-01-01T00:00:00+00:00"),
+        ),
+        (
+            episodes[1],
+            "E2",
+            "Episode",
+            Some(season),
+            Some(2),
+            Some(1),
+            Some("2001-01-08T00:00:00+00:00"),
+        ),
+        (
+            episodes[2],
+            "E3",
+            "Episode",
+            Some(season),
+            Some(3),
+            Some(1),
+            Some("2999-01-01T00:00:00+00:00"),
+        ),
+    ];
+    for (id, name, media_type, parent, index, season_number, premiere) in rows {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+             index_number, parent_index_number, premiere_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(media_type)
+        .bind(format!("{folder}/{name}"))
+        .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+        .bind(index)
+        .bind(season_number)
+        .bind(premiere)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    (series, episodes)
+}
+
+/// Sends a GET and returns the status and the ids in the answer's `Items`, in order.
+async fn g1f_ids(
+    app: &axum::Router,
+    uri: String,
+    token: Option<&str>,
+) -> (StatusCode, Vec<uuid::Uuid>) {
+    let (status, json) = send(app, request("GET", &uri, token, None)).await;
+    let ids = json["Items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| uuid::Uuid::parse_str(item["Id"].as_str().unwrap()).unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    (status, ids)
+}
+
+/// Gives the user a rating of 8 with Likes on the item.
+async fn g1f_rate(state: &AppState, user: &str, item: uuid::Uuid) {
+    rustyfin_db::repo_playback::set_user_rating(
+        &state.db,
+        user.parse().unwrap(),
+        item,
+        Some(true),
+        Some(8),
+    )
+    .await
+    .unwrap();
+}
+
+/// The user's `(Likes, UserRating)` on the item.
+async fn g1f_rating(state: &AppState, user: &str, item: uuid::Uuid) -> (Option<bool>, Option<i32>) {
+    let data =
+        rustyfin_db::repo_playback::get_user_item_data(&state.db, user.parse().unwrap(), item)
+            .await
+            .unwrap();
+    (data.likes, data.user_rating)
+}
+
+#[tokio::test]
+async fn g1f_delete_rating_follows_user_id() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let item = g1_insert_movie(&state).await;
+    let random = uuid::Uuid::new_v4().to_string();
+    let delete = |user: &str, token: Option<&str>| {
+        request(
+            "DELETE",
+            &format!("/Users/{user}/Items/{item}/Rating"),
+            token,
+            None,
+        )
+    };
+    let rated = (Some(true), Some(8));
+    let cleared = (None, None);
+    g1f_rate(&state, &owner_id, item).await;
+    g1f_rate(&state, &viewer_id, item).await;
+
+    assert_eq!(
+        send(&app, delete(&owner_id, None)).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A non-admin on another user, existing or not: 403, and the rating stays.
+    for target in [&owner_id, &random] {
+        assert_eq!(
+            send(&app, delete(target, Some(&viewer))).await.0,
+            StatusCode::FORBIDDEN,
+            "viewer on {target}"
+        );
+    }
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, rated);
+    // On themselves: today's answer, and their rating is cleared.
+    assert_eq!(
+        send(&app, delete(&viewer_id, Some(&viewer))).await,
+        (StatusCode::OK, serde_json::json!({}))
+    );
+    assert_eq!(g1f_rating(&state, &viewer_id, item).await, cleared);
+    // An administrator or the API key on another user: 200, and that user's rating is cleared.
+    g1f_rate(&state, &viewer_id, item).await;
+    assert_eq!(
+        send(&app, delete(&viewer_id, Some(&owner))).await,
+        (StatusCode::OK, serde_json::json!({}))
+    );
+    assert_eq!(g1f_rating(&state, &viewer_id, item).await, cleared);
+    assert_eq!(
+        send(&app, delete(&owner_id, Some("test-api-key"))).await,
+        (StatusCode::OK, serde_json::json!({}))
+    );
+    assert_eq!(g1f_rating(&state, &owner_id, item).await, cleared);
+    // An administrator on an unknown user: 404.
+    assert_eq!(
+        send(&app, delete(&random, Some(&owner))).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Sends `GET /Users/{user}/Items/Resume` and returns the status and the item ids.
+async fn g1f_resume(
+    app: &axum::Router,
+    user: &str,
+    token: Option<&str>,
+) -> (StatusCode, Vec<uuid::Uuid>) {
+    g1f_ids(app, format!("/Users/{user}/Items/Resume"), token).await
+}
+
+#[tokio::test]
+async fn g1f_user_resume_follows_user_id() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    // The owner has started one movie and the viewer another.
+    let owners_movie = g1_insert_movie(&state).await;
+    let viewers_movie = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) \
+         SELECT ?, library_id, 'G1 Movie 2', media_type, path || '.2' FROM media_items WHERE id = ?",
+    )
+    .bind(viewers_movie.to_string())
+    .bind(owners_movie.to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let random = uuid::Uuid::new_v4().to_string();
+    for (user, item) in [(&owner_id, owners_movie), (&viewer_id, viewers_movie)] {
+        rustyfin_db::repo_playback::update_playback_position(
+            &state.db,
+            user.parse().unwrap(),
+            item,
+            10_000_000,
+        )
+        .await
+        .unwrap();
+    }
+    let owners = vec![owners_movie];
+    let viewers = vec![viewers_movie];
+
+    assert_eq!(
+        g1f_resume(&app, &viewer_id, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A non-admin on another user, existing or not: 403.
+    for target in [&owner_id, &random] {
+        assert_eq!(
+            g1f_resume(&app, target, Some(&viewer)).await.0,
+            StatusCode::FORBIDDEN,
+            "viewer on {target}"
+        );
+    }
+    // On themselves: today's answer.
+    assert_eq!(
+        g1f_resume(&app, &viewer_id, Some(&viewer)).await,
+        (StatusCode::OK, viewers.clone())
+    );
+    assert_eq!(
+        g1f_resume(&app, &owner_id, Some(&owner)).await,
+        (StatusCode::OK, owners.clone())
+    );
+    // An administrator or the API key on another user: that user's list.
+    assert_eq!(
+        g1f_resume(&app, &viewer_id, Some(&owner)).await,
+        (StatusCode::OK, viewers)
+    );
+    assert_eq!(
+        g1f_resume(&app, &owner_id, Some("test-api-key")).await,
+        (StatusCode::OK, owners)
+    );
+    // An administrator on an unknown user: 404.
+    assert_eq!(
+        g1f_resume(&app, &random, Some(&owner)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Checks `GET {path}` (Next Up or Upcoming), with and without `seriesId`, for every kind of
+/// caller. `users` is what `g1_owner_and_viewer` returns; `all` is the list for a user who has
+/// played nothing and `owners` the owner's list.
+async fn g1f_assert_episode_list(
+    app: &axum::Router,
+    path: &str,
+    series: uuid::Uuid,
+    users: &(String, String, String, String),
+    all: &[uuid::Uuid],
+    owners: &[uuid::Uuid],
+) {
+    let (owner, owner_id, viewer, viewer_id) = users;
+    let random = uuid::Uuid::new_v4();
+    for base in [format!("{path}?"), format!("{path}?seriesId={series}&")] {
+        assert_eq!(
+            g1f_ids(app, base.clone(), None).await.0,
+            StatusCode::UNAUTHORIZED,
+            "anonymous {base}"
+        );
+        // A non-admin naming another user, existing or not: 403.
+        for target in [owner_id.clone(), random.to_string()] {
+            assert_eq!(
+                g1f_ids(app, format!("{base}userId={target}"), Some(viewer))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "viewer {base}userId={target}"
+            );
+        }
+        // A non-admin with their own id, the nil id or no userId: their own list.
+        for query in [
+            String::new(),
+            format!("userId={viewer_id}"),
+            format!("userId={G1F_NIL}"),
+        ] {
+            assert_eq!(
+                g1f_ids(app, format!("{base}{query}"), Some(viewer)).await,
+                (StatusCode::OK, all.to_vec()),
+                "viewer {base}{query}"
+            );
+        }
+        // An administrator: their own list with no userId, the nil id or their own id, another
+        // user's list with that user's id, and 404 for an unknown user.
+        for query in [
+            String::new(),
+            format!("userId={G1F_NIL}"),
+            format!("userId={owner_id}"),
+        ] {
+            assert_eq!(
+                g1f_ids(app, format!("{base}{query}"), Some(owner)).await,
+                (StatusCode::OK, owners.to_vec()),
+                "owner {base}{query}"
+            );
+        }
+        assert_eq!(
+            g1f_ids(app, format!("{base}userId={viewer_id}"), Some(owner)).await,
+            (StatusCode::OK, all.to_vec()),
+            "owner {base}userId={viewer_id}"
+        );
+        assert_eq!(
+            g1f_ids(app, format!("{base}userId={random}"), Some(owner))
+                .await
+                .0,
+            StatusCode::NOT_FOUND,
+            "owner {base}userId={random}"
+        );
+        // The API key: every episode with no userId (today's answer), a user's list with their id.
+        assert_eq!(
+            g1f_ids(app, base.clone(), Some("test-api-key")).await,
+            (StatusCode::OK, all.to_vec()),
+            "API key {base}"
+        );
+        assert_eq!(
+            g1f_ids(
+                app,
+                format!("{base}userId={owner_id}"),
+                Some("test-api-key")
+            )
+            .await,
+            (StatusCode::OK, owners.to_vec()),
+            "API key {base}userId={owner_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn g1f_next_up_follows_user_id() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let users = g1_owner_and_viewer(&state, &app).await;
+    let (series, [e1, e2, e3]) = g1f_insert_show(&state).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, users.1.parse().unwrap(), e1)
+        .await
+        .unwrap();
+    g1f_assert_episode_list(
+        &app,
+        "/Shows/NextUp",
+        series,
+        &users,
+        &[e1, e2, e3],
+        &[e2, e3],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn g1f_upcoming_follows_user_id() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let users = g1_owner_and_viewer(&state, &app).await;
+    let (series, [_, _, e3]) = g1f_insert_show(&state).await;
+    rustyfin_db::repo_playback::mark_played(&state.db, users.1.parse().unwrap(), e3)
+        .await
+        .unwrap();
+    g1f_assert_episode_list(&app, "/Shows/Upcoming", series, &users, &[e3], &[]).await;
+}
+
+/// Sends `GET /Notifications/{user}` and returns the status and the notification names.
+async fn g1f_notifications(
+    app: &axum::Router,
+    user: &str,
+    token: Option<&str>,
+) -> (StatusCode, Vec<String>) {
+    let uri = format!("/Notifications/{user}");
+    let (status, json) = send(app, request("GET", &uri, token, None)).await;
+    let names = json["Notifications"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|n| n["Name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    (status, names)
+}
+
+#[tokio::test]
+async fn g1f_notifications_follow_user_id() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let random = uuid::Uuid::new_v4().to_string();
+    for (user, name) in [(&owner_id, "for the owner"), (&viewer_id, "for the viewer")] {
+        sqlx::query("INSERT INTO notifications (user_id, name) VALUES (?, ?)")
+            .bind(user.parse::<uuid::Uuid>().unwrap().to_string())
+            .bind(name)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let owners = vec!["for the owner".to_string()];
+    let viewers = vec!["for the viewer".to_string()];
+
+    assert_eq!(
+        g1f_notifications(&app, &viewer_id, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A non-admin on another user, existing or not: 403.
+    for target in [&owner_id, &random] {
+        assert_eq!(
+            g1f_notifications(&app, target, Some(&viewer)).await.0,
+            StatusCode::FORBIDDEN,
+            "viewer on {target}"
+        );
+    }
+    // On themselves: today's answer.
+    assert_eq!(
+        g1f_notifications(&app, &viewer_id, Some(&viewer)).await,
+        (StatusCode::OK, viewers.clone())
+    );
+    // An administrator or the API key on another user: that user's notifications; unknown: 404.
+    assert_eq!(
+        g1f_notifications(&app, &viewer_id, Some(&owner)).await,
+        (StatusCode::OK, viewers)
+    );
+    assert_eq!(
+        g1f_notifications(&app, &owner_id, Some("test-api-key")).await,
+        (StatusCode::OK, owners)
+    );
+    assert_eq!(
+        g1f_notifications(&app, &random, Some(&owner)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
