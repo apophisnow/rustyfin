@@ -4946,3 +4946,83 @@ async fn g4_unsatisfiable_ranges_get_416() {
         }
     }
 }
+
+/// True when ffmpeg is on PATH; otherwise prints that `test` is skipped.
+fn g4_have_ffmpeg(test: &str) -> bool {
+    let found = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        println!("{test}: skipped, ffmpeg is not on PATH");
+    }
+    found
+}
+
+#[tokio::test]
+async fn g4_ffmpeg_error_is_returned() {
+    if !g4_have_ffmpeg("g4_ffmpeg_error_is_returned") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-garbage");
+    let file = std::path::Path::new(&folder).join("G4 Garbage.mkv");
+    std::fs::write(&file, vec![0x5a_u8; 4096]).unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let manager = state.transcode_manager.clone();
+    let app = app(state);
+
+    let started = std::time::Instant::now();
+    let uri = format!("/Videos/{id}/main.m3u8?PlaySessionId=g4-garbage");
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the error came after {:?}, not when ffmpeg exited",
+        started.elapsed()
+    );
+    let detail = body["Detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("Invalid data found"), "{body}");
+    assert!(!manager.is_active(id).await, "the failed transcode is gone");
+}
+
+#[tokio::test]
+async fn g4_active_encodings_needs_a_name() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+    let id = uuid::Uuid::new_v4();
+
+    for (uri, expected) in [
+        (
+            "/Videos/ActiveEncodings".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Videos/ActiveEncodings?deviceId=g4-dev".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "/Videos/ActiveEncodings?playSessionId=g4-psid".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "/Videos/ActiveEncodings?DeviceId=g4-dev&PlaySessionId=g4-psid".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            format!("/Videos/{id}/Transcode?PlaySessionId=g4-psid"),
+            StatusCode::NO_CONTENT,
+        ),
+        (format!("/Videos/{id}/Transcode"), StatusCode::NO_CONTENT),
+    ] {
+        let (status, body) = send(&app, request("DELETE", &uri, Some(&token), None)).await;
+        assert_eq!(status, expected, "DELETE {uri}: {body}");
+    }
+    let uri = "/Videos/ActiveEncodings?playSessionId=g4-psid";
+    let (status, _) = send(&app, request("DELETE", uri, None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

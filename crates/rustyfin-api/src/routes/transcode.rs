@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -6,7 +8,7 @@ use axum::routing::{delete, get};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use rustyfin_core::transcode::{HwAccel, TranscodeProfile};
+use rustyfin_core::transcode::{HwAccel, TranscodeError, TranscodeProfile};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -23,9 +25,10 @@ pub fn routes() -> Router<AppState> {
         // Legacy segment endpoint (backward compat)
         .route("/Videos/{id}/hls/{segment}", get(hls_segment_legacy))
         .route("/Videos/{id}/Transcode", delete(stop_transcode))
+        .route("/Videos/ActiveEncodings", delete(stop_active_encodings))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct TranscodeQuery {
     pub video_bitrate: Option<u32>,
@@ -44,6 +47,10 @@ pub struct TranscodeQuery {
     pub audio_only: Option<bool>,
     /// Enable adaptive bitrate transcoding
     pub adaptive_bitrate: Option<bool>,
+    /// Jellyfin play session id: the transcode session key
+    pub play_session_id: Option<String>,
+    /// Jellyfin device id: the session key when there is no play session id
+    pub device_id: Option<String>,
 }
 
 impl TranscodeQuery {
@@ -101,13 +108,29 @@ async fn hls_master_playlist(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Item {id} not found")))?;
 
+    let play_session_id = query.play_session_id.clone().unwrap_or_default();
+    let device_id = query.device_id.clone().unwrap_or_default();
     let profile = query.into_profile();
 
-    let (playlist_path, playback_id) = state
+    let (playlist_path, playback_id) = match state
         .transcode_manager
-        .start_transcode(id, &item.path, &profile)
+        .start_transcode(id, &item.path, &profile, &play_session_id, &device_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("Transcode failed: {e}")))?;
+    {
+        Ok(started) => started,
+        // ffmpeg has not written the playlist yet; the client should ask again shortly
+        Err(TranscodeError::PlaylistTimeout) => {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5")],
+            )
+                .into_response());
+        }
+        Err(TranscodeError::FfmpegFailed(msg)) => {
+            return Err(ApiError::Internal(format!("Transcode failed: {msg}")));
+        }
+        Err(e) => return Err(ApiError::Internal(format!("Transcode failed: {e}"))),
+    };
 
     // Read and return the playlist, rewriting relative segment paths to include playbackId
     let content = tokio::fs::read_to_string(&playlist_path)
@@ -153,26 +176,14 @@ async fn hls_segment(
     State(state): State<AppState>,
     Path((id, playback_id, segment_type, segment)): Path<(Uuid, Uuid, String, String)>,
 ) -> Result<Response, ApiError> {
-    // Verify the playback_id matches the active session
-    let active_playback_id = state
-        .transcode_manager
-        .get_playback_id(id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("No active transcode session for item {id}")))?;
-
-    if active_playback_id != playback_id {
-        return Err(ApiError::NotFound(format!(
-            "Playback session {playback_id} not found for item {id}"
-        )));
-    }
-
     // segment_type is typically "video", "audio", or "sub" — we just ignore it
     // and serve the segment file by name
     let _ = segment_type;
 
+    // The playback id names the session, which must belong to this item
     let segment_path = state
         .transcode_manager
-        .get_segment_path(id, &segment)
+        .segment_path(id, playback_id, &segment)
         .ok_or_else(|| ApiError::NotFound(format!("Segment {segment} not found for item {id}")))?;
 
     let data = tokio::fs::read(&segment_path)
@@ -205,7 +216,7 @@ async fn hls_segment_legacy(
 ) -> Result<Response, ApiError> {
     let segment_path = state
         .transcode_manager
-        .get_segment_path(id, &segment)
+        .legacy_segment_path(id, &segment)
         .ok_or_else(|| ApiError::NotFound(format!("Segment {segment} not found for item {id}")))?;
 
     let data = tokio::fs::read(&segment_path)
@@ -231,10 +242,46 @@ async fn hls_segment_legacy(
         .into_response())
 }
 
+/// Look up a query parameter by name, ignoring ASCII case (clients send both `PlaySessionId`
+/// and `playSessionId`). A missing parameter reads as "".
+fn query_value<'a>(query: &'a HashMap<String, String>, name: &str) -> &'a str {
+    query
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map_or("", |(_, value)| value.as_str())
+}
+
+/// DELETE /Videos/{id}/Transcode: stop this item's transcodes for one play session or device.
 async fn stop_transcode(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
-    state.transcode_manager.stop_transcode(id).await;
+    let play_session_id = query_value(&query, "PlaySessionId");
+    let device_id = query_value(&query, "DeviceId");
+    state
+        .transcode_manager
+        .stop_play_session(Some(id), play_session_id, device_id)
+        .await;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// DELETE /Videos/ActiveEncodings: stop the transcodes of a play session or device, any item.
+/// A request that names neither is refused.
+async fn stop_active_encodings(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let play_session_id = query_value(&query, "PlaySessionId");
+    let device_id = query_value(&query, "DeviceId");
+    if play_session_id.is_empty() && device_id.is_empty() {
+        return Err(ApiError::BadRequest(
+            "PlaySessionId or DeviceId is required".to_string(),
+        ));
+    }
+    state
+        .transcode_manager
+        .stop_play_session(None, play_session_id, device_id)
+        .await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
