@@ -225,7 +225,16 @@ const API = {
     completeStartup() { return this.post('/Startup/Complete'); },
 
     // Libraries
-    getLibraries() { return this.get('/Library/VirtualFolders'); },
+    getLibraries() {
+        if (this.isAdmin) return this.get('/Library/VirtualFolders');
+        // /Library/VirtualFolders is for administrators; other users get the same libraries from their views.
+        const types = { movies: 'Movies', tvshows: 'TvShows', music: 'Music', homevideos: 'Photos' };
+        return this.get('/UserViews').then(views => (views.Items || []).map(v => ({
+            id: v.Id,
+            name: v.Name,
+            content_type: types[v.CollectionType] || 'Mixed',
+        })));
+    },
     createLibrary(name, contentType, paths) {
         return this.post('/Library/VirtualFolders', { Name: name, ContentType: contentType, Paths: paths });
     },
