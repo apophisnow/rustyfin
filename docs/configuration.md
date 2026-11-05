@@ -13,9 +13,12 @@ Rustyfin wird über Umgebungsvariablen konfiguriert. Es sind keine Konfiguration
 | `RUSTYFIN_BIND` | Adresse und Port, auf dem der Server lauscht | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Datenverzeichnis (Datenbank, Cache, Konfiguration, Logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite-Datenbank-URL | `sqlite://<data_dir>/rustyfin.db?mode=rwc` |
-| `RUSTYFIN_SECRET` | JWT-Signierungsschlüssel | Zufällige UUID (bei jedem Start neu generiert) |
-| `RUSTYFIN_SERVER_ID` | Eindeutige Server-Kennung | Zufällige UUID (bei jedem Start neu generiert) |
+| `RUSTYFIN_SECRET` | Veraltet und ohne Wirkung — Access-Token werden serverseitig gespeichert und überstehen Neustarts | *(ungenutzt)* |
+| `RUSTYFIN_SERVER_ID` | Eindeutige Server-Kennung | Stabil; in `<data_dir>/server_id` gespeichert |
 | `RUSTYFIN_API_KEY` | Statischer API-Key für externe Integrationen | *(deaktiviert)* |
+| `RUSTYFIN_KNOWN_PROXIES` | Reverse-Proxies, denen beim Setzen von `X-Forwarded-For` vertraut wird, kommagetrennte IPs oder CIDRs (Loopback wird immer vertraut) | *(keine)* |
+| `RUSTYFIN_RATE_LIMIT` | Erlaubte Anmelde- und Passwort-Reset-Versuche pro Zeitfenster, pro Client-IP (`0` deaktiviert) | `10` |
+| `RUSTYFIN_RATE_WINDOW` | Zeitfenster der Ratenbegrenzung in Sekunden | `60` |
 | `RUST_LOG` | Log-Level-Filter (z.B. `debug`, `info`, `rustyfin=trace`) | `info` |
 
 ## Beispielkonfigurationen
@@ -33,7 +36,6 @@ Startet mit allen Standardwerten. Der Server lauscht auf Port 8096 und speichert
 ```bash
 export RUSTYFIN_BIND=127.0.0.1:8096
 export RUSTYFIN_DATA=/srv/rustyfin
-export RUSTYFIN_SECRET=ein-sicherer-geheimer-schluessel
 export RUSTYFIN_SERVER_ID=feste-server-id-hier
 export RUSTYFIN_API_KEY=mein-api-key
 export RUST_LOG=info
@@ -77,6 +79,8 @@ Rustyfin unterstützt den Betrieb hinter einem Reverse Proxy. Die folgenden Head
 - `X-Forwarded-Proto`
 - `X-Forwarded-Host`
 
+`X-Forwarded-For` wird nur ausgewertet, wenn die Verbindung von einem in `RUSTYFIN_KNOWN_PROXIES` eingetragenen Proxy stammt (Loopback wird immer vertraut); andernfalls wird die Peer-Adresse verwendet. So kann ein gefälschter Header die Ratenbegrenzung nicht umgehen.
+
 #### Nginx-Beispiel
 
 ```nginx
@@ -104,11 +108,11 @@ server {
 
 ## Authentifizierung
 
-### JWT
+### Zugriffstoken
 
-Rustyfin verwendet JWT-Token zur Authentifizierung. Der Signierungsschlüssel wird über `RUSTYFIN_SECRET` gesetzt. 
+Rustyfin gibt pro Gerät ein undurchsichtiges Zugriffstoken aus und speichert es serverseitig in der Datenbank. Die Token überstehen einen Neustart und bleiben gültig, bis sich das Gerät abmeldet, das Passwort des Benutzers geändert wird oder das Konto deaktiviert wird.
 
-> ⚠️ **In Produktionsumgebungen immer einen festen `RUSTYFIN_SECRET` setzen!** Andernfalls werden alle Sessions bei einem Neustart ungültig.
+> ℹ️ **`RUSTYFIN_SECRET` wird nicht mehr benötigt.** Die Variable wird ignoriert; Sessions bleiben über Neustarts hinweg erhalten.
 
 ### API-Key
 

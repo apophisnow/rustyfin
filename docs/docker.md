@@ -67,7 +67,6 @@ services:
     environment:
       - RUSTYFIN_DATA=/data
       - RUSTYFIN_BIND=0.0.0.0:8096
-      - RUSTYFIN_SECRET=ein-sicherer-geheimer-schluessel
       - RUSTYFIN_SERVER_ID=feste-server-id
       - RUSTYFIN_API_KEY=mein-api-key
       - RUST_LOG=info

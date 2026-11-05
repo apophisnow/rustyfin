@@ -286,16 +286,18 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_BIND` | Bind address:port | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Data directory (DB, cache, config, logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite connection string | `sqlite://<data>/rustyfin.db?mode=rwc` |
-| `RUSTYFIN_SECRET` | JWT signing secret | Random UUID (regenerated each start!) |
-| `RUSTYFIN_SERVER_ID` | Unique server identifier | Random UUID |
+| `RUSTYFIN_SECRET` | Deprecated and ignored — access tokens are stored server-side and survive restarts | *(unused)* |
+| `RUSTYFIN_SERVER_ID` | Unique server identifier | Stable; persisted to `<data>/server_id` |
 | `RUSTYFIN_API_KEY` | Static API key for integrations | Disabled |
+| `RUSTYFIN_KNOWN_PROXIES` | Reverse proxies trusted to set `X-Forwarded-For`, comma-separated IPs or CIDRs (loopback is always trusted) | *(none)* |
+| `RUSTYFIN_RATE_LIMIT` | Login and password-reset attempts per window, per client IP (`0` disables) | `10` |
+| `RUSTYFIN_RATE_WINDOW` | Rate-limit window, in seconds | `60` |
 | `RUST_LOG` | Log level (`debug`, `info`, `rustyfin=trace`) | `info` |
 
 **Example (production):**
 ```bash
 RUSTYFIN_BIND=127.0.0.1:8096 \
 RUSTYFIN_DATA=/srv/rustyfin \
-RUSTYFIN_SECRET="$(openssl rand -base64 32)" \
 RUSTYFIN_API_KEY="my-integration-key" \
 ./target/release/rustyfin
 ```

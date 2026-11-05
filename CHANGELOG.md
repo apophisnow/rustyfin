@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **pnpm for the web client**: `crates/rustyfin-web` uses pnpm instead of npm. `package.json` pins the version in `packageManager` (Corepack and `pnpm/action-setup` read it), and `pnpm-lock.yaml` replaces `package-lock.json` with the same dependency versions. The Dockerfile, the release workflow, `build.sh`, `start.sh` and the README use pnpm.
+- **Access tokens survive restarts**: Access tokens are now opaque values stored server-side, one per device, instead of self-contained JWTs signed with a per-start secret. A restart no longer logs anyone out, and the server id is stable across restarts (persisted to `<data>/server_id`). `RUSTYFIN_SECRET` is now ignored (with a one-time startup notice). **Upgrade note:** tokens issued by an older build stop working once, at the upgrade — every client signs in again after updating.
+- **Stricter login rate limit**: The login, forgot-password and reset endpoints now allow 10 requests per 60 seconds per client IP by default (was 500/60 s), tunable with `RUSTYFIN_RATE_LIMIT` and `RUSTYFIN_RATE_WINDOW` (`0` disables). `X-Forwarded-For` is trusted only from a proxy listed in the new `RUSTYFIN_KNOWN_PROXIES` (comma-separated IPs or CIDRs; loopback is always trusted); otherwise the connecting peer address is used, so a spoofed header can no longer claim the loopback exemption or rotate past the limit.
 
 ### Fixed
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
@@ -24,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The wizard shows every failed step and resumes there on retry.
   - `start.sh smoke` creates a throwaway owner in a temporary data directory.
 - **Library folders**: Creating a library now checks its folders. Before, `POST /Library/VirtualFolders` stored any path, so the setup wizard and the library dialog accepted a folder that does not exist, and the library's scan found nothing. Now each path must be a full path to a folder that exists on the server and that the server can list. Otherwise the server stores nothing and answers 400 with a message that names each bad path and the reason, for example `The folder "/media/films" was not found on the server.` In Docker, the paths are the ones inside the container.
+- **LAN admin takeover via the reset PIN (R1-01)**: The forgot-password flow now follows Jellyfin's. A reset PIN is issued only to a request from the local network and only for an existing user, written to a file in the data directory (mode 0600), and never returned or logged; the response is uniform and does not reveal whether a user exists. The PIN is random, stored only as a hash, valid for 30 minutes, single-use, and voided after five wrong attempts. The old biased PIN generator was removed (M-17).
+- **Access tokens can be revoked (R1-08, R1-09)**: Logging out ends that device's token, changing a password ends the user's other tokens, and disabling or deleting a user ends all of theirs; a disabled user's existing tokens are rejected. Restarts keep valid tokens valid.
+- **`admin`/`admin` after an upgrade**: At startup the server logs a warning naming any enabled administrator whose password is still `admin`.
+- **Password hashing no longer blocks the server (M-15)**: argon2 hashing and verification run on a blocking thread pool, so a burst of logins no longer stalls unrelated requests.
+- **Login response reflects the current login (M-16)**: `AuthenticateByName` now returns the user with the `LastLoginDate` set by that login, not the previous one.
 
 ## [0.14.0] - 2026-11-03
 
