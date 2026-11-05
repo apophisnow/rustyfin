@@ -233,8 +233,10 @@ async function wizComplete() {
             const libPath = $('wiz-lib-path').value.trim();
             if (libName && libPath) {
                 try {
-                    await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
+                    const lib = await API.createLibrary(libName, $('wiz-lib-type').value, [libPath]);
                     wizProgress.libraryCreated = true;
+                    // Scan it now, as the Add Library dialog does; the scheduler would not scan it for hours.
+                    API.scanLibrary(lib.id || lib.Id).catch(err => toast(t('library.scan_start_failed', { message: err.message }), 'error'));
                 } catch (e) {
                     showFinishError(t('wizard.library_create_failed', { message: e.message }));
                     return;
