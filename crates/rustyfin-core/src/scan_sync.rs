@@ -2,10 +2,11 @@
 //! reconciliation of movie and episode version groups with the database.
 //! All SQL that a scan uses to write items lives here.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -499,18 +500,75 @@ async fn settle_group(
     })
 }
 
-/// Moves the rows that refer to item `other` over to item `survivor`. A row whose key the survivor
-/// already has stays on `other`, and goes when `other` is deleted.
+/// One user's marks on one item, as `user_item_data` stores them.
+struct Marks {
+    position: i64,
+    plays: i64,
+    favorite: bool,
+    played: bool,
+    last_played: Option<String>,
+    rating: Option<i64>,
+    likes: Option<i64>,
+}
+
+/// The columns of a `Marks`, in the order `marks_on` reads them.
+type MarksRow = (i64, i64, i64, i64, Option<String>, Option<i64>, Option<i64>);
+
+/// Moves the references to item `other` over to item `survivor`. A user with a row on both copies
+/// keeps one row on the survivor, which combines the two (see `combine`), and the other copy's row
+/// is deleted. Other user data moves as it is, and so do pins. A collection or playlist that holds
+/// both copies keeps the survivor's entry. The activity log, sessions and recordings that name
+/// `other` name the survivor.
 async fn merge_references(
     conn: &mut SqliteConnection,
     survivor: &str,
     other: &str,
 ) -> Result<(), sqlx::Error> {
+    // The users with a row on both copies. Their rows combine before the move below, so the move
+    // cannot hit a key that the survivor already has.
+    let shared: Vec<String> = sqlx::query_scalar(
+        "SELECT user_id FROM user_item_data WHERE item_id = ?1
+         INTERSECT
+         SELECT user_id FROM user_item_data WHERE item_id = ?2",
+    )
+    .bind(other)
+    .bind(survivor)
+    .fetch_all(&mut *conn)
+    .await?;
+    for user in shared {
+        let ours = marks_on(conn, &user, survivor).await?;
+        let theirs = marks_on(conn, &user, other).await?;
+        let combined = combine(&ours, &theirs);
+        sqlx::query(
+            "UPDATE user_item_data SET playback_position_ticks = ?1, play_count = ?2,
+             is_favorite = ?3, played = ?4, last_played_date = ?5, user_rating = ?6, likes = ?7
+             WHERE user_id = ?8 AND item_id = ?9",
+        )
+        .bind(combined.position)
+        .bind(combined.plays)
+        .bind(i64::from(combined.favorite))
+        .bind(i64::from(combined.played))
+        .bind(combined.last_played.as_deref())
+        .bind(combined.rating)
+        .bind(combined.likes)
+        .bind(&user)
+        .bind(survivor)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("DELETE FROM user_item_data WHERE user_id = ?1 AND item_id = ?2")
+            .bind(&user)
+            .bind(other)
+            .execute(&mut *conn)
+            .await?;
+    }
     for sql in [
-        "UPDATE OR IGNORE user_item_data SET item_id = ?1 WHERE item_id = ?2",
+        "UPDATE user_item_data SET item_id = ?1 WHERE item_id = ?2",
         "UPDATE pinned_episodes SET episode_id = ?1 WHERE episode_id = ?2",
         "UPDATE OR IGNORE collection_items SET item_id = ?1 WHERE item_id = ?2",
         "UPDATE OR IGNORE playlist_items SET item_id = ?1 WHERE item_id = ?2",
+        "UPDATE activity_log SET item_id = ?1 WHERE item_id = ?2",
+        "UPDATE sessions SET now_playing_item_id = ?1 WHERE now_playing_item_id = ?2",
+        "UPDATE live_tv_recordings SET media_item_id = ?1 WHERE media_item_id = ?2",
     ] {
         sqlx::query(sql)
             .bind(survivor)
@@ -519,6 +577,72 @@ async fn merge_references(
             .await?;
     }
     Ok(())
+}
+
+/// `user`'s marks on item `item`. The row must exist.
+async fn marks_on(
+    conn: &mut SqliteConnection,
+    user: &str,
+    item: &str,
+) -> Result<Marks, sqlx::Error> {
+    let row: MarksRow = sqlx::query_as(
+        "SELECT playback_position_ticks, play_count, is_favorite, played, last_played_date,
+         user_rating, likes
+         FROM user_item_data WHERE user_id = ?1 AND item_id = ?2",
+    )
+    .bind(user)
+    .bind(item)
+    .fetch_one(&mut *conn)
+    .await?;
+    let (position, plays, favorite, played, last_played, rating, likes) = row;
+    Ok(Marks {
+        position,
+        plays,
+        favorite: favorite != 0,
+        played: played != 0,
+        last_played,
+        rating,
+        likes,
+    })
+}
+
+/// The row one user keeps when two copies merge. Flags are set if either row has them, and plays
+/// add up. The later play gives the date and position, where a missing or unparseable date is the
+/// oldest. On a tie the survivor's date is kept, or the other's if the survivor has none, and the
+/// survivor's position is kept unless it is 0. The survivor's rating and likes win when set.
+fn combine(survivor: &Marks, other: &Marks) -> Marks {
+    let survivor_at = played_at(survivor.last_played.as_deref());
+    let other_at = played_at(other.last_played.as_deref());
+    let (last_played, position) = match other_at.cmp(&survivor_at) {
+        Ordering::Greater => (other.last_played.clone(), other.position),
+        Ordering::Less => (survivor.last_played.clone(), survivor.position),
+        Ordering::Equal => (
+            survivor
+                .last_played
+                .clone()
+                .or_else(|| other.last_played.clone()),
+            if survivor.position == 0 {
+                other.position
+            } else {
+                survivor.position
+            },
+        ),
+    };
+    Marks {
+        position,
+        plays: survivor.plays + other.plays,
+        favorite: survivor.favorite || other.favorite,
+        played: survivor.played || other.played,
+        last_played,
+        rating: survivor.rating.or(other.rating),
+        likes: survivor.likes.or(other.likes),
+    }
+}
+
+/// The instant a stored play date stands for. A missing or unparseable date is `None`, which
+/// sorts before every instant.
+fn played_at(last_played: Option<&str>) -> Option<DateTime<FixedOffset>> {
+    last_played.and_then(|date| DateTime::parse_from_rfc3339(date).ok())
 }
 
 /// The files of a group as strings, in order.

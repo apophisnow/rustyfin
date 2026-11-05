@@ -1,6 +1,7 @@
 //! Library scans of real files in a temp dir: ignored folders and files (R1-12), symlink
 //! loops (M-19), removal of items that a scan no longer collects, episode numbers (R1-13),
-//! movie titles (R1-27), and the versions of a movie or an episode as one item (R1-20).
+//! movie titles (R1-27), and the versions of a movie or an episode as one item (R1-20), which
+//! keeps the user data of every copy (G9b).
 //!
 //! The tests marked "ffmpeg" write real clips and need ffmpeg and ffprobe; without them they
 //! print a line and pass.
@@ -1324,7 +1325,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     };
 
     // Argo: the versions were split into two items. user1 played the first; user2 played the
-    // first too, but also has a row of its own, not played, on the second, which wins.
+    // first too, and has an unplayed row of its own on the second. The rows combine, so both
+    // users have played Argo (G9b).
     let a1 = insert_movie(&old, &lib, &root.join(argo), Movie::default()).await;
     old_probe(&old, &lib, a1, &[argo]).await;
     let a2 = insert_movie(&old, &lib, &root.join(argo_uhd), year(2012)).await;
@@ -1408,7 +1410,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     }
     let mut want = vec![
         (user1.clone(), a2.to_string(), 1),
-        (user2.clone(), a2.to_string(), 0),
+        (user2.clone(), a2.to_string(), 1),
     ];
     want.sort();
     let got: Vec<(String, String, i64)> =
@@ -1808,4 +1810,644 @@ async fn tv_upgrade_matches_fresh_scan() {
         ids,
         "the second rescan probed again"
     );
+}
+
+// G9b: merged copies keep user data
+
+/// One user's `user_item_data` row, without its keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Marks {
+    position: i64,
+    plays: i64,
+    favorite: bool,
+    played: bool,
+    last_played: Option<String>,
+    rating: Option<i64>,
+    likes: Option<i64>,
+}
+
+/// Marks with only a position and a last played date.
+fn at(position: i64, last_played: Option<&str>) -> Marks {
+    Marks {
+        position,
+        last_played: last_played.map(str::to_string),
+        ..Marks::default()
+    }
+}
+
+const EARLY: &str = "2024-03-01T10:00:00+00:00";
+const LATE: &str = "2024-06-01T10:00:00+00:00";
+
+async fn insert_marks(pool: &SqlitePool, user: &str, item: Uuid, marks: &Marks) {
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, playback_position_ticks, play_count,
+           is_favorite, played, last_played_date, user_rating, likes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(user)
+    .bind(item.to_string())
+    .bind(marks.position)
+    .bind(marks.plays)
+    .bind(i64::from(marks.favorite))
+    .bind(i64::from(marks.played))
+    .bind(marks.last_played.as_deref())
+    .bind(marks.rating)
+    .bind(marks.likes)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+type MarksRow = (i64, i64, i64, i64, Option<String>, Option<i64>, Option<i64>);
+
+/// `user`'s row for `item`, if there is one.
+async fn marks_of(pool: &SqlitePool, user: &str, item: Uuid) -> Option<Marks> {
+    let row: Option<MarksRow> = sqlx::query_as(
+        "SELECT playback_position_ticks, play_count, is_favorite, played, last_played_date,
+                user_rating, likes
+         FROM user_item_data WHERE user_id = ?1 AND item_id = ?2",
+    )
+    .bind(user)
+    .bind(item.to_string())
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.map(
+        |(position, plays, favorite, played, last_played, rating, likes)| Marks {
+            position,
+            plays,
+            favorite: favorite != 0,
+            played: played != 0,
+            last_played,
+            rating,
+            likes,
+        },
+    )
+}
+
+/// Two empty copies of the movie in `<folder>`, as the old scanner stored them: a 2160p one,
+/// which survives the merge, and a 1080p one. Returns their ids.
+async fn two_copies(pool: &SqlitePool, lib: &Library, folder: &str) -> (Uuid, Uuid) {
+    let root = root_of(lib);
+    let uhd = touch(&root, &format!("{folder}/{folder} Bluray-2160p.mkv"));
+    let hd = touch(&root, &format!("{folder}/{folder} Bluray-1080p.mkv"));
+    let survivor = insert_movie(pool, lib, &uhd, Movie::default()).await;
+    let other = insert_movie(pool, lib, &hd, Movie::default()).await;
+    (survivor, other)
+}
+
+/// When both copies of a movie have a row for a user, the rows combine: a flag is set if
+/// either is, plays add up, the later play gives the date and position, and the survivor's
+/// rating and likes win when set (G9b AC 1).
+#[tokio::test]
+async fn merged_copies_combine_user_data() {
+    // (folder, the survivor's row, the other copy's row, the row after the merge)
+    let cases: Vec<(&str, Marks, Marks, Marks)> = vec![
+        // Flags and plays. The survivor has likes but no rating.
+        (
+            "Alpha (2001)",
+            Marks {
+                plays: 1,
+                played: true,
+                likes: Some(1),
+                ..at(0, Some(EARLY))
+            },
+            Marks {
+                plays: 2,
+                favorite: true,
+                rating: Some(8),
+                likes: Some(0),
+                ..at(0, None)
+            },
+            Marks {
+                plays: 3,
+                favorite: true,
+                played: true,
+                rating: Some(8),
+                likes: Some(1),
+                ..at(0, Some(EARLY))
+            },
+        ),
+        // The other copy was played later.
+        (
+            "Bravo (2002)",
+            Marks {
+                plays: 1,
+                played: true,
+                ..at(100, Some(EARLY))
+            },
+            at(500, Some(LATE)),
+            Marks {
+                plays: 1,
+                played: true,
+                ..at(500, Some(LATE))
+            },
+        ),
+        // The survivor was played later, and its rating wins.
+        (
+            "Charlie (2003)",
+            Marks {
+                rating: Some(3),
+                ..at(100, Some(LATE))
+            },
+            Marks {
+                rating: Some(9),
+                likes: Some(0),
+                ..at(500, Some(EARLY))
+            },
+            Marks {
+                rating: Some(3),
+                likes: Some(0),
+                ..at(100, Some(LATE))
+            },
+        ),
+        // A missing date is the oldest.
+        (
+            "Delta (2004)",
+            at(100, Some(EARLY)),
+            Marks {
+                favorite: true,
+                ..at(500, None)
+            },
+            Marks {
+                favorite: true,
+                ..at(100, Some(EARLY))
+            },
+        ),
+        (
+            "Echo (2005)",
+            at(100, None),
+            at(500, Some(EARLY)),
+            at(500, Some(EARLY)),
+        ),
+        // A tie keeps the survivor's position, unless that is 0.
+        (
+            "Foxtrot (2006)",
+            at(100, Some(LATE)),
+            at(500, Some(LATE)),
+            at(100, Some(LATE)),
+        ),
+        ("Golf (2007)", at(0, None), at(500, None), at(500, None)),
+        ("Hotel (2008)", at(100, None), at(500, None), at(100, None)),
+        // Dates compare as instants, not as text: 11:00+02:00 is before 10:00Z, and
+        // 10:00+02:00 is before 09:00Z.
+        (
+            "India (2009)",
+            at(100, Some("2024-06-01T10:00:00+00:00")),
+            at(500, Some("2024-06-01T11:00:00+02:00")),
+            at(100, Some("2024-06-01T10:00:00+00:00")),
+        ),
+        (
+            "Juliett (2010)",
+            at(100, Some("2024-06-01T10:00:00+02:00")),
+            at(500, Some("2024-06-01T09:00:00+00:00")),
+            at(500, Some("2024-06-01T09:00:00+00:00")),
+        ),
+        // One instant written two ways is a tie: the survivor's date, and the other's
+        // position, since the survivor's is 0.
+        (
+            "Kilo (2011)",
+            at(0, Some("2024-06-01T10:00:00+00:00")),
+            at(500, Some("2024-06-01T12:00:00+02:00")),
+            at(500, Some("2024-06-01T10:00:00+00:00")),
+        ),
+        // A date that does not parse is the oldest.
+        (
+            "Lima (2012)",
+            at(100, Some("yesterday")),
+            at(500, Some(EARLY)),
+            at(500, Some(EARLY)),
+        ),
+    ];
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let user = insert_user(&fx.pool).await;
+    let mut survivors = Vec::new();
+    for (folder, kept, merged, _) in &cases {
+        let (survivor, other) = two_copies(&fx.pool, &lib, folder).await;
+        insert_marks(&fx.pool, &user, survivor, kept).await;
+        insert_marks(&fx.pool, &user, other, merged).await;
+        survivors.push(survivor);
+    }
+
+    scan_idle(&fx.pool, &lib).await;
+
+    for ((folder, _, _, want), survivor) in cases.iter().zip(survivors) {
+        let uhd = format!("{folder}/{folder} Bluray-2160p.mkv");
+        assert_eq!(item_at(&fx.pool, &lib, &uhd).await, survivor, "{folder}");
+        let got = marks_of(&fx.pool, &user, survivor).await;
+        assert_eq!(got.as_ref(), Some(want), "{folder}");
+    }
+    let rows = count(&fx.pool, "SELECT COUNT(*) FROM user_item_data").await;
+    assert_eq!(rows, cases.len() as i64);
+}
+
+/// Each user's rows combine on their own, and a row on only one copy ends on the survivor as
+/// it was (G9b AC 2, 3).
+#[tokio::test]
+async fn merged_copies_keep_each_users_data() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let uhd = "Argo (2012)/Argo (2012) Bluray-2160p.mkv";
+    let (survivor, other) = two_copies(pool, &lib, "Argo (2012)").await;
+    let both = insert_user(pool).await;
+    let other_only = insert_user(pool).await;
+    let survivor_only = insert_user(pool).await;
+    // `both` played the survivor, then watched part of the other copy later.
+    let played = Marks {
+        plays: 1,
+        played: true,
+        ..at(0, Some(EARLY))
+    };
+    insert_marks(pool, &both, survivor, &played).await;
+    let partial = Marks {
+        favorite: true,
+        ..at(300, Some(LATE))
+    };
+    insert_marks(pool, &both, other, &partial).await;
+    let on_other = Marks {
+        plays: 2,
+        played: true,
+        rating: Some(7),
+        ..at(0, Some(EARLY))
+    };
+    insert_marks(pool, &other_only, other, &on_other).await;
+    let on_survivor = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(pool, &survivor_only, survivor, &on_survivor).await;
+
+    scan_idle(pool, &lib).await;
+
+    assert_eq!(paths(pool, &lib, "Movie").await, [uhd]);
+    assert_eq!(item_at(pool, &lib, uhd).await, survivor);
+    let combined = Marks {
+        plays: 1,
+        played: true,
+        favorite: true,
+        ..at(300, Some(LATE))
+    };
+    assert_eq!(marks_of(pool, &both, survivor).await, Some(combined));
+    assert_eq!(marks_of(pool, &other_only, survivor).await, Some(on_other));
+    assert_eq!(
+        marks_of(pool, &survivor_only, survivor).await,
+        Some(on_survivor)
+    );
+    assert_eq!(count(pool, "SELECT COUNT(*) FROM user_item_data").await, 3);
+}
+
+/// Three copies merge one at a time in owner order: the survivor, then by creation date. The
+/// 720p copy, made first, merges before the 1080p one, so its rating is the one kept
+/// (G9b AC 4).
+#[tokio::test]
+async fn three_copies_merge_in_owner_order() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    let made = |date| Movie {
+        date_created: Some(date),
+        ..Movie::default()
+    };
+    let uhd = "Heat (1995)/Heat (1995) Bluray-2160p.mkv";
+    let hd_file = "Heat (1995)/Heat (1995) Bluray-1080p.mkv";
+    let sd_file = "Heat (1995)/Heat (1995) Bluray-720p.mkv";
+    let survivor = insert_movie(
+        pool,
+        &lib,
+        &touch(&root, uhd),
+        made("2022-01-01T00:00:00+00:00"),
+    )
+    .await;
+    let hd = insert_movie(
+        pool,
+        &lib,
+        &touch(&root, hd_file),
+        made("2021-01-01T00:00:00+00:00"),
+    )
+    .await;
+    let sd = insert_movie(
+        pool,
+        &lib,
+        &touch(&root, sd_file),
+        made("2020-01-01T00:00:00+00:00"),
+    )
+    .await;
+    let user1 = insert_user(pool).await;
+    let user2 = insert_user(pool).await;
+    // user1 has a row on each copy. The 720p copy merges first and gives its position, date
+    // and rating; the 1080p copy then gives a later date and position, but not its rating.
+    let rows1 = [
+        (
+            survivor,
+            Marks {
+                plays: 1,
+                ..Marks::default()
+            },
+        ),
+        (
+            hd,
+            Marks {
+                plays: 1,
+                rating: Some(4),
+                ..at(200, Some(LATE))
+            },
+        ),
+        (
+            sd,
+            Marks {
+                plays: 1,
+                favorite: true,
+                rating: Some(9),
+                ..at(100, Some(EARLY))
+            },
+        ),
+    ];
+    for (item, marks) in &rows1 {
+        insert_marks(pool, &user1, *item, marks).await;
+    }
+    // user2 has rows only on the two copies that go.
+    let rows2 = [
+        (
+            hd,
+            Marks {
+                played: true,
+                ..at(0, Some(EARLY))
+            },
+        ),
+        (
+            sd,
+            Marks {
+                favorite: true,
+                ..at(50, Some(LATE))
+            },
+        ),
+    ];
+    for (item, marks) in &rows2 {
+        insert_marks(pool, &user2, *item, marks).await;
+    }
+
+    scan_idle(pool, &lib).await;
+
+    assert_eq!(paths(pool, &lib, "Movie").await, [uhd]);
+    assert_eq!(item_at(pool, &lib, uhd).await, survivor);
+    let want1 = Marks {
+        plays: 3,
+        favorite: true,
+        rating: Some(9),
+        ..at(200, Some(LATE))
+    };
+    assert_eq!(marks_of(pool, &user1, survivor).await, Some(want1));
+    let want2 = Marks {
+        favorite: true,
+        played: true,
+        ..at(50, Some(LATE))
+    };
+    assert_eq!(marks_of(pool, &user2, survivor).await, Some(want2));
+    assert_eq!(count(pool, "SELECT COUNT(*) FROM user_item_data").await, 2);
+}
+
+/// Collections and playlists that hold either copy hold the survivor once, and an activity
+/// entry, a session's playing item and a recording follow the survivor (G9b AC 6, 7).
+#[tokio::test]
+async fn merged_copies_keep_memberships_and_references() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let (argo, argo_hd) = two_copies(pool, &lib, "Argo (2012)").await;
+    let (heat, heat_hd) = two_copies(pool, &lib, "Heat (1995)").await;
+    let user = insert_user(pool).await;
+    let new_id = || Uuid::new_v4().to_string();
+    let (both_set, other_set, both_list, other_list) = (new_id(), new_id(), new_id(), new_id());
+    for set in [&both_set, &other_set] {
+        exec(
+            pool,
+            "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Set', ?2)",
+            &[set, &user],
+        )
+        .await;
+    }
+    for list in [&both_list, &other_list] {
+        exec(
+            pool,
+            "INSERT INTO playlists (id, name, user_id) VALUES (?1, 'List', ?2)",
+            &[list, &user],
+        )
+        .await;
+    }
+    const IN_SET: &str =
+        "INSERT INTO collection_items (collection_id, item_id, sort_order) VALUES (?1, ?2, ?3)";
+    const IN_LIST: &str =
+        "INSERT INTO playlist_items (playlist_id, item_id, sort_order) VALUES (?1, ?2, ?3)";
+    for (sql, container, item, order) in [
+        (IN_SET, &both_set, argo, "1"),
+        (IN_SET, &both_set, argo_hd, "2"),
+        (IN_SET, &other_set, heat_hd, "5"),
+        (IN_LIST, &both_list, heat, "3"),
+        (IN_LIST, &both_list, heat_hd, "4"),
+        (IN_LIST, &other_list, argo_hd, "7"),
+    ] {
+        exec(pool, sql, &[container, &item.to_string(), order]).await;
+    }
+    exec(
+        pool,
+        "INSERT INTO activity_log (name, type, user_id, item_id)
+         VALUES ('G9b played', 'VideoPlayback', ?1, ?2)",
+        &[&user, &argo_hd.to_string()],
+    )
+    .await;
+    let session = new_id();
+    exec(
+        pool,
+        "INSERT INTO sessions (id, user_id, device_id, now_playing_item_id)
+         VALUES (?1, ?2, 'G9b device', ?3)",
+        &[&session, &user, &heat_hd.to_string()],
+    )
+    .await;
+    let channel = new_id();
+    exec(
+        pool,
+        "INSERT INTO live_tv_channels (id, name) VALUES (?1, 'G9b channel')",
+        &[&channel],
+    )
+    .await;
+    exec(
+        pool,
+        "INSERT INTO live_tv_recordings (id, media_item_id, channel_id, name)
+         VALUES (?1, ?2, ?3, 'G9b recording')",
+        &[&new_id(), &argo_hd.to_string(), &channel],
+    )
+    .await;
+
+    scan_idle(pool, &lib).await;
+
+    assert_eq!(
+        paths(pool, &lib, "Movie").await,
+        [
+            "Argo (2012)/Argo (2012) Bluray-2160p.mkv",
+            "Heat (1995)/Heat (1995) Bluray-2160p.mkv"
+        ]
+    );
+    let mut want_sets = vec![
+        (both_set, argo.to_string(), 1),
+        (other_set, heat.to_string(), 5),
+    ];
+    want_sets.sort();
+    let sets: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT collection_id, item_id, sort_order FROM collection_items
+         ORDER BY collection_id, item_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(sets, want_sets);
+    let mut want_lists = vec![
+        (both_list, heat.to_string(), 3),
+        (other_list, argo.to_string(), 7),
+    ];
+    want_lists.sort();
+    let lists: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT playlist_id, item_id, sort_order FROM playlist_items
+         ORDER BY playlist_id, item_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(lists, want_lists);
+    let activity: Vec<String> =
+        sqlx::query_scalar("SELECT item_id FROM activity_log WHERE name = 'G9b played'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(activity, [argo.to_string()]);
+    let playing: Vec<String> =
+        sqlx::query_scalar("SELECT now_playing_item_id FROM sessions WHERE id = ?1")
+            .bind(&session)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(playing, [heat.to_string()]);
+    let recorded: Vec<String> = sqlx::query_scalar(
+        "SELECT media_item_id FROM live_tv_recordings WHERE name = 'G9b recording'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded, [argo.to_string()]);
+}
+
+/// Copies of an episode merge the same way, and the pins of both copies end on the survivor
+/// in its season (G9b AC 5).
+#[tokio::test]
+async fn merged_episode_copies_keep_pins_and_user_data() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, SEV_E1_SD);
+    touch(&root, SEV_E1_HD);
+    let sev = insert_tv(pool, &lib, "Series", "Severance", None, Tv::default()).await;
+    let season_1 = Tv {
+        sort_name: Some("season 0001"),
+        index: Some(1),
+        ..Tv::default()
+    };
+    let s1 = insert_tv(
+        pool,
+        &lib,
+        "Season",
+        "Severance/Season 1",
+        Some(sev),
+        season_1,
+    )
+    .await;
+    let made = |date| Tv {
+        parent_index: Some(1),
+        date_created: Some(date),
+        ..Tv::default()
+    };
+    let sd = insert_tv(
+        pool,
+        &lib,
+        "Episode",
+        SEV_E1_SD,
+        Some(s1),
+        made("2020-01-01T00:00:00+00:00"),
+    )
+    .await;
+    let hd = insert_tv(
+        pool,
+        &lib,
+        "Episode",
+        SEV_E1_HD,
+        Some(s1),
+        made("2021-01-01T00:00:00+00:00"),
+    )
+    .await;
+    let user1 = insert_user(pool).await;
+    let user2 = insert_user(pool).await;
+    // user1 pinned the 720p copy, and user2 the 1080p one, which survives.
+    for (user, episode) in [(&user1, sd), (&user2, hd)] {
+        exec(
+            pool,
+            "INSERT INTO pinned_episodes (user_id, series_id, episode_id, season_id, created_date)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            &[
+                user,
+                &sev.to_string(),
+                &episode.to_string(),
+                &s1.to_string(),
+            ],
+        )
+        .await;
+    }
+    let played = Marks {
+        plays: 1,
+        played: true,
+        ..at(0, Some(EARLY))
+    };
+    insert_marks(pool, &user1, sd, &played).await;
+    insert_marks(pool, &user1, hd, &at(400, Some(LATE))).await;
+    let on_sd = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(pool, &user2, sd, &on_sd).await;
+
+    scan_idle(pool, &lib).await;
+
+    assert_eq!(item_at(pool, &lib, SEV_E1_HD).await, hd);
+    let episodes = count(
+        pool,
+        "SELECT COUNT(*) FROM media_items WHERE media_type = 'Episode'",
+    )
+    .await;
+    assert_eq!(episodes, 1);
+    let season = item_at(pool, &lib, "Severance/Season 1").await;
+    let mut want_pins = [&user1, &user2].map(|user| {
+        (
+            user.clone(),
+            sev.to_string(),
+            hd.to_string(),
+            season.to_string(),
+        )
+    });
+    want_pins.sort();
+    let pins: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT user_id, series_id, episode_id, season_id FROM pinned_episodes ORDER BY user_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(pins, want_pins);
+    let combined = Marks {
+        plays: 1,
+        played: true,
+        ..at(400, Some(LATE))
+    };
+    assert_eq!(marks_of(pool, &user1, hd).await, Some(combined));
+    assert_eq!(marks_of(pool, &user2, hd).await, Some(on_sd));
+    assert_eq!(count(pool, "SELECT COUNT(*) FROM user_item_data").await, 2);
 }
