@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scan progress in the web client**: The scan progress connection now opens. The client used the wrong path (`/websocket` instead of `/socket`), sent no token and read the wrong fields, so the scan banner and the refresh after a scan never worked, and it retried about every second without logging anything. It now shows the banner while a library scans, refreshes the open view when the scan ends, logs one warning per outage, retries with backoff up to 30 s and closes on logout.
 - **Scan and Stop errors**: Every Scan button and Scan All now show an error toast when the scan can't start, for example "library not found". The task Stop button sent no request (`this.delete is not a function`); it now sends it and shows the server's error, for example when the task has already finished.
 - **Setup wizard library scan**: The library created in the setup wizard is scanned right away. Before, it stayed empty until the next scheduled scan, up to 12 hours later.
+- **Symlinked folders in the folder picker**: `GET /Library/BrowseDirectories` now lists a symlink that points to a folder, under the link's own path, since the library scan follows such links too. Before, the library dialog's folder picker left these folders out, so they could only be typed.
 
 ## [0.14.0] - 2026-11-03
 
