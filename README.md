@@ -46,9 +46,8 @@
 - ✅ **Error responses** — Jellyfin's exact error format with `Error` object (Code, Message, StackTrace)
 
 ### Authentication & Users
-- ✅ **User Auth** — JWT tokens, API keys, Quick Connect, Argon2 password hashing
+- ✅ **User Auth** — Opaque access tokens (random, stored hashed on the server), API keys, Quick Connect, Argon2 password hashing
 - ✅ **Device registration** — First-login device tracking
-- ✅ **JWT token refresh** — Automatic token renewal mechanism
 - ✅ **Password reset PIN flow** — Easy PIN password support
 - ✅ **User preferences** — Display preferences, parental controls
 - ✅ **User images** — Avatar upload and retrieval
@@ -150,7 +149,7 @@ rustyfin/
 ├── crates/
 │   ├── rustyfin-server   # Entry point, config, server bootstrap, middleware
 │   ├── rustyfin-api      # Axum routes, handlers, WebSocket, OpenAPI docs
-│   ├── rustyfin-auth     # Argon2, JWT, API keys, Quick Connect, device registration
+│   ├── rustyfin-auth     # Argon2, access tokens, API keys, Quick Connect, device registration
 │   ├── rustyfin-core     # Business logic: scanning, metadata, images, transcoding
 │   ├── rustyfin-db       # SQLx + SQLite, migrations, repositories, connection pools
 │   ├── rustyfin-model    # Shared DTOs, entities, Jellyfin API types
