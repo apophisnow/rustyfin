@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **pnpm for the web client**: `crates/rustyfin-web` uses pnpm instead of npm. `package.json` pins the version in `packageManager` (Corepack and `pnpm/action-setup` read it), and `pnpm-lock.yaml` replaces `package-lock.json` with the same dependency versions. The Dockerfile, the release workflow, `build.sh`, `start.sh` and the README use pnpm.
+- **Letter rail in the library**: The library page's letter bar is now a vertical rail at the right edge, like Jellyfin's alphabet picker. It stays in view while the list scrolls and highlights the letter of the first title at the top of the view. A click scrolls to that letter's first title and filters nothing; the first entry (`#`, or `Z` in Name Z-A, where the rail runs from Z to A) goes back to the top. It shows for the name sorts, as the bar did. Before, the bar scrolled away with the list and never marked the current letter.
 
 ### Fixed
 - **Startup wizard metadata settings**: The wizard now saves the chosen metadata language and country. It sent them as `preferred_metadata_language` and `metadata_country_code`, which `POST /Startup/Configuration` ignores because it expects PascalCase fields.
