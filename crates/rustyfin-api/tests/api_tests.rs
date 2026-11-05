@@ -4663,7 +4663,8 @@ async fn test_dynamic_hls_not_found() {
 // ── G1 follow-up ──
 // Another user's ratings, resume list, Next Up, Upcoming and notifications need that user or an
 // administrator, and a query without userId means the caller (Jellyfin's
-// RequestHelpers.GetUserId).
+// RequestHelpers.GetUserId). Remote control of a session or device needs its owner or an
+// administrator (SessionManager.AssertCanControl); GET /Sessions shows a non-admin only their own.
 
 const G1F_NIL: &str = "00000000-0000-0000-0000-000000000000";
 
@@ -5107,4 +5108,162 @@ async fn g1f_notifications_follow_user_id() {
         g1f_notifications(&app, &random, Some(&owner)).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+/// Creates a session for the owner on device "g1f-owner-device" and one for the viewer on
+/// "g1f-viewer-device", and returns `(owner_session, viewer_session)`.
+async fn g1f_sessions(state: &AppState, owner_id: &str, viewer_id: &str) -> (String, String) {
+    let mut ids = Vec::new();
+    for (user, device) in [
+        (owner_id, "g1f-owner-device"),
+        (viewer_id, "g1f-viewer-device"),
+    ] {
+        let user: uuid::Uuid = user.parse().unwrap();
+        let session = uuid::Uuid::new_v4();
+        rustyfin_db::repo_session::create_session(
+            &state.db, session, user, "", "G1F", "cli", device, "1.0", "{}",
+        )
+        .await
+        .unwrap();
+        rustyfin_db::repo_session::upsert_device(&state.db, device, "cli", "G1F", "1.0", user)
+            .await
+            .unwrap();
+        ids.push(session.to_string());
+    }
+    (ids[0].clone(), ids[1].clone())
+}
+
+#[tokio::test]
+async fn g1f_session_control_owner_or_admin() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (owner_session, viewer_session) = g1f_sessions(&state, &owner_id, &viewer_id).await;
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let command = serde_json::json!({
+        "Command": "DisplayMessage",
+        "Arguments": {"Header": "g1f", "Text": "test"}
+    });
+    let message = serde_json::json!({"Header": "g1f", "Text": "test"});
+    // (route with {} for the target, body, the viewer's target, the owner's target)
+    let routes = [
+        (
+            "/Sessions/{}/Command",
+            Some(command.clone()),
+            viewer_session.as_str(),
+            owner_session.as_str(),
+        ),
+        (
+            "/Sessions/{}/Command/DisplayMessage",
+            None,
+            viewer_session.as_str(),
+            owner_session.as_str(),
+        ),
+        (
+            "/Sessions/{}/Message",
+            Some(message),
+            viewer_session.as_str(),
+            owner_session.as_str(),
+        ),
+        (
+            "/Devices/{}/Command",
+            Some(command),
+            "g1f-viewer-device",
+            "g1f-owner-device",
+        ),
+    ];
+    for (route, body, mine, theirs) in &routes {
+        let post = |target: &str, token: Option<&str>| {
+            request("POST", &route.replace("{}", target), token, body.clone())
+        };
+        assert_eq!(
+            send(&app, post(mine, None)).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{route} anonymous"
+        );
+        // A non-admin on another user's session or device, or on an unknown one: 403.
+        for target in [*theirs, unknown.as_str()] {
+            assert_eq!(
+                send(&app, post(target, Some(&viewer))).await.0,
+                StatusCode::FORBIDDEN,
+                "{route} viewer on {target}"
+            );
+        }
+        // The owner of the session or device: today's answer.
+        assert_eq!(
+            send(&app, post(mine, Some(&viewer))).await,
+            (StatusCode::OK, serde_json::json!({})),
+            "{route} viewer on their own"
+        );
+        // An administrator or the API key: any existing session or device; unknown: 404.
+        for token in [owner.as_str(), "test-api-key"] {
+            for target in [*mine, *theirs] {
+                assert_eq!(
+                    send(&app, post(target, Some(token))).await,
+                    (StatusCode::OK, serde_json::json!({})),
+                    "{route} administrator on {target}"
+                );
+            }
+            assert_eq!(
+                send(&app, post(&unknown, Some(token))).await.0,
+                StatusCode::NOT_FOUND,
+                "{route} administrator on an unknown target"
+            );
+        }
+    }
+}
+
+/// Sends `GET /Sessions` and returns the status and each session's `(Id, UserId)`.
+async fn g1f_session_list(
+    app: &axum::Router,
+    token: Option<&str>,
+) -> (StatusCode, Vec<(String, uuid::Uuid)>) {
+    let (status, json) = send(app, request("GET", "/Sessions", token, None)).await;
+    let sessions = json
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|s| {
+                    (
+                        s["Id"].as_str().unwrap().to_string(),
+                        uuid::Uuid::parse_str(s["UserId"].as_str().unwrap()).unwrap(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (status, sessions)
+}
+
+#[tokio::test]
+async fn g1f_sessions_list_own_unless_admin() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let (owner_session, viewer_session) = g1f_sessions(&state, &owner_id, &viewer_id).await;
+    let viewer_uuid: uuid::Uuid = viewer_id.parse().unwrap();
+
+    assert_eq!(
+        g1f_session_list(&app, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A non-admin sees only their own sessions.
+    let (status, sessions) = g1f_session_list(&app, Some(&viewer)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        sessions.iter().all(|(_, user)| *user == viewer_uuid),
+        "the viewer sees only their own sessions: {sessions:?}"
+    );
+    assert!(sessions.iter().any(|(id, _)| *id == viewer_session));
+    // An administrator and the API key see everyone's.
+    for token in [owner.as_str(), "test-api-key"] {
+        let (status, sessions) = g1f_session_list(&app, Some(token)).await;
+        assert_eq!(status, StatusCode::OK);
+        for session in [&owner_session, &viewer_session] {
+            assert!(
+                sessions.iter().any(|(id, _)| id == session),
+                "an administrator sees {session}"
+            );
+        }
+    }
 }
