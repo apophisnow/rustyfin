@@ -257,7 +257,8 @@ pub struct ClientAddr {
     pub ip: IpAddr,
     /// The connecting peer, canonical.
     peer: IpAddr,
-    /// False when the forwarded chain could not be read to a client address.
+    /// False when the forwarded chain could not be read to a client address, or when a peer that is
+    /// not a trusted proxy sent a forwarding header.
     resolved: bool,
 }
 
@@ -284,16 +285,26 @@ impl ClientAddr {
     }
 }
 
-/// Logs once per process when a local-network peer sends `X-Forwarded-For` while no proxies are
-/// configured, so the header is ignored. The header value is never logged.
-fn warn_forwarded_without_proxies(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) {
+/// Request headers that say the peer forwards for someone else. A peer that is not a trusted proxy
+/// and sends any of them is never taken as the client.
+const FORWARDING_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
+
+/// True when the request carries any of [`FORWARDING_HEADERS`], whatever its value. Presence alone
+/// decides; no value is parsed.
+fn has_forwarding_header(headers: &HeaderMap) -> bool {
+    FORWARDING_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// Logs once per process when a local-network peer that is not a trusted proxy sends a forwarding
+/// header. Header values are never logged.
+fn warn_untrusted_forwarder(peer: IpAddr) {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if known.is_empty()
-        && is_local_network(peer)
-        && headers.contains_key("x-forwarded-for")
-        && !WARNED.swap(true, Ordering::Relaxed)
-    {
-        tracing::warn!("X-Forwarded-For from {peer} ignored: RUSTYFIN_KNOWN_PROXIES is not set");
+    if is_local_network(peer) && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "{peer} sent a forwarding header but is not in RUSTYFIN_KNOWN_PROXIES, so its requests are neither local nor exempt from the login limit and all its clients share one limit; if {peer} is a reverse proxy, add it to RUSTYFIN_KNOWN_PROXIES"
+        );
     }
 }
 
@@ -314,20 +325,24 @@ fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
 
 /// Resolves the client a request is attributed to. The peer is canonicalized first.
 ///
-/// A peer that is not a trusted proxy is the client, and its `X-Forwarded-For` is ignored. A trusted
-/// peer's `X-Forwarded-For` lines are read last line first, each line right to left. The first entry
+/// A peer that is not a trusted proxy is the client unless it sends `X-Forwarded-For`, `Forwarded`
+/// or `X-Real-IP`; then the request is unresolved and the headers are not read. A trusted peer's
+/// `X-Forwarded-For` lines are read last line first, each line right to left. The first entry
 /// that is not a trusted proxy is the client, and entries to its left are never read. If an entry
 /// cannot be read, or every hop is a trusted proxy, the request is unresolved: it is keyed on the
 /// peer and is neither local nor exempt from the login limit.
 pub fn resolve_client(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) -> ClientAddr {
     let peer = peer.to_canonical();
-    warn_forwarded_without_proxies(peer, headers, known);
     let unresolved = ClientAddr {
         ip: peer,
         peer,
         resolved: false,
     };
     if !is_trusted_proxy(peer, known) {
+        if has_forwarding_header(headers) {
+            warn_untrusted_forwarder(peer);
+            return unresolved;
+        }
         return ClientAddr {
             ip: peer,
             peer,
@@ -357,9 +372,9 @@ pub fn resolve_client(peer: IpAddr, headers: &HeaderMap, known: &[IpNet]) -> Cli
 
 /// Per-client budget for the login endpoints only (AuthenticateByName, ForgotPassword,
 /// ForgotPassword/Pin, ResetPassword), mounted on those routes in `routes::build_router`. The client
-/// comes from `resolve_client`, so X-Forwarded-For is read only from a trusted proxy. A request is
-/// exempt only when it resolves to exact loopback and the peer is exact loopback. A budget of 0
-/// disables the limit.
+/// comes from `resolve_client`, so X-Forwarded-For is read only from a trusted proxy, and a peer that
+/// is not one but sends a forwarding header is never exempt. A request is exempt only when it
+/// resolves to exact loopback and the peer is exact loopback. A budget of 0 disables the limit.
 pub async fn rate_limit(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,

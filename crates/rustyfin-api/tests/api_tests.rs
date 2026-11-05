@@ -5711,14 +5711,15 @@ async fn g2f_with_owner(state: &AppState) {
 }
 
 #[tokio::test]
-async fn g2f_unlisted_loopback_peer_xff_is_ignored() {
-    // Loopback is a trusted proxy only when listed, so its XFF is ignored and the request stays the
-    // loopback peer's own, which is exempt. 90c99b5 always trusted loopback and limited 203.0.113.5.
+async fn g2f_unlisted_loopback_peer_with_xff_is_not_exempt() {
+    // Loopback is a trusted proxy only when listed, so its XFF is never read. Since G2c a peer that
+    // is not listed but sends XFF is unresolved: keyed on itself and not exempt. 90c99b5 always
+    // trusted loopback and limited 203.0.113.5; 9dd5a44 took the request as loopback's own, exempt.
     let app = g2f_app_from(g2f_state("").await, "127.0.0.1:6100");
     assert_eq!(
         g2f_limited(&app, 5, &["203.0.113.5"]).await,
-        0,
-        "an unlisted loopback peer's XFF is ignored"
+        2,
+        "an unlisted loopback peer that sends XFF draws on its own budget of 3"
     );
 }
 
@@ -6173,4 +6174,186 @@ async fn g2f_admin_device_delete_ends_that_devices_sessions() {
     );
     let (me, _) = send(&app, request("GET", "/Users/Me", Some(&admin_t), None)).await;
     assert_eq!(me, StatusCode::OK, "other devices stay signed in");
+}
+
+// ── G2c: second review of the G2 merge. These use only what 9dd5a44 exposes, so they compile there
+// and fail at runtime. ──
+
+const G2C_XFF: (&str, &str) = ("X-Forwarded-For", "203.0.113.9");
+const G2C_XRI: (&str, &str) = ("X-Real-IP", "203.0.113.9");
+const G2C_FWD: (&str, &str) = ("Forwarded", "for=203.0.113.9");
+
+/// A state with the default login budget (10 per 60 s) and no RUSTYFIN_KNOWN_PROXIES.
+async fn g2c_default_budget_state() -> AppState {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(
+        rustyfin_api::middleware::DEFAULT_LOGIN_LIMIT,
+        rustyfin_api::middleware::DEFAULT_LOGIN_WINDOW_SECS,
+    );
+    state
+}
+
+/// A POST of `json` to `uri` that carries each of `headers`.
+fn g2c_post(uri: &str, headers: &[(&str, &str)], json: String) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json");
+    for (name, value) in headers {
+        b = b.header(*name, *value);
+    }
+    b.body(Body::from(json)).unwrap()
+}
+
+/// Sends `n` failed logins that carry `headers`; returns how many got 429.
+async fn g2c_limited(app: &axum::Router, n: usize, headers: &[(&str, &str)]) -> usize {
+    let mut limited = 0;
+    for _ in 0..n {
+        let req = g2c_post(
+            "/Users/AuthenticateByName",
+            headers,
+            r#"{"Username":"nobody","Pw":"x"}"#.to_string(),
+        );
+        if app.clone().oneshot(req).await.unwrap().status() == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    limited
+}
+
+/// Sends ForgotPassword for `user` with `headers`; returns the reset-file path the answer names.
+async fn g2c_forgot(
+    app: &axum::Router,
+    user: &str,
+    headers: &[(&str, &str)],
+) -> std::path::PathBuf {
+    let json = serde_json::json!({ "EnteredUsername": user }).to_string();
+    let (status, body) = send(app, g2c_post("/Users/ForgotPassword", headers, json)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ForgotPassword is always 200: {body:?}"
+    );
+    body["PinFile"].as_str().expect("a PinFile path").into()
+}
+
+#[test]
+fn g2c_unlisted_peer_with_a_forwarding_header_is_unresolved() {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use rustyfin_api::middleware::{parse_known_proxies, resolve_client};
+    let one = |name: &'static str, value: &'static [u8]| {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_bytes(value).unwrap(),
+        );
+        h
+    };
+    // Any value counts, even one that names no address or is not ASCII: it is never parsed.
+    let cases = [
+        one("x-forwarded-for", b"203.0.113.9"),
+        one("x-real-ip", b"203.0.113.9"),
+        one("forwarded", b"for=203.0.113.9"),
+        one("x-forwarded-for", b""),
+        one("x-forwarded-for", b"\xff"),
+    ];
+    for known in [Vec::new(), parse_known_proxies("10.0.0.1")] {
+        for headers in &cases {
+            for peer in ["127.0.0.1", "192.168.1.20"] {
+                let client = resolve_client(peer.parse().unwrap(), headers, &known);
+                assert!(!client.is_exempt(), "{peer} with {headers:?} is not exempt");
+                assert!(!client.is_local(), "{peer} with {headers:?} is not local");
+                assert_eq!(
+                    client.limiter_key(),
+                    peer,
+                    "{peer} with {headers:?} is keyed on itself"
+                );
+            }
+        }
+    }
+    // Without any of them the peer is the client, as before.
+    let none = HeaderMap::new();
+    let loopback = resolve_client("127.0.0.1".parse().unwrap(), &none, &[]);
+    assert!(
+        loopback.is_exempt() && loopback.is_local(),
+        "direct loopback stays exempt and local"
+    );
+    let lan = resolve_client("192.168.1.20".parse().unwrap(), &none, &[]);
+    assert!(
+        lan.is_local() && !lan.is_exempt(),
+        "a direct LAN client stays local"
+    );
+}
+
+/// 127.0.0.1 sends `header` with no proxies listed, as a same-host proxy would: it draws on
+/// 127.0.0.1's default budget and is not local, while direct loopback stays exempt.
+async fn g2c_unlisted_loopback_proxy_case(header: (&str, &str)) {
+    let app = g2f_app_from(g2c_default_budget_state().await, "127.0.0.1:6200");
+    assert_eq!(
+        g2c_limited(&app, 15, &[header]).await,
+        5,
+        "{} from an unlisted loopback peer: 10 allowed, then 429",
+        header.0
+    );
+    assert_eq!(
+        g2c_limited(&app, 3, &[]).await,
+        0,
+        "direct loopback stays exempt after the proxied requests used up the budget"
+    );
+
+    let state = g2c_default_budget_state().await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "127.0.0.1:6200");
+    assert!(
+        !g2c_forgot(&app, "owner", &[header]).await.exists(),
+        "{} from an unlisted loopback peer is not local: no reset file",
+        header.0
+    );
+}
+
+#[tokio::test]
+async fn g2c_unlisted_loopback_proxy_with_xff_is_limited_and_gets_no_reset_file() {
+    g2c_unlisted_loopback_proxy_case(G2C_XFF).await;
+}
+
+#[tokio::test]
+async fn g2c_unlisted_loopback_proxy_with_x_real_ip_is_limited_and_gets_no_reset_file() {
+    g2c_unlisted_loopback_proxy_case(G2C_XRI).await;
+}
+
+#[tokio::test]
+async fn g2c_unlisted_loopback_proxy_with_forwarded_is_limited_and_gets_no_reset_file() {
+    g2c_unlisted_loopback_proxy_case(G2C_FWD).await;
+}
+
+#[tokio::test]
+async fn g2c_direct_loopback_stays_exempt_and_gets_the_reset_file() {
+    // Today's result for a direct client, kept by G2c.
+    let state = g2c_default_budget_state().await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "127.0.0.1:6200");
+    assert_eq!(
+        g2c_limited(&app, 15, &[]).await,
+        0,
+        "direct loopback is exempt"
+    );
+    assert!(
+        g2c_forgot(&app, "owner", &[]).await.exists(),
+        "direct loopback is local and gets the reset file"
+    );
+}
+
+#[tokio::test]
+async fn g2c_direct_lan_client_is_local_only_without_a_forwarding_header() {
+    let state = g2c_default_budget_state().await;
+    g2f_with_owner(&state).await;
+    let app = g2f_app_from(state, "192.168.1.20:6300");
+    assert!(
+        !g2c_forgot(&app, "owner", &[G2C_XFF]).await.exists(),
+        "a LAN peer that sends X-Forwarded-For is not local"
+    );
+    assert!(
+        g2c_forgot(&app, "owner", &[]).await.exists(),
+        "the same LAN peer without it stays local"
+    );
 }
