@@ -221,4 +221,47 @@ mod tests {
         fresh.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn g2c_a_latest_db_without_032_upgrades_to_the_fresh_schema() {
+        // The :latest image (master 75fea9a) shipped 001-031 and G1's 033 but not 032. SQLx applies
+        // the missing 032 after 033 at the next start.
+        let dir = temp_dir();
+        let latest = dir.join("latest.db");
+        let pool = plain_pool(&latest).await;
+        Migrator::with_migrations(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version <= MASTER_LAST_VERSION || m.version == 33)
+                .cloned()
+                .collect(),
+        )
+        .run(&pool)
+        .await
+        .unwrap();
+        let applied: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            applied.contains(&33) && !applied.contains(&32),
+            "the :latest DB has 033 and no 032: {applied:?}"
+        );
+        pool.close().await;
+
+        let upgraded = init_db(latest.to_str().unwrap()).await.unwrap();
+        let fresh = init_db(dir.join("fresh.db").to_str().unwrap())
+            .await
+            .unwrap();
+        assert_reset_pins_hardened(&upgraded).await;
+        assert_eq!(
+            schema(&upgraded).await,
+            schema(&fresh).await,
+            "a :latest DB and a fresh DB end with the same schema"
+        );
+        upgraded.close().await;
+        fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
