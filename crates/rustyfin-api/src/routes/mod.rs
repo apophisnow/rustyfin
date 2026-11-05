@@ -16,6 +16,7 @@ mod library;
 mod live_tv;
 mod localization;
 mod media_segments;
+mod oidc;
 mod packages;
 mod persons;
 mod playback;
@@ -56,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
     let public = Router::new()
         .merge(system::public_routes())
         .merge(users::public_routes())
+        .merge(oidc::public_routes())
         .merge(quick_connect::public_routes())
         .merge(dlna::routes().route_layer(axum_mw::from_fn_with_state(
             state.clone(),
@@ -72,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(activity::admin_routes())
         .merge(session::admin_routes())
         .merge(users::admin_routes())
+        .merge(oidc::admin_routes())
         .merge(library::admin_routes())
         .merge(images::admin_routes())
         .merge(items::admin_routes())

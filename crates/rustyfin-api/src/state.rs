@@ -46,4 +46,6 @@ pub struct AppState {
     pub http_client: Client,
     /// Shared TMDb client (rate limiter, retries, response cache). Cloning shares them.
     pub tmdb: rustyfin_core::tmdb_client::TmdbClient,
+    /// OIDC provider cache and HTTP client (discovery and JWKS are fetched through it).
+    pub oidc: crate::oidc::OidcState,
 }

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use super::quick_connect;
 use crate::error::ApiError;
+use crate::oidc::PASSWORD_SIGN_IN_OFF;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -25,8 +26,13 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
     let device = token_device(&headers);
-    let (user, token) =
-        rustyfin_auth::authenticate(&state.db, &req.username, &req.password, &device).await?;
+    let user = rustyfin_auth::check_password(&state.db, &req.username, &req.password).await?;
+    // While password sign-in is off, only administrators may sign in with a password.
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !config.allow_password_sign_in && !user.is_administrator {
+        return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
+    }
+    let (user, token) = rustyfin_auth::issue_login_token(&state.db, user.id, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
 

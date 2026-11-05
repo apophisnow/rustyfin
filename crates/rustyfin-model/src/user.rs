@@ -66,7 +66,8 @@ pub struct CreateUserRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ChangePasswordRequest {
-    pub current_pw: String,
+    /// Left out by a user without a password yet, and by an admin changing someone else's (AC25).
+    pub current_pw: Option<String>,
     pub new_pw: String,
 }
 

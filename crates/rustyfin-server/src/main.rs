@@ -220,6 +220,7 @@ async fn main() {
         image_cache,
         http_client,
         tmdb,
+        oidc: rustyfin_api::oidc::OidcState::new(),
     };
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)

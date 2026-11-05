@@ -89,6 +89,7 @@ async fn test_state() -> AppState {
             reqwest::Client::new(),
             Default::default(),
         ),
+        oidc: rustyfin_api::oidc::OidcState::new(),
     }
 }
 
@@ -3381,7 +3382,6 @@ async fn b21_quick_connect_sign_in_shares_the_login_limit() {
 // Task 2: settings, the public info and the password switch (AC1-AC5, AC20-AC25, AC28).
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_settings_are_admin_only() {
     let t = b21().await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -3406,7 +3406,6 @@ async fn b21_settings_are_admin_only() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_settings_defaults() {
     let t = b21().await;
     assert_eq!(
@@ -3431,7 +3430,6 @@ async fn b21_settings_defaults() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_settings_merge_and_keep_the_secret_write_only() {
     let t = b21().await;
     let extra = serde_json::json!({
@@ -3479,7 +3477,6 @@ async fn b21_settings_merge_and_keep_the_secret_write_only() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_settings_scopes() {
     let t = b21().await;
     let cases = [
@@ -3520,7 +3517,6 @@ async fn b21_settings_scopes() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_settings_refuse_bad_values() {
     let t = b21().await;
     let base = t.op.base.clone();
@@ -3561,7 +3557,6 @@ async fn b21_settings_refuse_bad_values() {
 type B21Break = fn(&mut B21OpState, &str);
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_settings_check_the_provider() {
     let t = b21().await;
     let off = serde_json::json!({ "IssuerUrl": t.op.base, "ClientId": B21_CLIENT_ID });
@@ -3671,7 +3666,6 @@ async fn b21_settings_check_the_provider() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_info_is_public_and_minimal() {
     let t = b21().await;
     let info = || send(&t.app, request("GET", "/Auth/Oidc/Info", None, None));
@@ -3695,7 +3689,6 @@ async fn b21_info_is_public_and_minimal() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_password_switch_refuses_non_admins() {
     let t = b21().await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -3743,7 +3736,6 @@ async fn b21_password_switch_refuses_non_admins() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_password_switch_stops_reset_pins_for_non_admins() {
     let t = b21().await;
     for name in ["bob", "cy", "dee"] {
@@ -3808,7 +3800,6 @@ async fn b21_password_switch_stops_reset_pins_for_non_admins() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_passwordless_user_is_refused_at_password_sign_in() {
     let t = b21().await;
     b21_passwordless(&t.state, "pat").await;
@@ -3828,7 +3819,6 @@ async fn b21_passwordless_user_is_refused_at_password_sign_in() {
 }
 
 #[tokio::test]
-#[ignore = "B21 task 2"]
 async fn b21_passwordless_user_sets_a_first_password() {
     let t = b21().await;
     let (pat_id, pat) = b21_passwordless(&t.state, "pat").await;

@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::middleware::resolve_client;
+use crate::oidc::PASSWORD_RESET_OFF;
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -181,13 +182,15 @@ async fn change_password(
         return Err(ApiError::Forbidden("User update not allowed.".to_string()));
     }
 
-    // non-admins must verify current password
-    if !claims.is_admin {
-        let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
-            .await?
-            .ok_or(ApiError::NotFound("user not found".into()))?;
-
-        let valid = rustyfin_auth::verify_password(&req.current_pw, &user.password_hash)
+    // The current password is required, except when an admin changes someone else's. A user with
+    // no password yet (empty stored hash) may set the first one without it.
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await?
+        .ok_or(ApiError::NotFound("user not found".into()))?;
+    let admin_for_other = claims.is_admin && claims.sub != id;
+    if !admin_for_other && !user.password_hash.is_empty() {
+        let current = req.current_pw.as_deref().unwrap_or("");
+        let valid = rustyfin_auth::verify_password(current, &user.password_hash)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         if !valid {
@@ -321,6 +324,15 @@ async fn issue_reset_pin(db: SqlitePool, name: String, pin_path: PathBuf, expire
             return;
         }
     };
+    // While password sign-in is off, only an administrator gets a reset PIN.
+    match rustyfin_db::repo_oidc::get_settings(&db).await {
+        Ok(config) if config.allow_password_sign_in || user.is_administrator => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "reset PIN: could not read the sign-in settings");
+            return;
+        }
+    }
     let pin = match rustyfin_auth::create_reset_pin(&db, user.id, &expires_at).await {
         Ok(Some(pin)) => pin,
         Ok(None) => return,
@@ -374,6 +386,18 @@ async fn reset_password_pin(
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
 
+    // While password sign-in is off, only an administrator may reset a password by PIN. The PIN is
+    // already spent here, so its file goes too.
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !config.allow_password_sign_in && !user.is_administrator {
+        let _ = std::fs::remove_file(
+            state
+                .data_dir
+                .join(rustyfin_auth::reset_pin_filename(&user.name)),
+        );
+        return Err(ApiError::Forbidden(PASSWORD_RESET_OFF.to_string()));
+    }
+
     let norm = rustyfin_auth::normalize_reset_pin(&req.pin);
     let hash = rustyfin_auth::hash_password(&norm)
         .await
@@ -410,6 +434,12 @@ async fn reset_password(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
+
+    // While password sign-in is off, only an administrator may reset a password.
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !config.allow_password_sign_in && !user.is_administrator {
+        return Err(ApiError::Forbidden(PASSWORD_RESET_OFF.to_string()));
+    }
 
     // Hash the new password
     let hash = rustyfin_auth::hash_password(&req.temp_password)

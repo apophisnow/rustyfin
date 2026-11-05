@@ -239,11 +239,22 @@ pub async fn authenticate(
     password: &str,
     device: &TokenDevice,
 ) -> Result<(User, String), AuthError> {
+    let user = check_password(pool, username, password).await?;
+    issue_login_token(pool, user.id, device).await
+}
+
+/// Checks a user's name and password and returns the user. A user without a password (an OIDC
+/// sign-in makes one, AC23) gets the answer of a wrong password, not a hash error.
+pub async fn check_password(
+    pool: &SqlitePool,
+    username: &str,
+    password: &str,
+) -> Result<User, AuthError> {
     let user = repo_user::get_user_by_name(pool, username)
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
-    if !verify_password(password, &user.password_hash).await? {
+    if user.password_hash.is_empty() || !verify_password(password, &user.password_hash).await? {
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -252,7 +263,7 @@ pub async fn authenticate(
         return Err(AuthError::InvalidCredentials);
     }
 
-    issue_login_token(pool, user.id, device).await
+    Ok(user)
 }
 
 /// Issues a token for a user who signed in with an approved Quick Connect request instead of a
@@ -274,7 +285,7 @@ pub async fn authenticate_approved(
 /// Records a login and issues a token for `device`. The returned user is re-read after the login,
 /// so its LastLoginDate is the new one (M-16). A new login on a device replaces that device's
 /// previous token.
-async fn issue_login_token(
+pub async fn issue_login_token(
     pool: &SqlitePool,
     user_id: Uuid,
     device: &TokenDevice,
