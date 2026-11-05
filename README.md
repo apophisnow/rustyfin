@@ -286,9 +286,9 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_BIND` | Bind address:port | `0.0.0.0:8096` |
 | `RUSTYFIN_DATA` | Data directory (DB, cache, config, logs) | `~/.rustyfin` |
 | `RUSTYFIN_DB` | SQLite connection string | `sqlite://<data>/rustyfin.db?mode=rwc` |
-| `RUSTYFIN_SECRET` | JWT signing secret | Random UUID (regenerated each start!) |
+| `RUSTYFIN_SECRET` | JWT signing secret (an empty value counts as unset) | Random UUID (regenerated each start!) |
 | `RUSTYFIN_SERVER_ID` | Unique server identifier | Random UUID |
-| `RUSTYFIN_API_KEY` | Static API key for integrations | Disabled |
+| `RUSTYFIN_API_KEY` | Static API key for integrations, for example from `openssl rand -hex 32` (an empty value disables it) | Disabled |
 | `RUSTYFIN_TMDB_API_KEY` | TMDb API key (v3 key or v4 read access token). Takes precedence over the key in the server config and is never saved there | Config key, else TMDb off |
 | `RUSTYFIN_TMDB_BASE_URL` | TMDb API base URL (absolute http(s) URL; an invalid value stops startup) | `https://api.themoviedb.org/3` |
 | `RUSTYFIN_TMDB_IMAGE_BASE_URL` | TMDb image base URL (absolute http(s) URL; an invalid value stops startup) | `https://image.tmdb.org/t/p/original` |
@@ -299,7 +299,7 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 RUSTYFIN_BIND=127.0.0.1:8096 \
 RUSTYFIN_DATA=/srv/rustyfin \
 RUSTYFIN_SECRET="$(openssl rand -base64 32)" \
-RUSTYFIN_API_KEY="my-integration-key" \
+RUSTYFIN_API_KEY="<output of openssl rand -hex 32>" \
 ./target/release/rustyfin
 ```
 
