@@ -3063,3 +3063,173 @@ async fn b18_scheduler_skips_a_library_another_caller_claimed() {
     drop(web);
     assert_eq!(sched.scans().state(lib.id), None);
 }
+
+// B18: a music scan counts the files of every root before it walks them. With a metadata provider
+// configured, each new artist, album and track is one more unit, which its refresh advances, so the
+// percent reaches 99 only at the end. A rescan reuses the artist rows of earlier scans.
+
+/// A music library whose roots are `<temp dir>/<root>` for each of `roots`, in that order.
+async fn b18_music_library(fx: &Fixture, roots: &[&str]) -> Library {
+    let paths = roots
+        .iter()
+        .map(|root| {
+            let root = fx.path(root);
+            std::fs::create_dir_all(&root).unwrap();
+            root.to_str().unwrap().to_string()
+        })
+        .collect();
+    let lib = Library {
+        id: Uuid::new_v4(),
+        name: roots[0].to_string(),
+        content_type: LibraryContentType::Music,
+        paths,
+    };
+    rustyfin_db::repo_library::create_library(&fx.pool, &lib)
+        .await
+        .unwrap();
+    lib
+}
+
+/// Scans `lib` with `omdb_key` as its only provider key, and returns the frames its run sent.
+/// OMDb looks up only movies and series, so a key makes the refresh count without a request.
+async fn b18_music_frames(
+    fx: &Fixture,
+    lib: &Library,
+    omdb_key: Option<&str>,
+) -> Vec<(u8, ScanStatus)> {
+    let scans = ScanRegistry::new();
+    let mut rx = scans.subscribe();
+    let ticket = scans.queue(lib.id);
+    let client = reqwest::Client::new();
+    scanner::scan_library_with_metadata(&fx.pool, lib, &client, None, omdb_key, None, &ticket)
+        .await
+        .unwrap();
+    drop(ticket);
+    b17_sent(&mut rx)
+        .into_iter()
+        .map(|(id, progress, status)| {
+            assert_eq!(id, lib.id);
+            (progress, status)
+        })
+        .collect()
+}
+
+/// The library's `MusicAlbum` rows (artists and albums) as (path, parent's path), relative to its
+/// first root, sorted.
+async fn b18_music_albums(pool: &SqlitePool, lib: &Library) -> Vec<(String, Option<String>)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT a.path, p.path FROM media_items a LEFT JOIN media_items p ON p.id = a.parent_id
+         WHERE a.library_id = ?1 AND a.media_type = 'MusicAlbum'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut out: Vec<(String, Option<String>)> = rows
+        .iter()
+        .map(|(path, parent)| (rel(&root, path), parent.as_deref().map(|p| rel(&root, p))))
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn b18_music_progress_counts_every_root_before_the_walk() {
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["B18 Music A", "B18 Music B"]).await;
+    let (a, b) = (PathBuf::from(&lib.paths[0]), PathBuf::from(&lib.paths[1]));
+    touch(&a, "Artist A/Album 1/01 Song 1.mp3");
+    touch(&a, "Artist A/Album 1/02 Song 2.mp3");
+    touch(&a, "Artist A/Album 1/03 Song 3.mp3");
+    touch(&b, "Artist B/Album 2/01 Song 4.mp3");
+
+    let frames = b18_music_frames(&fx, &lib, None).await;
+    use ScanStatus::{Active, Idle, Queued};
+    // Root A's 3 files and root B's 1 are 4 units, known before the first file is read.
+    assert_eq!(
+        frames,
+        [
+            (0, Queued),
+            (0, Active),
+            (25, Active),
+            (50, Active),
+            (75, Active),
+            (99, Active),
+            (100, Idle)
+        ]
+    );
+    assert_eq!(
+        count(
+            &fx.pool,
+            "SELECT COUNT(*) FROM media_items WHERE media_type = 'Audio'"
+        )
+        .await,
+        4
+    );
+}
+
+#[tokio::test]
+async fn b18_music_progress_counts_new_items_when_a_provider_is_set() {
+    let fx = Fixture::new().await;
+    let lib = b18_music_library(&fx, &["B18 Music C", "B18 Music D"]).await;
+    let (c, d) = (PathBuf::from(&lib.paths[0]), PathBuf::from(&lib.paths[1]));
+    touch(&c, "Artist C/Album 3/01 Song 1.mp3");
+    touch(&c, "Artist C/Album 3/02 Song 2.mp3");
+    touch(&d, "Artist D/Album 4/01 Song 3.mp3");
+
+    let frames = b18_music_frames(&fx, &lib, Some("b18-test")).await;
+    use ScanStatus::{Active, Idle, Queued};
+    assert_eq!(frames[..2], [(0, Queued), (0, Active)], "{frames:?}");
+    assert_eq!(frames.last(), Some(&(100, Idle)), "{frames:?}");
+    let active: Vec<u8> = frames
+        .iter()
+        .filter(|(_, status)| *status == Active)
+        .map(|(progress, _)| *progress)
+        .collect();
+    assert!(
+        active.windows(2).all(|w| w[0] < w[1]),
+        "the percent only goes up: {frames:?}"
+    );
+    // 3 files and 7 new items (2 artists, 2 albums, 3 tracks) are 10 units. The walk does the 3
+    // files, and the refresh of the new items of both roots does the other 7, one tenth each.
+    assert!(
+        active.ends_with(&[50, 60, 70, 80, 90, 99]),
+        "each refreshed item moves the percent by a tenth: {frames:?}"
+    );
+    assert_eq!(
+        b18_music_albums(&fx.pool, &lib).await.len(),
+        4,
+        "2 artists and 2 albums"
+    );
+    assert_eq!(
+        count(
+            &fx.pool,
+            "SELECT COUNT(*) FROM media_items WHERE media_type = 'Audio'"
+        )
+        .await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn b18_music_rescan_reuses_the_artist_of_an_earlier_scan() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("B18 Music E", LibraryContentType::Music).await;
+    let root = root_of(&lib);
+    touch(&root, "Artist E/Album 5/01 Song 1.mp3");
+    scan(&fx.pool, &lib).await;
+    touch(&root, "Artist E/Album 6/01 Song 2.mp3");
+    scan(&fx.pool, &lib).await;
+
+    let artist = Some("Artist E".to_string());
+    assert_eq!(
+        b18_music_albums(&fx.pool, &lib).await,
+        [
+            ("Artist E".to_string(), None),
+            ("Artist E/Album 5".to_string(), artist.clone()),
+            ("Artist E/Album 6".to_string(), artist),
+        ],
+        "one artist row for the artist folder, the parent of both albums"
+    );
+}

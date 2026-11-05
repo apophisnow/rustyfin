@@ -51,9 +51,11 @@ pub async fn scan_library_with_metadata(
         library.content_type,
         library.paths
     );
+    // The refresh shows as progress only when a provider is configured to make API calls.
+    let counted = tmdb.is_some() || omdb_api_key.is_some() || fanart_api_key.is_some();
     let (count, new_item_ids) = match library.content_type {
         LibraryContentType::TvShows => scan_tv_library(pool, library, ticket).await?,
-        LibraryContentType::Music => scan_music_library(pool, library, ticket).await?,
+        LibraryContentType::Music => scan_music_library(pool, library, ticket, counted).await?,
         _ => scan_flat_library(pool, library, ticket).await?,
     };
 
@@ -65,9 +67,8 @@ pub async fn scan_library_with_metadata(
             new_item_ids.len(),
             library.name
         );
-        // The refresh shows as progress only when a provider is configured to make API calls.
-        let counted = tmdb.is_some() || omdb_api_key.is_some() || fanart_api_key.is_some();
-        if counted {
+        // A music scan reserved the units of its new items as it created them.
+        if counted && library.content_type != LibraryContentType::Music {
             ticket.add_total(new_item_ids.len());
         }
         // Increased from 5 to 10 — TMDb rate limits are typically 20-40 req/s, so 10 is safe.
@@ -711,10 +712,12 @@ async fn scan_tv_library(
 
 /// Recursive scan for Music: path/Artist/Album/track files
 /// Builds Artist → Album → Track hierarchy using directory structure and audio tags.
+/// With `counted`, each new artist, album and track reserves one unit of the ticket's total.
 async fn scan_music_library(
     pool: &SqlitePool,
     library: &Library,
     ticket: &ScanTicket,
+    counted: bool,
 ) -> Result<(u32, Vec<Uuid>), sqlx::Error> {
     let _guard = SCAN_LOCK.lock().await;
     ticket.start();
@@ -729,25 +732,34 @@ async fn scan_music_library(
             .into_iter()
             .collect();
 
-    // Pre-load all existing music album paths into HashMaps for O(1) ID lookup.
-    // Artists and albums both use MediaType::MusicAlbum in the DB.
-    let existing_albums: HashMap<String, Uuid> =
+    // Pre-load the music album rows once for the whole scan, for O(1) ID lookup.
+    // Artists and albums both use MediaType::MusicAlbum in the DB, so artist paths are here too.
+    // album_path -> album_id
+    let mut album_map: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "MusicAlbum").await?;
+    // artist_key -> artist_id, for the artist rows of earlier scans, keyed as the loop keys them
+    let mut artist_map: HashMap<String, Uuid> =
+        rustyfin_db::repo_media::get_library_artists(pool, library.id)
+            .await?
+            .into_iter()
+            .map(|(id, path, name)| {
+                let key = if path.is_empty() {
+                    name.to_lowercase()
+                } else {
+                    path
+                };
+                (key, id)
+            })
+            .collect();
 
+    // Walk every root before the first file, so that the total covers all of them.
+    let mut roots: Vec<(&Path, Vec<PathBuf>)> = Vec::new();
     for lib_path in &library.paths {
         let path = Path::new(lib_path);
         if !path.exists() {
             tracing::warn!("library path does not exist: {}", lib_path);
             continue;
         }
-
-        // album_path -> album_id (start with pre-loaded DB data)
-        let mut album_map: HashMap<String, Uuid> = existing_albums.clone();
-        // artist_key -> artist_id (built during scan; artists share MusicAlbum type)
-        let mut artist_map: HashMap<String, Uuid> = HashMap::new();
-
-        // Collect new items for batch insert in a single transaction
-        let mut new_items: Vec<MediaItem> = Vec::new();
 
         // Async directory traversal — non-blocking on Tokio runtime
         let (files, _, _) = collect_files(path).await;
@@ -757,7 +769,13 @@ async fn scan_music_library(
             files.len(),
             lib_path
         );
-        ticket.add_total(files.len());
+        roots.push((path, files));
+    }
+    ticket.add_total(roots.iter().map(|(_, files)| files.len()).sum());
+
+    for (path, files) in roots {
+        // Collect new items for batch insert in a single transaction
+        let mut new_items: Vec<MediaItem> = Vec::new();
 
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
@@ -895,6 +913,9 @@ async fn scan_music_library(
                     };
                     new_items.push(artist_item);
                     artist_map.insert(artist_key, id);
+                    if counted {
+                        ticket.add_total(1);
+                    }
                     Some(id)
                 }
             } else {
@@ -929,6 +950,9 @@ async fn scan_music_library(
                 };
                 new_items.push(album_item);
                 album_map.insert(album_dir, id);
+                if counted {
+                    ticket.add_total(1);
+                }
                 id
             };
 
@@ -964,6 +988,9 @@ async fn scan_music_library(
             };
 
             new_items.push(item);
+            if counted {
+                ticket.add_total(1);
+            }
         }
 
         tracing::info!(
@@ -980,6 +1007,14 @@ async fn scan_music_library(
                 rustyfin_db::repo_media::batch_upsert_media_items(pool, &new_items).await
             {
                 tracing::error!("failed to batch insert music items: {}", e);
+                // The batch was not stored, so a later root must not find its artists or albums.
+                // Its units will never be refreshed, so they count as done now.
+                let unstored: HashSet<Uuid> = new_items.iter().map(|item| item.id).collect();
+                artist_map.retain(|_, id| !unstored.contains(id));
+                album_map.retain(|_, id| !unstored.contains(id));
+                if counted {
+                    ticket.advance(new_items.len());
+                }
             } else {
                 // Find and save local images for albums (cover art)
                 let mut all_images: Vec<rustyfin_model::image::ItemImage> = Vec::new();
@@ -1016,7 +1051,7 @@ async fn scan_music_library(
                     }
                 }
                 count += new_items.len() as u32;
-                new_item_ids = new_items.iter().map(|item| item.id).collect();
+                new_item_ids.extend(new_items.iter().map(|item| item.id));
             }
         }
     }

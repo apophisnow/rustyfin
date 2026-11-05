@@ -1287,6 +1287,26 @@ pub async fn get_library_items_by_type(
     Ok(map)
 }
 
+/// Fetch the artist rows of a music library (`MusicAlbum` rows with no parent), returning
+/// (id, path, name) tuples. Used by the scanner to reuse the artists of earlier scans.
+pub async fn get_library_artists(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> Result<Vec<(Uuid, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, path, name FROM media_items \
+         WHERE library_id = ? AND media_type = 'MusicAlbum' AND parent_id IS NULL",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let artists = rows
+        .into_iter()
+        .filter_map(|(id, path, name)| Uuid::parse_str(&id).ok().map(|uid| (uid, path, name)))
+        .collect();
+    Ok(artists)
+}
+
 /// Fetch all movie items for a library, returning (path, id) pairs.
 /// Used by the scanner to pre-load movie paths for version detection,
 /// avoiding per-item database queries during scanning.
