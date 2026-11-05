@@ -131,6 +131,70 @@ pub async fn redeem_reset_pin(pool: &SqlitePool, pin: &str) -> Result<Option<Uui
     Ok(repo_user::redeem_reset_pin(pool, &reset_pin_hash(pin)).await?)
 }
 
+// ── One-time setup codes (B20) ──
+
+/// Crockford's base32 alphabet: the characters of a setup code (no `I`, `L`, `O` or `U`).
+const SETUP_CODE_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A new one-time code: 12 characters of Crockford's base32 from `OsRng` (60 bits), shown as
+/// `XXXX-XXXX-XXXX`.
+pub fn generate_setup_code() -> String {
+    let mut bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut bytes);
+    let alphabet = SETUP_CODE_ALPHABET.as_bytes();
+    // 32 characters and `b & 31`: each byte maps to one character with no bias.
+    bytes
+        .chunks(4)
+        .map(|group| {
+            group
+                .iter()
+                .map(|b| char::from(alphabet[usize::from(b & 31)]))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A code's canonical form: dashes and whitespace dropped, uppercased, `I` and `L` read as `1`,
+/// `O` as `0`. `None` unless exactly 12 Crockford characters remain.
+pub fn normalize_setup_code(code: &str) -> Option<String> {
+    // `to_ascii_uppercase`, not `to_uppercase`: a non-ASCII letter must not fold into `I` or `O`.
+    let canonical: String = code
+        .chars()
+        .filter(|c| *c != '-' && !c.is_whitespace())
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        })
+        .collect();
+    let valid = canonical.len() == 12 && canonical.chars().all(|c| SETUP_CODE_ALPHABET.contains(c));
+    valid.then_some(canonical)
+}
+
+/// An argon2 hash of the code's canonical form, on the blocking pool. `HashError` for a non-code.
+pub async fn hash_setup_code(code: &str) -> Result<String, AuthError> {
+    let canonical = normalize_setup_code(code).ok_or(AuthError::HashError)?;
+    hash_password(&canonical).await
+}
+
+/// Whether `code` is the code hashed in `hash`, compared in canonical form. `false` for a
+/// non-code.
+pub async fn verify_setup_code(code: &str, hash: &str) -> Result<bool, AuthError> {
+    match normalize_setup_code(code) {
+        Some(canonical) => verify_password(&canonical, hash).await,
+        None => Ok(false),
+    }
+}
+
+/// A password hash no sign-in can match: argon2 of 32 `OsRng` bytes as hex, a secret then dropped.
+pub async fn unusable_password_hash() -> Result<String, AuthError> {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    hash_password(&secret).await
+}
+
 // ── Opaque, server-side access tokens ──
 
 /// A bearer token: 16 random bytes as 32 lowercase hex characters.
@@ -351,5 +415,86 @@ mod tests {
         let pin = "123456";
         let hash = hash_pin(pin).unwrap();
         assert!(!verify_pin("654321", &hash).unwrap());
+    }
+
+    // ── B20: one-time setup codes ──
+
+    const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    #[test]
+    fn b20_setup_codes_have_the_crockford_shape() {
+        for _ in 0..200 {
+            let code = generate_setup_code();
+            let groups: Vec<&str> = code.split('-').collect();
+            assert_eq!(groups.len(), 3, "{code}");
+            for group in groups {
+                assert_eq!(group.len(), 4, "{code}");
+                assert!(group.chars().all(|c| CROCKFORD.contains(c)), "{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn b20_setup_codes_differ_and_use_the_whole_alphabet() {
+        let codes: std::collections::HashSet<String> =
+            (0..1000).map(|_| generate_setup_code()).collect();
+        assert_eq!(codes.len(), 1000, "repeated codes");
+        let seen: std::collections::HashSet<char> = codes.iter().flat_map(|c| c.chars()).collect();
+        for c in CROCKFORD.chars() {
+            assert!(seen.contains(&c), "{c} never appears in 1000 codes");
+        }
+    }
+
+    #[test]
+    fn b20_normalize_setup_codes() {
+        let canonical = Some("ABCDEFGHJKMN".to_string());
+        assert_eq!(normalize_setup_code("ABCD-EFGH-JKMN"), canonical);
+        assert_eq!(normalize_setup_code(" abcd efgh-jkmn "), canonical);
+        assert_eq!(normalize_setup_code("ABCDEFGHJKMN"), canonical);
+        assert_eq!(
+            normalize_setup_code("IL0O-ilo0-1234"),
+            Some("110011001234".to_string())
+        );
+        for bad in [
+            "",
+            "ABCD-EFGH-JKM",
+            "ABCD-EFGH-JKMNP",
+            "ABCD-EFGH-JKMU",
+            "ABCD_EFGH_JKMN",
+        ] {
+            assert_eq!(normalize_setup_code(bad), None, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b20_setup_code_hashes_verify_in_canonical_form() {
+        let code = generate_setup_code();
+        let hash = hash_setup_code(&code).await.unwrap();
+        assert!(hash.starts_with("$argon2"), "{hash}");
+        assert!(!hash.contains(&code) && !hash.contains(&code.replace('-', "")));
+        assert!(verify_setup_code(&code, &hash).await.unwrap());
+        let loose = code.to_lowercase().replace('-', " ");
+        assert!(verify_setup_code(&loose, &hash).await.unwrap(), "{loose}");
+        let mut other = generate_setup_code();
+        while other == code {
+            other = generate_setup_code();
+        }
+        assert!(!verify_setup_code(&other, &hash).await.unwrap());
+        assert!(!verify_setup_code("not a code", &hash).await.unwrap());
+        assert!(matches!(
+            hash_setup_code("not a code").await,
+            Err(AuthError::HashError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn b20_unusable_password_hash_matches_nothing() {
+        let first = unusable_password_hash().await.unwrap();
+        let second = unusable_password_hash().await.unwrap();
+        assert!(first.starts_with("$argon2"), "{first}");
+        assert_ne!(first, second);
+        for guess in ["", "admin", "password"] {
+            assert!(!verify_password(guess, &first).await.unwrap(), "{guess:?}");
+        }
     }
 }

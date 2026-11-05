@@ -89,6 +89,7 @@ async fn test_state() -> AppState {
             reqwest::Client::new(),
             Default::default(),
         ),
+        jellyfin_import: Default::default(),
     }
 }
 
@@ -10526,4 +10527,352 @@ async fn b20_import_preview_leaves_the_source_and_its_secrets_alone() {
         !jf::files_hold_canary(&files),
         "secret in Rustyfin's database"
     );
+}
+
+// B20 2b: the import run, its status and the created users' one-time codes.
+
+/// `GET /JellyfinImport/Status` as the admin; expects 200.
+async fn b20_status(w: &B20World) -> serde_json::Value {
+    let uri = "/JellyfinImport/Status";
+    let (status, answer) = send_authed(&w.app, "GET", uri, &w.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer
+}
+
+/// Starts an import run with `body`; expects 202 `{"State":"Running"}`.
+async fn b20_start(w: &B20World, body: serde_json::Value) {
+    let (status, answer) = b20_post(w, "Run", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    assert_eq!(answer, serde_json::json!({ "State": "Running" }));
+}
+
+/// Polls the status until the run no longer runs (two minutes at most) and returns that first
+/// answer, the only one that shows the codes.
+async fn b20_wait(w: &B20World) -> serde_json::Value {
+    for _ in 0..2400 {
+        let answer = b20_status(w).await;
+        if answer["State"] != "Running" {
+            return answer;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the import still runs after two minutes");
+}
+
+/// Runs an import with `body` to its end, expects it to complete and returns the report.
+async fn b20_run(w: &B20World, body: serde_json::Value) -> serde_json::Value {
+    b20_start(w, body).await;
+    let answer = b20_wait(w).await;
+    assert_eq!(answer["State"], "Completed", "{answer}");
+    answer["Result"].clone()
+}
+
+/// Whether `code` has the shape of a one-time code: `XXXX-XXXX-XXXX` in Crockford's base32.
+fn b20_is_code(code: &str) -> bool {
+    let groups: Vec<&str> = code.split('-').collect();
+    let crockford = |c: char| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c);
+    groups.len() == 3
+        && groups
+            .iter()
+            .all(|group| group.len() == 4 && group.chars().all(crockford))
+}
+
+/// Every stored setup code: user id, hash and date.
+async fn b20_code_rows(state: &AppState) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT user_id || ' ' || code_hash || ' ' || created_at FROM user_setup_codes \
+         ORDER BY user_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap()
+}
+
+/// The report entry of the Jellyfin user `name`.
+fn b20_entry(report: &serde_json::Value, name: &str) -> B20User {
+    b20_users(report)
+        .into_iter()
+        .find(|user| user.name == name)
+        .unwrap_or_else(|| panic!("no {name} in {report}"))
+}
+
+async fn b20_user_count(state: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn b20_import_run_and_status_are_admin_only() {
+    let w = b20_world().await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = Some(serde_json::json!({ "SourcePath": install }));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Run", &body, &viewer).await;
+    g1_assert_admin_only(&w.app, "GET", "/JellyfinImport/Status", &None, &viewer).await;
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_status_is_idle_before_a_run() {
+    let w = b20_world().await;
+    let idle = serde_json::json!({
+        "State": "Idle",
+        "Stage": null,
+        "Done": 0,
+        "Total": 0,
+        "Result": null,
+        "Error": null,
+    });
+    assert_eq!(b20_status(&w).await, idle);
+}
+
+#[tokio::test]
+async fn b20_import_run_rejects_bad_sources() {
+    let w = b20_world().await;
+    let new = b20_install(&w, "new", jf::Layout::New).await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let junk = w.jf_root.join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("jellyfin.db"), b"not a database").unwrap();
+    let missing = w.jf_root.join("missing");
+    let before = b20_db_digest(&w.state).await;
+    let cases = [
+        ("empty", serde_json::json!({ "SourcePath": "" })),
+        (
+            "relative",
+            serde_json::json!({ "SourcePath": "relative/config" }),
+        ),
+        ("missing", serde_json::json!({ "SourcePath": missing })),
+        ("not a database", serde_json::json!({ "SourcePath": junk })),
+        (
+            "Old without library.db",
+            serde_json::json!({ "SourcePath": new, "Layout": "Old" }),
+        ),
+        (
+            "New without BaseItems",
+            serde_json::json!({ "SourcePath": old, "Layout": "New" }),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, answer) = b20_post(&w, "Run", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(b20_db_digest(&w.state).await, before, "a refused run wrote");
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn b20_import_run_creates_picked_users_with_codes() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Carol", true));
+    w.source.users.push(jf::JfUser::new(4, "dave", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let picked: Vec<uuid::Uuid> = ["Alice", "bob", "Carol"]
+        .into_iter()
+        .map(|name| w.source.user(name).id)
+        .collect();
+    let users_before = b20_user_count(&w.state).await;
+    let listing = jf::listing(&install);
+    let log = jf::LogCapture::start();
+    let body = serde_json::json!({ "SourcePath": install, "UserIds": picked });
+    let report = b20_run(&w, body).await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(jf::listing(&install), listing, "the source changed");
+
+    // Alice matches alice; bob and Carol are created with codes; dave is not picked.
+    let bob = b20_entry(&report, "bob");
+    let carol = b20_entry(&report, "Carol");
+    let (Some(bob_id), Some(bob_code)) = (bob.user_id, bob.code) else {
+        panic!("bob: no UserId or Code in {report}");
+    };
+    let (Some(carol_id), Some(carol_code)) = (carol.user_id, carol.code) else {
+        panic!("Carol: no UserId or Code in {report}");
+    };
+    let created = |name: &str, id: uuid::Uuid, code: &str| B20User {
+        user_id: Some(id),
+        code: Some(code.to_string()),
+        ..b20_user(&w, name, "Create", None, None)
+    };
+    let expected = vec![
+        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        created("bob", bob_id, &bob_code),
+        created("Carol", carol_id, &carol_code),
+        b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
+    ];
+    assert_eq!(b20_users(&report), expected);
+    assert!(carol.was_admin, "the report names Jellyfin's admins");
+    assert_ne!(bob_code, carol_code);
+    assert_eq!(
+        b20_user_count(&w.state).await,
+        users_before + 2,
+        "only bob and Carol are created"
+    );
+
+    for (name, id, code) in [("bob", bob_id, &bob_code), ("Carol", carol_id, &carol_code)] {
+        assert!(b20_is_code(code), "{name}: {code}");
+        let (admin, password): (bool, String) = sqlx::query_as(
+            "SELECT is_administrator, password_hash FROM users WHERE id = ? AND name = ?",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+        assert!(!admin, "{name}: created as an administrator");
+        assert!(
+            password.starts_with("$argon2"),
+            "{name}: password {password}"
+        );
+        let code_hash: String =
+            sqlx::query_scalar("SELECT code_hash FROM user_setup_codes WHERE user_id = ?")
+                .bind(id.to_string())
+                .fetch_one(&w.state.db)
+                .await
+                .unwrap();
+        let plain = code.replace('-', "");
+        assert!(code_hash.starts_with("$argon2"), "{name}: code hash");
+        assert!(!code_hash.contains(&plain), "{name}: the code is stored");
+        let verified = rustyfin_auth::verify_setup_code(code, &code_hash).await;
+        assert!(verified.unwrap(), "{name}: the hash is not the code's");
+        assert!(
+            login(&w.app, name, code).await.is_none(),
+            "{name}: the code signed in"
+        );
+        assert!(
+            login(&w.app, name, "").await.is_none(),
+            "{name}: no password signed in"
+        );
+        assert!(
+            !text.contains(code.as_str()) && !text.contains(&plain),
+            "{name}: the code is in the log"
+        );
+    }
+
+    let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import run");
+    assert!(text.lines().any(info), "no INFO line in {text}");
+    assert!(!text.contains(jf::CANARY), "secret in the log");
+    assert!(
+        !report.to_string().contains(jf::CANARY),
+        "secret in the report"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_run_creates_one_user_per_name() {
+    // Jellyfin users whose names differ only in case: the one created first matches the other.
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Erin", false));
+    w.source.users.push(jf::JfUser::new(4, "erin", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let erins: Vec<B20User> = b20_users(&report)
+        .into_iter()
+        .filter(|user| user.name.eq_ignore_ascii_case("erin"))
+        .collect();
+    let [first, second] = erins.as_slice() else {
+        panic!("{report}");
+    };
+    let actions = (first.action.as_str(), second.action.as_str());
+    assert_eq!(actions, ("Create", "Match"), "{report}");
+    assert!(first.code.is_some() && second.code.is_none(), "{report}");
+    assert!(first.user_id.is_some(), "{report}");
+    assert_eq!(second.user_id, first.user_id, "{report}");
+    let erin_users: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE lower(name) = 'erin'")
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(erin_users, 1);
+}
+
+#[tokio::test]
+async fn b20_import_run_shows_codes_once() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert!(
+        b20_entry(&report, "bob").code.is_some(),
+        "the first answer has no code"
+    );
+
+    let again = b20_status(&w).await;
+    assert_eq!(again["State"], "Completed", "{again}");
+    let mut expected = report.clone();
+    for user in expected["Users"].as_array_mut().unwrap() {
+        user["Code"] = serde_json::Value::Null;
+    }
+    assert_eq!(again["Result"], expected, "only the codes go");
+}
+
+#[tokio::test]
+async fn b20_import_second_run_creates_nothing() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let body = serde_json::json!({ "SourcePath": install });
+        let first = b20_run(&w, body.clone()).await;
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let digest = b20_db_digest(&w.state).await;
+        let codes = b20_code_rows(&w.state).await;
+        assert_eq!(codes.len(), 1, "{name}: one code, bob's");
+
+        let second = b20_run(&w, body).await;
+        let users = vec![
+            b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+            b20_user(&w, "bob", "Match", None, Some(bob)),
+        ];
+        assert_eq!(b20_users(&second), users, "{name}");
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            digest,
+            "{name}: the second run wrote"
+        );
+        assert_eq!(
+            b20_code_rows(&w.state).await,
+            codes,
+            "{name}: the codes changed"
+        );
+        let alice = login(&w.app, "alice", "alicepass").await;
+        assert!(alice.is_some(), "{name}: alice's password changed");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_conflicts_while_running() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": install });
+    let held = w
+        .state
+        .jellyfin_import
+        .try_start()
+        .expect("an idle job starts");
+    let (status, answer) = b20_post(&w, "Run", body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["Status"], 409, "{answer}");
+    let running = b20_status(&w).await;
+    assert_eq!(running["State"], "Running", "{running}");
+    assert_eq!(running["Stage"], "Reading", "{running}");
+
+    // A run that ends without a result has failed, and the next run starts.
+    drop(held);
+    let failed = b20_status(&w).await;
+    assert_eq!(failed["State"], "Failed", "{failed}");
+    assert!(failed["Error"].is_string(), "{failed}");
+    assert!(failed["Result"].is_null(), "{failed}");
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "bob").action, "Create");
 }

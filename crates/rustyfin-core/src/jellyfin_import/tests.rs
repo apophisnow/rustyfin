@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
-use super::ImportError;
+use super::job::{ImportJob, ImportStage, ImportStatus, JobState};
 use super::paths::{PathMapping, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
     ProviderIds, guid_from_blob, guid_from_text, locate, parse_jellyfin_date, parse_provider_ids,
 };
+use super::{ImportError, ImportReport, ItemReport, Layout, UserAction, UserRow};
 
 /// A temp folder removed when the test ends.
 struct TempDir(PathBuf);
@@ -248,4 +249,115 @@ fn b20_match_user_names() {
     assert_eq!(match_user_name("BOB", &users), UserMatch::Ambiguous);
     assert_eq!(match_user_name("ünal", &users), UserMatch::Matched(unal));
     assert_eq!(match_user_name("carol", &users), UserMatch::NoMatch);
+}
+
+// ── 2b: the import job (spec 2.19, 2.21, 2.25) ──
+
+/// A small report whose one created user holds `code`.
+fn b20_report_with_code(code: &str) -> ImportReport {
+    ImportReport {
+        layout: Layout::New,
+        data_path: "/config/data".to_string(),
+        path_mappings: Vec::new(),
+        suggested_path_mappings: Vec::new(),
+        unpaired_library_paths: Vec::new(),
+        users: vec![UserRow {
+            jellyfin_id: Uuid::from_u128(7),
+            name: "bob".to_string(),
+            was_administrator: false,
+            action: UserAction::Create,
+            reason: None,
+            user_id: Some(Uuid::from_u128(8)),
+            code: Some(code.to_string()),
+        }],
+        items: ItemReport {
+            total: 0,
+            matched_by_path: 0,
+            matched_by_id: 0,
+            unmatched: 0,
+            unmatched_samples: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn b20_job_is_idle_at_first() {
+    let status = ImportJob::default().status();
+    assert_eq!((status.state, status.stage), (JobState::Idle, None));
+    assert_eq!((status.done, status.total), (0, 0));
+    assert!(status.result.is_none() && status.error.is_none());
+}
+
+#[test]
+fn b20_job_runs_one_at_a_time() {
+    let job = ImportJob::default();
+    let clone = job.clone();
+    let handle = job.try_start().expect("an idle job starts");
+    assert!(clone.try_start().is_none(), "a second run while one runs");
+    let status = clone.status();
+    assert_eq!(
+        (status.state, status.stage),
+        (JobState::Running, Some(ImportStage::Reading))
+    );
+    handle.stage(ImportStage::Users, 3);
+    handle.progress(2);
+    let status = job.status();
+    assert_eq!(status.stage, Some(ImportStage::Users));
+    assert_eq!((status.done, status.total), (2, 3));
+    handle.stage(ImportStage::Matching, 10);
+    let status = job.status();
+    assert_eq!(
+        (status.done, status.total),
+        (0, 10),
+        "a new stage starts at 0"
+    );
+    handle.complete(b20_report_with_code("ABCD-EFGH-JKMN"));
+    let status = job.status();
+    assert_eq!((status.state, status.stage), (JobState::Completed, None));
+    assert!(status.error.is_none());
+
+    let again = job.try_start().expect("a finished job starts again");
+    let status = job.status();
+    assert_eq!(status.state, JobState::Running);
+    assert!(status.result.is_none(), "a new run drops the old report");
+    again.fail("stopped".to_string());
+}
+
+#[test]
+fn b20_job_shows_codes_once() {
+    let job = ImportJob::default();
+    let handle = job.try_start().unwrap();
+    handle.complete(b20_report_with_code("ABCD-EFGH-JKMN"));
+    let code = |status: &ImportStatus| status.result.as_ref().unwrap().users[0].code.clone();
+    let first = job.status();
+    assert_eq!(code(&first), Some("ABCD-EFGH-JKMN".to_string()));
+    let second = job.status();
+    assert_eq!(second.state, JobState::Completed);
+    assert_eq!(code(&second), None, "the code is shown once");
+    let user_id = second.result.unwrap().users[0].user_id;
+    assert_eq!(
+        user_id,
+        Some(Uuid::from_u128(8)),
+        "the rest of the report stays"
+    );
+}
+
+#[test]
+fn b20_job_reports_failures() {
+    let job = ImportJob::default();
+    job.try_start().unwrap().fail("cannot read x".to_string());
+    let status = job.status();
+    assert_eq!((status.state, status.stage), (JobState::Failed, None));
+    assert_eq!(status.error.as_deref(), Some("cannot read x"));
+    assert!(status.result.is_none());
+
+    // A handle dropped without an ending fails the run; the job starts again.
+    drop(job.try_start().unwrap());
+    let status = job.status();
+    assert_eq!(status.state, JobState::Failed);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("the import stopped before it finished")
+    );
+    assert!(job.try_start().is_some());
 }

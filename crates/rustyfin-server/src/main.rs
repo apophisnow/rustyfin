@@ -220,6 +220,7 @@ async fn main() {
         image_cache,
         http_client,
         tmdb,
+        jellyfin_import: Default::default(),
     };
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)

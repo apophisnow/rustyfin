@@ -2535,6 +2535,7 @@ dependencies = [
  "moka",
  "quick-xml",
  "reqwest",
+ "rustyfin-auth",
  "rustyfin-db",
  "rustyfin-model",
  "serde",
