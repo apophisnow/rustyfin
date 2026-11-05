@@ -38,3 +38,9 @@ rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 rustyfin-core = { workspace = true }
 uuid = { workspace = true }
+# B21: the OIDC tests run a fake provider that signs ID tokens.
+base64 = "0.22"
+hmac = "0.12"
+p256 = "0.14"
+sha2 = "0.10"
+url = "2"
