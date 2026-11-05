@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Password hashing no longer blocks the server (M-15)**: argon2 hashing and verification run on a blocking thread pool, so a burst of logins no longer stalls unrelated requests.
 - **Login response reflects the current login (M-16)**: `AuthenticateByName` now returns the user with the `LastLoginDate` set by that login, not the previous one.
 - **Proxy address handling**: `X-Forwarded-For` is read across all header lines, right to left, with `ip:port` and `[v6]:port` entries; loopback is trusted as a proxy only when listed in `RUSTYFIN_KNOWN_PROXIES`, and a malformed entry no longer resolves to a client-chosen address. The reset-PIN LAN check uses the same client address, IPv4-mapped IPv6 peers count as their IPv4 address, and IPv6 clients share one login budget per /64. Before, a client behind a same-host proxy could claim the loopback exemption.
+- **Reset PIN guessing bound**: a new forgot-password request no longer replaces a pending or voided reset, so each reset allows at most 5 wrong PINs; redemption is atomic and deletes the PIN. `ResetPassword` answers an unknown user like a wrong PIN.
 
 ## [0.14.0] - 2026-11-03
 

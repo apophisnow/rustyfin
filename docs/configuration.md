@@ -81,7 +81,7 @@ Rustyfin unterstützt den Betrieb hinter einem Reverse Proxy. Die folgenden Head
 
 `X-Forwarded-For` wird nur ausgewertet, wenn die Verbindung von einem in `RUSTYFIN_KNOWN_PROXIES` eingetragenen Proxy stammt; das gilt auch für Loopback (`127.0.0.1`, `::1`). Rustyfin liest alle `X-Forwarded-For`-Zeilen von rechts nach links und nimmt die erste Adresse, die kein eingetragener Proxy ist; `ip`, `ip:port`, `[v6]` und `[v6]:port` werden erkannt. Ist ein Eintrag unlesbar oder sind alle Einträge eingetragene Proxies, zählt die Anfrage als vom Proxy kommend: Sie ist weder lokal noch von der Ratenbegrenzung ausgenommen. IPv6-Clients teilen sich ein Budget pro /64-Netz.
 
-⚠️ **Hinter einem Reverse Proxy `RUSTYFIN_KNOWN_PROXIES` setzen.** Ohne diese Variable zählt jeder Client als die Adresse des Proxys. Läuft der Proxy auf demselben Host wie im Beispiel unten, gilt damit jeder Client als Loopback: Er ist von der Ratenbegrenzung ausgenommen und kann einen Passwort-Reset starten. Für das Beispiel: `RUSTYFIN_KNOWN_PROXIES=127.0.0.1`.
+> ⚠️ **Hinter einem Reverse Proxy `RUSTYFIN_KNOWN_PROXIES` setzen.** Ohne diese Variable zählt jeder Client als die Adresse des Proxys. Läuft der Proxy auf demselben Host wie im Beispiel unten, gilt damit jeder Client als Loopback: Er ist von der Ratenbegrenzung ausgenommen und kann einen Passwort-Reset starten. Für das Beispiel: `RUSTYFIN_KNOWN_PROXIES=127.0.0.1`.
 
 #### Nginx-Beispiel
 
@@ -115,6 +115,12 @@ server {
 Rustyfin gibt pro Gerät ein undurchsichtiges Zugriffstoken aus und speichert es serverseitig in der Datenbank. Die Token überstehen einen Neustart und bleiben gültig, bis sich das Gerät abmeldet, das Passwort des Benutzers geändert wird oder das Konto deaktiviert wird.
 
 > ℹ️ **`RUSTYFIN_SECRET` wird nicht mehr benötigt.** Die Variable wird ignoriert; Sessions bleiben über Neustarts hinweg erhalten.
+
+### Passwort zurücksetzen (PIN)
+
+„Passwort vergessen“ erzeugt einen PIN und schreibt ihn in die Datei `passwordreset-<hash>.json` im Datenverzeichnis; die Antwort nennt nur den Dateipfad, nie den PIN. Die Datei wird nur geschrieben, wenn der Benutzer existiert und die Anfrage aus dem lokalen Netz kommt (Loopback, private IPv4-Bereiche, Link-Local, IPv6 ULA und Link-Local; die Client-Adresse wird wie bei der Ratenbegrenzung über `RUSTYFIN_KNOWN_PROXIES` bestimmt). Der PIN gilt 30 Minuten und ist nach 5 falschen Eingaben ungültig. Pro Benutzer gibt es höchstens einen offenen Reset; eine neue Anfrage erzeugt erst nach dessen Ablauf einen neuen PIN. Nach dem Einlösen ist der PIN das neue Passwort, und alle Sitzungen des Benutzers werden beendet.
+
+> ℹ️ **Docker:** Im Bridge-Netz kommen Verbindungen von außen oft von der Gateway-Adresse (z. B. `172.17.0.1`). Diese Adresse ist privat und zählt als lokales Netz, daher kann dann jeder, der den Port erreicht, einen Reset starten (der PIN landet trotzdem nur in der Datei).
 
 ### API-Key
 

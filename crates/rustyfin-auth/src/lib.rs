@@ -102,17 +102,19 @@ pub fn reset_pin_filename(username: &str) -> String {
     format!("passwordreset-{h}.json")
 }
 
-/// Generate a reset PIN for `user_id`, store only its hash (with the given RFC3339 `expires_at`),
-/// and return the plaintext PIN once so the caller can write it to the on-disk reset file.
-/// NEVER log the return value.
+/// Generate a reset PIN for `user_id`, store only its hash (with the given RFC3339 `expires_at`).
+/// Returns `Some(pin)`, the plaintext PIN once, so the caller can write it to the on-disk reset
+/// file, when the user had no pending or voided reset. Returns `None` when one exists: that reset
+/// stays in force and the generated PIN is discarded. NEVER log the return value.
 pub async fn create_reset_pin(
     pool: &SqlitePool,
     user_id: Uuid,
     expires_at: &str,
-) -> Result<String, AuthError> {
+) -> Result<Option<String>, AuthError> {
     let pin = generate_reset_pin();
-    repo_user::store_reset_pin(pool, user_id, &reset_pin_hash(&pin), expires_at).await?;
-    Ok(pin)
+    let stored =
+        repo_user::store_reset_pin(pool, user_id, &reset_pin_hash(&pin), expires_at).await?;
+    Ok(stored.then_some(pin))
 }
 
 /// Validate a reset PIN for one named user (`/Users/ResetPassword`). Returns the user id on success.

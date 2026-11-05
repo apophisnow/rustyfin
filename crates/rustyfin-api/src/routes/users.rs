@@ -257,7 +257,8 @@ async fn update_configuration(
 /// Start a password reset. The response is uniform whether or not the user exists, so it never
 /// reveals account existence, and it never contains the PIN. The PIN is written (mode 0600 on Unix)
 /// to a file under the data dir ONLY when the user exists AND the resolved client (see
-/// `resolve_client`) is on the local network. A remote caller gets the same 200 with a file path
+/// `resolve_client`) is on the local network AND the user has no pending or voided reset, since a
+/// new request never replaces an open reset. Every other request gets the same 200 with a file path
 /// that is not created.
 async fn forgot_password(
     State(state): State<AppState>,
@@ -273,10 +274,10 @@ async fn forgot_password(
     if resolve_client(peer.ip(), &headers, &state.known_proxies).is_local()
         && let Some(user) =
             rustyfin_db::repo_user::get_user_by_name(&state.db, &req.entered_username).await?
-    {
-        let pin = rustyfin_auth::create_reset_pin(&state.db, user.id, &expires_at)
+        && let Some(pin) = rustyfin_auth::create_reset_pin(&state.db, user.id, &expires_at)
             .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+    {
         // The PIN lives only in this file. Never log it.
         let contents = serde_json::json!({
             "Pin": pin,
@@ -352,10 +353,11 @@ async fn reset_password(
     State(state): State<AppState>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Look up the user by username
+    // Look up the user by username. An unknown user gets the wrong-PIN error, so the response does
+    // not reveal whether the account exists.
     let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &req.username)
         .await?
-        .ok_or_else(|| ApiError::BadRequest("user not found".to_string()))?;
+        .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
     // Validate the PIN
     let validated = rustyfin_auth::validate_reset_pin(&state.db, user.id, &req.pin)

@@ -4167,3 +4167,169 @@ async fn g2f_ipv6_clients_share_a_slash64_budget() {
         "a different /64 keeps its own budget"
     );
 }
+
+/// Starts a reset for "owner" (from loopback) and returns the PIN in the reset file.
+async fn g2f_start_reset(app: &axum::Router) -> String {
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/Users/ForgotPassword",
+            None,
+            Some(serde_json::json!({"EnteredUsername":"owner"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let file = body["PinFile"].as_str().expect("a PinFile path");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(file).expect("the reset file")).unwrap();
+    parsed["Pin"]
+        .as_str()
+        .expect("a Pin in the file")
+        .to_string()
+}
+
+/// Redeems `pin` through ForgotPassword/Pin and returns the status.
+async fn g2f_redeem(app: &axum::Router, pin: &str) -> StatusCode {
+    send(
+        app,
+        request(
+            "POST",
+            "/Users/ForgotPassword/Pin",
+            None,
+            Some(serde_json::json!({ "Pin": pin })),
+        ),
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn g2f_reissue_after_five_misses_grants_no_new_guesses() {
+    // A new ForgotPassword must not reset the attempt count. 90c99b5 replaced the voided reset with
+    // a fresh one, so every re-issue gave 5 more guesses.
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let _ = g2f_start_reset(&app).await;
+    for n in 1..=5 {
+        assert_eq!(
+            g2f_redeem(&app, "ZZ-ZZ-ZZ-ZZ").await,
+            StatusCode::NOT_FOUND,
+            "miss {n}"
+        );
+    }
+    let pin = g2f_start_reset(&app).await;
+    assert_eq!(
+        g2f_redeem(&app, &pin).await,
+        StatusCode::NOT_FOUND,
+        "after 5 misses the PIN in the reset file stays void until the reset expires"
+    );
+    assert!(
+        g2_login_device(&app, "owner", "pw-owner", "d")
+            .await
+            .is_some(),
+        "the password is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn g2f_reissue_keeps_the_attempt_count() {
+    // 3 misses, a re-issue, 2 more misses: 5 in all, so the PIN in the reset file is void. 90c99b5
+    // restarted the count at the re-issue.
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let _ = g2f_start_reset(&app).await;
+    for _ in 0..3 {
+        assert_eq!(g2f_redeem(&app, "ZZ-ZZ-ZZ-ZZ").await, StatusCode::NOT_FOUND);
+    }
+    let pin = g2f_start_reset(&app).await;
+    for _ in 0..2 {
+        assert_eq!(g2f_redeem(&app, "ZZ-ZZ-ZZ-ZZ").await, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        g2f_redeem(&app, &pin).await,
+        StatusCode::NOT_FOUND,
+        "5 misses in all void the reset"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn g2f_concurrent_redemption_succeeds_once() {
+    // The right PIN sent 8 times at once succeeds exactly once. 90c99b5 checked and marked the PIN
+    // in separate statements, so concurrent requests could all pass the check.
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let pin = g2f_start_reset(&app).await;
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let pin = pin.clone();
+        tasks.push(tokio::spawn(async move { g2f_redeem(&app, &pin).await }));
+    }
+    let mut ok = 0;
+    for t in tasks {
+        if t.await.unwrap() == StatusCode::OK {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 1, "exactly one concurrent redemption succeeds");
+}
+
+#[tokio::test]
+async fn g2f_redeemed_pin_row_is_deleted() {
+    // A redeemed PIN is deleted, not kept as used. 90c99b5 kept the row.
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let pin = g2f_start_reset(&app).await;
+    assert_eq!(g2f_redeem(&app, &pin).await, StatusCode::OK);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM password_reset_pins")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "no reset row is left after redemption");
+}
+
+#[tokio::test]
+async fn g2f_reset_password_hides_unknown_users() {
+    // ResetPassword answers an unknown user exactly like a wrong PIN. 90c99b5 said "user not found".
+    let state = test_state().await;
+    let app = app(state);
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let attempt = |name: &str| {
+        request(
+            "POST",
+            "/Users/ResetPassword",
+            None,
+            Some(serde_json::json!({
+                "Username": name, "Pin": "ZZ-ZZ-ZZ-ZZ", "TempPassword": "x"
+            })),
+        )
+    };
+    let known = send(&app, attempt("owner")).await;
+    let unknown = send(&app, attempt("ghost")).await;
+    assert_ne!(known.0, StatusCode::OK, "a wrong PIN fails");
+    assert_eq!(
+        unknown, known,
+        "an unknown user gets the same status and body as a wrong PIN"
+    );
+}
