@@ -4827,3 +4827,122 @@ async fn test_dynamic_hls_not_found() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── G4: transcode pipeline and byte ranges ──
+//
+// Unsatisfiable ranges get 416 instead of a panic or the whole file. Tests that need ffmpeg skip
+// with a note when it is not on PATH. Every test removes its data dir, also when it fails.
+
+/// Removes a test's data dir when dropped.
+struct G4Dir(std::path::PathBuf);
+
+impl Drop for G4Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Stores a library on `file`'s folder with one item of `media_type` ("Movie" or "Audio") whose
+/// path is `file`, and returns the item's id.
+async fn g4_insert_item(state: &AppState, media_type: &str, file: &std::path::Path) -> uuid::Uuid {
+    let content_type = if media_type == "Audio" {
+        rustyfin_model::library::LibraryContentType::Music
+    } else {
+        rustyfin_model::library::LibraryContentType::Movies
+    };
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: format!("G4 {}", uuid::Uuid::new_v4().simple()),
+        content_type,
+        paths: vec![file.parent().unwrap().to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(item_id.to_string())
+    .bind(lib.id.to_string())
+    .bind(file.file_stem().unwrap().to_str().unwrap())
+    .bind(media_type)
+    .bind(file.to_str().unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    item_id
+}
+
+/// GETs `uri` with a bearer token and a `Range` header; returns the status, the `Content-Range`
+/// header and the body.
+async fn g4_get_range(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    range: &str,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Range", range)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let content_range = resp
+        .headers()
+        .get("content-range")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, content_range, body)
+}
+
+#[tokio::test]
+async fn g4_unsatisfiable_ranges_get_416() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "g4-ranges");
+    let file = std::path::Path::new(&folder).join("G4 Range.mp4");
+    let content: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file, &content).unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let app = app(state);
+
+    for uri in [
+        format!("/Videos/{id}/stream?Static=true"),
+        format!("/Audio/{id}/stream?Static=true"),
+    ] {
+        for range in ["bytes=-0", "bytes=999999999-", "bytes=1000-"] {
+            let (status, content_range, body) = g4_get_range(&app, &uri, &token, range).await;
+            assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{uri} {range}");
+            assert_eq!(content_range.as_deref(), Some("bytes */1000"), "{range}");
+            assert!(body.is_empty(), "{range}: 416 must not carry the file");
+        }
+
+        let (status, content_range, body) = g4_get_range(&app, &uri, &token, "bytes=0-99").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(content_range.as_deref(), Some("bytes 0-99/1000"));
+        assert_eq!(body, &content[..100]);
+
+        let (status, content_range, body) = g4_get_range(&app, &uri, &token, "bytes=-100").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(content_range.as_deref(), Some("bytes 900-999/1000"));
+        assert_eq!(body, &content[900..]);
+
+        // A header that is not one byte range is ignored: the whole file.
+        for range in ["abc", "bytes=0-0,5-9"] {
+            let (status, content_range, body) = g4_get_range(&app, &uri, &token, range).await;
+            assert_eq!(status, StatusCode::OK, "{range}");
+            assert_eq!(content_range, None, "{range}");
+            assert_eq!(body, content, "{range}");
+        }
+    }
+}

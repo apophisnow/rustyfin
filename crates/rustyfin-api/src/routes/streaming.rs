@@ -118,13 +118,13 @@ async fn stream_file(
         return Ok((StatusCode::NOT_MODIFIED, ()).into_response());
     }
 
-    let range_header = headers
+    let byte_range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| parse_range(s, file_size));
+        .map_or(ByteRange::Ignore, |s| parse_range(s, file_size));
 
-    match range_header {
-        Some((start, end)) => {
+    match byte_range {
+        ByteRange::Partial(start, end) => {
             let length = end - start + 1;
 
             // Reopen for range request (need mutable handle for seek)
@@ -156,7 +156,15 @@ async fn stream_file(
             )
                 .into_response())
         }
-        None => {
+        ByteRange::Unsatisfiable => Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [
+                (header::CONTENT_RANGE, format!("bytes */{file_size}")),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+        )
+            .into_response()),
+        ByteRange::Ignore => {
             let file = tokio::fs::File::open(&file_path)
                 .await
                 .map_err(|e| ApiError::Internal(format!("Cannot open file: {e}")))?;
@@ -180,30 +188,66 @@ async fn stream_file(
     }
 }
 
-/// Parse a `Range: bytes=START-END` header, returning inclusive (start, end).
-fn parse_range(range: &str, file_size: u64) -> Option<(u64, u64)> {
-    let range = range.strip_prefix("bytes=")?;
-    let mut parts = range.splitn(2, '-');
-    let start_str = parts.next()?.trim();
-    let end_str = parts.next()?.trim();
+/// How to answer a `Range` header (RFC 9110 §14.1.2).
+#[derive(Debug, PartialEq, Eq)]
+enum ByteRange {
+    /// 206 with bytes `start..=end`.
+    Partial(u64, u64),
+    /// 416 with `Content-Range: bytes */<size>`.
+    Unsatisfiable,
+    /// Not a single byte range we serve: 200 with the whole file.
+    Ignore,
+}
+
+/// Parse a `Range: bytes=START-END` header for a file of `file_size` bytes.
+fn parse_range(range: &str, file_size: u64) -> ByteRange {
+    let Some(spec) = range.strip_prefix("bytes=") else {
+        return ByteRange::Ignore;
+    };
+    // Multi-range requests are not served; they get the whole file.
+    if spec.contains(',') {
+        return ByteRange::Ignore;
+    }
+    let Some((start_str, end_str)) = spec.split_once('-') else {
+        return ByteRange::Ignore;
+    };
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
 
     if start_str.is_empty() {
-        // suffix range: bytes=-500
-        let suffix: u64 = end_str.parse().ok()?;
-        let start = file_size.checked_sub(suffix)?;
-        Some((start, file_size - 1))
-    } else {
-        let start: u64 = start_str.parse().ok()?;
-        let end = if end_str.is_empty() {
-            file_size - 1
-        } else {
-            end_str.parse().ok()?
+        // Suffix range: `bytes=-N` is the last N bytes.
+        return match end_str.parse::<u64>() {
+            Ok(0) => ByteRange::Unsatisfiable,
+            Ok(n) if n > file_size => ByteRange::Ignore,
+            Ok(n) => ByteRange::Partial(file_size - n, file_size - 1),
+            Err(_) => ByteRange::Ignore,
         };
-        if start > end || start >= file_size {
-            return None;
-        }
-        Some((start, end.min(file_size - 1)))
     }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return ByteRange::Ignore;
+    };
+    // `A-` has no explicit end and runs to the last byte of the file.
+    let end = if end_str.is_empty() {
+        None
+    } else {
+        let Ok(end) = end_str.parse::<u64>() else {
+            return ByteRange::Ignore;
+        };
+        if end < start {
+            return ByteRange::Ignore;
+        }
+        Some(end)
+    };
+    if start >= file_size {
+        return ByteRange::Unsatisfiable;
+    }
+    // start < file_size here, so file_size >= 1 and `file_size - 1` cannot underflow.
+    let last = match end {
+        Some(end) => end.min(file_size - 1),
+        None => file_size - 1,
+    };
+    ByteRange::Partial(start, last)
 }
 
 fn mime_from_path(path: &str) -> String {
@@ -1009,57 +1053,148 @@ mod tests {
 
     #[test]
     fn test_parse_range_full_range() {
-        assert_eq!(parse_range("bytes=0-999", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=0-999", 1000), ByteRange::Partial(0, 999));
     }
 
     #[test]
     fn test_parse_range_partial() {
-        assert_eq!(parse_range("bytes=100-199", 1000), Some((100, 199)));
+        assert_eq!(
+            parse_range("bytes=100-199", 1000),
+            ByteRange::Partial(100, 199)
+        );
     }
 
     #[test]
     fn test_parse_range_open_ended() {
-        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(
+            parse_range("bytes=500-", 1000),
+            ByteRange::Partial(500, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_suffix() {
-        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(
+            parse_range("bytes=-100", 1000),
+            ByteRange::Partial(900, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_clamp_end_to_file_size() {
-        assert_eq!(parse_range("bytes=0-9999", 1000), Some((0, 999)));
+        assert_eq!(
+            parse_range("bytes=0-9999", 1000),
+            ByteRange::Partial(0, 999)
+        );
     }
 
     #[test]
     fn test_parse_range_invalid_no_bytes_prefix() {
-        assert_eq!(parse_range("0-999", 1000), None);
+        assert_eq!(parse_range("0-999", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_start_beyond_file() {
-        assert_eq!(parse_range("bytes=1000-1100", 1000), None);
+        assert_eq!(
+            parse_range("bytes=1000-1100", 1000),
+            ByteRange::Unsatisfiable
+        );
     }
 
     #[test]
     fn test_parse_range_start_greater_than_end() {
-        assert_eq!(parse_range("bytes=500-100", 1000), None);
+        assert_eq!(parse_range("bytes=500-100", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_empty_string() {
-        assert_eq!(parse_range("", 1000), None);
+        assert_eq!(parse_range("", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_invalid_numbers() {
-        assert_eq!(parse_range("bytes=abc-def", 1000), None);
+        assert_eq!(parse_range("bytes=abc-def", 1000), ByteRange::Ignore);
     }
 
     #[test]
     fn test_parse_range_suffix_larger_than_file() {
-        assert_eq!(parse_range("bytes=-1001", 1000), None);
+        assert_eq!(parse_range("bytes=-1001", 1000), ByteRange::Ignore);
+    }
+
+    // RFC 9110 §14.1.2: a suffix of length 0 and a first byte at or past the end are unsatisfiable (416).
+
+    #[test]
+    fn test_parse_range_zero_suffix_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=-0", 1000), ByteRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_parse_range_start_far_beyond_file_is_unsatisfiable() {
+        assert_eq!(
+            parse_range("bytes=999999999-", 1000),
+            ByteRange::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn test_parse_range_start_at_file_size_is_unsatisfiable() {
+        assert_eq!(parse_range("bytes=1000-", 1000), ByteRange::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_parse_range_huge_numbers_do_not_overflow() {
+        assert_eq!(
+            parse_range("bytes=18446744073709551615-", 1000),
+            ByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range("bytes=0-18446744073709551615", 1000),
+            ByteRange::Partial(0, 999)
+        );
+        assert_eq!(
+            parse_range("bytes=-18446744073709551615", 1000),
+            ByteRange::Ignore
+        );
+        assert_eq!(
+            parse_range("bytes=18446744073709551616-", 1000),
+            ByteRange::Ignore
+        );
+    }
+
+    #[test]
+    fn test_parse_range_empty_file() {
+        assert_eq!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-0", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-5", 0), ByteRange::Ignore);
+    }
+
+    #[test]
+    fn test_parse_range_single_bytes() {
+        assert_eq!(parse_range("bytes=0-0", 1000), ByteRange::Partial(0, 0));
+        assert_eq!(
+            parse_range("bytes=999-", 1000),
+            ByteRange::Partial(999, 999)
+        );
+        assert_eq!(parse_range("bytes=-1", 1000), ByteRange::Partial(999, 999));
+    }
+
+    #[test]
+    fn test_parse_range_suffix_of_whole_file() {
+        assert_eq!(parse_range("bytes=-1000", 1000), ByteRange::Partial(0, 999));
+    }
+
+    #[test]
+    fn test_parse_range_multiple_ranges_are_ignored() {
+        assert_eq!(parse_range("bytes=0-0,5-9", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=-0,0-9", 1000), ByteRange::Ignore);
+    }
+
+    #[test]
+    fn test_parse_range_without_numbers_is_ignored() {
+        assert_eq!(parse_range("bytes=-", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=", 1000), ByteRange::Ignore);
+        assert_eq!(parse_range("bytes=12", 1000), ByteRange::Ignore);
     }
 
     // ── mime_from_path ──
