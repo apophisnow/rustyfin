@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Setup wizard library scan**: The library created in the setup wizard is scanned right away. Before, it stayed empty until the next scheduled scan, up to 12 hours later.
 - **Symlinked folders in the folder picker**: `GET /Library/BrowseDirectories` now lists a symlink that points to a folder, under the link's own path, since the library scan follows such links too. Before, the library dialog's folder picker left these folders out, so they could only be typed.
 - **Scan notice in the web client**: Starting a scan now shows one toast as the request is sent, and the scan banner is gone. Before, the banner showed alongside the toast, and the toast came only when the scan had ended, since the scan request answers then. The setup wizard now also shows a toast when it starts its scan. A scan that can't start, for example for a deleted library, shows only the error, and one that fails later shows "Scan failed".
+- **Resume or start over**: Starting a video that has a resume point from a card, the home page's Play button or an episode now asks whether to resume from the saved time or to start from the beginning, as in Jellyfin. Before, only the detail page offered the choice, and everything else resumed without asking. Escape or a click outside the menu cancels. A video without a resume point, or one in its last 10 %, starts at once.
 
 ## [0.14.0] - 2026-11-03
 

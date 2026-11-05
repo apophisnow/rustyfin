@@ -478,6 +478,18 @@
     </div>
 </dialog>
 
+<!-- Resume or start over, opened by playWithResumeChoice for a video with a resume point -->
+<dialog id="resume-menu" class="modal bg-black/70 backdrop-blur-md">
+    <div class="modal-box max-w-xs jf-menu rounded-2xl p-5">
+        <h3 id="resume-menu-title" class="text-base font-bold text-white mb-4 truncate"></h3>
+        <form method="dialog" class="flex flex-col gap-2">
+            <button id="resume-menu-resume" value="resume" class="jf-btn-primary w-full text-sm" autofocus></button>
+            <button value="start" class="jf-btn-ghost w-full text-sm" data-i18n="player.start_from_beginning">Start from beginning</button>
+        </form>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button data-i18n="common.backdrop_close">close</button></form>
+</dialog>
+
 <!-- Toast notification container -->
 <div id="toast-container" class="fixed bottom-5 right-5 z-[200] space-y-2 pointer-events-none"></div>
 

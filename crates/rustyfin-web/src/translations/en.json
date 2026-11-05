@@ -174,7 +174,9 @@
         "stream": "Stream",
         "video_stream_fallback": "Video stream (fallback)",
         "audio_stream": "Audio stream",
-        "hls_error": "HLS stream error"
+        "hls_error": "HLS stream error",
+        "resume_from": "Resume from {{time}}",
+        "start_from_beginning": "Start from beginning"
     },
     "admin": {
         "new_user_title": "New User",

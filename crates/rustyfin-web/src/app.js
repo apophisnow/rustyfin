@@ -326,7 +326,13 @@ function startScanWithToast(request, startedMessage) {
 // Clicks on rendered markup are dispatched here from data-action and data-* attributes, so server values never end up inside inline JavaScript.
 const clickActions = {
     navigate: el => navigate(el.dataset.page, el.dataset.id),
-    play: el => playItem(el.dataset.id, el.dataset.streamType, el.dataset.title, { fromStart: el.dataset.fromStart === 'true' }),
+    // A video with a resume point asks first; the detail page's Resume and Play from beginning buttons are that choice
+    play: el => {
+        const { id, streamType, title } = el.dataset;
+        if (el.dataset.resume === 'true') playItem(id, streamType, title);
+        else if (el.dataset.fromStart === 'true') playItem(id, streamType, title, { fromStart: true });
+        else playWithResumeChoice(id, streamType, title);
+    },
     'scan-library': el => startScanWithToast(API.scanLibrary(el.dataset.id), t('library.scan_started_for', { name: el.dataset.name })),
     'scan-library-page': el => {
         const id = el.dataset.id;
@@ -1320,7 +1326,7 @@ async function renderDetail(itemId) {
                         <!-- Action Bar -->
                         <div class="flex flex-wrap items-center gap-3">
                             ${canPlay ? `
-                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}">
+                            <button class="jf-btn-primary !py-3 !px-7 text-sm font-bold shadow-xl" data-action="play" data-id="${escapeHtml(id)}" data-stream-type="${escapeHtml(streamType)}" data-title="${escapeHtml(name)}"${resumeTicks > 0 ? ' data-resume="true"' : ''}>
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
                                 ${resumeTicks > 0 ? t('detail.resume') : t('common.play')}
                             </button>
@@ -1488,6 +1494,50 @@ function resumePositionTicks(item) {
     const runtime = item.RunTimeTicks || 0;
     if (runtime > 0 && pos >= runtime * 0.9) return 0;
     return pos;
+}
+
+// The resume point as m:ss under an hour and h:mm:ss from an hour on
+function formatResumeTime(ticks) {
+    const total = Math.floor(ticks / 1e7);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = String(total % 60).padStart(2, '0');
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+// Asks whether to resume at ticks or start over. Resolves 'resume' or 'start', or '' when the menu is cancelled
+// (Escape, a click outside) or already open. Escape keeps the old returnValue, so it is cleared before opening.
+function askResumeOrStart(title, ticks) {
+    const menu = $('resume-menu');
+    if (!menu || menu.open) return Promise.resolve('');
+    $('resume-menu-title').textContent = title;
+    $('resume-menu-resume').textContent = t('player.resume_from', { time: formatResumeTime(ticks) });
+    menu.returnValue = '';
+    return new Promise(resolve => {
+        menu.addEventListener('close', () => resolve(menu.returnValue), { once: true });
+        menu.showModal();
+        // The buttons fade in with the dialog (input.css transitions all their properties, visibility too), so
+        // autofocus finds Resume still hidden and focuses the backdrop; focus Resume once the fade is done
+        setTimeout(() => { if (menu.open) $('resume-menu-resume').focus(); }, 250);
+    });
+}
+
+// Starts an item from a card or a Play button. A video with a resume point asks first whether to resume.
+async function playWithResumeChoice(itemId, streamType = 'Videos', title = '') {
+    if (streamType !== 'Videos') return playItem(itemId, streamType, title);
+    // Read the point after the last Stopped report and uncached, so it includes the position just saved
+    await pendingStop;
+    let item = null;
+    try {
+        item = await API.get('/Items/' + itemId);
+    } catch (e) {
+        console.warn('Could not load item for resume point:', e);
+    }
+    const ticks = resumePositionTicks(item);
+    if (ticks <= 0) return playItem(itemId, streamType, title);
+    const choice = await askResumeOrStart(title || item?.Name || '', ticks);
+    if (choice === 'resume') playItem(itemId, streamType, title);
+    else if (choice === 'start') playItem(itemId, streamType, title, { fromStart: true });
 }
 
 // Stops the session that is still playing, if any. Returns the promise of its Stopped report.
