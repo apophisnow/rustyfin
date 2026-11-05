@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **TMDb client**: All TMDb requests share one client with rate limiting (about 9 per second, 4 in flight), retries with backoff, `Retry-After` handling for 429 and the `Rustyfin/<version>` User-Agent. The API key no longer appears in logs or errors. New variables `RUSTYFIN_TMDB_API_KEY`, `RUSTYFIN_TMDB_BASE_URL` and `RUSTYFIN_TMDB_IMAGE_BASE_URL`; the env key takes precedence over the config key and is never shown in or saved to the server configuration.
+
 ## [0.14.0] - 2026-11-03
 
 ### Fixed

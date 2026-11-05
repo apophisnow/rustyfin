@@ -289,6 +289,9 @@ Hardening options (ProtectHome, ProtectSystem, NoNewPrivileges) are enabled by d
 | `RUSTYFIN_SECRET` | JWT signing secret | Random UUID (regenerated each start!) |
 | `RUSTYFIN_SERVER_ID` | Unique server identifier | Random UUID |
 | `RUSTYFIN_API_KEY` | Static API key for integrations | Disabled |
+| `RUSTYFIN_TMDB_API_KEY` | TMDb API key (v3 key or v4 read access token). Takes precedence over the key in the server config and is never saved there | Config key, else TMDb off |
+| `RUSTYFIN_TMDB_BASE_URL` | TMDb API base URL (absolute http(s) URL; an invalid value stops startup) | `https://api.themoviedb.org/3` |
+| `RUSTYFIN_TMDB_IMAGE_BASE_URL` | TMDb image base URL (absolute http(s) URL; an invalid value stops startup) | `https://image.tmdb.org/t/p/original` |
 | `RUST_LOG` | Log level (`debug`, `info`, `rustyfin=trace`) | `info` |
 
 **Example (production):**
