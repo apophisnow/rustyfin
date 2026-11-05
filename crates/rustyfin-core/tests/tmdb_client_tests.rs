@@ -740,6 +740,41 @@ async fn a_rate_limit_pauses_every_request() {
     );
 }
 
+/// Requests that took their start slot before the 429 came back must wait for the pause too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rate_limit_holds_requests_already_waiting_for_a_slot() {
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    // The 50 ms reply delay lets every request take its slot before the 429 arrives.
+    let stub = start_stub(Duration::from_millis(50), move |path, _| {
+        if arrivals.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::RateLimited("1")
+        } else {
+            ok(path)
+        }
+    })
+    .await;
+    let interval = Duration::from_millis(200);
+    let settings = TmdbSettings {
+        min_interval: interval,
+        ..stub.fast_settings()
+    };
+    let client = TmdbClient::new(http(), settings);
+    get_all(paths(&client.api(None).unwrap(), 520..523)).await;
+    let hits = by_arrival(stub.hits());
+    let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert_eq!(hits.len(), 4, "three requests and one retry, got {order:?}");
+    let first = hits[0].at;
+    for hit in &hits[1..] {
+        let gap = hit.at.duration_since(first);
+        assert!(
+            gap >= Duration::from_millis(990),
+            "{} went out {gap:?} after a 429 with Retry-After: 1",
+            hit.path
+        );
+    }
+    assert_spaced(&hits[1..], interval);
+}
+
 #[tokio::test]
 async fn server_errors_are_retried_with_backoff() {
     let stub = start_stub(Duration::ZERO, |path, seen| match seen {

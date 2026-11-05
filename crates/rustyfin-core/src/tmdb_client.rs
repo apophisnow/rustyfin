@@ -136,43 +136,58 @@ fn absolute_base_url(var: &str, raw: &str) -> Result<String, String> {
     }
 }
 
-/// Spacing and concurrency shared by every clone and handle of one client.
+/// Spacing and concurrency shared by every clone and handle of one client. No attempt starts
+/// during a pause.
 struct Limiter {
     permits: Semaphore,
     min_interval: Duration,
-    /// Earliest start for the next attempt. Locked only inside `reserve` and `pause`, never
-    /// across an await.
-    next_slot: Mutex<Instant>,
+    /// Locked only inside `reserve`, `pause` and `is_paused`, never across an await.
+    state: Mutex<State>,
+}
+
+/// What `Limiter::state` guards.
+struct State {
+    /// Earliest start for the next attempt.
+    next_slot: Instant,
+    /// Attempts may not start before this instant. Moved only by `pause`, and only forward.
+    paused_until: Instant,
 }
 
 impl Limiter {
     fn new(max_concurrent: usize, min_interval: Duration) -> Limiter {
+        let now = Instant::now();
         Limiter {
             permits: Semaphore::new(max_concurrent.max(1)),
             min_interval,
-            next_slot: Mutex::new(Instant::now()),
+            state: Mutex::new(State {
+                next_slot: now,
+                paused_until: now,
+            }),
         }
     }
 
     /// Takes the next start slot, `max(now, next_slot)`. The slot after it is `min_interval` later.
+    /// The slot may fall inside a pause. `attempt` then takes a new one.
     fn reserve(&self) -> Instant {
-        let mut next = self
-            .next_slot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let start = (*next).max(Instant::now());
-        *next = start + self.min_interval;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = state.next_slot.max(Instant::now());
+        state.next_slot = start + self.min_interval;
         start
     }
 
-    /// A 429 pauses every request until `wait` from now.
+    /// A 429 pauses every request until `wait` from now. Slots taken from now on come after the
+    /// pause. Slots already taken are checked again when they arrive, in `attempt`.
     fn pause(&self, wait: Duration) {
         let until = Instant::now() + wait;
-        let mut next = self
-            .next_slot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *next = (*next).max(until);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.next_slot = state.next_slot.max(until);
+        state.paused_until = state.paused_until.max(until);
+    }
+
+    /// True while a pause runs at this moment.
+    fn is_paused(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Instant::now() < state.paused_until
     }
 }
 
@@ -342,7 +357,8 @@ impl TmdbApi {
     }
 
     /// One HTTP attempt: permit, then start slot, then send and read the body. The permit is
-    /// released when this returns.
+    /// released when this returns. If a pause runs when the slot arrives, the attempt takes a
+    /// new slot and waits again.
     async fn attempt(&self, url: &Url) -> Result<serde_json::Value, Failure> {
         let shared: &Shared = &self.client.0;
         let _permit = shared
@@ -351,7 +367,12 @@ impl TmdbApi {
             .acquire()
             .await
             .expect("the limiter semaphore is never closed");
-        sleep_until(shared.limiter.reserve()).await;
+        loop {
+            sleep_until(shared.limiter.reserve()).await;
+            if !shared.limiter.is_paused() {
+                break;
+            }
+        }
 
         let mut request = shared
             .http
