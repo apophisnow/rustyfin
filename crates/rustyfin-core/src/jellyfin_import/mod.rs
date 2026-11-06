@@ -498,9 +498,10 @@ impl TrackMapper<'_> {
                     .choice_index(db, rf_item, row.item, choice, StreamKind::Subtitle)
                     .await?;
                 match index {
-                    Some(index) => {
+                    Some((index, key)) => {
                         counts.subtitle += 1;
                         mapped.subtitle = Some(index);
+                        mapped.subtitle_key = Some(key);
                     }
                     None => counts.unmapped += 1,
                 }
@@ -512,9 +513,10 @@ impl TrackMapper<'_> {
                 .choice_index(db, rf_item, row.item, choice, StreamKind::Audio)
                 .await?;
             match index {
-                Some(index) => {
+                Some((index, key)) => {
                     counts.audio += 1;
                     mapped.audio = Some(index);
+                    mapped.audio_key = Some(key);
                 }
                 None => counts.unmapped += 1,
             }
@@ -522,8 +524,9 @@ impl TrackMapper<'_> {
         Ok(mapped)
     }
 
-    /// The Rustyfin stream index a Jellyfin track choice maps to (spec 2.30, 2.32), or None. The
-    /// source is the one at the Jellyfin item's translated path (spec 2.16), else the first.
+    /// The Rustyfin stream index a Jellyfin track choice maps to (spec 2.30, 2.32), with the key of
+    /// that stream (see `StreamIdentity`), or None. The source is the one at the Jellyfin item's
+    /// translated path (spec 2.16), and no other.
     async fn choice_index(
         &mut self,
         db: &SqlitePool,
@@ -531,7 +534,7 @@ impl TrackMapper<'_> {
         jf_item: Uuid,
         choice: i64,
         kind: StreamKind,
-    ) -> Result<Option<i64>, ImportError> {
+    ) -> Result<Option<(i64, String)>, ImportError> {
         let Some(jf) = self.items.get(&jf_item) else {
             return Ok(None);
         };
@@ -550,7 +553,14 @@ impl TrackMapper<'_> {
             return Ok(None);
         };
         let streams = self.streams.get(&jf_item).map(Vec::as_slice).unwrap_or(&[]);
-        Ok(tracks::map_track(choice, kind, streams, &source.streams))
+        let Some(index) = tracks::map_track(choice, kind, streams, &source.streams) else {
+            return Ok(None);
+        };
+        Ok(source
+            .streams
+            .iter()
+            .find(|row| row.index == index)
+            .map(|row| (index, row.identity().key())))
     }
 }
 

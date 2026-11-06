@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rustyfin_model::media::MediaType;
+use rustyfin_model::media_source::StreamIdentity;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -34,8 +35,13 @@ pub struct UserDataRow {
     pub likes: Option<bool>,
     /// The remembered audio stream index, in Rustyfin's numbering.
     pub audio: Option<i64>,
+    /// The key of the stream the audio index named (`StreamIdentity::key`); None when none.
+    pub audio_key: Option<String>,
     /// The remembered subtitle stream index, in Rustyfin's numbering; -1 means subtitles off.
     pub subtitle: Option<i64>,
+    /// The key of the stream the subtitle index named (`StreamIdentity::key`); None when none, and
+    /// for subtitles off.
+    pub subtitle_key: Option<String>,
 }
 
 /// A media stream of a Rustyfin media source (spec 2.31): a `media_streams` row.
@@ -52,6 +58,22 @@ pub struct StreamRow {
     pub is_forced: bool,
 }
 
+impl StreamRow {
+    /// This stream's identity (see `StreamIdentity`).
+    pub fn identity(&self) -> StreamIdentity<'_> {
+        StreamIdentity {
+            codec_type: &self.codec_type,
+            codec: self.codec.as_deref(),
+            language: self.language.as_deref(),
+            title: self.title.as_deref(),
+            is_external: self.is_external,
+            path: self.path.as_deref(),
+            is_default: self.is_default,
+            is_forced: self.is_forced,
+        }
+    }
+}
+
 /// A media source of an item, with its streams in `stream_index` order (spec 2.31).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceStreams {
@@ -60,7 +82,8 @@ pub struct SourceStreams {
 }
 
 /// `user_item_data`: item_id, played, play_count, playback_position_ticks, last_played_date,
-/// is_favorite, user_rating, likes, audio_stream_index, subtitle_stream_index.
+/// is_favorite, user_rating, likes, audio_stream_index, subtitle_stream_index, audio_stream_key,
+/// subtitle_stream_key.
 type DataDbRow = (
     String,
     bool,
@@ -72,6 +95,8 @@ type DataDbRow = (
     Option<bool>,
     Option<i64>,
     Option<i64>,
+    Option<String>,
+    Option<String>,
 );
 
 /// `media_streams`: stream_index, codec_type, codec, language, title, is_external, path, is_default,
@@ -150,7 +175,8 @@ pub async fn user_data_rows(
 ) -> Result<HashMap<Uuid, UserDataRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, DataDbRow>(
         "SELECT item_id, played, play_count, playback_position_ticks, last_played_date, \
-         is_favorite, user_rating, likes, audio_stream_index, subtitle_stream_index \
+         is_favorite, user_rating, likes, audio_stream_index, subtitle_stream_index, \
+         audio_stream_key, subtitle_stream_key \
          FROM user_item_data WHERE user_id = ?",
     )
     .bind(user.to_string())
@@ -168,6 +194,8 @@ pub async fn user_data_rows(
         likes,
         audio,
         subtitle,
+        audio_key,
+        subtitle_key,
     ) in rows
     {
         let Ok(item) = Uuid::parse_str(&item) else {
@@ -184,7 +212,9 @@ pub async fn user_data_rows(
                 user_rating,
                 likes,
                 audio,
+                audio_key,
                 subtitle,
+                subtitle_key,
             },
         );
     }
@@ -204,8 +234,8 @@ pub async fn write_user_data(
         sqlx::query(
             "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
              playback_position_ticks, last_played_date, is_favorite, user_rating, likes, \
-             audio_stream_index, subtitle_stream_index) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             audio_stream_index, subtitle_stream_index, audio_stream_key, subtitle_stream_key) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(user_id, item_id) DO UPDATE SET \
              played = excluded.played, \
              play_count = excluded.play_count, \
@@ -215,7 +245,9 @@ pub async fn write_user_data(
              user_rating = excluded.user_rating, \
              likes = excluded.likes, \
              audio_stream_index = excluded.audio_stream_index, \
-             subtitle_stream_index = excluded.subtitle_stream_index",
+             subtitle_stream_index = excluded.subtitle_stream_index, \
+             audio_stream_key = excluded.audio_stream_key, \
+             subtitle_stream_key = excluded.subtitle_stream_key",
         )
         .bind(&user_id)
         .bind(item.to_string())
@@ -228,6 +260,8 @@ pub async fn write_user_data(
         .bind(row.likes)
         .bind(row.audio)
         .bind(row.subtitle)
+        .bind(row.audio_key.as_deref())
+        .bind(row.subtitle_key.as_deref())
         .execute(&mut *tx)
         .await?;
     }

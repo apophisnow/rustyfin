@@ -417,7 +417,9 @@ fn jf_watched() -> JfUserData {
 /// The Rustyfin indexes of `jf_watched`'s track choices.
 const MAPPED: MappedTracks = MappedTracks {
     audio: Some(2),
+    audio_key: None,
     subtitle: Some(4),
+    subtitle_key: None,
 };
 
 #[test]
@@ -546,7 +548,9 @@ fn b20_merge_without_a_rustyfin_row() {
         user_rating: Some(8),
         likes: Some(true),
         audio: Some(2),
+        audio_key: None,
         subtitle: Some(4),
+        subtitle_key: None,
     };
     assert_eq!(
         merge(None, &jf_watched(), MAPPED),
@@ -577,7 +581,9 @@ fn b20_merge_keeps_newer_rustyfin_progress() {
         user_rating: Some(3),
         likes: Some(false),
         audio: Some(7),
+        audio_key: None,
         subtitle: None,
+        subtitle_key: None,
     };
     // Played and favorite if either; the larger count, the later date, Rustyfin's rating,
     // likes, position and tracks.
@@ -611,7 +617,9 @@ fn b20_merge_takes_newer_jellyfin_progress() {
     // A track without a mapped value keeps Rustyfin's; subtitle -1 (off) is a value.
     let tracks = MappedTracks {
         audio: None,
+        audio_key: None,
         subtitle: Some(-1),
+        subtitle_key: None,
     };
     let expected = UserDataRow {
         played: true,
@@ -622,7 +630,9 @@ fn b20_merge_takes_newer_jellyfin_progress() {
         user_rating: Some(8),
         likes: Some(true),
         audio: Some(7),
+        audio_key: None,
         subtitle: Some(-1),
+        subtitle_key: None,
     };
     assert_eq!(merge(Some(&stored), &jf_watched(), tracks), expected);
 
@@ -673,12 +683,66 @@ fn b20_merge_on_a_tie_keeps_rustyfin_progress() {
     };
     let tracks = MappedTracks {
         audio: Some(2),
+        audio_key: None,
         subtitle: None,
+        subtitle_key: None,
     };
     assert_eq!(
         merge(Some(&stored), &undated, tracks),
         stored,
         "neither side has a date"
+    );
+}
+
+#[test]
+fn b20_merge_moves_keys_with_indexes() {
+    let key = |name: &str| Some(name.to_string());
+    let stored = UserDataRow {
+        last_played: at(1),
+        audio: Some(7),
+        audio_key: key("rf audio"),
+        subtitle: Some(0),
+        subtitle_key: key("rf subtitle"),
+        ..UserDataRow::default()
+    };
+    // A newer Jellyfin row: a mapped index brings its key, an unmapped one keeps Rustyfin's pair.
+    let tracks = MappedTracks {
+        audio: Some(2),
+        audio_key: key("jf audio"),
+        subtitle: None,
+        subtitle_key: None,
+    };
+    let merged = merge(Some(&stored), &jf_watched(), tracks.clone());
+    assert_eq!(
+        (
+            merged.audio,
+            merged.audio_key,
+            merged.subtitle,
+            merged.subtitle_key
+        ),
+        (Some(2), key("jf audio"), Some(0), key("rf subtitle"))
+    );
+    // Subtitles off name no stream.
+    let off = MappedTracks {
+        subtitle: Some(-1),
+        ..MappedTracks::default()
+    };
+    let merged = merge(Some(&stored), &jf_watched(), off);
+    assert_eq!((merged.subtitle, merged.subtitle_key), (Some(-1), None));
+    // An older Jellyfin row keeps both of Rustyfin's pairs.
+    let newer = UserDataRow {
+        last_played: at(9),
+        ..stored.clone()
+    };
+    let merged = merge(Some(&newer), &jf_watched(), tracks);
+    assert_eq!(
+        (
+            merged.audio,
+            merged.audio_key,
+            merged.subtitle,
+            merged.subtitle_key
+        ),
+        (Some(7), key("rf audio"), Some(0), key("rf subtitle"))
     );
 }
 
@@ -756,14 +820,16 @@ fn b20_merge_is_idempotent() {
     };
     let off = MappedTracks {
         audio: None,
+        audio_key: None,
         subtitle: Some(-1),
+        subtitle_key: None,
     };
     for existing in &stored {
         for jf in [jf_watched(), undated.clone()] {
-            for tracks in [MAPPED, MappedTracks::default(), off] {
-                let once = merge(existing.as_ref(), &jf, tracks);
+            for tracks in [MAPPED, MappedTracks::default(), off.clone()] {
+                let once = merge(existing.as_ref(), &jf, tracks.clone());
                 assert_eq!(
-                    merge(Some(&once), &jf, tracks),
+                    merge(Some(&once), &jf, tracks.clone()),
                     once,
                     "{existing:?} {jf:?} {tracks:?}"
                 );
@@ -819,12 +885,13 @@ fn b20_choose_source() {
     };
     let sources = [first.clone(), second.clone()];
     assert_eq!(choose_source(&sources, Some("/m/A/b.mkv")), Some(&second));
+    assert_eq!(choose_source(&sources, Some("/m/A/a.mkv")), Some(&first));
     assert_eq!(
         choose_source(&sources, Some("/m/A/c.mkv")),
-        Some(&first),
-        "no source has the path: the first"
+        None,
+        "no source has the path: the choices were made on another file"
     );
-    assert_eq!(choose_source(&sources, None), Some(&first));
+    assert_eq!(choose_source(&sources, None), None, "no path: no source");
     assert_eq!(choose_source(&[], Some("/m/A/a.mkv")), None);
 }
 

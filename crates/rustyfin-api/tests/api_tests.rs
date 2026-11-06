@@ -9883,6 +9883,175 @@ async fn b20_track_defaults_per_media_source() {
     assert_eq!(sources, expected);
 }
 
+/// `b20_full_streams` with `edit` applied to the streams at index 2 (ger audio) and 4 (ger
+/// subtitle).
+fn b20_streams_with(edit: impl Fn(&mut serde_json::Value)) -> serde_json::Value {
+    let mut streams = b20_full_streams();
+    for index in [2, 4] {
+        edit(&mut streams[index]);
+    }
+    streams
+}
+
+/// The defaults of `name`, a movie with `before`, after choosing audio 2 and subtitle 4 and a
+/// rescan that finds `after` in the same file.
+async fn b20_defaults_after_rescan(
+    state: &AppState,
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> B20Defaults {
+    let item = b20_movie(state, name, before).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(app, token, "/Progress", body).await;
+    assert_eq!(
+        b20_only_defaults(app, token, item).await,
+        b20_both(2, 4),
+        "{name}: before the rescan"
+    );
+    rustyfin_db::repo_media_source::delete_media_sources(&state.db, &item)
+        .await
+        .unwrap();
+    let file = std::path::Path::new(&media_folder(state, name)).join(format!("{name}.mkv"));
+    b20_insert_source(state, item, &file, after).await;
+    b20_only_defaults(app, token, item).await
+}
+
+#[tokio::test]
+async fn b20_rescan_offers_only_the_chosen_streams() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let set = |key: &'static str, audio: serde_json::Value, subtitle: serde_json::Value| {
+        b20_streams_with(move |stream| {
+            let kind = stream["CodecType"].as_str().unwrap().to_string();
+            stream[key] = if kind == "Audio" {
+                audio.clone()
+            } else {
+                subtitle.clone()
+            };
+        })
+    };
+    let external = |path: &str| {
+        let mut streams = b20_full_streams();
+        streams[4]["IsExternal"] = serde_json::json!(true);
+        streams[4]["Path"] = serde_json::json!(path);
+        streams
+    };
+    let json = |value: &str| serde_json::json!(value);
+    let kept = b20_both(2, 4);
+    let neither: B20Defaults = (None, None);
+    let cases = [
+        ("Same", b20_full_streams(), b20_full_streams(), kept.clone()),
+        (
+            "Case",
+            b20_full_streams(),
+            b20_streams_with(|stream| {
+                for key in ["Codec", "CodecType", "Language"] {
+                    let upper = stream[key].as_str().unwrap().to_uppercase();
+                    stream[key] = serde_json::json!(upper);
+                }
+            }),
+            kept.clone(),
+        ),
+        (
+            "Codec",
+            b20_full_streams(),
+            set("Codec", json("eac3"), json("ass")),
+            neither.clone(),
+        ),
+        (
+            "Language",
+            b20_full_streams(),
+            set("Language", json("fre"), json("fre")),
+            neither.clone(),
+        ),
+        (
+            "Title",
+            b20_full_streams(),
+            set("Title", json("Commentary"), json("Signs")),
+            neither.clone(),
+        ),
+        (
+            "Default",
+            b20_full_streams(),
+            set(
+                "IsDefault",
+                serde_json::json!(true),
+                serde_json::json!(true),
+            ),
+            neither.clone(),
+        ),
+        (
+            "Forced",
+            b20_full_streams(),
+            set("IsForced", serde_json::json!(true), serde_json::json!(true)),
+            neither.clone(),
+        ),
+        (
+            "External",
+            external("/subs/B20 Ext.ger.srt"),
+            external("/subs/B20 Ext.fre.srt"),
+            (Some(serde_json::json!(2)), None),
+        ),
+        (
+            "External Moved",
+            external("/subs/B20 Ext.ger.srt"),
+            external("/elsewhere/B20 Ext.ger.srt"),
+            kept.clone(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, before, after, expected) in cases {
+        let name = format!("B20 Rescan {case}");
+        let got = b20_defaults_after_rescan(&state, &app, &token, &name, before, after).await;
+        if got != expected {
+            wrong.push(format!("{case}: {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn b20_track_choice_names_the_reported_source() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Dub", b20_full_streams()).await;
+    let folder = media_folder(&state, "B20 Dub");
+    let file = std::path::Path::new(&folder).join("B20 Dub - French.mkv");
+    std::fs::write(&file, b"b20").unwrap();
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "ac3", "CodecType": "Audio", "Language": "fre" },
+    ]);
+    let dub = b20_insert_source(&state, item, &file, streams).await;
+
+    // Audio 1 of the French version: the first version's audio 1 is another stream.
+    let body = serde_json::json!({
+        "ItemId": item, "MediaSourceId": dub.simple().to_string(), "PositionTicks": 0,
+        "AudioStreamIndex": 1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    let audio_1 = (Some(serde_json::json!(1)), None);
+    assert_eq!(sources, vec![(2, audio_1.clone()), (5, (None, None))]);
+
+    // Without MediaSourceId, the first version listed that has an audio 1 names it.
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    assert_eq!(sources, vec![(2, (None, None)), (5, audio_1)]);
+}
+
 // Import from Jellyfin: the importer reads a Jellyfin data folder read-only (synthetic databases
 // in both layouts, written by `jellyfin_fixture`), matches users by name and items by path pair or
 // provider id, and its preview reports what an import would do without writing anything.
@@ -12720,7 +12889,12 @@ async fn b20_import_metadata_survives_a_rescan() {
 /// `layout`. Jellyfin's Alpha gets TMDB 111 and an overview; "Alpha (stale)", listed before it, is
 /// a Movie at an old path in Alpha's folder with TMDB 111, its own overview and bob's played row.
 /// Rustyfin's Alpha has no TMDB id, so only an id the import writes can match the stale entry.
-async fn b20_stale_world(name: &str, layout: jf::Layout) -> (B20World, std::path::PathBuf) {
+/// `edit` gets the world and the stale entry's id before the install.
+async fn b20_stale_world_with(
+    name: &str,
+    layout: jf::Layout,
+    edit: impl FnOnce(&mut B20World, uuid::Uuid),
+) -> (B20World, std::path::PathBuf) {
     let mut w = b20_world().await;
     b20_edit(&mut w, "Alpha", |i| {
         i.provider("Tmdb", "111").meta(jf::JfMeta {
@@ -12747,10 +12921,59 @@ async fn b20_stale_world(name: &str, layout: jf::Layout) -> (B20World, std::path
         last_played: Some("2025-04-01 08:00:00"),
         ..Default::default()
     });
+    let stale_id = stale.id;
     let at = w.source.items.iter().position(|i| i.name == "Alpha");
     w.source.items.insert(at.unwrap(), stale);
+    edit(&mut w, stale_id);
     let install = b20_install(&w, name, layout).await;
     (w, install)
+}
+
+/// The stale world, as installed.
+async fn b20_stale_world(name: &str, layout: jf::Layout) -> (B20World, std::path::PathBuf) {
+    b20_stale_world_with(name, layout, |_, _| {}).await
+}
+
+#[tokio::test]
+async fn b20_import_maps_tracks_only_at_the_jellyfin_path() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        // bob chose the stale file's aac and German subtitles; Rustyfin's Alpha has streams of
+        // the same kinds and codecs, but at its own path, not the stale entry's.
+        let (w, install) = b20_stale_world_with(name, layout, |w, stale| {
+            let stream = jf::JfStream::new;
+            w.source.streams.extend([
+                stream(stale, 0, "Video", "h264"),
+                stream(stale, 1, "Audio", "aac"),
+                stream(stale, 2, "Subtitle", "srt").language("ger"),
+            ]);
+            let bob = w.source.user("bob").id;
+            let mut rows = w.source.user_data.iter_mut();
+            let row = rows
+                .find(|row| row.user == bob && row.item == stale)
+                .unwrap();
+            row.audio = Some(1);
+            row.subtitle = Some(2);
+        })
+        .await;
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alpha_file = std::path::PathBuf::from(format!("{}/Alpha (2001)/Alpha.mkv", w.movies));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle" },
+        ]);
+        b20_insert_source(&w.state, alpha, &alpha_file, streams).await;
+
+        let body = serde_json::json!({ "SourcePath": install });
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body).await;
+        for report in [&preview, &report] {
+            assert_eq!(b20_track_counts(report), (0, 0, 0, 2), "{name}: {report}");
+        }
+        let bob = b20_entry(&report, "bob").user_id.unwrap().to_string();
+        let tracks = b20_stored_tracks(&w.state, &bob, alpha).await;
+        assert_eq!(tracks, (None, None), "{name}: choices of another file");
+    }
 }
 
 #[tokio::test]

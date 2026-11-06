@@ -77,14 +77,24 @@ pub async fn update_playback_position(
     Ok(())
 }
 
+/// A remembered track: the index of the stream a user chose, with the key of that stream when it
+/// was chosen (`StreamIdentity::key`). The key is None when no stream of that kind was there, and
+/// for subtitles off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamChoice {
+    pub index: i32,
+    pub key: Option<String>,
+}
+
 /// Remember the audio and subtitle stream a user chose for an item. A `None` leaves the stored
-/// value as it is; a subtitle of -1 means subtitles were turned off.
+/// index and key as they are; a chosen index replaces both. A subtitle of -1 means subtitles were
+/// turned off.
 pub async fn save_stream_choice(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
-    audio: Option<i32>,
-    subtitle: Option<i32>,
+    audio: Option<&StreamChoice>,
+    subtitle: Option<&StreamChoice>,
 ) -> Result<(), sqlx::Error> {
     if audio.is_none() && subtitle.is_none() {
         return Ok(());
@@ -93,42 +103,55 @@ pub async fn save_stream_choice(
     let iid = item_id.to_string();
 
     sqlx::query(
-        "INSERT INTO user_item_data (user_id, item_id, audio_stream_index, subtitle_stream_index) \
-         VALUES (?, ?, ?, ?) \
+        "INSERT INTO user_item_data (user_id, item_id, audio_stream_index, subtitle_stream_index, \
+         audio_stream_key, subtitle_stream_key) \
+         VALUES (?, ?, ?, ?, ?, ?) \
          ON CONFLICT(user_id, item_id) DO UPDATE SET \
          audio_stream_index = COALESCE(excluded.audio_stream_index, user_item_data.audio_stream_index), \
-         subtitle_stream_index = COALESCE(excluded.subtitle_stream_index, user_item_data.subtitle_stream_index)",
+         audio_stream_key = CASE WHEN excluded.audio_stream_index IS NULL \
+         THEN user_item_data.audio_stream_key ELSE excluded.audio_stream_key END, \
+         subtitle_stream_index = COALESCE(excluded.subtitle_stream_index, user_item_data.subtitle_stream_index), \
+         subtitle_stream_key = CASE WHEN excluded.subtitle_stream_index IS NULL \
+         THEN user_item_data.subtitle_stream_key ELSE excluded.subtitle_stream_key END",
     )
     .bind(&uid)
     .bind(&iid)
-    .bind(audio)
-    .bind(subtitle)
+    .bind(audio.map(|choice| choice.index))
+    .bind(subtitle.map(|choice| choice.index))
+    .bind(audio.and_then(|choice| choice.key.as_deref()))
+    .bind(subtitle.and_then(|choice| choice.key.as_deref()))
     .execute(pool)
     .await?;
 
     Ok(())
 }
 
-/// The audio and subtitle stream a user last chose for an item, `(None, None)` when nothing is
-/// remembered.
+/// The audio and subtitle stream a user last chose for an item, each with its key; `(None, None)`
+/// when nothing is remembered.
 pub async fn get_stream_choice(
     pool: &SqlitePool,
     user_id: Uuid,
     item_id: Uuid,
-) -> Result<(Option<i32>, Option<i32>), sqlx::Error> {
+) -> Result<(Option<StreamChoice>, Option<StreamChoice>), sqlx::Error> {
     let uid = user_id.to_string();
     let iid = item_id.to_string();
 
-    let row = sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
-        "SELECT audio_stream_index, subtitle_stream_index FROM user_item_data \
-         WHERE user_id = ? AND item_id = ?",
+    let row = sqlx::query_as::<_, (Option<i32>, Option<String>, Option<i32>, Option<String>)>(
+        "SELECT audio_stream_index, audio_stream_key, subtitle_stream_index, subtitle_stream_key \
+         FROM user_item_data WHERE user_id = ? AND item_id = ?",
     )
     .bind(&uid)
     .bind(&iid)
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.unwrap_or((None, None)))
+    let (audio_index, audio_key, subtitle_index, subtitle_key) = row.unwrap_or_default();
+    let choice =
+        |index: Option<i32>, key: Option<String>| index.map(|index| StreamChoice { index, key });
+    Ok((
+        choice(audio_index, audio_key),
+        choice(subtitle_index, subtitle_key),
+    ))
 }
 
 pub async fn mark_played(

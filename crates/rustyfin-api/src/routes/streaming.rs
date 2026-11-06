@@ -4,6 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use rustyfin_db::repo_playback::StreamChoice;
 use rustyfin_model::auth::Claims;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -864,10 +865,16 @@ async fn video_playback_info(
     let media_sources: Vec<rustyfin_model::playback_info::PlaybackMediaSource> = media_sources
         .into_iter()
         .map(|source| {
-            let default_audio_stream_index =
-                remembered_audio.filter(|&index| has_stream_at(&source, "Audio", index));
+            let default_audio_stream_index = remembered_audio
+                .as_ref()
+                .filter(|choice| has_remembered_stream(&source, "Audio", choice))
+                .map(|choice| choice.index);
             let default_subtitle_stream_index = remembered_subtitle
-                .filter(|&index| index == -1 || has_stream_at(&source, "Subtitle", index));
+                .as_ref()
+                .filter(|choice| {
+                    choice.index == -1 || has_remembered_stream(&source, "Subtitle", choice)
+                })
+                .map(|choice| choice.index);
             rustyfin_model::playback_info::PlaybackMediaSource {
                 source,
                 default_audio_stream_index,
@@ -952,16 +959,20 @@ fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str
     stream.codec_type.eq_ignore_ascii_case(kind)
 }
 
-/// Whether `source` has a stream of `kind` ("Audio", "Subtitle") at `index`.
-fn has_stream_at(
+/// Whether `source` has a stream of `kind` ("Audio", "Subtitle") at the choice's index whose key is
+/// the one stored with the choice. A choice with no stored key never matches.
+fn has_remembered_stream(
     source: &rustyfin_model::media_source::MediaSourceResponse,
     kind: &str,
-    index: i32,
+    choice: &StreamChoice,
 ) -> bool {
+    let Some(key) = choice.key.as_deref() else {
+        return false;
+    };
     source
         .media_streams
         .iter()
-        .any(|s| s.index == index && is_stream_type(s, kind))
+        .any(|s| s.index == choice.index && is_stream_type(s, kind) && s.identity().key() == key)
 }
 
 /// Check if a media source can be directly played by the client.

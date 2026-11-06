@@ -5,12 +5,15 @@ use rustyfin_db::repo_jellyfin_import::UserDataRow;
 
 use super::source::JfUserData;
 
-/// The Rustyfin track indexes a Jellyfin row's track choices map to (spec 2.16). `None` where a
-/// choice has no counterpart. A subtitle of `Some(-1)` means subtitles off.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// The Rustyfin track indexes a Jellyfin row's track choices map to (spec 2.16), each with the key
+/// of the stream it names (see `StreamIdentity`). `None` where a choice has no counterpart. A
+/// subtitle of `Some(-1)` means subtitles off, which names no stream and so has no key.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MappedTracks {
     pub audio: Option<i64>,
+    pub audio_key: Option<String>,
     pub subtitle: Option<i64>,
+    pub subtitle_key: Option<String>,
 }
 
 /// A Jellyfin rating as Rustyfin's whole rating from 0 to 10 (spec 2.13): rounded half away from
@@ -51,12 +54,20 @@ fn progress(row: &JfUserData) -> (Option<DateTime<Utc>>, i64, i64) {
 /// 2.14). Played and favorite are either side's; the play count is the larger; the date is the
 /// later. A rating and likes Rustyfin has are kept, else Jellyfin's. The position and the mapped
 /// tracks come from Jellyfin only when its row is newer: when there is no Rustyfin row, when
-/// Rustyfin's row has no date and Jellyfin's has one, or when Jellyfin's date is later. A track
-/// Jellyfin maps to nothing keeps Rustyfin's.
+/// Rustyfin's row has no date and Jellyfin's has one, or when Jellyfin's date is later. A track's
+/// index and key move together: a track Jellyfin maps to nothing keeps Rustyfin's pair.
 pub fn merge(existing: Option<&UserDataRow>, jf: &JfUserData, mapped: MappedTracks) -> UserDataRow {
     let stored = existing.cloned().unwrap_or_default();
     // `Option` orders None below Some, so this is also true for a date where Rustyfin has none.
     let jellyfin_newer = existing.is_none() || jf.last_played > stored.last_played;
+    let (audio, audio_key) = match mapped.audio {
+        Some(index) if jellyfin_newer => (Some(index), mapped.audio_key),
+        _ => (stored.audio, stored.audio_key),
+    };
+    let (subtitle, subtitle_key) = match mapped.subtitle {
+        Some(index) if jellyfin_newer => (Some(index), mapped.subtitle_key),
+        _ => (stored.subtitle, stored.subtitle_key),
+    };
     UserDataRow {
         played: stored.played || jf.played,
         play_count: stored.play_count.max(jf.play_count),
@@ -71,15 +82,9 @@ pub fn merge(existing: Option<&UserDataRow>, jf: &JfUserData, mapped: MappedTrac
             .user_rating
             .or_else(|| jf.rating.and_then(convert_rating)),
         likes: stored.likes.or(jf.likes),
-        audio: if jellyfin_newer {
-            mapped.audio.or(stored.audio)
-        } else {
-            stored.audio
-        },
-        subtitle: if jellyfin_newer {
-            mapped.subtitle.or(stored.subtitle)
-        } else {
-            stored.subtitle
-        },
+        audio,
+        audio_key,
+        subtitle,
+        subtitle_key,
     }
 }

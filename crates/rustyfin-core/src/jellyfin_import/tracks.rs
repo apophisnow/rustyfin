@@ -19,13 +19,13 @@ pub fn normalize_codec(codec: &str) -> String {
 }
 
 /// The source a Jellyfin item's track choices refer to (spec 2.16): the one at `path` (the
-/// translated Jellyfin path), else the first.
+/// translated Jellyfin path). None when no source is at that path; a choice never falls back to
+/// another source.
 pub fn choose_source<'a>(
     sources: &'a [SourceStreams],
     path: Option<&str>,
 ) -> Option<&'a SourceStreams> {
     path.and_then(|path| sources.iter().find(|source| source.path.as_str() == path))
-        .or_else(|| sources.first())
 }
 
 /// The Rustyfin stream index that the Jellyfin track `choice` of `kind` maps to (spec 2.16, 2.30).
