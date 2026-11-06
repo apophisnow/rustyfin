@@ -5160,7 +5160,6 @@ async fn b21_unlink_needs_another_way_in() {
 // Fix round 1: the review of 9cc903a (spec §10, AC37-AC42).
 
 #[tokio::test]
-#[ignore = "B21 fix 1"]
 async fn b21_admin_group_member_links_from_the_profile() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -5207,7 +5206,6 @@ async fn b21_admin_group_member_links_from_the_profile() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 1"]
 async fn b21_rename_is_for_administrators_while_oidc_is_on() {
     let t = b21_on(serde_json::json!({})).await;
     let bob_id = add_user(&t.state, "bob", "pw-bob", false).await;

@@ -22,6 +22,10 @@ pub const PASSWORD_SIGN_IN_OFF: &str = "Password sign-in is turned off for this 
 /// The refusal for a non-administrator's password reset while the switch is off (AC22).
 pub const PASSWORD_RESET_OFF: &str = "Password reset is turned off for this account.";
 
+/// The refusal for a non-administrator's rename while sign-in through the provider is on (AC38).
+pub const RENAME_OFF: &str =
+    "Usernames can't be changed while sign-in through the provider is on. Ask an administrator.";
+
 /// The path of the provider's redirect, under the public URL.
 const CALLBACK_PATH: &str = "/Auth/Oidc/Callback";
 

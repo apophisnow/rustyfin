@@ -187,7 +187,8 @@ pub(crate) async fn sign_in(
 }
 
 /// The account a sign-in is for (AC7, AC8): the user the identity is linked to, else the one user
-/// with the same name, else a new user. A name match never takes an administrator's account, and a
+/// with the same name, else a new user. A name match never takes an administrator's account, nor
+/// any account when the claims put the person in the admin group (they link from the profile). A
 /// user who has a link never takes a second one.
 async fn sign_in_account(
     pool: &SqlitePool,
@@ -231,6 +232,10 @@ async fn sign_in_account(
         [existing] => {
             // A name match never links an administrator's account; the Link endpoint does that.
             if existing.is_administrator {
+                return Err(SignInError::Refused("admin_link_required"));
+            }
+            // Nor for a member of the admin group (AC37): the profile link applies the group.
+            if in_group(claims, &config.group_claim, &config.admin_group) {
                 return Err(SignInError::Refused("admin_link_required"));
             }
             if repo_oidc::user_has_link(pool, existing.id).await? {
