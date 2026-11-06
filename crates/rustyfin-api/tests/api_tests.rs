@@ -5644,7 +5644,6 @@ async fn b21_links_survive_renames() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 3 fix 4"]
 async fn b21_quick_connect_caps_live_requests_per_client() {
     let state = test_state().await;
     let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
@@ -6096,7 +6095,6 @@ async fn b21_simultaneous_sign_ins_take_a_name_once() {
 }
 
 #[test]
-#[ignore = "B21 round 3 fix 4"]
 fn b21_ipv6_clients_are_keyed_by_their_slash56() {
     let key = |ip: &str| {
         rustyfin_api::middleware::resolve_client(
@@ -10740,7 +10738,6 @@ async fn g2f_mapped_proxy_peer_is_trusted() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 3 fix 4"]
 async fn g2f_ipv6_clients_share_a_slash56_budget() {
     // One site rotating through its /56 must not get a fresh budget per address or per /64.
     // 90c99b5 keyed every full IPv6 address separately, G2f each /64 (B21 round 3: the /56).

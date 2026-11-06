@@ -302,13 +302,13 @@ impl ClientAddr {
         self.resolved && is_exempt_loopback(self.ip) && is_exempt_loopback(self.peer)
     }
 
-    /// The login-limiter key: the IPv4 address (no port), or the IPv6 /64 network, so one host that
-    /// rotates addresses within its /64 shares one budget.
+    /// The login-limiter key: the IPv4 address (no port), or the IPv6 /56 network, so one site that
+    /// rotates addresses or /64 subnets within its /56 shares one budget.
     pub fn limiter_key(&self) -> String {
         match self.ip {
             IpAddr::V4(v4) => v4.to_string(),
             IpAddr::V6(v6) => {
-                Ipv6Net::new(v6, 64).map_or_else(|_| v6.to_string(), |net| net.trunc().to_string())
+                Ipv6Net::new(v6, 56).map_or_else(|_| v6.to_string(), |net| net.trunc().to_string())
             }
         }
     }
@@ -412,7 +412,7 @@ pub async fn rate_limit(
 ) -> Result<Response, ApiError> {
     let client = resolve_client(addr.ip(), req.headers(), &state.known_proxies);
 
-    // Every client that is not exempt draws on its limiter key: the IPv4 address, or the IPv6 /64.
+    // Every client that is not exempt draws on its limiter key: the IPv4 address, or the IPv6 /56.
     if !client.is_exempt() && !state.rate_limiter.check(&client.limiter_key()).await {
         tracing::warn!(ip = %client.ip, "rate limit exceeded");
         return Err(ApiError::RateLimited);
