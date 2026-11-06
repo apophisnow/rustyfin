@@ -622,6 +622,8 @@ struct ItemRow {
     index_number: Option<i32>,
     parent_index_number: Option<i32>,
     parent_id: Option<String>,
+    /// The series of the item's season, when the item is an episode.
+    series_id: Option<String>,
 }
 
 /// A source of an item, as [`reconcile_groups`] reads it.
@@ -639,12 +641,13 @@ struct SourceRow {
 enum Wanted {
     /// A movie: its title and year.
     Movie { title: String, year: Option<i32> },
-    /// An episode: the stem of its first file, its numbers, and its season.
+    /// An episode: the stem of its first file, its numbers, its season, and the series of that season.
     Episode {
         name: String,
         index_number: Option<i32>,
         parent_index_number: Option<i32>,
         parent_id: Uuid,
+        series_id: Uuid,
     },
 }
 
@@ -671,8 +674,9 @@ pub enum GroupOutcome {
 /// Matches each movie version group with its item, merges the other owners of a group into the
 /// survivor, updates the survivor's path and names, and says what to probe. The outcomes are in the
 /// order of `groups`. `scope` is the part of the library that the scan collected: only the items in it
-/// are read. `gone` is the set that [`gone_items`] returns: a group with no owner takes over the first of
-/// these items that it matches. Call this before the removal of items that are no longer collected.
+/// are read. `gone` is the set that [`gone_items`] returns: a group with no owner takes over the oldest of
+/// these items that it matches, and merges the others into it. Call this before the removal of items that
+/// are no longer collected.
 pub async fn reconcile_movie_groups(
     pool: &SqlitePool,
     library_id: Uuid,
@@ -693,10 +697,13 @@ pub async fn reconcile_movie_groups(
     reconcile_groups(pool, library_id, "Movie", scope, &wanted, gone).await
 }
 
-/// One episode's files in version order, and the fields that the episode gives its item.
+/// One episode's files in version order, and the fields that the episode gives its item. `series_id` is the
+/// series that holds `season_id`. With a season number, the episode takes over a gone episode of that series
+/// with the same numbers, whatever the name of its season folder was.
 pub struct EpisodeGroup {
     pub files: Vec<PathBuf>,
     pub season_id: Uuid,
+    pub series_id: Uuid,
     pub index_number: Option<i32>,
     pub parent_index_number: Option<i32>,
 }
@@ -727,6 +734,7 @@ pub async fn reconcile_episode_groups(
                 index_number: group.index_number,
                 parent_index_number: group.parent_index_number,
                 parent_id: group.season_id,
+                series_id: group.series_id,
             },
         })
         .collect();
@@ -738,9 +746,10 @@ pub async fn reconcile_episode_groups(
 /// Groups are handled in order of their first file, and the writes for one group run in one
 /// transaction. Only the items with a path or a source in `scope` are read, with all the sources of
 /// those items. Only the probe failures in `scope` are read, since every file of `groups` is in `scope`.
-/// The groups with an owner settle first. A group with no owner then takes over the first item of `gone`
-/// that it matches (see [`takes_over`]) and that no owned group claims, so that the item keeps its id.
-/// A group that takes none gets a new item.
+/// The groups with an owner settle first. A group with no owner then takes over the items of `gone` that it
+/// matches (see [`takes_over`]) and that no owned group claims, oldest first: the oldest keeps its id, and the
+/// others merge into it. A group that matches none gets a new item. A group looks for gone items only when
+/// one of its probeable files is neither a trailer nor a sample (see [`naming::is_trailer_or_sample`]).
 async fn reconcile_groups(
     pool: &SqlitePool,
     library_id: Uuid,
@@ -758,7 +767,8 @@ async fn reconcile_groups(
     );
     let items: Vec<ItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created,
-                index_number, parent_index_number, parent_id
+                index_number, parent_index_number, parent_id,
+                (SELECT s.parent_id FROM media_items AS s WHERE s.id = m.parent_id) AS series_id
          FROM media_items AS m
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}"
     )))
@@ -870,7 +880,7 @@ async fn reconcile_groups(
         outcomes.push((idx, outcome));
     }
 
-    // The gone items, oldest first. A group with no owner takes over the first of them that it matches.
+    // The gone items, oldest first. A group with no owner takes over those of them that it matches.
     let mut gone_order: Vec<&ItemRow> = items
         .iter()
         .filter(|item| gone.contains(item.id.as_str()))
@@ -881,22 +891,40 @@ async fn reconcile_groups(
     for (idx, probeable) in unowned {
         let group = &groups[idx];
         let primary = probeable.first().unwrap_or(&group.files[0]);
-        // A group whose files all failed to probe makes a new item: a taken-over item keeps its old
-        // sources, since the probe that replaces them does not run.
-        let heir = gone_order.iter().copied().find(|item| {
-            !probeable.is_empty()
-                && !claimed.contains(item.id.as_str())
-                && takes_over(item, group, primary)
-        });
-        let outcome = match heir {
-            Some(item) => {
-                claimed.insert(item.id.as_str());
+        // A group whose files all failed to probe takes over nothing, since a taken-over item keeps its old
+        // sources and the probe that replaces them does not run. A group whose files are all trailers or
+        // samples takes over nothing either.
+        let heirs: Vec<&ItemRow> = if probeable
+            .iter()
+            .any(|file| !naming::is_trailer_or_sample(Path::new(file)))
+        {
+            gone_order
+                .iter()
+                .copied()
+                .filter(|item| {
+                    !claimed.contains(item.id.as_str()) && takes_over(item, group, primary)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let outcome = match heirs.split_first() {
+            Some((&survivor, others)) => {
+                claimed.extend(heirs.iter().map(|item| item.id.as_str()));
                 tracing::info!(
                     "{media_type} {} takes the new file {primary} of {}",
-                    item.id,
-                    item.path
+                    survivor.id,
+                    survivor.path
                 );
-                settle_group(pool, group, &probeable, primary, item, &[], &[]).await?
+                for other in others {
+                    tracing::info!(
+                        "{media_type} {} of {} merges into {}",
+                        other.id,
+                        other.path,
+                        survivor.id
+                    );
+                }
+                settle_group(pool, group, &probeable, primary, survivor, others, &[]).await?
             }
             None => GroupOutcome::New {
                 path: primary.clone(),
@@ -943,8 +971,8 @@ fn owners_of<'a>(
 /// Whether the gone item `item` is the unit of `group`, so that the group takes it over. A movie is the
 /// unit when its old file is in the folder of `primary`, with the title and year of the group. The title
 /// and year may match the item's stored ones or those of its old file name, read by `naming::clean_name`,
-/// since metadata can rename an item. An episode is the unit when it has the group's episode number in
-/// the group's season.
+/// since metadata can rename an item. An episode is the unit when it has the group's episode and season
+/// numbers, and is in the group's series, or, when the group has no season number, in the group's season.
 fn takes_over(item: &ItemRow, group: &WantedGroup, primary: &str) -> bool {
     match &group.wanted {
         Wanted::Movie { title, year } => {
@@ -961,12 +989,21 @@ fn takes_over(item: &ItemRow, group: &WantedGroup, primary: &str) -> bool {
         }
         Wanted::Episode {
             index_number,
+            parent_index_number,
+            series_id,
             parent_id,
             ..
         } => {
+            // With a season number, the episode may sit in another season folder of the same series.
+            let same_place = if parent_index_number.is_some() {
+                item.series_id.as_deref() == Some(series_id.to_string().as_str())
+            } else {
+                item.parent_id.as_deref() == Some(parent_id.to_string().as_str())
+            };
             item.index_number.is_some()
                 && item.index_number == *index_number
-                && item.parent_id.as_deref() == Some(parent_id.to_string().as_str())
+                && item.parent_index_number == *parent_index_number
+                && same_place
         }
     }
 }

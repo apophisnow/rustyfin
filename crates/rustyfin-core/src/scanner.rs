@@ -600,9 +600,9 @@ async fn scan_tv_library(
     let existing_seasons: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season", &filter)
             .await?;
-    // The episode files of each season, by season id: the season's name, then its files in walk
-    // order. The episodes are reconciled once every path has been walked.
-    let mut episode_files: BTreeMap<Uuid, (String, Vec<PathBuf>)> = BTreeMap::new();
+    // The episode files of each season, by season id: the id of its series, the season's name, then its
+    // files in walk order. The episodes are reconciled once every path has been walked.
+    let mut episode_files: BTreeMap<Uuid, (Uuid, String, Vec<PathBuf>)> = BTreeMap::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -766,8 +766,8 @@ async fn scan_tv_library(
 
             episode_files
                 .entry(season_id)
-                .or_insert_with(|| (season_name, Vec::new()))
-                .1
+                .or_insert_with(|| (series_id, season_name, Vec::new()))
+                .2
                 .push(file_path_buf);
         }
 
@@ -812,7 +812,7 @@ async fn scan_tv_library(
     // Group the files of each season into episodes, then reconcile the episodes with the items.
     // The numbers of an episode come from its primary file, the first of its versions.
     let mut episode_groups: Vec<scan_sync::EpisodeGroup> = Vec::new();
-    for (&season_id, (season_name, season_files)) in &episode_files {
+    for (&season_id, (series_id, season_name, season_files)) in &episode_files {
         for versions in naming::group_episode_files(season_files, parse_season_number(season_name))
         {
             let stem = versions[0]
@@ -823,6 +823,7 @@ async fn scan_tv_library(
             episode_groups.push(scan_sync::EpisodeGroup {
                 files: versions,
                 season_id,
+                series_id: *series_id,
                 index_number: parsed.map(|n| n.episode),
                 parent_index_number: parse_season_number(season_name)
                     .or_else(|| parsed.and_then(|n| n.season)),

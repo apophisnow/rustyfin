@@ -4880,3 +4880,256 @@ async fn b18_music_rescans_give_a_new_file_no_track_of_another_disc() {
         "the new track 1 took over the item of another track"
     );
 }
+
+/// The id of the season item, as text, that holds the episode `item`.
+async fn b18_season_of(pool: &SqlitePool, item: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?1")
+        .bind(item.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// B18 fix round 2, item 1: when Sonarr's season folder format changes, as `Season 1` to
+/// `Season 01`, Rename Files moves every file of a season to the new folder. Each episode keeps its
+/// item, with its id and its users' data, through a rescan of its show or a full scan, and the old
+/// season goes. The gone episode of another show is no episode of a new show with its numbers.
+#[tokio::test]
+async fn b18_tv_rescans_move_episodes_to_a_renamed_season_folder() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let old = [
+        "Next/Season 2/Next - S02E01 - Return WEBDL-720p.mkv",
+        "Show/Season 1/Show - S01E01 - Pilot WEBDL-720p.mkv",
+        "Show/Season 1/Show - S01E02 - Second WEBDL-720p.mkv",
+    ];
+    let new = [
+        "Next/Season 02/Next (2019) - S02E01 - Return [WEBDL-720p].mkv",
+        "Show/Season 01/Show (2020) - S01E01 - Pilot [WEBDL-720p].mkv",
+        "Show/Season 01/Show (2020) - S01E02 - Second [WEBDL-720p].mkv",
+    ];
+    let other = "Other/Season 1/Other - S01E01 - Start WEBDL-720p.mkv";
+    for rel in old.iter().chain([&other]) {
+        touch(&root, rel);
+    }
+    scan(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let mut ids = Vec::new();
+    for rel in old {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, &b18_watched()).await;
+        ids.push(item);
+    }
+    let other_id = item_at(pool, &lib, other).await;
+    let rename = |season: &str, renamed: &str, at: &[usize]| {
+        std::fs::create_dir_all(root.join(renamed)).unwrap();
+        for &i in at {
+            std::fs::rename(root.join(old[i]), root.join(new[i])).unwrap();
+        }
+        std::fs::remove_dir(root.join(season)).unwrap();
+    };
+
+    // A rescan of Show after its season folder is renamed, and a full scan after Next's is.
+    rename("Show/Season 1", "Show/Season 01", &[1, 2]);
+    b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Show"))).await;
+    rename("Next/Season 2", "Next/Season 02", &[0]);
+    scan(pool, &lib).await;
+
+    let check = async || {
+        assert_eq!(
+            paths(pool, &lib, "Episode").await,
+            [new[0], other, new[1], new[2]]
+        );
+        assert_eq!(
+            paths(pool, &lib, "Season").await,
+            ["Next/Season 02", "Other/Season 1", "Show/Season 01"]
+        );
+        for (rel, &item) in new.iter().zip(&ids) {
+            assert_eq!(
+                item_at(pool, &lib, rel).await,
+                item,
+                "{rel} keeps the item of the file it replaced"
+            );
+            assert_eq!(
+                marks_of(pool, &user, item).await,
+                Some(b18_watched()),
+                "{rel} keeps its user data"
+            );
+            let season = Path::new(rel).parent().unwrap().to_str().unwrap();
+            assert_eq!(
+                b18_season_of(pool, item).await,
+                Some(item_at(pool, &lib, season).await.to_string()),
+                "{rel} moves to its new season"
+            );
+        }
+    };
+    check().await;
+    scan(pool, &lib).await;
+    check().await;
+
+    // Other's episode gives way to the same numbers in another show.
+    let third = "Third/Season 1/Third - S01E01 - Begin WEBDL-720p.mkv";
+    std::fs::remove_dir_all(root.join("Other")).unwrap();
+    touch(&root, third);
+    scan(pool, &lib).await;
+    assert_ne!(
+        item_at(pool, &lib, third).await,
+        other_id,
+        "an episode of another show took the gone episode over"
+    );
+}
+
+/// B18 fix round 2, item 2: a new file that more than one gone item matches takes over the oldest
+/// of them, and the others merge into it with their users' data, as the items of one file do. Here
+/// two copies of one episode, in `Season 1` and `Season 01`, give way to one file.
+#[tokio::test]
+async fn b18_rescans_merge_every_gone_item_that_a_new_file_takes_over() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let first = "Show/Season 1/Show - S01E01 - Pilot WEBDL-720p.mkv";
+    let second = "Show/Season 01/Show - S01E01 - Pilot HDTV-720p.mkv";
+    touch(&root, first);
+    scan(pool, &lib).await;
+    touch(&root, second);
+    scan(pool, &lib).await;
+    let older = item_at(pool, &lib, first).await;
+    let newer = item_at(pool, &lib, second).await;
+    assert_ne!(older, newer, "each season folder holds an item of its own");
+    for (item, date) in [
+        (older, "2024-01-01T00:00:00+00:00"),
+        (newer, "2024-02-01T00:00:00+00:00"),
+    ] {
+        exec(
+            pool,
+            "UPDATE media_items SET date_created = ?1 WHERE id = ?2",
+            &[date, &item.to_string()],
+        )
+        .await;
+    }
+    let user = insert_user(pool).await;
+    let older_marks = Marks {
+        position: 42,
+        plays: 2,
+        played: true,
+        last_played: Some(EARLY.to_string()),
+        ..Marks::default()
+    };
+    let newer_marks = Marks {
+        position: 7,
+        plays: 1,
+        favorite: true,
+        last_played: Some(LATE.to_string()),
+        rating: Some(8),
+        ..Marks::default()
+    };
+    insert_marks(pool, &user, older, &older_marks).await;
+    insert_marks(pool, &user, newer, &newer_marks).await;
+
+    std::fs::remove_dir_all(root.join("Show/Season 1")).unwrap();
+    std::fs::remove_file(root.join(second)).unwrap();
+    let added = "Show/Season 01/Show - S01E01 - Pilot Bluray-1080p.mkv";
+    touch(&root, added);
+    b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Show"))).await;
+
+    assert_eq!(
+        b18_ids(pool, &lib, "Episode").await,
+        [(added.to_string(), older.to_string())],
+        "the new file takes over the older item, and the newer one merges into it"
+    );
+    assert_eq!(paths(pool, &lib, "Season").await, ["Show/Season 01"]);
+    assert_eq!(
+        marks_of(pool, &user, older).await,
+        Some(Marks {
+            position: 7,
+            plays: 3,
+            favorite: true,
+            played: true,
+            last_played: Some(LATE.to_string()),
+            rating: Some(8),
+            likes: None,
+        }),
+        "the merged item keeps the user data of both"
+    );
+    assert_eq!(marks_of(pool, &user, newer).await, None);
+}
+
+/// B18 fix round 2, item 4: a trailer or a sample, by Jellyfin's names for them, takes over no gone
+/// item, even as the only new file in the folder of a movie or the season of an episode whose file
+/// just went. It gets an item of its own. A movie's new file that comes with a trailer takes the
+/// movie over.
+#[tokio::test]
+async fn b18_rescans_give_no_gone_item_to_a_trailer_or_sample() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let user = insert_user(pool).await;
+    let movie = "Heat (1995)/Heat (1995) WEBDL-720p.mkv";
+    let mut took = Vec::new();
+    for (n, extra) in [
+        "Heat (1995)-trailer.mkv",
+        "Heat (1995).Trailer.mkv",
+        "Heat (1995) - trailer2.mkv",
+        "Heat (1995)_sample.mkv",
+        "Heat (1995)-SAMPLE.mkv",
+        "trailer.mkv",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lib = fx
+            .library(&format!("film{n}"), LibraryContentType::Movies)
+            .await;
+        let root = root_of(&lib);
+        touch(&root, movie);
+        scan(pool, &lib).await;
+        let gone = item_at(pool, &lib, movie).await;
+        insert_marks(pool, &user, gone, &b18_watched()).await;
+        std::fs::remove_file(root.join(movie)).unwrap();
+        let rel = format!("Heat (1995)/{extra}");
+        touch(&root, &rel);
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Heat (1995)"))).await;
+        let item = item_at(pool, &lib, &rel).await;
+        if item == gone || marks_of(pool, &user, item).await.is_some() {
+            took.push(rel);
+        }
+    }
+
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&tv);
+    let pilot = "Show/Season 1/Show - S01E01 - Pilot WEBDL-720p.mkv";
+    touch(&root, pilot);
+    scan(pool, &tv).await;
+    let gone = item_at(pool, &tv, pilot).await;
+    insert_marks(pool, &user, gone, &b18_watched()).await;
+    std::fs::remove_file(root.join(pilot)).unwrap();
+    let trailer = "Show/Season 1/Show - S01E01 - Pilot-trailer.mkv";
+    touch(&root, trailer);
+    b18_rescan(pool, &tv, &ScanScope::Folder(root.join("Show"))).await;
+    let item = item_at(pool, &tv, trailer).await;
+    if item == gone || marks_of(pool, &user, item).await.is_some() {
+        took.push(trailer.to_string());
+    }
+    assert!(took.is_empty(), "these took over a gone item: {took:?}");
+
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, movie);
+    scan(pool, &lib).await;
+    let gone = item_at(pool, &lib, movie).await;
+    std::fs::remove_file(root.join(movie)).unwrap();
+    touch(&root, "Heat (1995)/Heat (1995) Bluray-1080p.mkv");
+    touch(&root, "Heat (1995)/Heat (1995)-trailer.mkv");
+    b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Heat (1995)"))).await;
+    assert_eq!(
+        b18_ids(pool, &lib, "Movie")
+            .await
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>(),
+        [gone.to_string()],
+        "the new file and its trailer take the movie over"
+    );
+}
