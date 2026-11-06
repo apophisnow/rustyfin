@@ -1381,16 +1381,16 @@ pub(crate) fn parse_year(name: &str) -> Option<i32> {
 
 /// Identity of a directory, for symlink loop detection: its (device, inode) on unix.
 #[cfg(unix)]
-type DirId = (u64, u64);
+pub(crate) type DirId = (u64, u64);
 
 /// Identity of a directory, for symlink loop detection: its canonical path off unix.
 #[cfg(not(unix))]
-type DirId = PathBuf;
+pub(crate) type DirId = PathBuf;
 
 /// The identity of the directory at `path`. `fs::metadata` follows symlinks, so a link and its
 /// target have the same identity.
 #[cfg(unix)]
-async fn dir_id(path: &Path) -> std::io::Result<DirId> {
+pub(crate) async fn dir_id(path: &Path) -> std::io::Result<DirId> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).await?;
     Ok((meta.dev(), meta.ino()))
@@ -1398,7 +1398,7 @@ async fn dir_id(path: &Path) -> std::io::Result<DirId> {
 
 /// The identity of the directory at `path`: its canonical path, since there are no inodes off unix.
 #[cfg(not(unix))]
-async fn dir_id(path: &Path) -> std::io::Result<DirId> {
+pub(crate) async fn dir_id(path: &Path) -> std::io::Result<DirId> {
     fs::canonicalize(path).await
 }
 

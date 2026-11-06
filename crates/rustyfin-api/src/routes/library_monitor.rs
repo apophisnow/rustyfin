@@ -2,7 +2,7 @@
 //! `Media/Updated` and the *arr Webhook.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use rustyfin_core::library_monitor::RescanRunner;
+use rustyfin_core::library_monitor::{MAX_REPORTED_PATHS, RescanRunner};
 use rustyfin_core::scan_progress::ScanTicket;
 use rustyfin_core::scanner::{self, ScanChanges, ScanScope};
 use rustyfin_core::tmdb_client::TmdbClient;
@@ -139,10 +139,20 @@ async fn media_updated(
     if updates.updates.iter().any(|update| update.path.is_empty()) {
         return ApiError::BadRequest("an update has an empty Path".to_string()).into_response();
     }
-    let changes = state.task_scheduler.changes();
-    for update in &updates.updates {
-        changes.report(Path::new(&update.path)).await;
+    if updates.updates.len() > MAX_REPORTED_PATHS {
+        return ApiError::PayloadTooLarge(format!(
+            "at most {MAX_REPORTED_PATHS} paths per request, got {}",
+            updates.updates.len()
+        ))
+        .into_response();
     }
+    let paths: Vec<PathBuf> = updates
+        .updates
+        .iter()
+        .map(|update| PathBuf::from(&update.path))
+        .collect();
+    let changes = state.task_scheduler.changes();
+    changes.report_all(&paths).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -163,11 +173,23 @@ async fn arr_webhook(
             return ApiError::BadRequest(format!("the body is not JSON: {e}")).into_response();
         }
     };
+    let mapped: Vec<String> = changed_paths(&payload)
+        .iter()
+        .map(|path| map.apply(path))
+        .collect();
+    if mapped.len() > MAX_REPORTED_PATHS {
+        return ApiError::PayloadTooLarge(format!(
+            "at most {MAX_REPORTED_PATHS} paths per request, got {}",
+            mapped.len()
+        ))
+        .into_response();
+    }
+    let paths: Vec<PathBuf> = mapped.iter().map(PathBuf::from).collect();
     let changes = state.task_scheduler.changes();
-    for path in changed_paths(&payload) {
-        let mapped = map.apply(&path);
-        if !changes.report(Path::new(&mapped)).await {
-            tracing::info!("webhook: {mapped} is in no library");
+    let answers = changes.report_all(&paths).await;
+    for (path, queued) in mapped.iter().zip(answers) {
+        if !queued {
+            tracing::info!("webhook: {path} is in no library");
         }
     }
     StatusCode::NO_CONTENT.into_response()

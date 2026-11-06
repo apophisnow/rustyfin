@@ -2,12 +2,14 @@
 //! `changed_paths` lists the paths that an event names, and `PathMap` maps the apps' paths to this
 //! server's. The endpoints are in `routes::library_monitor`.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 /// The paths that a Webhook event names, each once, at its first place. The order depends on the
 /// event type. An unknown event, or a payload that is not an object, names none.
 pub fn changed_paths(payload: &Value) -> Vec<String> {
-    let mut paths = Vec::new();
+    let mut paths = Paths::default();
     match payload["eventType"].as_str() {
         Some("Download") => {
             add_path(&mut paths, &payload["episodeFile"]["path"]);
@@ -40,22 +42,31 @@ pub fn changed_paths(payload: &Value) -> Vec<String> {
         Some("ArtistDelete" | "AlbumDelete") => add_path(&mut paths, &payload["artist"]["path"]),
         _ => {}
     }
-    paths
+    paths.list
+}
+
+/// The paths of one event, each once, in the order in which they were first added.
+#[derive(Default)]
+struct Paths {
+    list: Vec<String>,
+    /// The paths of `list`, so that a path is looked up without scanning `list`.
+    seen: HashSet<String>,
 }
 
 /// Adds `value` to `paths` when it is a non-empty string that `paths` does not hold yet.
-fn add_path(paths: &mut Vec<String>, value: &Value) {
+fn add_path(paths: &mut Paths, value: &Value) {
     let Some(path) = value.as_str() else {
         return;
     };
-    if !path.is_empty() && !paths.iter().any(|known| known == path) {
-        paths.push(path.to_string());
+    if !path.is_empty() && !paths.seen.contains(path) {
+        paths.seen.insert(path.to_string());
+        paths.list.push(path.to_string());
     }
 }
 
 /// Adds the values at `keys` of each entry of the array `list`, entry by entry. A value that is not
 /// an array adds nothing.
-fn add_paths(paths: &mut Vec<String>, list: &Value, keys: &[&str]) {
+fn add_paths(paths: &mut Paths, list: &Value, keys: &[&str]) {
     for entry in list.as_array().into_iter().flatten() {
         for key in keys {
             add_path(paths, &entry[*key]);

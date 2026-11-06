@@ -1,11 +1,13 @@
 //! The library monitor's change queue (B18). It maps each path that changed to the unit of a library
-//! that rescans it, waits until that unit has been quiet for the settle delay, then rescans it. One
+//! that rescans it, and a folder unit takes the name that its folder has on disk. The unit waits
+//! until it has been quiet for the settle delay, then it is rescanned. A pending full scan keeps
+//! the instant at which it became pending, so the reports that it takes in do not postpone it. One
 //! worker runs the due rescans one at a time, oldest report first.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -19,10 +21,13 @@ use uuid::Uuid;
 
 use crate::naming;
 use crate::scan_progress::ScanTicket;
-use crate::scanner::{self, AUDIO_EXTENSIONS, ScanChanges, ScanScope, VIDEO_EXTENSIONS};
+use crate::scanner::{self, AUDIO_EXTENSIONS, DirId, ScanChanges, ScanScope, VIDEO_EXTENSIONS};
 
 /// How many pending units one library keeps. One more of them becomes a full scan of the library.
 pub const FULL_SCAN_LIMIT: usize = 50;
+
+/// How many paths one request to `POST /Library/Media/Updated` or the Webhook may report.
+pub const MAX_REPORTED_PATHS: usize = 10_000;
 
 /// Rescans one unit of a library. The API attaches a runner that also clears its caches and sends
 /// `LibraryChanged`.
@@ -45,7 +50,8 @@ struct Inner {
     pool: SqlitePool,
     runner: RwLock<Arc<dyn RescanRunner>>,
     delay: RwLock<Duration>,
-    /// Each pending unit, with the instant of its last report.
+    /// Each pending unit, with the instant of its last report. A pending full scan keeps the
+    /// instant at which it became pending.
     pending: Mutex<HashMap<(Uuid, ScanScope), Instant>>,
     notify: Notify,
     /// Set once the worker has been spawned.
@@ -101,26 +107,51 @@ impl ChangeQueue {
     /// queued it. A path that no library holds, or that lies in a folder the scanner skips, is
     /// dropped.
     pub async fn report(&self, path: &Path) -> bool {
+        self.report_all(&[path.to_path_buf()])
+            .await
+            .first()
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Queues the units of `paths`. Returns one answer per path, in order: true when at least one
+    /// library queued it. The libraries are loaded once for all paths, and a folder unit takes the
+    /// name that its folder has on disk.
+    pub async fn report_all(&self, paths: &[PathBuf]) -> Vec<bool> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
         let libraries = match rustyfin_db::repo_library::get_all_libraries(&self.inner.pool).await {
             Ok(libraries) => libraries,
             Err(e) => {
                 tracing::warn!(
-                    "library monitor: could not load the libraries for {}: {e}",
-                    path.display()
+                    "library monitor: could not load the libraries for {} paths: {e}",
+                    paths.len()
                 );
-                return false;
+                return vec![false; paths.len()];
             }
         };
-        let units: Vec<(Uuid, ScanScope)> = libraries
-            .iter()
-            .filter_map(|library| unit_for(&library.paths, path).map(|scope| (library.id, scope)))
-            .collect();
+        let mut answers = Vec::with_capacity(paths.len());
+        let mut units = Vec::new();
+        for path in paths {
+            let found: Vec<(Uuid, ScanScope)> = libraries
+                .iter()
+                .filter_map(|library| {
+                    unit_for(&library.paths, path).map(|scope| (library.id, scope))
+                })
+                .collect();
+            if found.is_empty() {
+                tracing::debug!(
+                    "library monitor: {} is in no library or in an ignored folder",
+                    path.display()
+                );
+            }
+            answers.push(!found.is_empty());
+            units.extend(found);
+        }
+        let units = name_folders_on_disk(units).await;
         if units.is_empty() {
-            tracing::debug!(
-                "library monitor: {} is in no library or in an ignored folder",
-                path.display()
-            );
-            return false;
+            return answers;
         }
 
         let now = Instant::now();
@@ -134,7 +165,7 @@ impl ChangeQueue {
             tokio::spawn(work(self.inner.clone()));
         }
         self.inner.notify.notify_one();
-        true
+        answers
     }
 
     /// The pending units, sorted. For diagnostics and tests.
@@ -145,17 +176,19 @@ impl ChangeQueue {
     }
 }
 
-/// Queues `scope` of `library` at `now`. A pending full scan of the library takes the unit in, and
-/// more than `FULL_SCAN_LIMIT` units of one library become one full scan.
+/// Queues `scope` of `library` at `now`. A pending full scan of the library takes the unit in and
+/// keeps the instant at which it became pending. More than `FULL_SCAN_LIMIT` units of one library
+/// become one full scan, pending from `now`.
 fn queue_unit(
     pending: &mut HashMap<(Uuid, ScanScope), Instant>,
     library: Uuid,
     scope: ScanScope,
     now: Instant,
 ) {
-    if let Some(last) = pending.get_mut(&(library, ScanScope::Library)) {
-        *last = now;
-    } else if scope == ScanScope::Library {
+    if pending.contains_key(&(library, ScanScope::Library)) {
+        return;
+    }
+    if scope == ScanScope::Library {
         full_scan(pending, library, now);
     } else {
         pending.insert((library, scope), now);
@@ -165,10 +198,109 @@ fn queue_unit(
     }
 }
 
-/// Replaces the pending units of `library` with one full scan of it, reported at `now`.
+/// Replaces the pending units of `library` with one full scan of it, which is pending from `now`.
 fn full_scan(pending: &mut HashMap<(Uuid, ScanScope), Instant>, library: Uuid, now: Instant) {
     pending.retain(|(id, _), _| *id != library);
     pending.insert((library, ScanScope::Library), now);
+}
+
+/// What a library path holds, for the folder units under it. It is read at most once per call.
+struct Listing {
+    /// The names in the path, sorted. None when the path cannot be listed.
+    names: Option<Vec<OsString>>,
+    /// The names by the identity of the folder that each names, each list sorted. Read when a
+    /// folder is not listed by its own name.
+    by_id: Option<HashMap<DirId, Vec<OsString>>>,
+}
+
+/// Gives each folder unit the name that its folder has on disk. Each library path is listed at most
+/// once, and each distinct folder is resolved once.
+async fn name_folders_on_disk(units: Vec<(Uuid, ScanScope)>) -> Vec<(Uuid, ScanScope)> {
+    let mut listings: HashMap<PathBuf, Listing> = HashMap::new();
+    let mut resolved: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut named = Vec::with_capacity(units.len());
+    for (library, scope) in units {
+        let scope = match scope {
+            ScanScope::Folder(folder) => {
+                let on_disk = match resolved.get(&folder) {
+                    Some(on_disk) => on_disk.clone(),
+                    None => {
+                        let on_disk = folder_on_disk(&folder, &mut listings).await;
+                        resolved.insert(folder, on_disk.clone());
+                        on_disk
+                    }
+                };
+                ScanScope::Folder(on_disk)
+            }
+            other => other,
+        };
+        named.push((library, scope));
+    }
+    named
+}
+
+/// The name that `folder` has on disk. `folder` is `root.join(name)` for its library path `root`.
+/// A name that the listing of `root` holds stays. Otherwise, when `folder` exists, it takes the
+/// name of a listed folder with the same identity: a name that ignores case first, then the others,
+/// each group in sorted order.
+async fn folder_on_disk(folder: &Path, listings: &mut HashMap<PathBuf, Listing>) -> PathBuf {
+    let (Some(root), Some(name)) = (folder.parent(), folder.file_name()) else {
+        return folder.to_path_buf();
+    };
+    if !listings.contains_key(root) {
+        let names = list_names(root).await;
+        listings.insert(root.to_path_buf(), Listing { names, by_id: None });
+    }
+    let Some(listing) = listings.get_mut(root) else {
+        return folder.to_path_buf();
+    };
+    let Some(names) = &listing.names else {
+        return folder.to_path_buf();
+    };
+    if names
+        .binary_search_by(|known| known.as_os_str().cmp(name))
+        .is_ok()
+    {
+        return folder.to_path_buf();
+    }
+    let Ok(id) = scanner::dir_id(folder).await else {
+        return folder.to_path_buf();
+    };
+    if listing.by_id.is_none() {
+        listing.by_id = Some(index_by_id(root, names).await);
+    }
+    let Some(same) = listing.by_id.as_ref().and_then(|by_id| by_id.get(&id)) else {
+        return folder.to_path_buf();
+    };
+    let wanted = name.to_string_lossy().to_lowercase();
+    let chosen = same
+        .iter()
+        .find(|candidate| candidate.to_string_lossy().to_lowercase() == wanted)
+        .or(same.first());
+    chosen.map_or_else(|| folder.to_path_buf(), |chosen| root.join(chosen))
+}
+
+/// The names in the folder `root`, sorted. None when it cannot be listed.
+async fn list_names(root: &Path) -> Option<Vec<OsString>> {
+    let mut entries = tokio::fs::read_dir(root).await.ok()?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        names.push(entry.file_name());
+    }
+    names.sort();
+    Some(names)
+}
+
+/// The names in `root` by the identity of the folder that each names, each list in the order of
+/// `names`. A name whose identity cannot be read is left out.
+async fn index_by_id(root: &Path, names: &[OsString]) -> HashMap<DirId, Vec<OsString>> {
+    let mut by_id: HashMap<DirId, Vec<OsString>> = HashMap::new();
+    for name in names {
+        if let Ok(id) = scanner::dir_id(&root.join(name)).await {
+            by_id.entry(id).or_default().push(name.clone());
+        }
+    }
+    by_id
 }
 
 /// The runner that a new queue starts with: `scan_with_metadata`, with no metadata providers.

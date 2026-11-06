@@ -9392,6 +9392,71 @@ async fn b18_media_updated_refuses_bad_callers_and_bodies() {
 }
 
 #[tokio::test]
+async fn b18_media_updated_and_the_webhook_take_at_most_10000_paths() {
+    use rustyfin_core::scanner::ScanScope;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = create_library_via_api(&app, &state, &token, "B18 Many Films", "Movies").await;
+    let music = create_library_via_api(&app, &state, &token, "B18 Many Tracks", "Music").await;
+    let films_dir = std::path::PathBuf::from(media_folder(&state, "b18 many films"));
+    let music_dir = std::path::PathBuf::from(media_folder(&state, "b18 many tracks"));
+    let changes = state.task_scheduler.changes();
+    changes.set_delay(std::time::Duration::from_secs(3600));
+    let updates = |n: usize| {
+        let updates: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let path = films_dir.join(format!("Film {i} (2000)/Film {i} (2000).mkv"));
+                serde_json::json!({ "Path": path })
+            })
+            .collect();
+        serde_json::json!({ "Updates": updates }).to_string()
+    };
+    // Lidarr's Download event names each track file.
+    let tracks = |n: usize| {
+        let files: Vec<serde_json::Value> = (0..n)
+            .map(|i| serde_json::json!({ "path": music_dir.join(format!("Artist {i}/Album/01 Song.flac")) }))
+            .collect();
+        serde_json::json!({ "eventType": "Download", "trackFiles": files }).to_string()
+    };
+    let media_updated = "/Library/Media/Updated";
+    let webhook = "/Library/Media/Webhook?api_key=test-api-key";
+    let json = ("Content-Type", "application/json");
+    let headers = [B18_ARR_AUTH[0], json];
+
+    for (uri, body) in [(media_updated, updates(10_001)), (webhook, tracks(10_001))] {
+        let (status, text) = b18_send(&app, "POST", uri, &headers, Some(&body)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}: {text}");
+        let error: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(error["Title"], "Payload Too Large", "{uri}: {text}");
+        assert_eq!(
+            error["Detail"], "at most 10000 paths per request, got 10001",
+            "{uri}: {text}"
+        );
+    }
+    assert!(
+        changes.pending().is_empty(),
+        "a refused request queues nothing: {:?}",
+        changes.pending()
+    );
+
+    // At the limit each path is reported. More than 50 folders of a library make one full scan.
+    for (uri, body) in [(media_updated, updates(10_000)), (webhook, tracks(10_000))] {
+        let started = std::time::Instant::now();
+        let (status, text) = b18_send(&app, "POST", uri, &headers, Some(&body)).await;
+        eprintln!("{uri}: 10000 paths in {} ms", started.elapsed().as_millis());
+        assert_eq!(status, StatusCode::NO_CONTENT, "{uri}: {text}");
+    }
+    assert_eq!(
+        changes.pending(),
+        b18_sorted(vec![
+            (films, ScanScope::Library),
+            (music, ScanScope::Library)
+        ])
+    );
+}
+
+#[tokio::test]
 async fn b18_arr_lookups_work_with_only_the_api_key() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -9602,6 +9667,24 @@ fn b18_webhook_changed_paths_of_every_fixture() {
         }
         assert_eq!(changed_paths(&payload), expected, "{file}");
     }
+}
+
+#[test]
+fn b18_webhook_changed_paths_of_a_large_event_take_linear_time() {
+    use rustyfin_api::arr_webhook::changed_paths;
+
+    // About as many track files as a body of 2 MB, the body limit, holds. The paths that the
+    // endpoint refuses past its limit of 10000 are still read first.
+    let files: Vec<serde_json::Value> = (0..100_000)
+        .map(|n| serde_json::json!({ "path": format!("/m/{n}") }))
+        .collect();
+    let payload = serde_json::json!({ "eventType": "Download", "trackFiles": files });
+    let started = std::time::Instant::now();
+    let paths = changed_paths(&payload);
+    let took = started.elapsed();
+    assert_eq!(paths.len(), 100_000);
+    assert_eq!(paths[99_999], "/m/99999");
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
 }
 
 #[test]

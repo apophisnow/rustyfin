@@ -441,6 +441,41 @@ async fn report_drops_paths_in_no_library_and_in_ignored_folders() {
 }
 
 #[tokio::test]
+async fn report_all_answers_for_each_path_and_queues_their_units() {
+    let fx = Fixture::new().await;
+    let films = fx
+        .library("films", LibraryContentType::Movies, &["films"])
+        .await;
+    let shows = fx
+        .library("shows", LibraryContentType::TvShows, &["shows"])
+        .await;
+    let rec = Arc::new(Recorder::default());
+    let queue = queue(&fx, &rec, Duration::from_secs(3600));
+
+    let heat = root(&films).join("Heat (1995)");
+    let show = root(&shows).join("Show");
+    let answers = queue
+        .report_all(&[
+            heat.join("Heat (1995).mkv"),
+            fx.dir.join("elsewhere/Other (2001)/Other (2001).mkv"),
+            show.join("Season 1/Show S01E01.mkv"),
+            heat.join("@eaDir/Heat (1995).mkv.jpg"),
+            heat.join("Heat (1995).nfo"),
+        ])
+        .await;
+    assert_eq!(answers, vec![true, false, true, false, true]);
+    assert_eq!(
+        queue.pending(),
+        sorted(vec![
+            (films.id, ScanScope::Folder(heat)),
+            (shows.id, ScanScope::Folder(show)),
+        ])
+    );
+    assert_eq!(queue.report_all(&[]).await, Vec::<bool>::new());
+    assert!(rec.calls().is_empty());
+}
+
+#[tokio::test]
 async fn a_report_of_the_library_path_turns_its_pending_units_into_one_full_scan() {
     let fx = Fixture::new().await;
     let films = fx
@@ -509,6 +544,40 @@ async fn repeated_reports_within_the_delay_make_one_rescan_after_the_last() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(rec.calls().len(), 1, "one rescan for four reports");
     assert_eq!(queue.pending(), vec![]);
+}
+
+#[tokio::test]
+async fn reports_that_a_pending_full_scan_takes_in_do_not_postpone_it() {
+    let fx = Fixture::new().await;
+    let films = fx
+        .library("films", LibraryContentType::Movies, &["films"])
+        .await;
+    let rec = Arc::new(Recorder::default());
+    let delay = Duration::from_secs(1);
+    let queue = queue(&fx, &rec, delay);
+
+    let pending_since = Instant::now();
+    assert!(queue.report(&root(&films)).await);
+    // Changes every 150 ms for 2.5 s, longer than the delay, with the library path once more.
+    for n in 0..17 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let path = if n == 8 {
+            root(&films)
+        } else {
+            root(&films).join(format!("Film {n} (2000)/Film {n} (2000).mkv"))
+        };
+        assert!(queue.report(&path).await);
+    }
+    let calls = rec.wait_for(1).await;
+    assert_eq!(
+        (calls[0].library, calls[0].scope.clone()),
+        (films.id, ScanScope::Library)
+    );
+    assert!(
+        calls[0].at < pending_since + 2 * delay,
+        "the full scan started {:?} after it became pending, with a delay of {delay:?}",
+        calls[0].at.saturating_duration_since(pending_since)
+    );
 }
 
 #[tokio::test]
@@ -767,4 +836,82 @@ async fn the_default_runner_rescans_the_reported_folder() {
         paths, expected,
         "the folder that was not reported stays out"
     );
+}
+
+/// Whether the names in `dir` ignore case, as on a casefold or an SMB mount.
+fn ignores_case(dir: &Path) -> bool {
+    std::fs::write(dir.join("CaseProbe"), b"").unwrap();
+    let ignores = dir.join("caseprobe").exists();
+    std::fs::remove_file(dir.join("CaseProbe")).unwrap();
+    ignores
+}
+
+/// The id and path of each movie of `lib`, by path.
+async fn stored_movies(fx: &Fixture, lib: &Library) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT id, path FROM media_items WHERE library_id = ?1 AND media_type = 'Movie'
+         ORDER BY path",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap()
+}
+
+// Runs only where the temp dir ignores case, e.g. with TMPDIR on a tmpfs mounted with `casefold`
+// whose folder has `chattr +F`.
+#[tokio::test]
+async fn a_path_reported_in_another_case_rescans_the_folder_by_its_name_on_disk() {
+    captured_logs();
+    let fx = Fixture::new().await;
+    if !ignores_case(&fx.dir) {
+        eprintln!(
+            "skipped: {} tells case apart; set TMPDIR to a folder that ignores case",
+            fx.dir.display()
+        );
+        return;
+    }
+    let lib = fx
+        .library("b18 casefold films", LibraryContentType::Movies, &["films"])
+        .await;
+    let films = root(&lib);
+    touch(&films, "The Matrix (1999)/The Matrix (1999).mkv");
+    scanner::scan_library(&fx.pool, &lib).await.unwrap();
+    scanner::wait_for_idle().await;
+    let before = stored_movies(&fx, &lib).await;
+    assert_eq!(before.len(), 1, "{before:?}");
+    let on_disk = ScanScope::Folder(films.join("The Matrix (1999)"));
+    let reported = films.join("the matrix (1999)/The Matrix (1999).mkv");
+
+    let monitor = ChangeQueue::new(fx.pool.clone());
+    monitor.set_delay(Duration::ZERO);
+    assert!(monitor.report(&reported).await);
+    let done = wait_for_log(&[
+        "library monitor: rescanned ",
+        &format!(" of '{}' in ", lib.name),
+    ])
+    .await;
+    scanner::wait_for_idle().await;
+    assert!(
+        done.contains(&format!("rescanned {on_disk:?} of ")),
+        "{done}"
+    );
+    assert_eq!(
+        stored_movies(&fx, &lib).await,
+        before,
+        "no second item for the folder's other case"
+    );
+    scanner::scan_library(&fx.pool, &lib).await.unwrap();
+    scanner::wait_for_idle().await;
+    assert_eq!(
+        stored_movies(&fx, &lib).await,
+        before,
+        "a full scan keeps the item"
+    );
+
+    let rec = Arc::new(Recorder::default());
+    let recorded = queue(&fx, &rec, Duration::from_secs(3600));
+    assert!(recorded.report(&reported).await);
+    assert!(recorded.report(&films.join("THE MATRIX (1999)")).await);
+    assert_eq!(recorded.pending(), vec![(lib.id, on_disk)]);
 }
