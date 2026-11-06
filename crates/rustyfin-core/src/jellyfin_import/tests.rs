@@ -14,7 +14,7 @@ use super::paths::{PathMapping, suggest_metadata, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
     JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob, guid_from_text, locate,
-    parse_jellyfin_date, parse_old_images, parse_provider_ids,
+    open_snapshot, parse_jellyfin_date, parse_old_images, parse_provider_ids,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -1322,4 +1322,161 @@ fn b20_suggest_metadata_pair() {
         Some(pair("/a/metadata", &local))
     );
     assert_eq!(suggest_metadata(&[], &tmp.0, &[]), None);
+}
+
+// Fix 7, 8: a source database is read into memory with its `-wal` applied as SQLite's recovery
+// would: committed frames only, up to the first torn or damaged frame; a damaged header means no
+// frames. Reading changes nothing in the folder.
+
+/// A WAL-mode `jellyfin.db` in `dir` whose file holds table `t` with row 1, and a writer that
+/// never checkpoints, so what it adds stays in the `-wal`.
+async fn wal_writer(dir: &Path) -> sqlx::SqliteConnection {
+    use sqlx::ConnectOptions;
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join("jellyfin.db"))
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE t (n INTEGER, pad TEXT); INSERT INTO t VALUES (1, ''); \
+         PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint = 0;",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    conn
+}
+
+/// The `n` of every row of `t` in the snapshot of `file`.
+async fn snapshot_rows(file: &Path) -> Vec<i64> {
+    let mut conn = open_snapshot(file)
+        .await
+        .unwrap_or_else(|e| panic!("{}: {e:?}", file.display()));
+    sqlx::query_scalar("SELECT n FROM t ORDER BY n")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+}
+
+/// Each entry of `dir` with its size and modification time.
+fn folder_listing(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            (entry.path(), meta.len(), meta.modified().unwrap())
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// A copy of `from`'s `jellyfin.db` with `wal` as its `-wal`, in the new folder `to`.
+fn source_with_wal(from: &Path, to: &Path, wal: &[u8]) -> PathBuf {
+    std::fs::create_dir_all(to).unwrap();
+    let file = to.join("jellyfin.db");
+    std::fs::copy(from.join("jellyfin.db"), &file).unwrap();
+    std::fs::write(to.join("jellyfin.db-wal"), wal).unwrap();
+    file
+}
+
+#[tokio::test]
+async fn b20_snapshot_applies_committed_wal_frames() {
+    let tmp = TempDir::new();
+    let mut writer = wal_writer(&tmp.0).await;
+    sqlx::query("INSERT INTO t VALUES (2, '')")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    let file = tmp.0.join("jellyfin.db");
+    let before = folder_listing(&tmp.0);
+    assert_eq!(snapshot_rows(&file).await, [1, 2]);
+    assert_eq!(folder_listing(&tmp.0), before, "reading changed the folder");
+    let no_wal = source_with_wal(&tmp.0, &tmp.0.join("no_wal"), b"");
+    assert_eq!(
+        snapshot_rows(&no_wal).await,
+        [1],
+        "row 2 is only in the -wal"
+    );
+}
+
+#[tokio::test]
+async fn b20_snapshot_skips_torn_and_uncommitted_frames() {
+    let tmp = TempDir::new();
+    let mut writer = wal_writer(&tmp.0).await;
+    sqlx::query("INSERT INTO t VALUES (2, '')")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    let wal_path = tmp.0.join("jellyfin.db-wal");
+    let first = std::fs::metadata(&wal_path).unwrap().len() as usize;
+    // Twenty rows of 4000 characters: one transaction over many pages, so many frames.
+    sqlx::query(
+        "WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < 20) \
+         INSERT INTO t SELECT 3, hex(randomblob(2000)) FROM k",
+    )
+    .execute(&mut writer)
+    .await
+    .unwrap();
+    let wal = std::fs::read(&wal_path).unwrap();
+    let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+    let frame = 24 + page_size;
+    assert!(
+        wal.len() >= first + 3 * frame,
+        "the second transaction spans frames"
+    );
+    for (case, cut) in [
+        ("whole first transaction", first),
+        ("frames without their commit", first + 2 * frame + 100),
+        ("torn commit frame", wal.len() - 1),
+    ] {
+        let dir = tmp.0.join(case.replace(' ', "_"));
+        let file = source_with_wal(&tmp.0, &dir, &wal[..cut]);
+        assert_eq!(snapshot_rows(&file).await, [1, 2], "{case}");
+    }
+    let all = snapshot_rows(&tmp.0.join("jellyfin.db")).await;
+    assert_eq!(all.len(), 22, "the whole -wal");
+    assert_eq!(all.iter().filter(|&&n| n == 3).count(), 20);
+}
+
+#[tokio::test]
+async fn b20_snapshot_stops_at_a_damaged_frame_and_ignores_a_damaged_header() {
+    let tmp = TempDir::new();
+    let mut writer = wal_writer(&tmp.0).await;
+    let wal_path = tmp.0.join("jellyfin.db-wal");
+    let mut ends = Vec::new();
+    for n in 2i64..=4 {
+        sqlx::query("INSERT INTO t VALUES (?, '')")
+            .bind(n)
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        ends.push(std::fs::metadata(&wal_path).unwrap().len() as usize);
+    }
+    let wal = std::fs::read(&wal_path).unwrap();
+    // A byte of the page in the first frame that adds 3: 3 and 4 are gone.
+    let mut bad_page = wal.clone();
+    bad_page[ends[0] + 24 + 100] ^= 0xff;
+    // A salt of the first frame that adds 4: only 4 is gone.
+    let mut bad_salt = wal.clone();
+    bad_salt[ends[1] + 8] ^= 0xff;
+    // A salt in the header: its checksum fails, so no frame counts.
+    let mut bad_header = wal.clone();
+    bad_header[16] ^= 0xff;
+    for (case, bytes, rows) in [
+        ("damaged page", bad_page, vec![1, 2]),
+        ("damaged frame salt", bad_salt, vec![1, 2, 3]),
+        ("damaged header", bad_header, vec![1]),
+    ] {
+        let dir = tmp.0.join(case.replace(' ', "_"));
+        let file = source_with_wal(&tmp.0, &dir, &bytes);
+        assert_eq!(snapshot_rows(&file).await, rows, "{case}");
+    }
+    assert_eq!(
+        snapshot_rows(&tmp.0.join("jellyfin.db")).await,
+        [1, 2, 3, 4]
+    );
 }

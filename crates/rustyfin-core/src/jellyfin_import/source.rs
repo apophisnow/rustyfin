@@ -1,14 +1,16 @@
-//! Reading a Jellyfin data folder (spec 2.1-2.4, 2.12-2.13). Each database is opened read-only and
-//! read inside one transaction, which is rolled back.
+//! Reading a Jellyfin data folder (spec 2.1-2.4, 2.12-2.13). Each database is read into memory once,
+//! with its `-wal` applied, and queried there (`open_snapshot`); the source folder is never written.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use rustyfin_model::image::ImageType;
 use rustyfin_model::media::MediaType;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{Acquire, ConnectOptions, SqliteConnection};
+use sqlx::{ConnectOptions, SqliteConnection};
 use uuid::Uuid;
 
 use super::{ImportError, Layout, LayoutChoice};
@@ -430,25 +432,31 @@ pub async fn read_snapshot(
     choice: LayoutChoice,
 ) -> Result<Snapshot, ImportError> {
     let file = location.data_path.join(JELLYFIN_DB);
-    let mut conn = open_read_only(&file).await?;
-    let mut tx = conn.begin().await.map_err(|e| unreadable(&file, &e))?;
-    let db = read_jellyfin_db(&mut tx, choice)
+    let mut conn = open_snapshot(&file).await?;
+    let db = read_jellyfin_db(&mut conn, choice)
         .await
         .map_err(|e| unreadable(&file, &e))?;
-    tx.rollback().await.map_err(|e| unreadable(&file, &e))?;
-
-    let (items, user_data, streams) = match db.layout {
-        Layout::New => (db.items, db.user_data, db.streams),
-        Layout::Old => read_old_layout(&location.data_path, &db.users).await?,
+    let ((items, user_data, streams), metadata) = match db.layout {
+        Layout::New => {
+            let metadata = read_new_metadata(&mut conn)
+                .await
+                .map_err(|e| unreadable(&file, &e))?;
+            drop(conn);
+            ((db.items, db.user_data, db.streams), metadata)
+        }
+        Layout::Old => {
+            // The old layout's rows come from `library.db`, read next: this image is done with.
+            drop(conn);
+            read_old_layout(&location.data_path, &db.users).await?
+        }
     };
-    let metadata = read_metadata(location, db.layout).await?;
     Ok(Snapshot {
         layout: db.layout,
         users: db.users,
         items,
         user_data,
         streams,
-        metadata,
+        metadata: metadata_of(metadata, db.layout),
     })
 }
 
@@ -607,16 +615,22 @@ async fn read_new_layout(conn: &mut SqliteConnection) -> Result<ItemRows, sqlx::
     ))
 }
 
-/// The old layout's items, user-data rows and streams, from `library.db` (else
-/// `library.db.old`). A row reaches every importable item that has its `key` (`UserDataKey`).
-async fn read_old_layout(data_path: &Path, users: &[JfUser]) -> Result<ItemRows, ImportError> {
+/// The old layout's items, user-data rows, streams and metadata rows, all from one image of
+/// `library.db` (else `library.db.old`). A row reaches every importable item that has its `key`
+/// (`UserDataKey`).
+async fn read_old_layout(
+    data_path: &Path,
+    users: &[JfUser],
+) -> Result<(ItemRows, MetadataRows), ImportError> {
     let file = library_file(data_path)?;
-    let mut conn = open_read_only(&file).await?;
-    let mut tx = conn.begin().await.map_err(|e| unreadable(&file, &e))?;
-    let (item_rows, data_rows, stream_rows) = read_library_db(&mut tx)
+    let mut conn = open_snapshot(&file).await?;
+    let (item_rows, data_rows, stream_rows) = read_library_db(&mut conn)
         .await
         .map_err(|e| unreadable(&file, &e))?;
-    tx.rollback().await.map_err(|e| unreadable(&file, &e))?;
+    let metadata = read_library_metadata(&mut conn)
+        .await
+        .map_err(|e| unreadable(&file, &e))?;
+    drop(conn);
 
     let mut items = Vec::new();
     let mut keyed: HashMap<String, Vec<Uuid>> = HashMap::new();
@@ -685,7 +699,8 @@ async fn read_old_layout(data_path: &Path, users: &[JfUser]) -> Result<ItemRows,
             });
         }
     }
-    Ok((items, user_data, streams_of(stream_rows, stream_kind_text)))
+    let streams = streams_of(stream_rows, stream_kind_text);
+    Ok(((items, user_data, streams), metadata))
 }
 
 async fn read_library_db(conn: &mut SqliteConnection) -> Result<LibraryRows, sqlx::Error> {
@@ -744,27 +759,6 @@ pub fn parse_old_images(text: &str) -> Vec<JfImage> {
             })
         })
         .collect()
-}
-
-/// The metadata rows of the layout's database (spec 5.4, 5.7, 5.8): `jellyfin.db` for the new
-/// layout, `library.db` (else `library.db.old`) for the old one. Only metadata columns are read.
-async fn read_metadata(
-    location: &SourceLocation,
-    layout: Layout,
-) -> Result<JfMetadata, ImportError> {
-    let file = match layout {
-        Layout::New => location.data_path.join(JELLYFIN_DB),
-        Layout::Old => library_file(&location.data_path)?,
-    };
-    let mut conn = open_read_only(&file).await?;
-    let mut tx = conn.begin().await.map_err(|e| unreadable(&file, &e))?;
-    let rows = match layout {
-        Layout::New => read_new_metadata(&mut tx).await,
-        Layout::Old => read_library_metadata(&mut tx).await,
-    }
-    .map_err(|e| unreadable(&file, &e))?;
-    tx.rollback().await.map_err(|e| unreadable(&file, &e))?;
-    Ok(metadata_of(rows, layout))
 }
 
 /// The new layout's metadata rows: items, image rows and credits (spec 5.4, 5.7, 5.8).
@@ -1011,19 +1005,261 @@ fn library_file(data_path: &Path) -> Result<PathBuf, ImportError> {
     )))
 }
 
-/// Opens one database read-only, and `immutable` unless its `-wal` file holds frames (spec 2.3).
-/// No `create_if_missing` and no pragma: sqlx sets none unless asked.
-async fn open_read_only(file: &Path) -> Result<SqliteConnection, ImportError> {
-    let mut wal = file.as_os_str().to_owned();
-    wal.push("-wal");
-    let wal_has_frames = std::fs::metadata(&wal).is_ok_and(|meta| meta.len() > 0);
-    SqliteConnectOptions::new()
-        .filename(file)
-        .read_only(true)
-        .immutable(!wal_has_frames)
+/// How long `open_snapshot` waits before it reads the files again (spec Fix 7).
+const SNAPSHOT_RETRY: Duration = Duration::from_millis(100);
+/// How many reads `open_snapshot` makes before it gives up on files that keep changing.
+const SNAPSHOT_TRIES: usize = 5;
+/// The piece size in which `same_bytes` compares a file with the bytes read before.
+const COMPARE_CHUNK: u64 = 1 << 20;
+
+/// Reads `file` into memory once, applies its `-wal` as SQLite's recovery does, and returns a
+/// read-only connection to that image (spec Fix 7). SQLite never opens the file, so nothing is
+/// created or changed in the source folder, and the image is one state of the file.
+pub(crate) async fn open_snapshot(file: &Path) -> Result<SqliteConnection, ImportError> {
+    let owned = file.to_path_buf();
+    let mut image = tokio::task::spawn_blocking(move || read_image(&owned))
+        .await
+        .map_err(|e| unreadable_path(file, &std::io::Error::other(e)))??;
+    // Header bytes 18 and 19 are the file format versions; 2 means WAL, which a deserialized
+    // image refuses. The applied image is a rollback-journal database, so they say 1.
+    if image.len() >= 100 {
+        image[18] = 1;
+        image[19] = 1;
+    }
+    let mut conn = SqliteConnectOptions::new()
         .connect()
         .await
-        .map_err(|e| unreadable(file, &e))
+        .map_err(|e| unreadable(file, &e))?;
+    let buf = sqlx::sqlite::SqliteOwnedBuf::try_from(image.as_slice())
+        .map_err(|e| unreadable(file, &e))?;
+    drop(image);
+    conn.deserialize(None, buf, true)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
+    Ok(conn)
+}
+
+/// The image of `file` with its `-wal` applied, from a read in which the files stayed the same. Up
+/// to `SNAPSHOT_TRIES` reads, `SNAPSHOT_RETRY` apart; then `BadSource`.
+fn read_image(file: &Path) -> Result<Vec<u8>, ImportError> {
+    for attempt in 1..=SNAPSHOT_TRIES {
+        if let Some(image) = read_once(file)? {
+            return Ok(image);
+        }
+        if attempt < SNAPSHOT_TRIES {
+            std::thread::sleep(SNAPSHOT_RETRY);
+        }
+    }
+    Err(ImportError::BadSource(format!(
+        "{} kept changing while it was read; try again when Jellyfin is idle or stopped",
+        file.display()
+    )))
+}
+
+/// One read of `file` and its `-wal`, in this order: the `-wal` head, the database, the `-wal`,
+/// the database again (compared byte for byte), the `-wal` head again. None when the files changed
+/// in between: the two heads differ, or the `-wal`'s head is not the one read first.
+fn read_once(file: &Path) -> Result<Option<Vec<u8>>, ImportError> {
+    let wal_file = wal_path(file);
+    let head1 = wal_head(&wal_file)?;
+    let db = std::fs::read(file).map_err(|e| unreadable_path(file, &e))?;
+    let wal = match std::fs::read(&wal_file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(unreadable_path(&wal_file, &e)),
+    };
+    let same = same_bytes(file, &db)?;
+    let head2 = wal_head(&wal_file)?;
+    let wal_matches = head1.as_ref().map(|head| &head[..]) == wal.get(..32);
+    if same && head1 == head2 && wal_matches {
+        apply_wal(file, db, &wal).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The `-wal` file of a database: its path with `-wal` appended.
+fn wal_path(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
+/// The first 32 bytes of the `-wal` at `wal`; None when the file is missing or shorter.
+fn wal_head(wal: &Path) -> Result<Option<[u8; 32]>, ImportError> {
+    let mut handle = match std::fs::File::open(wal) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable_path(wal, &e)),
+    };
+    let mut head = [0u8; 32];
+    match handle.read_exact(&mut head) {
+        Ok(()) => Ok(Some(head)),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(unreadable_path(wal, &e)),
+    }
+}
+
+/// Whether `file` holds exactly `expected`, compared in `COMPARE_CHUNK` pieces so that the file is
+/// never held twice in memory.
+fn same_bytes(file: &Path, expected: &[u8]) -> Result<bool, ImportError> {
+    let mut handle = std::fs::File::open(file).map_err(|e| unreadable_path(file, &e))?;
+    let mut chunk = Vec::new();
+    let mut offset = 0;
+    loop {
+        chunk.clear();
+        handle
+            .by_ref()
+            .take(COMPARE_CHUNK)
+            .read_to_end(&mut chunk)
+            .map_err(|e| unreadable_path(file, &e))?;
+        if chunk.is_empty() {
+            return Ok(offset == expected.len());
+        }
+        let part = expected
+            .get(offset..)
+            .and_then(|rest| rest.get(..chunk.len()));
+        if part != Some(chunk.as_slice()) {
+            return Ok(false);
+        }
+        offset += chunk.len();
+    }
+}
+
+/// `file`'s image with `wal` applied as SQLite's recovery applies it (file format section 4): only
+/// the frames up to the last valid commit frame count. `db` is returned as it is when none does.
+/// Errors name the file and say nothing about its data.
+fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, ImportError> {
+    // The header is 32 bytes. A short one, a magic or page size that isn't SQLite's, or a checksum
+    // that fails means no frames at all.
+    let (Some(magic), Some(version), Some(page), Some(sum0), Some(sum1)) = (
+        be32(wal, 0),
+        be32(wal, 4),
+        be32(wal, 8),
+        be32(wal, 24),
+        be32(wal, 28),
+    ) else {
+        return Ok(db);
+    };
+    let big_endian = match magic {
+        0x377f_0683 => true,
+        0x377f_0682 => false,
+        _ => return Ok(db),
+    };
+    let page = page as usize;
+    if !page.is_power_of_two() || !(512..=65_536).contains(&page) {
+        return Ok(db);
+    }
+    // The header is 32 bytes long, so its first 24 are there to checksum.
+    if checksum(&wal[..24], big_endian, (0, 0)) != (sum0, sum1) {
+        return Ok(db);
+    }
+    if version != 3_007_000 {
+        return Err(bad_wal(
+            file,
+            "its -wal has a format version this import does not read",
+        ));
+    }
+
+    // The frames from offset 32 while a whole one fits. `frames` holds the valid ones as (page
+    // number, offset of the page); `commit` is the size of the last commit frame and how many
+    // frames it covers.
+    let frame_len = 24 + page;
+    let salts = &wal[16..24];
+    let mut running = (sum0, sum1);
+    let mut frames: Vec<(u32, usize)> = Vec::new();
+    let mut commit: Option<(u32, usize)> = None;
+    let mut at = 32;
+    while let Some(frame) = wal.get(at..).and_then(|rest| rest.get(..frame_len)) {
+        let (Some(number), Some(size)) = (be32(frame, 0), be32(frame, 4)) else {
+            break;
+        };
+        if number == 0 || frame[8..16] != *salts {
+            break;
+        }
+        let sum = checksum(&frame[..8], big_endian, running);
+        let sum = checksum(&frame[24..], big_endian, sum);
+        if be32(frame, 16) != Some(sum.0) || be32(frame, 20) != Some(sum.1) {
+            break;
+        }
+        running = sum;
+        frames.push((number, at + 24));
+        if size != 0 {
+            commit = Some((size, frames.len()));
+        }
+        at += frame_len;
+    }
+    let Some((commit_size, applied)) = commit else {
+        return Ok(db);
+    };
+    frames.truncate(applied);
+
+    // A non-empty database file must be a whole database of the -wal's page size; an empty one is
+    // built from the frames alone. The commit may not name more pages than the file and frames give.
+    let fits = db.is_empty() || (db.len() >= 100 && db_page_size(&db) == Some(page));
+    if !fits {
+        return Err(bad_wal(file, "its database file does not match its -wal"));
+    }
+    let pages = commit_size as usize;
+    if pages > db.len().div_ceil(page) + applied {
+        return Err(bad_wal(
+            file,
+            "its -wal commits more pages than its database holds",
+        ));
+    }
+    let size = pages
+        .checked_mul(page)
+        .ok_or_else(|| bad_wal(file, "its -wal commits more pages than fit in memory"))?;
+    db.resize(size, 0);
+    for (number, start) in frames {
+        let number = number as usize;
+        if number > pages {
+            continue;
+        }
+        let dest = (number - 1) * page;
+        if let (Some(out), Some(data)) = (
+            db.get_mut(dest..).and_then(|rest| rest.get_mut(..page)),
+            wal.get(start..).and_then(|rest| rest.get(..page)),
+        ) {
+            out.copy_from_slice(data);
+        }
+    }
+    Ok(db)
+}
+
+/// A `-wal` that can't be applied to its database: the message names the file and the problem.
+fn bad_wal(file: &Path, problem: &str) -> ImportError {
+    ImportError::BadSource(format!("{}: {problem}", file.display()))
+}
+
+/// The big-endian u32 at byte `at` of `bytes`, or None when four bytes don't lie there.
+fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+    let word: [u8; 4] = bytes.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_be_bytes(word))
+}
+
+/// The page size in a database file's header (bytes 16 and 17, where 1 means 65536).
+fn db_page_size(db: &[u8]) -> Option<usize> {
+    let size = u16::from_be_bytes(db.get(16..18)?.try_into().ok()?);
+    Some(if size == 1 { 65_536 } else { usize::from(size) })
+}
+
+/// SQLite's WAL checksum (file format section 4.2) over the whole 8-byte pairs of `data`, continuing
+/// from `sum`. The words are little-endian for the magic 0x377f0682 and big-endian for 0x377f0683.
+fn checksum(data: &[u8], big_endian: bool, mut sum: (u32, u32)) -> (u32, u32) {
+    for pair in data.as_chunks::<8>().0 {
+        let word = |at: usize| {
+            let bytes = [pair[at], pair[at + 1], pair[at + 2], pair[at + 3]];
+            if big_endian {
+                u32::from_be_bytes(bytes)
+            } else {
+                u32::from_le_bytes(bytes)
+            }
+        };
+        sum.0 = sum.0.wrapping_add(word(0)).wrapping_add(sum.1);
+        sum.1 = sum.1.wrapping_add(word(4)).wrapping_add(sum.0);
+    }
+    sum
 }
 
 /// The 2.9 type of a .NET type name (its last part, with that part); other types are `None`.

@@ -11558,6 +11558,274 @@ async fn b20_import_run_leaves_the_source_and_its_secrets_alone() {
     }
 }
 
+/// Fix 4: a run reads, merges and writes each user's rows in one write transaction, so progress a
+/// client saves while the run works isn't overwritten with the rows the run read before.
+#[tokio::test]
+async fn b20_import_keeps_progress_saved_during_the_run() {
+    use sqlx::ConnectOptions;
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    // A progress report's write, open from before the run starts until the run reads.
+    let mut writer = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(w.state.data_dir.join("test.db"))
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
+         playback_position_ticks, last_played_date, is_favorite) \
+         VALUES (?, ?, 0, 0, 7777, '2026-01-01T00:00:00Z', 0)",
+    )
+    .bind(w.alice.to_string())
+    .bind(alpha.to_string())
+    .execute(&mut writer)
+    .await
+    .unwrap();
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "MetadataMode": "None",
+    });
+    b20_start(&w, body).await;
+    // The job itself, not `/JellyfinImport/Status`: the pool shares its cache, so a request made
+    // while a pool connection waits for the write lock waits with it.
+    let watch_data = Some(rustyfin_core::jellyfin_import::ImportStage::WatchData);
+    let mut stage = None;
+    for _ in 0..1000 {
+        stage = w.state.jellyfin_import.status().stage;
+        if stage == watch_data {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(stage, watch_data, "the run never reached its watch data");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    let answer = b20_wait(&w).await;
+    assert_eq!(answer["State"], "Completed", "{answer}");
+    let row = b20_data(&w.state, w.alice, alpha)
+        .await
+        .expect("alice's Alpha row");
+    assert_eq!(
+        row.position, 7777,
+        "the progress saved during the run was lost"
+    );
+    assert_eq!(row.last_played, b20_at("2026-01-01T00:00:00Z"));
+    assert!(
+        row.played && row.favorite,
+        "Jellyfin's played and favorite merge in"
+    );
+    assert_eq!(row.play_count, 2);
+}
+
+/// Runs `statements` on a WAL-mode copy of `file` made outside the install folder, then puts the
+/// copy and its `-wal` (no checkpoint ran, so the changes are only there) in place of `file`: a
+/// source as a running Jellyfin leaves it.
+async fn b20_change_in_wal(w: &B20World, file: &std::path::Path, statements: &[&'static str]) {
+    use sqlx::{ConnectOptions, Connection};
+    let wal = |db: &std::path::Path| {
+        let mut name = db.as_os_str().to_owned();
+        name.push("-wal");
+        std::path::PathBuf::from(name)
+    };
+    let scratch = w
+        .jf_root
+        .join(format!("wal_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let copy = scratch.join(file.file_name().unwrap());
+    std::fs::copy(file, &copy).unwrap();
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&copy)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA wal_autocheckpoint = 0")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for &statement in statements {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    let frames = std::fs::metadata(wal(&copy)).unwrap().len();
+    assert!(frames > 32, "no frames in {}", wal(&copy).display());
+    std::fs::copy(&copy, file).unwrap();
+    std::fs::copy(wal(&copy), wal(file)).unwrap();
+    conn.close().await.unwrap();
+}
+
+const B20_RENAME_BOB: &str = r#"UPDATE "Users" SET "Username" = 'carol' WHERE "Username" = 'bob'"#;
+const B20_RENAME_GAMMA_NEW: &str =
+    r#"UPDATE "BaseItems" SET "Name" = 'Gamma WAL' WHERE "Name" = 'Gamma'"#;
+const B20_RENAME_GAMMA_OLD: &str =
+    "UPDATE TypedBaseItems SET Name = 'Gamma WAL' WHERE Name = 'Gamma'";
+
+/// Fix 7: a source whose `-wal` holds changes is read with them, and nothing appears or changes
+/// under the source folder (no `-shm` either).
+#[tokio::test]
+async fn b20_import_reads_the_wal_and_leaves_the_source_folder_alone() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let data = install.join("data");
+        match layout {
+            jf::Layout::New => {
+                let changes = [B20_RENAME_BOB, B20_RENAME_GAMMA_NEW];
+                b20_change_in_wal(&w, &data.join("jellyfin.db"), &changes).await;
+            }
+            jf::Layout::Old => {
+                b20_change_in_wal(&w, &data.join("jellyfin.db"), &[B20_RENAME_BOB]).await;
+                let library = data.join("library.db");
+                b20_change_in_wal(&w, &library, &[B20_RENAME_GAMMA_OLD]).await;
+            }
+        }
+        let before = jf::listing(&install);
+        let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        assert_eq!(
+            jf::listing(&install),
+            before,
+            "{name}: the preview changed the source folder"
+        );
+        let names: Vec<String> = b20_users(&report).into_iter().map(|u| u.name).collect();
+        assert!(
+            names.iter().any(|n| n == "carol") && !names.iter().any(|n| n == "bob"),
+            "{name}: users {names:?}"
+        );
+        let samples = b20_samples(&report);
+        assert!(
+            samples.iter().any(|(_, item, _)| item == "Gamma WAL"),
+            "{name}: samples {samples:?}"
+        );
+        let alice = w.source.user("Alice").id;
+        let body = serde_json::json!({ "SourcePath": install, "UserIds": [alice] });
+        b20_run(&w, body).await;
+        assert_eq!(
+            jf::listing(&install),
+            before,
+            "{name}: the run changed the source folder"
+        );
+    }
+}
+
+/// One state of the flipping writer: Gamma's name (read with the items) and Alpha's tagline (read
+/// with the metadata), changed together.
+const B20_FLIPS_NEW: [&str; 2] = [
+    r#"BEGIN; UPDATE "BaseItems" SET "Name" = 'Gamma' WHERE "Name" = 'Gamma Y';
+       UPDATE "BaseItems" SET "Tagline" = NULL WHERE "Name" = 'Alpha'; COMMIT;"#,
+    r#"BEGIN; UPDATE "BaseItems" SET "Name" = 'Gamma Y' WHERE "Name" = 'Gamma';
+       UPDATE "BaseItems" SET "Tagline" = 'one' WHERE "Name" = 'Alpha'; COMMIT;"#,
+];
+const B20_FLIPS_OLD: [&str; 2] = [
+    "BEGIN; UPDATE TypedBaseItems SET Name = 'Gamma' WHERE Name = 'Gamma Y';
+     UPDATE TypedBaseItems SET Tagline = NULL WHERE Name = 'Alpha'; COMMIT;",
+    "BEGIN; UPDATE TypedBaseItems SET Name = 'Gamma Y' WHERE Name = 'Gamma';
+     UPDATE TypedBaseItems SET Tagline = 'one' WHERE Name = 'Alpha'; COMMIT;",
+];
+
+/// What a FillEmpty preview saw: Gamma's name and the metadata's `Fields` count.
+fn b20_seen(report: &serde_json::Value) -> (String, i64) {
+    let gamma = b20_samples(report)
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .find(|name| name.starts_with("Gamma"))
+        .unwrap_or_else(|| panic!("no Gamma sample: {report}"));
+    (gamma, report["Metadata"]["Fields"].as_i64().unwrap_or(-1))
+}
+
+/// Fix 8: while Jellyfin writes, a preview reads one state of each file: everything it reports
+/// from a file comes from the same commit, or it fails as changing. The writer gets a worker
+/// thread of its own, so it flips while a preview runs, not only when the preview yields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b20_import_reads_one_state_while_jellyfin_writes() {
+    use sqlx::{ConnectOptions, Connection};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for (name, layout, file, flips) in [
+        ("new", jf::Layout::New, "jellyfin.db", B20_FLIPS_NEW),
+        ("old", jf::Layout::Old, "library.db", B20_FLIPS_OLD),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(install.join("data").join(file))
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "FillEmpty" });
+        let mut states = Vec::new();
+        for flip in flips {
+            let mut conn = options.connect().await.unwrap();
+            sqlx::raw_sql(flip).execute(&mut conn).await.unwrap();
+            conn.close().await.unwrap();
+            states.push(b20_seen(&b20_preview(&w, body.clone()).await));
+        }
+        assert!(
+            states[0].0 != states[1].0 && states[0].1 != states[1].1,
+            "{name}: the two states look alike: {states:?}"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipped = Arc::new(AtomicUsize::new(0));
+        // No fsync per commit: the writer flips often, as a busy Jellyfin would.
+        let mut conn = options
+            .clone()
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Off)
+            .connect()
+            .await
+            .unwrap();
+        let writer = tokio::spawn({
+            let (stop, flipped) = (stop.clone(), flipped.clone());
+            async move {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    sqlx::raw_sql(flips[n % 2])
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                    n += 1;
+                    flipped.store(n, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                conn.close().await.unwrap();
+            }
+        });
+        let (mut read, mut overlapped) = (0, 0);
+        for attempt in 0..30 {
+            let before = flipped.load(Ordering::Relaxed);
+            let (status, report) = b20_post(&w, "Preview", body.clone()).await;
+            if flipped.load(Ordering::Relaxed) > before {
+                overlapped += 1;
+            }
+            if status == StatusCode::OK {
+                let seen = b20_seen(&report);
+                assert!(
+                    states.contains(&seen),
+                    "{name}: preview {attempt} mixed two states: {seen:?}, states {states:?}"
+                );
+                read += 1;
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {report}");
+                assert!(
+                    report.to_string().contains("kept changing"),
+                    "{name}: {report}"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
+        assert!(read > 0, "{name}: no preview read the source");
+        assert!(
+            overlapped >= 10,
+            "{name}: the writer flipped during only {overlapped} of 30 previews"
+        );
+    }
+}
+
 // B20 3: one-time codes and first sign-in.
 
 type B20Answer = (StatusCode, Option<String>, serde_json::Value);

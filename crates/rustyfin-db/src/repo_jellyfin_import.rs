@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use rustyfin_model::media::MediaType;
 use rustyfin_model::media_source::StreamIdentity;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 /// A Rustyfin item an imported Jellyfin item can match (spec 2.10).
@@ -167,10 +167,10 @@ pub async fn import_targets(pool: &SqlitePool) -> Result<Vec<ImportTarget>, sqlx
     Ok(targets)
 }
 
-/// The user's watch data by item (spec 2.31). A stored date that doesn't parse reads as none; a row
-/// whose item id doesn't parse is skipped.
-pub async fn user_data_rows(
-    pool: &SqlitePool,
+/// The user's watch data by item (spec 2.31), read on `db`: a pool, or a transaction's connection. A
+/// stored date that doesn't parse reads as none; a row whose item id doesn't parse is skipped.
+pub async fn user_data_rows<'e>(
+    db: impl sqlx::SqliteExecutor<'e>,
     user: Uuid,
 ) -> Result<HashMap<Uuid, UserDataRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, DataDbRow>(
@@ -180,7 +180,7 @@ pub async fn user_data_rows(
          FROM user_item_data WHERE user_id = ?",
     )
     .bind(user.to_string())
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     let mut data = HashMap::with_capacity(rows.len());
     for (
@@ -221,15 +221,14 @@ pub async fn user_data_rows(
     Ok(data)
 }
 
-/// Writes the user's rows in one transaction (spec 2.31): each row is inserted, or every value
-/// column of its existing row is replaced.
+/// Writes the user's rows on `conn` (spec 2.31): each row is inserted, or every value column of its
+/// existing row is replaced. No transaction of its own: the caller's makes the writes atomic.
 pub async fn write_user_data(
-    pool: &SqlitePool,
+    conn: &mut SqliteConnection,
     user: Uuid,
     rows: &[(Uuid, UserDataRow)],
 ) -> Result<(), sqlx::Error> {
     let user_id = user.to_string();
-    let mut tx = pool.begin().await?;
     for (item, row) in rows {
         sqlx::query(
             "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
@@ -262,10 +261,10 @@ pub async fn write_user_data(
         .bind(row.subtitle)
         .bind(row.audio_key.as_deref())
         .bind(row.subtitle_key.as_deref())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await
+    Ok(())
 }
 
 /// The item's media sources by `created_at` then `id`, each with its streams by `stream_index`

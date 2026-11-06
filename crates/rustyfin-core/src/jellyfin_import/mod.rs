@@ -427,11 +427,8 @@ async fn plan_watch_data(
 
     let mut done = 0;
     for (_, owner, group_rows) in groups {
-        let mut current = match owner {
-            Some(user) => user_data_rows(db, user).await.map_err(ImportError::Db)?,
-            None => HashMap::new(),
-        };
-        let mut changed: HashSet<Uuid> = HashSet::new();
+        // The tracks are mapped first, outside any transaction: the mapper reads through `db`.
+        let mut mapped = Vec::with_capacity(group_rows.len());
         for row in &group_rows {
             done += 1;
             if let Some(handle) = handle {
@@ -441,31 +438,63 @@ async fn plan_watch_data(
                 report.unmatched += 1;
                 continue;
             };
-            let mapped = mapper
+            let tracks = mapper
                 .map_tracks(db, rf_item, row, &mut track_counts)
                 .await?;
-            let merged = merge::merge(current.get(&rf_item), row, mapped);
-            if current.get(&rf_item) == Some(&merged) {
-                report.unchanged += 1;
-            } else {
-                report.imported += 1;
-                current.insert(rf_item, merged);
-                changed.insert(rf_item);
-            }
+            mapped.push((rf_item, row, tracks));
         }
+        // A run with an owner reads, merges and writes in one `BEGIN IMMEDIATE` transaction, so a
+        // progress report saved meanwhile is not overwritten (B20 fix 4). Between the begin and the
+        // commit only `tx` is used: a second pool connection would wait on this transaction.
         if let (Some(_), Some(user)) = (handle, owner) {
+            let mut tx = db
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(ImportError::Db)?;
+            let (current, changed) = merge_group(&mut *tx, owner, mapped, &mut report).await?;
             let writes: Vec<(Uuid, UserDataRow)> = changed
                 .iter()
                 .filter_map(|item| current.get(item).map(|row| (*item, row.clone())))
                 .collect();
             if !writes.is_empty() {
-                write_user_data(db, user, &writes)
+                write_user_data(&mut tx, user, &writes)
                     .await
                     .map_err(ImportError::Db)?;
             }
+            tx.commit().await.map_err(ImportError::Db)?;
+        } else {
+            // A preview, or a group without an owner: merged for the counts, written nowhere.
+            merge_group(db, owner, mapped, &mut report).await?;
         }
     }
     Ok((report, track_counts))
+}
+
+/// Merges one group's mapped rows into its owner's rows (spec 2.32) and counts them: `unchanged`
+/// when the merge leaves a row as it was, `imported` otherwise. Returns the owner's rows after the
+/// merge and the Rustyfin items whose row changed. Without an owner, the rows merge against nothing.
+async fn merge_group<'e>(
+    db: impl sqlx::SqliteExecutor<'e>,
+    owner: Option<Uuid>,
+    mapped: Vec<(Uuid, &JfUserData, merge::MappedTracks)>,
+    report: &mut WatchDataReport,
+) -> Result<(HashMap<Uuid, UserDataRow>, HashSet<Uuid>), ImportError> {
+    let mut current = match owner {
+        Some(user) => user_data_rows(db, user).await.map_err(ImportError::Db)?,
+        None => HashMap::new(),
+    };
+    let mut changed: HashSet<Uuid> = HashSet::new();
+    for (rf_item, row, tracks) in mapped {
+        let merged = merge::merge(current.get(&rf_item), row, tracks);
+        if current.get(&rf_item) == Some(&merged) {
+            report.unchanged += 1;
+        } else {
+            report.imported += 1;
+            current.insert(rf_item, merged);
+            changed.insert(rf_item);
+        }
+    }
+    Ok((current, changed))
 }
 
 /// The Jellyfin side of the track mapping (spec 2.30, 2.32), read once: the items and streams by
