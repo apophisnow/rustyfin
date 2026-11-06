@@ -475,6 +475,80 @@ async fn report_all_answers_for_each_path_and_queues_their_units() {
     assert!(rec.calls().is_empty());
 }
 
+/// B18 fix round 2, item 5: a report reads nothing on disk, so a hung mount cannot hold up
+/// `Media/Updated` or the Webhook. While the runtime's only blocking thread is busy, as a read on a
+/// hung NFS mount keeps it, `report_all` answers and queues the units under the reported names.
+#[test]
+fn report_all_returns_while_the_blocking_pool_is_busy() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fx = Fixture::new().await;
+        let lib = fx
+            .library("films", LibraryContentType::Movies, &["films"])
+            .await;
+        let films = root(&lib);
+        touch(&films, "Heat (1995)/Heat (1995).mkv");
+        let rec = Arc::new(Recorder::default());
+        let queue = queue(&fx, &rec, Duration::from_secs(3600));
+
+        let (busy, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            busy.send(()).unwrap();
+            let _ = held.recv();
+        });
+        started.await.unwrap();
+        let answers = tokio::time::timeout(
+            Duration::from_secs(5),
+            queue.report_all(&[
+                films.join("Heat (1995)/Heat (1995).mkv"),
+                films.join("Loose (2001).mkv"),
+            ]),
+        )
+        .await;
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+
+        assert_eq!(
+            answers.expect("report_all waited for the blocking pool"),
+            [true, true]
+        );
+        assert_eq!(
+            queue.pending(),
+            sorted(vec![
+                (lib.id, ScanScope::Folder(films.join("Heat (1995)"))),
+                (lib.id, ScanScope::RootFiles(films.clone())),
+            ])
+        );
+    });
+}
+
+/// A file directly in the library path that is no video or audio file, such as a subtitle, is
+/// rescanned with the root files.
+#[tokio::test]
+async fn a_reported_file_of_another_type_in_the_library_path_rescans_the_root_files() {
+    let fx = Fixture::new().await;
+    let lib = fx
+        .library("films", LibraryContentType::Movies, &["films"])
+        .await;
+    let films = root(&lib);
+    let subtitle = touch(&films, "Loose (2001).en.srt");
+    let rec = Arc::new(Recorder::default());
+    let queue = queue(&fx, &rec, Duration::ZERO);
+
+    assert!(queue.report(&subtitle).await);
+    let calls = rec.wait_for(1).await;
+    assert_eq!(
+        (calls[0].library, calls[0].scope.clone()),
+        (lib.id, ScanScope::RootFiles(films))
+    );
+}
+
 #[tokio::test]
 async fn a_report_of_the_library_path_turns_its_pending_units_into_one_full_scan() {
     let fx = Fixture::new().await;
@@ -909,9 +983,13 @@ async fn a_path_reported_in_another_case_rescans_the_folder_by_its_name_on_disk(
         "a full scan keeps the item"
     );
 
+    // Each rescan names the folder as it is on disk, whatever case the report used.
     let rec = Arc::new(Recorder::default());
-    let recorded = queue(&fx, &rec, Duration::from_secs(3600));
+    let recorded = queue(&fx, &rec, Duration::ZERO);
     assert!(recorded.report(&reported).await);
     assert!(recorded.report(&films.join("THE MATRIX (1999)")).await);
-    assert_eq!(recorded.pending(), vec![(lib.id, on_disk)]);
+    let calls = rec.wait_for(2).await;
+    for call in calls {
+        assert_eq!((call.library, call.scope), (lib.id, on_disk.clone()));
+    }
 }

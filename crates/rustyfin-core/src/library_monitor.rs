@@ -1,8 +1,9 @@
 //! The library monitor's change queue (B18). It maps each path that changed to the unit of a library
-//! that rescans it, and a folder unit takes the name that its folder has on disk. The unit waits
-//! until it has been quiet for the settle delay, then it is rescanned. A pending full scan keeps
-//! the instant at which it became pending, so the reports that it takes in do not postpone it. One
-//! worker runs the due rescans one at a time, oldest report first.
+//! that rescans it. A folder unit takes the name that its folder has on disk when it is rescanned,
+//! not when it is reported. The unit waits until it has been quiet for the settle delay, then it is
+//! rescanned. A pending full scan keeps the instant at which it became pending, so the reports that
+//! it takes in do not postpone it. One worker runs the due rescans one at a time, oldest report
+//! first.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -105,7 +106,8 @@ impl ChangeQueue {
 
     /// Queues the unit of every library that holds `path`. Returns true when at least one library
     /// queued it. A path that no library holds, or that lies in a folder the scanner skips, is
-    /// dropped.
+    /// dropped. It reads nothing on disk, so a hung mount cannot hold up a report. Units are
+    /// queued under the reported names, and the worker names them on disk just before the rescan.
     pub async fn report(&self, path: &Path) -> bool {
         self.report_all(&[path.to_path_buf()])
             .await
@@ -115,8 +117,9 @@ impl ChangeQueue {
     }
 
     /// Queues the units of `paths`. Returns one answer per path, in order: true when at least one
-    /// library queued it. The libraries are loaded once for all paths, and a folder unit takes the
-    /// name that its folder has on disk.
+    /// library queued it. The libraries are loaded once for all paths. It reads nothing on disk, so
+    /// a hung mount cannot hold up a report. Units are queued under the reported names, and the
+    /// worker names them on disk just before the rescan.
     pub async fn report_all(&self, paths: &[PathBuf]) -> Vec<bool> {
         if paths.is_empty() {
             return Vec::new();
@@ -149,7 +152,6 @@ impl ChangeQueue {
             answers.push(!found.is_empty());
             units.extend(found);
         }
-        let units = name_folders_on_disk(units).await;
         if units.is_empty() {
             return answers;
         }
@@ -204,57 +206,15 @@ fn full_scan(pending: &mut HashMap<(Uuid, ScanScope), Instant>, library: Uuid, n
     pending.insert((library, ScanScope::Library), now);
 }
 
-/// What a library path holds, for the folder units under it. It is read at most once per call.
-struct Listing {
-    /// The names in the path, sorted. None when the path cannot be listed.
-    names: Option<Vec<OsString>>,
-    /// The names by the identity of the folder that each names, each list sorted. Read when a
-    /// folder is not listed by its own name.
-    by_id: Option<HashMap<DirId, Vec<OsString>>>,
-}
-
-/// Gives each folder unit the name that its folder has on disk. Each library path is listed at most
-/// once, and each distinct folder is resolved once.
-async fn name_folders_on_disk(units: Vec<(Uuid, ScanScope)>) -> Vec<(Uuid, ScanScope)> {
-    let mut listings: HashMap<PathBuf, Listing> = HashMap::new();
-    let mut resolved: HashMap<PathBuf, PathBuf> = HashMap::new();
-    let mut named = Vec::with_capacity(units.len());
-    for (library, scope) in units {
-        let scope = match scope {
-            ScanScope::Folder(folder) => {
-                let on_disk = match resolved.get(&folder) {
-                    Some(on_disk) => on_disk.clone(),
-                    None => {
-                        let on_disk = folder_on_disk(&folder, &mut listings).await;
-                        resolved.insert(folder, on_disk.clone());
-                        on_disk
-                    }
-                };
-                ScanScope::Folder(on_disk)
-            }
-            other => other,
-        };
-        named.push((library, scope));
-    }
-    named
-}
-
-/// The name that `folder` has on disk. `folder` is `root.join(name)` for its library path `root`.
-/// A name that the listing of `root` holds stays. Otherwise, when `folder` exists, it takes the
-/// name of a listed folder with the same identity: a name that ignores case first, then the others,
-/// each group in sorted order.
-async fn folder_on_disk(folder: &Path, listings: &mut HashMap<PathBuf, Listing>) -> PathBuf {
+/// The name that `folder` has on disk. `folder` is `root.join(name)` for its library path `root`,
+/// which is listed here, once. A name that the listing holds stays. Otherwise, when `folder`
+/// exists, it takes the name of a listed folder with the same identity: a name that ignores case
+/// first, then the others, each group in sorted order.
+async fn folder_on_disk(folder: &Path) -> PathBuf {
     let (Some(root), Some(name)) = (folder.parent(), folder.file_name()) else {
         return folder.to_path_buf();
     };
-    if !listings.contains_key(root) {
-        let names = list_names(root).await;
-        listings.insert(root.to_path_buf(), Listing { names, by_id: None });
-    }
-    let Some(listing) = listings.get_mut(root) else {
-        return folder.to_path_buf();
-    };
-    let Some(names) = &listing.names else {
+    let Some(names) = list_names(root).await else {
         return folder.to_path_buf();
     };
     if names
@@ -266,10 +226,8 @@ async fn folder_on_disk(folder: &Path, listings: &mut HashMap<PathBuf, Listing>)
     let Ok(id) = scanner::dir_id(folder).await else {
         return folder.to_path_buf();
     };
-    if listing.by_id.is_none() {
-        listing.by_id = Some(index_by_id(root, names).await);
-    }
-    let Some(same) = listing.by_id.as_ref().and_then(|by_id| by_id.get(&id)) else {
+    let by_id = index_by_id(root, &names).await;
+    let Some(same) = by_id.get(&id) else {
         return folder.to_path_buf();
     };
     let wanted = name.to_string_lossy().to_lowercase();
@@ -301,6 +259,27 @@ async fn index_by_id(root: &Path, names: &[OsString]) -> HashMap<DirId, Vec<OsSt
         }
     }
     by_id
+}
+
+/// The scope to rescan, as it is on disk now. A folder unit that names a file becomes the root
+/// files of its library path. Any other folder unit takes the name that its folder has on disk,
+/// and every other scope comes back unchanged. Two limits are known. A folder directly in a
+/// library path whose name ends in a video or audio extension rescans the root files. A folder
+/// reported in two cases, on a case-insensitive mount, is rescanned twice, each time by its name
+/// on disk.
+async fn on_disk(scope: ScanScope) -> ScanScope {
+    match scope {
+        ScanScope::Folder(folder) => {
+            let is_file = tokio::fs::metadata(&folder)
+                .await
+                .is_ok_and(|meta| meta.is_file());
+            match folder.parent() {
+                Some(parent) if is_file => ScanScope::RootFiles(parent.to_path_buf()),
+                _ => ScanScope::Folder(folder_on_disk(&folder).await),
+            }
+        }
+        other => other,
+    }
 }
 
 /// The runner that a new queue starts with: `scan_with_metadata`, with no metadata providers.
@@ -400,6 +379,7 @@ impl Inner {
                 return;
             }
         };
+        let scope = on_disk(scope).await;
         let name = library.name.clone();
         tracing::info!("library monitor: rescanning {scope:?} of '{name}'");
         let runner = self.current_runner();
@@ -442,12 +422,14 @@ async fn work(inner: Arc<Inner>) {
     }
 }
 
-/// The unit that a change at `path` rescans, for a library whose paths are `library_paths`.
+/// The unit that a change at `path` rescans, for a library whose paths are `library_paths`. It
+/// reads nothing on disk.
 ///
 /// The longest library path that holds `path` decides. `path` equal to it is the whole library.
-/// Below it, the unit is the top-level folder that `path` lies in, with its subfolders, or, for a
-/// file directly in the library path, the library path's root files. Returns `None` when no library
-/// path holds `path`, or when a name on the way is one that the scanner skips.
+/// Below it, the unit is the top-level folder that `path` lies in, with its subfolders. A single
+/// name below the library path is the root files when it ends in a video or audio extension, else
+/// a folder. The worker turns a folder unit that names a file into the root files. Returns `None`
+/// when no library path holds `path`, or when a name on the way is one that the scanner skips.
 pub fn unit_for(library_paths: &[String], path: &Path) -> Option<ScanScope> {
     let root = library_paths
         .iter()
@@ -470,8 +452,7 @@ pub fn unit_for(library_paths: &[String], path: &Path) -> Option<ScanScope> {
         [] => Some(ScanScope::Library),
         [first, _, ..] => Some(ScanScope::Folder(root.join(first))),
         [only] => {
-            let root_file = !path.is_dir() && (path.is_file() || is_media_name(only));
-            if root_file {
+            if is_media_name(only) {
                 Some(ScanScope::RootFiles(root.to_path_buf()))
             } else {
                 Some(ScanScope::Folder(root.join(only)))
