@@ -5870,7 +5870,6 @@ fn b21_web_explains_taken_names() {
 }
 
 #[test]
-#[ignore = "B21 round 2 fix 4"]
 fn b21_web_password_switch_names_hand_granted_admins() {
     let texts = [
         (
