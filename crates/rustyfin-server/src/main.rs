@@ -291,7 +291,7 @@ async fn main() {
     let app = build_router(state)
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(request_span));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -498,6 +498,17 @@ fn load_or_create_server_id(data_dir: &std::path::Path) -> String {
     id
 }
 
+/// The span of one request: the method, the path without the query string, and the HTTP version.
+/// Query strings carry `api_key` tokens and the OIDC callback's `code` and `state` (AC43).
+fn request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        uri = %request.uri().path(),
+        version = ?request.version(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,3 +543,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod request_log_tests;
