@@ -2003,9 +2003,9 @@ const OIDC_ERROR_KEYS = new Map([
     ['invalid_token', 'oidc.error.invalid_token'],
     ['no_username', 'oidc.error.no_username'],
     ['not_allowed', 'oidc.error.not_allowed'],
-    ['admin_link_required', 'oidc.error.admin_link_required'],
+    ['name_taken', 'oidc.error.name_taken'],
+    ['name_taken_ask_admin', 'oidc.error.name_taken_ask_admin'],
     ['already_linked', 'oidc.error.already_linked'],
-    ['ambiguous_user', 'oidc.error.ambiguous_user'],
     ['account_disabled', 'oidc.error.account_disabled'],
     ['server_error', 'oidc.error.server_error'],
 ]);
@@ -2709,7 +2709,6 @@ function renderOidcAdminSettings(s) {
             <div>
                 ${label('oidc-username-claim', 'oidc.username_claim')}
                 <input id="oidc-username-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.UsernameClaim)}">
-                ${warn('oidc.warn_username')}
             </div>
             <div>
                 ${label('oidc-group-claim', 'oidc.group_claim')}

@@ -5812,7 +5812,6 @@ fn b21_translation(lang: &str, path: &str) -> Option<String> {
 }
 
 #[test]
-#[ignore = "B21 round 2 fix 1 web"]
 fn b21_web_explains_taken_names() {
     let texts = [
         (
