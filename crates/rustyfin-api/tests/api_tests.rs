@@ -5255,7 +5255,6 @@ async fn b21_rename_is_for_administrators_while_oidc_is_on() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 2"]
 async fn b21_quick_connect_initiate_shares_the_login_limit() {
     let mut state = test_state().await;
     add_user(&state, "alice", "pw-alice", false).await;
@@ -5289,7 +5288,6 @@ async fn b21_quick_connect_initiate_shares_the_login_limit() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 2"]
 async fn b21_quick_connect_caps_live_requests() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -5334,7 +5332,6 @@ async fn b21_quick_connect_caps_live_requests() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 2"]
 async fn b21_quick_connect_authorize_skips_expired_requests() {
     let state = test_state().await;
     let app = app(state.clone());

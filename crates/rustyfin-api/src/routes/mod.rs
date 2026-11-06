@@ -121,12 +121,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin)
         .layer(axum_mw::from_fn_with_state(state.clone(), require_auth));
 
-    // Rate limit only the endpoints that check a password or PIN. route_layer applies the
-    // limiter to matched routes only, so every other route is unlimited.
+    // Rate limit only the endpoints that check a password or PIN, and Quick Connect's Initiate,
+    // which starts a sign-in. route_layer applies the limiter to matched routes only, so every
+    // other route is unlimited.
     let login = Router::new()
         .merge(auth::routes())
         .merge(users::login_routes())
         .merge(oidc::login_routes())
+        .merge(quick_connect::login_routes())
         .route_layer(axum_mw::from_fn_with_state(state.clone(), rate_limit));
 
     #[allow(unused_mut)]
