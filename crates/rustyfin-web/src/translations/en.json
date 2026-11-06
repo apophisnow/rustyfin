@@ -361,7 +361,7 @@
             "invalid_token": "The provider's answer could not be verified. Please try again.",
             "no_username": "The provider did not send a usable username.",
             "not_allowed": "Your provider account is not allowed to sign in here. Ask an administrator.",
-            "admin_link_required": "This name belongs to an administrator. Sign in with your password and link the account on your profile first.",
+            "admin_link_required": "Administrator accounts are linked from the profile: sign in with your password, then link the account there.",
             "already_linked": "This provider login or account is already linked to another account.",
             "ambiguous_user": "More than one account has this name. Ask an administrator.",
             "account_disabled": "This account is disabled. Ask an administrator.",

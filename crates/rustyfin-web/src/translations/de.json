@@ -361,7 +361,7 @@
             "invalid_token": "Die Antwort des Anbieters konnte nicht überprüft werden. Bitte erneut versuchen.",
             "no_username": "Der Anbieter hat keinen verwendbaren Benutzernamen gesendet.",
             "not_allowed": "Dieses Anbieter-Konto darf sich hier nicht anmelden. Bitte einen Administrator fragen.",
-            "admin_link_required": "Dieser Name gehört zu einem Administrator. Bitte zuerst mit dem Passwort anmelden und das Konto im Profil verknüpfen.",
+            "admin_link_required": "Administratorkonten werden im Profil verknüpft: Bitte mit dem Passwort anmelden und das Konto dort verknüpfen.",
             "already_linked": "Diese Anmeldung oder dieses Konto ist bereits mit einem anderen Konto verknüpft.",
             "ambiguous_user": "Mehrere Konten haben diesen Namen. Bitte einen Administrator fragen.",
             "account_disabled": "Dieses Konto ist deaktiviert. Bitte einen Administrator fragen.",
