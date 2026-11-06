@@ -19,7 +19,9 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::flow::{Flow, FlowKind};
-use super::{OidcState, Provider, callback_url, claim_username, in_group, names_match};
+use super::{
+    OidcState, Provider, callback_url, claim_username, in_group, names_match, password_allowed,
+};
 
 /// How a sign-in ended without a user: the code the browser is sent, or a database failure.
 #[derive(Debug)]
@@ -186,10 +188,10 @@ pub(crate) async fn sign_in(
     Ok(user_id)
 }
 
-/// The account a sign-in is for (AC7, AC8): the user the identity is linked to, else the one user
-/// with the same name, else a new user. A name match never takes an administrator's account, nor
-/// any account when the claims put the person in the admin group (they link from the profile). A
-/// user who has a link never takes a second one.
+/// The account a sign-in is for (AC44): the user the identity is linked to; else, when no user has
+/// the name (ASCII letters in any case), a new user. A taken name is refused (`name_taken`, or
+/// `name_taken_ask_admin` when no matching account can sign in with a password), and the person
+/// links from the profile.
 async fn sign_in_account(
     pool: &SqlitePool,
     config: &OidcConfig,
@@ -214,50 +216,30 @@ async fn sign_in_account(
         .into_iter()
         .filter(|user| names_match(&user.name, &username))
         .collect();
-    match same_name.as_slice() {
-        [] => {
-            let user = User {
-                id: Uuid::new_v4(),
-                name: username.clone(),
-                password_hash: String::new(),
-                is_administrator: false,
-                created_at: now,
-                last_login_date: None,
-                configuration: Value::Object(Map::new()),
-            };
-            repo_oidc::create_linked_user(pool, &user, &config.issuer_url, subject, &username, now)
-                .await?;
-            Ok(user.id)
-        }
-        [existing] => {
-            // A name match never links an administrator's account; the Link endpoint does that.
-            if existing.is_administrator {
-                return Err(SignInError::Refused("admin_link_required"));
-            }
-            // Nor for a member of the admin group (AC37): the profile link applies the group.
-            if in_group(claims, &config.group_claim, &config.admin_group) {
-                return Err(SignInError::Refused("admin_link_required"));
-            }
-            if repo_oidc::user_has_link(pool, existing.id).await? {
-                return Err(SignInError::Refused("already_linked"));
-            }
-            if repo_user::is_disabled(pool, existing.id).await? {
-                return Err(SignInError::Refused("account_disabled"));
-            }
-            repo_oidc::create_link(
-                pool,
-                existing.id,
-                &config.issuer_url,
-                subject,
-                &username,
-                now,
-                Some(now),
-            )
+    if same_name.is_empty() {
+        let user = User {
+            id: Uuid::new_v4(),
+            name: username.clone(),
+            password_hash: String::new(),
+            is_administrator: false,
+            created_at: now,
+            last_login_date: None,
+            configuration: Value::Object(Map::new()),
+        };
+        repo_oidc::create_linked_user(pool, &user, &config.issuer_url, subject, &username, now)
             .await?;
-            Ok(existing.id)
-        }
-        _ => Err(SignInError::Refused("ambiguous_user")),
+        return Ok(user.id);
     }
+    // A taken name is refused whole (AC44): nothing is created, linked or granted here.
+    for user in &same_name {
+        if !repo_user::is_disabled(pool, user.id).await?
+            && !user.password_hash.is_empty()
+            && password_allowed(pool, config, user).await?
+        {
+            return Err(SignInError::Refused("name_taken"));
+        }
+    }
+    Err(SignInError::Refused("name_taken_ask_admin"))
 }
 
 /// A profile link (AC29, AC8, AC12): the identity goes to the caller's own account. There is no name

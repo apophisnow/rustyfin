@@ -4072,7 +4072,6 @@ async fn b21_sign_in_again_follows_the_link() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_sign_in_refuses_a_taken_name() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "Alice", "pw-alice", false).await;
@@ -4099,7 +4098,6 @@ async fn b21_sign_in_refuses_a_taken_name() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_sign_in_refuses_taken_names() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "ada", "pw-ada", true).await;
@@ -5169,7 +5167,6 @@ async fn b21_unlink_needs_another_way_in() {
 // Fix round 1: the review of 9cc903a (spec §10, AC37-AC42).
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_admin_group_member_links_from_the_profile() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -5216,7 +5213,6 @@ async fn b21_admin_group_member_links_from_the_profile() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_self_rename_works_with_oidc_on() {
     let t = b21_on(serde_json::json!({})).await;
     let bob_id = add_user(&t.state, "bob", "pw-bob", false).await;
@@ -5362,7 +5358,6 @@ async fn b21_quick_connect_authorize_skips_expired_requests() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_names_match_in_ascii_case_only() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "kelvin", "pw-kelvin", false).await;
@@ -5513,7 +5508,6 @@ async fn b21_resending_the_policy_keeps_the_group_flag() {
 // Fix round 2: the re-check of fd5f398 (spec §11, AC44-AC49).
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_taken_name_without_a_password_says_ask_an_administrator() {
     let t = b21_on(serde_json::json!({ "AllowPasswordSignIn": false })).await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -5569,7 +5563,6 @@ async fn b21_taken_name_without_a_password_says_ask_an_administrator() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 1"]
 async fn b21_links_survive_renames() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "bob", "pw-bob", false).await;

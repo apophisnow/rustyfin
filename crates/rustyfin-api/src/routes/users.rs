@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::middleware::resolve_client;
-use crate::oidc::{PASSWORD_RESET_OFF, RENAME_OFF, password_allowed};
+use crate::oidc::{PASSWORD_RESET_OFF, password_allowed};
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -475,11 +475,6 @@ async fn update_user_name(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if claims.sub != id && !claims.is_admin {
         return Err(ApiError::Forbidden("User update not allowed.".to_string()));
-    }
-    // While sign-in through the provider is on, only an administrator may rename (AC38).
-    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
-    if !claims.is_admin && config.enabled {
-        return Err(ApiError::Forbidden(RENAME_OFF.to_string()));
     }
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
