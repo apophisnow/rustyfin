@@ -320,10 +320,51 @@ pub async fn authenticate(
     finish_sign_in(pool, &user, device).await
 }
 
+/// The hash a setup-code check verifies against when there is no code hash: argon2 with the same
+/// parameters as code hashes, made once per process by `unusable_password_hash`.
+static DUMMY_CODE_HASH: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+/// The check of a setup code (B20 fix 5), shared by `authenticate_with_setup_code` and
+/// `setup_code_pending`. Exactly one argon2 verification runs whoever is asked about: against the
+/// user's code hash when the user exists and has one, else against the dummy hash. A malformed code
+/// counts as wrong. So the answer time does not tell an unknown user, a user without a code or a
+/// disabled user from a wrong code. Returns the user and the code hash only when the user exists,
+/// is enabled, has a code and `code` is that code.
+async fn check_setup_code(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+) -> Result<Option<(User, String)>, AuthError> {
+    let user = repo_user::get_user_by_name(pool, username).await?;
+    let (hash, enabled) = match &user {
+        Some(user) => (
+            repo_setup_code::code_hash(pool, user.id).await?,
+            !repo_user::is_disabled(pool, user.id).await?,
+        ),
+        None => (None, false),
+    };
+    let canonical = normalize_setup_code(code);
+    let verified = match (&hash, &canonical) {
+        (Some(hash), Some(canonical)) => verify_password(canonical, hash).await?,
+        _ => {
+            let dummy = DUMMY_CODE_HASH
+                .get_or_try_init(unusable_password_hash)
+                .await?;
+            verify_password(canonical.as_deref().unwrap_or("000000000000"), dummy).await?;
+            false
+        }
+    };
+    Ok(match (user, hash) {
+        (Some(user), Some(hash)) if verified && enabled => Some((user, hash)),
+        _ => None,
+    })
+}
+
 /// Sets the password of a pending user and signs in (B20 3.3, 3.8). `code` must be the user's
 /// current setup code. `new_password` replaces the unusable password, and the code is used up, so
-/// it fails from then on. A wrong code, a disabled user or a code that another request used first
-/// gives `InvalidCredentials`.
+/// it fails from then on. A wrong code, an unknown user, a user without a code, a disabled user, a
+/// malformed code or a code that another request used first gives `InvalidCredentials`, at the same
+/// cost (B20 fix 5).
 pub async fn authenticate_with_setup_code(
     pool: &SqlitePool,
     username: &str,
@@ -331,16 +372,9 @@ pub async fn authenticate_with_setup_code(
     new_password: &str,
     device: &TokenDevice,
 ) -> Result<(User, String), AuthError> {
-    let user = repo_user::get_user_by_name(pool, username)
-        .await?
-        .ok_or(AuthError::UserNotFound)?;
-
-    let Some(hash) = repo_setup_code::code_hash(pool, user.id).await? else {
+    let Some((user, hash)) = check_setup_code(pool, username, code).await? else {
         return Err(AuthError::InvalidCredentials);
     };
-    if repo_user::is_disabled(pool, user.id).await? || !verify_setup_code(code, &hash).await? {
-        return Err(AuthError::InvalidCredentials);
-    }
 
     let password_hash = hash_password(new_password).await?;
     if !repo_setup_code::redeem(pool, user.id, &hash, &password_hash).await? {
@@ -350,22 +384,14 @@ pub async fn authenticate_with_setup_code(
 }
 
 /// Whether `code` is the current setup code of the enabled user `username` (B20 3.2, 3.8). Nothing
-/// is written; an unknown user, a disabled user or a user without a code gives `false`.
+/// is written; an unknown user, a disabled user, a user without a code or a malformed code gives
+/// `false`, at the same cost (B20 fix 5).
 pub async fn setup_code_pending(
     pool: &SqlitePool,
     username: &str,
     code: &str,
 ) -> Result<bool, AuthError> {
-    let Some(user) = repo_user::get_user_by_name(pool, username).await? else {
-        return Ok(false);
-    };
-    if repo_user::is_disabled(pool, user.id).await? {
-        return Ok(false);
-    }
-    match repo_setup_code::code_hash(pool, user.id).await? {
-        Some(hash) => verify_setup_code(code, &hash).await,
-        None => Ok(false),
-    }
+    Ok(check_setup_code(pool, username, code).await?.is_some())
 }
 
 /// The steps of a sign-in after its checks: the last login is recorded, the user is re-read so the

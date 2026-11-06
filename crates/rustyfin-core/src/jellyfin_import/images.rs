@@ -2,7 +2,9 @@
 //! image, and the copy Rustyfin makes of it.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -80,41 +82,90 @@ pub struct UsableImage {
     pub ext: &'static str,
     /// FNV-1a 64 over the file's length and modification time (see `check`).
     pub hash: u64,
+    /// The file as `check` saw it; `copy` requires the same file.
+    identity: FileIdentity,
+}
+
+/// What makes a file the same file (spec 5.9): its length and modification time, and on unix its
+/// device and inode, so a file that is replaced or moved is another one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    /// Nanoseconds since the epoch, negative before it.
+    modified: i128,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+/// The identity of the file with metadata `meta`; `None` when it has no modification time.
+fn identity(meta: &fs::Metadata) -> Option<FileIdentity> {
+    let modified = match meta.modified().ok()?.duration_since(UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
+    };
+    Some(FileIdentity {
+        len: meta.len(),
+        modified,
+        #[cfg(unix)]
+        dev: meta.dev(),
+        #[cfg(unix)]
+        ino: meta.ino(),
+    })
 }
 
 /// The usable image at `file` (spec 5.9): its canonical path lies under the canonical `root`, it is
-/// a regular file of at most 32 MiB, and its first 12 bytes carry a known signature. The hash covers
-/// the length (u64) and the modification time in nanoseconds since the epoch (i128), both little
-/// endian; a changed file gets a new hash.
+/// a regular file of at most 32 MiB, and its first 12 bytes carry a known signature. The file is
+/// opened once, and its size, identity and signature are read from that handle; on Linux the handle
+/// must still be at the canonical path. The hash covers the length (u64) and the modification time
+/// in nanoseconds since the epoch (i128), both little endian; a changed file gets a new hash.
 pub fn check(file: &Path, root: &Path) -> Option<UsableImage> {
     let source = fs::canonicalize(file).ok()?;
     let root = fs::canonicalize(root).ok()?;
     if !source.starts_with(&root) {
         return None;
     }
-    let meta = fs::metadata(&source).ok()?;
+    // Only a regular file is opened: opening a FIFO would wait for a writer.
+    if !fs::metadata(&source).ok()?.is_file() {
+        return None;
+    }
+    let handle = fs::File::open(&source).ok()?;
+    if !opened_at(&handle, &source) {
+        return None;
+    }
+    let meta = handle.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_BYTES {
         return None;
     }
     let mut head = Vec::with_capacity(12);
-    fs::File::open(&source)
-        .ok()?
-        .take(12)
-        .read_to_end(&mut head)
-        .ok()?;
+    (&handle).take(12).read_to_end(&mut head).ok()?;
     let ext = signature(&head)?;
-    let nanos = match meta.modified().ok()?.duration_since(UNIX_EPOCH) {
-        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
-        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
-    };
+    let identity = identity(&meta)?;
     let mut seed = Vec::with_capacity(24);
-    seed.extend_from_slice(&meta.len().to_le_bytes());
-    seed.extend_from_slice(&nanos.to_le_bytes());
+    seed.extend_from_slice(&identity.len.to_le_bytes());
+    seed.extend_from_slice(&identity.modified.to_le_bytes());
     Some(UsableImage {
         source,
         ext,
         hash: fnv1a(&seed),
+        identity,
     })
+}
+
+/// Whether `handle` is still the file at `path`. On Linux the handle's `/proc/self/fd` link must be
+/// `path`, so a link swapped in after `path` was canonicalized is refused.
+#[cfg(target_os = "linux")]
+fn opened_at(handle: &fs::File, path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+        .is_ok_and(|link| link.as_path() == path)
+}
+
+/// Elsewhere the link is not checked: `copy` still refuses a file that was swapped after `check`.
+#[cfg(not(target_os = "linux"))]
+fn opened_at(_handle: &fs::File, _path: &Path) -> bool {
+    true
 }
 
 /// FNV-1a 64 over `bytes`.
@@ -136,7 +187,10 @@ pub fn copy_name(image_type: ImageType, index: usize, image: &UsableImage) -> St
 }
 
 /// Copies `image` to `dest`: creates the folder, writes a temporary file beside `dest`, then renames
-/// it into place. The temporary file is removed when the copy fails.
+/// it into place. The copy reads the file that `check` saw: it must have the same identity and
+/// signature, else it is an error before any folder or file is created. Its bytes come from that
+/// handle, from the first one, at most `MAX_BYTES`. The temporary file is removed when the copy
+/// fails.
 pub fn copy(image: &UsableImage, dest: &Path) -> std::io::Result<()> {
     let folder = dest
         .parent()
@@ -144,13 +198,38 @@ pub fn copy(image: &UsableImage, dest: &Path) -> std::io::Result<()> {
     let name = dest
         .file_name()
         .ok_or_else(|| std::io::Error::other("the copy has no name"))?;
+    let changed = || std::io::Error::other("the image changed after it was checked");
+    // Only a regular file is opened: opening a FIFO would wait for a writer.
+    if !fs::metadata(&image.source)?.is_file() {
+        return Err(changed());
+    }
+    let mut handle = fs::File::open(&image.source)?;
+    let meta = handle.metadata()?;
+    let mut head = Vec::with_capacity(12);
+    (&handle).take(12).read_to_end(&mut head)?;
+    if identity(&meta).as_ref() != Some(&image.identity) || signature(&head) != Some(image.ext) {
+        return Err(changed());
+    }
+    handle.rewind()?;
     fs::create_dir_all(folder)?;
     let temp = folder.join(format!(".{}.tmp", name.to_string_lossy()));
-    let result = fs::copy(&image.source, &temp)
-        .map(|_| ())
-        .and_then(|()| fs::rename(&temp, dest));
+    let result =
+        write_copy(&mut handle, image.identity.len, &temp).and_then(|()| fs::rename(&temp, dest));
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Writes the bytes of `source` from its current position, at most `MAX_BYTES`, to a new file at
+/// `temp`. The copy must be `len` bytes, the checked length.
+fn write_copy(source: &mut fs::File, len: u64, temp: &Path) -> std::io::Result<()> {
+    let mut out = fs::File::create(temp)?;
+    let copied = std::io::copy(&mut Read::by_ref(source).take(MAX_BYTES), &mut out)?;
+    if copied != len {
+        return Err(std::io::Error::other(
+            "the image changed while it was copied",
+        ));
+    }
+    Ok(())
 }

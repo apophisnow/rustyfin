@@ -1480,3 +1480,75 @@ async fn b20_snapshot_stops_at_a_damaged_frame_and_ignores_a_damaged_header() {
         [1, 2, 3, 4]
     );
 }
+
+/// Writes a JPEG of `len` bytes to `path`: the signature, then `fill`.
+fn write_jpeg(path: &Path, len: usize, fill: u8) {
+    let mut bytes = vec![fill; len];
+    bytes[..3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn b20_image_copy_takes_only_the_checked_file() {
+    use super::images::{check, copy};
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new();
+    let root = tmp.0.join("metadata");
+    let outside = tmp.0.join("outside");
+    let out = tmp.0.join("images");
+    for dir in [root.join("aa"), outside.join("aa")] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    // A file outside the root that looks like the poster: a JPEG of the same length and time.
+    let poster = root.join("aa/poster.jpg");
+    let secret = outside.join("aa/poster.jpg");
+    write_jpeg(&poster, 4096, b'p');
+    write_jpeg(&secret, 4096, b's');
+    let modified = std::fs::metadata(&poster).unwrap().modified().unwrap();
+    let file = std::fs::File::options().write(true).open(&secret).unwrap();
+    file.set_modified(modified).unwrap();
+    drop(file);
+
+    // Unchanged, the checked file is copied.
+    let image = check(&poster, &root).unwrap();
+    copy(&image, &out.join("kept.jpg")).unwrap();
+    assert_eq!(
+        std::fs::read(out.join("kept.jpg")).unwrap(),
+        std::fs::read(&poster).unwrap()
+    );
+
+    // After its check, the file becomes a link to the other one.
+    let image = check(&poster, &root).unwrap();
+    let moved = root.join("aa/poster.moved");
+    std::fs::rename(&poster, &moved).unwrap();
+    symlink(&secret, &poster).unwrap();
+    let copied = copy(&image, &out.join("link.jpg"));
+    assert!(copied.is_err(), "copied the file a link put in its place");
+    std::fs::remove_file(&poster).unwrap();
+    std::fs::rename(&moved, &poster).unwrap();
+
+    // After its check, its folder becomes a link to a folder outside the root.
+    let image = check(&poster, &root).unwrap();
+    std::fs::rename(root.join("aa"), root.join("aa.moved")).unwrap();
+    symlink(outside.join("aa"), root.join("aa")).unwrap();
+    let copied = copy(&image, &out.join("folder.jpg"));
+    assert!(copied.is_err(), "copied through a folder link");
+    std::fs::remove_file(root.join("aa")).unwrap();
+    std::fs::rename(root.join("aa.moved"), root.join("aa")).unwrap();
+
+    // After its check, the file grows.
+    let image = check(&poster, &root).unwrap();
+    let mut file = std::fs::File::options().append(true).open(&poster).unwrap();
+    std::io::Write::write_all(&mut file, &[b'p'; 100]).unwrap();
+    drop(file);
+    let copied = copy(&image, &out.join("grown.jpg"));
+    assert!(copied.is_err(), "copied a file that changed");
+
+    // Only the first copy is there, and no temporary file.
+    let names: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["kept.jpg"]);
+}

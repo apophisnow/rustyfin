@@ -159,7 +159,7 @@ pub async fn targets_after(
             if row.lock_data {
                 continue;
             }
-            let (tmdb, tvdb) = provider_writes(mode, jf, row);
+            let (tmdb, tvdb) = provider_writes(jf, row);
             if tmdb.is_some() {
                 next[n].tmdb_id = tmdb;
             }
@@ -478,7 +478,7 @@ fn field_writes(
         Some(&tags_now),
         tags_now.is_empty(),
     );
-    let (tmdb, tvdb) = provider_writes(mode, jf, row);
+    let (tmdb, tvdb) = provider_writes(jf, row);
     let original_title = wanted(
         mode,
         true,
@@ -565,22 +565,19 @@ fn field_writes(
     }
 }
 
-/// The TMDB and TVDB ids a matched item gets (spec 5.15). `targets_after` makes the same calls, so
+/// The TMDB and TVDB ids a matched item gets (spec 5.15). They only fill an empty field, in both
+/// modes, because they decide what matches (B20 fix 3). `targets_after` makes the same calls, so
 /// the matching of the next run sees the ids this run writes.
-fn provider_writes(
-    mode: MetadataMode,
-    jf: &JfItem,
-    row: &ItemMetadata,
-) -> (Option<i64>, Option<i64>) {
+fn provider_writes(jf: &JfItem, row: &ItemMetadata) -> (Option<i64>, Option<i64>) {
     let tmdb = wanted(
-        mode,
+        MetadataMode::FillEmpty,
         true,
         jf.providers.tmdb,
         row.tmdb_id.as_ref(),
         row.tmdb_id.is_none(),
     );
     let tvdb = wanted(
-        mode,
+        MetadataMode::FillEmpty,
         true,
         jf.providers.tvdb,
         row.tvdb_id.as_ref(),

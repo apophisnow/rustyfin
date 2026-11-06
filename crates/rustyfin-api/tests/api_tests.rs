@@ -12083,6 +12083,85 @@ async fn b20_disabled_pending_user_cannot_use_the_code() {
 }
 
 #[tokio::test]
+async fn b20_setup_code_checks_cost_the_same_for_everyone() {
+    use std::time::{Duration, Instant};
+    // carol is a second pending user, disabled below.
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert!(b20_entry(&report, "bob").code.is_some(), "bob has no code");
+    let carol = b20_entry(&report, "carol").user_id.unwrap();
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(carol.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+
+    // bob with a wrong code is the measure: his code hash is verified. Then a user that doesn't
+    // exist, alice (no code), carol (disabled) and bob with a code of the wrong shape.
+    let wrong = "0000-0000-0000";
+    let cases = [
+        ("bob", wrong),
+        ("nobody", wrong),
+        ("alice", wrong),
+        ("carol", wrong),
+        ("bob", "not a code"),
+    ];
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "b20-timing".to_string(),
+        device_name: "test".to_string(),
+        app_name: "test".to_string(),
+        app_version: "1".to_string(),
+    };
+    let mut redeem = [Duration::MAX; 5];
+    let mut pending = [Duration::MAX; 5];
+    let mut errors = Vec::new();
+    // The fastest of two tries, the cases in turn.
+    for _ in 0..2 {
+        for (n, (name, code)) in cases.iter().enumerate() {
+            let start = Instant::now();
+            let result = rustyfin_auth::authenticate_with_setup_code(
+                &w.state.db,
+                name,
+                code,
+                "new pass",
+                &device,
+            )
+            .await;
+            redeem[n] = redeem[n].min(start.elapsed());
+            errors.push((*name, *code, result.err().map(|e| format!("{e:?}"))));
+            let start = Instant::now();
+            let found = rustyfin_auth::setup_code_pending(&w.state.db, name, code)
+                .await
+                .unwrap();
+            pending[n] = pending[n].min(start.elapsed());
+            assert!(!found, "{name} with {code:?} is pending");
+        }
+    }
+    for (check, times) in [
+        ("AuthenticateWithSetupCode", redeem),
+        ("the code check of a sign-in", pending),
+    ] {
+        for (n, (name, code)) in cases.iter().enumerate().skip(1) {
+            assert!(
+                times[n] * 4 >= times[0],
+                "{check}: {name} with {code:?} took {:?}, bob with a wrong code {:?}",
+                times[n],
+                times[0]
+            );
+        }
+    }
+    for (name, code, error) in errors {
+        assert_eq!(
+            error.as_deref(),
+            Some("InvalidCredentials"),
+            "{name} with {code:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn b20_setup_code_sign_in_is_rate_limited() {
     let mut state = test_state().await;
     state.rate_limiter = RateLimiter::new(3, 60);
@@ -13325,42 +13404,64 @@ async fn b20_import_metadata_none_matches_on_stored_ids() {
 }
 
 #[tokio::test]
-async fn b20_import_metadata_replaced_ids_count_for_matching() {
-    let (w, install) = b20_stale_world("jf", jf::Layout::New).await;
-    let alpha = b20_item(&w.state, "Alpha").await;
-    sqlx::query("UPDATE media_items SET tmdb_id = 555 WHERE id = ?")
-        .bind(alpha.to_string())
-        .execute(&w.state.db)
-        .await
-        .unwrap();
-    // Filling keeps Rustyfin's TMDB id, so the stale entry stays unmatched.
-    let fill = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
-    assert_eq!(b20_item_counts(&fill), (10, 5, 2, 3), "{fill}");
+async fn b20_import_metadata_replace_keeps_rustyfins_ids() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let show = b20_item(&w.state, "Show").await;
+        // Rustyfin's own ids, which differ from Jellyfin's (TMDB 111 for Alpha, TVDB 333).
+        for (sql, id) in [
+            ("UPDATE media_items SET tmdb_id = 555 WHERE id = ?", alpha),
+            ("UPDATE media_items SET tvdb_id = 444 WHERE id = ?", show),
+        ] {
+            sqlx::query(sql)
+                .bind(id.to_string())
+                .execute(&w.state.db)
+                .await
+                .unwrap();
+        }
+        // Filling keeps Rustyfin's TMDB id, so the stale entry stays unmatched.
+        let fill = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        assert_eq!(b20_item_counts(&fill), (10, 5, 2, 3), "{name}: {fill}");
 
-    let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "Replace" });
-    let first = b20_run(&w, body.clone()).await;
-    assert_eq!(b20_item_counts(&first), (10, 5, 3, 2), "{first}");
-    let fields = b20_fields(&w.state, alpha).await;
-    assert_eq!(fields["tmdb_id"], 111, "{fields}");
-    assert_eq!(fields["name"], "Alpha", "the stale entry renamed Alpha");
-    assert_eq!(
-        fields["overview"], "Jellyfin overview of Alpha.",
-        "{fields}"
-    );
-    let rows = b20_db_digest(&w.state).await;
-    let meta = b20_meta_digest(&w.state).await;
-    let second = b20_run(&w, body).await;
-    assert_eq!(b20_item_counts(&second), (10, 5, 3, 2), "{second}");
-    assert_eq!(b20_watch_counts(&second).1, 0, "{second}");
-    assert_eq!(b20_meta_counts(&second), [0; 6], "{second}");
-    assert_eq!(
-        b20_db_digest(&w.state).await,
-        rows,
-        "the second run changed rows"
-    );
-    assert_eq!(
-        b20_meta_digest(&w.state).await,
-        meta,
-        "the second run changed metadata"
-    );
+        // Replacing keeps them too: the ids decide what matches.
+        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "Replace" });
+        let preview = b20_preview(&w, body.clone()).await;
+        let first = b20_run(&w, body.clone()).await;
+        for report in [&preview, &first] {
+            assert_eq!(b20_item_counts(report), (10, 5, 2, 3), "{name}: {report}");
+        }
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(fields["tmdb_id"], 555, "{name}: {fields}");
+        assert_eq!(
+            fields["name"], "Alpha",
+            "{name}: the stale entry renamed Alpha"
+        );
+        assert_eq!(
+            fields["overview"], "Jellyfin overview of Alpha.",
+            "{name}: Replace still replaces the other fields"
+        );
+        let fields = b20_fields(&w.state, show).await;
+        assert_eq!(fields["tvdb_id"], 444, "{name}: {fields}");
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(stored, None, "{name}: the stale entry's row was imported");
+
+        let rows = b20_db_digest(&w.state).await;
+        let meta = b20_meta_digest(&w.state).await;
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second).1, 0, "{name}: {second}");
+        assert_eq!(b20_meta_counts(&second), [0; 6], "{name}: {second}");
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            rows,
+            "{name}: the second run changed rows"
+        );
+        assert_eq!(
+            b20_meta_digest(&w.state).await,
+            meta,
+            "{name}: the second run changed metadata"
+        );
+    }
 }
