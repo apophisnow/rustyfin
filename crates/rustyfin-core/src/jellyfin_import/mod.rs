@@ -264,6 +264,15 @@ async fn plan_report(
         .path_mappings
         .clone()
         .unwrap_or_else(|| suggested.pairs.clone());
+    // The ids this run's metadata step writes count for matching (spec 5.14).
+    let targets = metadata::targets_after(
+        db,
+        req.metadata_mode,
+        &prepared.snapshot,
+        &targets,
+        &path_mappings,
+    )
+    .await?;
     let mut users = plan::plan_users(
         &prepared.snapshot.users,
         req.user_ids.as_deref(),
@@ -293,6 +302,7 @@ async fn plan_report(
 
     // Metadata (spec 5.9): the metadata folder's pair is suggested from the matched items' images.
     let matched = plan::matched_items(&prepared.snapshot.items, &targets, &path_mappings);
+    let by_path = plan::matched_by_path(&prepared.snapshot.items, &targets, &path_mappings);
     let image_paths = metadata_image_paths(&prepared.snapshot, &matched);
     if let Some(pair) = paths::suggest_metadata(
         &image_paths,
@@ -310,6 +320,7 @@ async fn plan_report(
             mode: req.metadata_mode,
             snapshot: &prepared.snapshot,
             matched: &matched,
+            by_path: &by_path,
             pairs: &path_mappings,
             program_data: &prepared.location.program_data_path,
             data_dir,

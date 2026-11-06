@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rustyfin_db::repo_jellyfin_import::{
-    ExtrasWrite, ImageRow, ImageWrite, ItemMetadata, ItemWrite, LinkWrite, MetadataState,
-    MetadataWrites, NewPerson, PersonLink, StoredImage, StoredLink, StudioWrite, metadata_state,
-    write_metadata,
+    ExtrasWrite, ImageRow, ImageWrite, ImportTarget, ItemMetadata, ItemWrite, LinkWrite,
+    MetadataState, MetadataWrites, NewPerson, PersonLink, StoredImage, StoredLink, StudioWrite,
+    metadata_state, write_metadata,
 };
 use rustyfin_model::image::ImageType;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ use super::ImportError;
 use super::images::{self, UsableImage};
 use super::job::{ImportStage, JobHandle};
 use super::paths::PathMapping;
+use super::plan;
 use super::source::{JfCredit, JfImage, JfItem, JfItemMeta, Snapshot, parse_jellyfin_date};
 
 /// How a run treats the metadata Rustyfin already has (spec 5.1).
@@ -61,6 +62,9 @@ pub struct MetadataInput<'a> {
     pub snapshot: &'a Snapshot,
     /// Jellyfin item id to Rustyfin item id (`plan::matched_items`).
     pub matched: &'a HashMap<Uuid, Uuid>,
+    /// The Jellyfin items matched by path (`plan::matched_by_path`), which a matched item's
+    /// metadata comes from first (spec 5.15).
+    pub by_path: &'a HashSet<Uuid>,
     pub pairs: &'a [PathMapping],
     pub program_data: &'a Path,
     pub data_dir: &'a Path,
@@ -119,6 +123,60 @@ pub async fn import(
     Ok(report)
 }
 
+/// The targets the matching uses (spec 5.14): the stored ones, plus the TMDB and TVDB ids this
+/// run's metadata step would write, since those ids decide what the next run matches.
+pub async fn targets_after(
+    db: &SqlitePool,
+    mode: MetadataMode,
+    snapshot: &Snapshot,
+    targets: &[ImportTarget],
+    pairs: &[PathMapping],
+) -> Result<Vec<ImportTarget>, ImportError> {
+    if mode == MetadataMode::None {
+        return Ok(targets.to_vec());
+    }
+    let state = metadata_state(db).await.map_err(ImportError::Db)?;
+    let rows: HashMap<Uuid, &ItemMetadata> = state
+        .items
+        .iter()
+        .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+        .collect();
+    let position: HashMap<Uuid, usize> = targets
+        .iter()
+        .enumerate()
+        .map(|(n, target)| (target.id, n))
+        .collect();
+    // Path matching does not depend on the ids, so it is the same in every round.
+    let by_path = plan::matched_by_path(&snapshot.items, targets, pairs);
+    let mut current = targets.to_vec();
+    let mut matched = plan::matched_items(&snapshot.items, &current, pairs);
+    for _ in 0..4 {
+        let mut next = targets.to_vec();
+        for (jf, id) in sources(&snapshot.items, &matched, &by_path) {
+            let (Some(&row), Some(&n)) = (rows.get(&id), position.get(&id)) else {
+                continue;
+            };
+            if row.lock_data {
+                continue;
+            }
+            let (tmdb, tvdb) = provider_writes(mode, jf, row);
+            if tmdb.is_some() {
+                next[n].tmdb_id = tmdb;
+            }
+            if tvdb.is_some() {
+                next[n].tvdb_id = tvdb;
+            }
+        }
+        let next_matched = plan::matched_items(&snapshot.items, &next, pairs);
+        if next_matched == matched {
+            return Ok(next);
+        }
+        current = next;
+        matched = next_matched;
+    }
+    Ok(current)
+}
+
 /// What a run plans (spec 5.10): the rows to write, the report counts, and the image files to copy.
 #[derive(Default)]
 struct Plan {
@@ -136,6 +194,29 @@ struct FileCopy {
     row: usize,
     source: UsableImage,
     dest: PathBuf,
+}
+
+/// The Jellyfin item each matched Rustyfin id takes its metadata from (spec 5.15): the first
+/// of its items matched by path, else the first of its items. Returned with the id, in item order.
+fn sources<'a>(
+    items: &'a [JfItem],
+    matched: &HashMap<Uuid, Uuid>,
+    by_path: &HashSet<Uuid>,
+) -> Vec<(&'a JfItem, Uuid)> {
+    // Each Rustyfin id's source position: its first item, moved to its first item by path.
+    let mut chosen: HashMap<Uuid, usize> = HashMap::new();
+    for (n, jf) in items.iter().enumerate() {
+        let Some(&id) = matched.get(&jf.id) else {
+            continue;
+        };
+        let slot = chosen.entry(id).or_insert(n);
+        if by_path.contains(&jf.id) && !by_path.contains(&items[*slot].id) {
+            *slot = n;
+        }
+    }
+    let mut picked: Vec<(usize, Uuid)> = chosen.into_iter().map(|(id, n)| (n, id)).collect();
+    picked.sort_unstable();
+    picked.into_iter().map(|(n, id)| (&items[n], id)).collect()
 }
 
 /// Plans every write of the import from the Rustyfin rows and the snapshot (spec 5.1 to 5.9). It
@@ -181,18 +262,11 @@ fn plan_writes(input: &MetadataInput<'_>, state: &MetadataState) -> Plan {
         person_ids.entry(name.clone()).or_insert_with(|| id.clone());
     }
     let empty = JfItemMeta::default();
-    let mut seen: HashSet<Uuid> = HashSet::new();
     let mut person_names: Vec<String> = Vec::new();
-    for jf in &input.snapshot.items {
-        let Some(&id) = input.matched.get(&jf.id) else {
-            continue;
-        };
+    for (jf, id) in sources(&input.snapshot.items, input.matched, input.by_path) {
         let Some(&row) = rows.get(&id) else {
             continue;
         };
-        if !seen.insert(id) {
-            continue;
-        }
         if row.lock_data {
             plan.locked += 1;
             continue;
@@ -404,20 +478,7 @@ fn field_writes(
         Some(&tags_now),
         tags_now.is_empty(),
     );
-    let tmdb = wanted(
-        mode,
-        true,
-        jf.providers.tmdb,
-        row.tmdb_id.as_ref(),
-        row.tmdb_id.is_none(),
-    );
-    let tvdb = wanted(
-        mode,
-        true,
-        jf.providers.tvdb,
-        row.tvdb_id.as_ref(),
-        row.tvdb_id.is_none(),
-    );
+    let (tmdb, tvdb) = provider_writes(mode, jf, row);
     let original_title = wanted(
         mode,
         true,
@@ -502,6 +563,30 @@ fn field_writes(
         studios: studio_write,
         changed: item_fields + extras_fields + usize::from(studio_change),
     }
+}
+
+/// The TMDB and TVDB ids a matched item gets (spec 5.15). `targets_after` makes the same calls, so
+/// the matching of the next run sees the ids this run writes.
+fn provider_writes(
+    mode: MetadataMode,
+    jf: &JfItem,
+    row: &ItemMetadata,
+) -> (Option<i64>, Option<i64>) {
+    let tmdb = wanted(
+        mode,
+        true,
+        jf.providers.tmdb,
+        row.tmdb_id.as_ref(),
+        row.tmdb_id.is_none(),
+    );
+    let tvdb = wanted(
+        mode,
+        true,
+        jf.providers.tvdb,
+        row.tvdb_id.as_ref(),
+        row.tvdb_id.is_none(),
+    );
+    (tmdb, tvdb)
 }
 
 /// Whether a Jellyfin value is written over Rustyfin's `current` (spec 5.1): `FillEmpty` only when

@@ -298,6 +298,21 @@ pub fn matched_items(
         .collect()
 }
 
+/// The ids of the Jellyfin items that match by path: pass 1 of `match_found` (spec 5.15).
+pub fn matched_by_path(
+    items: &[JfItem],
+    targets: &[ImportTarget],
+    pairs: &[PathMapping],
+) -> HashSet<Uuid> {
+    let found = match_found(items, targets, pairs);
+    items
+        .iter()
+        .zip(&found)
+        .filter(|(_, hit)| matches!(hit, Some((Found::ByPath, _))))
+        .map(|(item, _)| item.id)
+        .collect()
+}
+
 /// The sample order: by path, then by name. A missing path or name sorts as "".
 fn sample_order(item: &JfItem) -> (&str, &str) {
     (

@@ -12715,3 +12715,161 @@ async fn b20_import_metadata_survives_a_rescan() {
         "the rescan lost imported data"
     );
 }
+
+/// The B20 world with a stale Jellyfin entry of Alpha, installed into the folder `name` in
+/// `layout`. Jellyfin's Alpha gets TMDB 111 and an overview; "Alpha (stale)", listed before it, is
+/// a Movie at an old path in Alpha's folder with TMDB 111, its own overview and bob's played row.
+/// Rustyfin's Alpha has no TMDB id, so only an id the import writes can match the stale entry.
+async fn b20_stale_world(name: &str, layout: jf::Layout) -> (B20World, std::path::PathBuf) {
+    let mut w = b20_world().await;
+    b20_edit(&mut w, "Alpha", |i| {
+        i.provider("Tmdb", "111").meta(jf::JfMeta {
+            overview: Some("Jellyfin overview of Alpha."),
+            ..Default::default()
+        })
+    });
+    let stale = jf::JfItem::new(
+        "Movie",
+        "Alpha (stale)",
+        Some("/data/movies/Alpha (2001)/Alpha.old.avi"),
+    )
+    .provider("Tmdb", "111")
+    .meta(jf::JfMeta {
+        overview: Some("Stale overview."),
+        ..Default::default()
+    });
+    let bob = w.source.user("bob").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: bob,
+        item: stale.id,
+        played: true,
+        play_count: 1,
+        last_played: Some("2025-04-01 08:00:00"),
+        ..Default::default()
+    });
+    let at = w.source.items.iter().position(|i| i.name == "Alpha");
+    w.source.items.insert(at.unwrap(), stale);
+    let install = b20_install(&w, name, layout).await;
+    (w, install)
+}
+
+#[tokio::test]
+async fn b20_import_metadata_ids_count_for_matching() {
+    // The watch counts of the first run and of the second.
+    for (name, layout, first_watch, second_watch) in [
+        ("new", jf::Layout::New, (7, 5, 0, 2), (7, 0, 5, 2)),
+        ("old", jf::Layout::Old, (6, 5, 0, 1), (6, 0, 5, 1)),
+    ] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let body = serde_json::json!({ "SourcePath": install });
+        let preview = b20_preview(&w, body.clone()).await;
+        let first = b20_run(&w, body.clone()).await;
+        for report in [&preview, &first] {
+            assert_eq!(b20_item_counts(report), (10, 5, 3, 2), "{name}: {report}");
+            assert_eq!(b20_watch_counts(report), first_watch, "{name}: {report}");
+            assert_eq!(
+                b20_meta_counts(report),
+                [1, 2, 0, 0, 0, 0],
+                "{name}: {report}"
+            );
+        }
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(fields["tmdb_id"], 111, "{name}: {fields}");
+        assert_eq!(
+            fields["overview"], "Jellyfin overview of Alpha.",
+            "{name}: the path match is the source"
+        );
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let expected = B20Data {
+            played: true,
+            play_count: 1,
+            last_played: b20_at("2025-04-01T08:00:00Z"),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(
+            stored,
+            Some(expected),
+            "{name}: bob's row of the stale entry"
+        );
+
+        let rows = b20_db_digest(&w.state).await;
+        let meta = b20_meta_digest(&w.state).await;
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 3, 2), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
+        assert_eq!(b20_meta_counts(&second), [0; 6], "{name}: {second}");
+        assert_eq!(b20_db_digest(&w.state).await, rows, "{name}: second run");
+        assert_eq!(b20_meta_digest(&w.state).await, meta, "{name}: second run");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_none_matches_on_stored_ids() {
+    // The watch counts of the first run and of the second.
+    for (name, layout, first_watch, second_watch) in [
+        ("new", jf::Layout::New, (7, 4, 0, 3), (7, 0, 4, 3)),
+        ("old", jf::Layout::Old, (6, 4, 0, 2), (6, 0, 4, 2)),
+    ] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "None" });
+        let first = b20_run(&w, body.clone()).await;
+        assert_eq!(b20_item_counts(&first), (10, 5, 2, 3), "{name}: {first}");
+        assert_eq!(b20_watch_counts(&first), first_watch, "{name}: {first}");
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(
+            fields["tmdb_id"],
+            serde_json::Value::Null,
+            "{name}: {fields}"
+        );
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(stored, None, "{name}: the stale entry matched");
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_replaced_ids_count_for_matching() {
+    let (w, install) = b20_stale_world("jf", jf::Layout::New).await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    sqlx::query("UPDATE media_items SET tmdb_id = 555 WHERE id = ?")
+        .bind(alpha.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    // Filling keeps Rustyfin's TMDB id, so the stale entry stays unmatched.
+    let fill = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert_eq!(b20_item_counts(&fill), (10, 5, 2, 3), "{fill}");
+
+    let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "Replace" });
+    let first = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_item_counts(&first), (10, 5, 3, 2), "{first}");
+    let fields = b20_fields(&w.state, alpha).await;
+    assert_eq!(fields["tmdb_id"], 111, "{fields}");
+    assert_eq!(fields["name"], "Alpha", "the stale entry renamed Alpha");
+    assert_eq!(
+        fields["overview"], "Jellyfin overview of Alpha.",
+        "{fields}"
+    );
+    let rows = b20_db_digest(&w.state).await;
+    let meta = b20_meta_digest(&w.state).await;
+    let second = b20_run(&w, body).await;
+    assert_eq!(b20_item_counts(&second), (10, 5, 3, 2), "{second}");
+    assert_eq!(b20_watch_counts(&second).1, 0, "{second}");
+    assert_eq!(b20_meta_counts(&second), [0; 6], "{second}");
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        rows,
+        "the second run changed rows"
+    );
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "the second run changed metadata"
+    );
+}
