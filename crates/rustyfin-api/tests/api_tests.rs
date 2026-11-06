@@ -5488,7 +5488,6 @@ async fn b21_password_switch_stops_reset_pins_for_group_granted_admins() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 5"]
 async fn b21_resending_the_policy_keeps_the_group_flag() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     let result = t

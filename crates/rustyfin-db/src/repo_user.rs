@@ -220,18 +220,22 @@ pub async fn update_password(
     Ok(result.rows_affected() > 0)
 }
 
-/// Sets the administrator flag by hand. A hand change clears the flag the admin group set (AC19).
+/// Sets the administrator flag by hand. A hand change clears the flag the admin group set (AC19);
+/// sending the current value keeps it (AC42).
 pub async fn update_policy(
     pool: &SqlitePool,
     id: Uuid,
     is_administrator: bool,
 ) -> Result<bool, sqlx::Error> {
-    let result =
-        sqlx::query("UPDATE users SET is_administrator = ?, admin_from_group = 0 WHERE id = ?")
-            .bind(is_administrator as i32)
-            .bind(id.to_string())
-            .execute(pool)
-            .await?;
+    let result = sqlx::query(
+        "UPDATE users SET admin_from_group = \
+         CASE WHEN is_administrator = ?1 THEN admin_from_group ELSE 0 END, \
+         is_administrator = ?1 WHERE id = ?2",
+    )
+    .bind(is_administrator as i32)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
 
