@@ -30,19 +30,36 @@ jobs:
         with:
           # $CARGO_HOME/bin holds the image's toolchain; nothing is cargo-installed
           cache-bin: "false"
-      # Tests that lock a folder skip themselves when they can still read it, as root can,
-      # and BrowseDirectories lists only roots such as /home. So cargo runs as ci, with its
-      # home in /home/ci, and this step fails if ci can list a folder with mode 000.
-      - name: Add a user that isn't root
+      # A test that can't run here skips itself and passes, and libtest hides a passing test's
+      # output. Tests that lock a folder skip if they can still read it, as root can;
+      # BrowseDirectories lists only roots such as /home; the media tests need ffmpeg and
+      # ffprobe. So cargo runs as ci, with its home in /home/ci, and this step fails unless ci
+      # meets all of that. runuser lowers the soft limit on open files to 1024 before its PAM
+      # session, whose pam_limits then applies ci.conf, so cargo gets 65536 as on a bare runner.
+      - name: Add a user that isn't root and check what the tests need
         run: |
           useradd --create-home ci
           chown -R ci: . /usr/local/cargo
-          mkdir -m 000 /tmp/locked
-          if runuser -u ci -- ls /tmp/locked; then
-            echo "::error::ci can list a folder with mode 000, so tests would skip"
+          echo 'ci soft nofile 65536' > /etc/security/limits.d/ci.conf
+          mkdir /tmp/locked
+          touch /tmp/locked/file
+          chmod 000 /tmp/locked
+          runuser -u ci -- sh -e <<'EOF'
+          if ls /tmp/locked || stat /tmp/locked/file; then
+            echo "::error::ci can read a folder with mode 000 or stat a file in it, so tests would skip"
             exit 1
           fi
-          rmdir /tmp/locked
+          case $HOME in
+            /home/?*) ;;
+            *) echo "::error::HOME is ${HOME:-unset}, not under /home, so a test would skip"; exit 1 ;;
+          esac
+          for tool in ffmpeg ffprobe; do
+            "$tool" -version </dev/null >/dev/null || { echo "::error::$tool -version fails, so tests would skip"; exit 1; }
+          done
+          [ "$(ulimit -n)" -ge 65536 ] || { echo "::error::ci may open only $(ulimit -n) files, not 65536"; exit 1; }
+          echo "ci: HOME $HOME, $(ulimit -n) open files, $(command -v ffmpeg), $(command -v ffprobe)"
+          EOF
+          rm -r /tmp/locked
       - name: Format check
         run: runuser -u ci -- cargo fmt --all -- --check
       - name: Clippy
