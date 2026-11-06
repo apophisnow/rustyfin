@@ -5368,7 +5368,6 @@ async fn b21_quick_connect_authorize_skips_expired_requests() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 3 fix 1"]
 async fn b21_taken_names_fold_case_and_compatibility_forms() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "kelvin", "pw-kelvin", false).await;

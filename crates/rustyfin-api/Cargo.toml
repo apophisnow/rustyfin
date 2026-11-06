@@ -33,6 +33,8 @@ base64 = "0.22"
 futures-util = "0.3"
 dashmap = "6"
 ipnet = "2"
+unicode-normalization = "0.1.26"
+unicase = "2.10"
 
 [dev-dependencies]
 http-body-util = "0.1"

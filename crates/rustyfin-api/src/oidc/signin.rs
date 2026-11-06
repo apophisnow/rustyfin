@@ -189,9 +189,9 @@ pub(crate) async fn sign_in(
 }
 
 /// The account a sign-in is for (AC44): the user the identity is linked to; else, when no user has
-/// the name (ASCII letters in any case), a new user. A taken name is refused (`name_taken`, or
-/// `name_taken_ask_admin` when no matching account can sign in with a password), and the person
-/// links from the profile.
+/// the name (it matches in any case and compatibility form, `names_match`), a new user. A taken
+/// name is refused (`name_taken`, or `name_taken_ask_admin` when no matching account can sign in
+/// with a password), and the person links from the profile.
 async fn sign_in_account(
     pool: &SqlitePool,
     config: &OidcConfig,

@@ -3135,6 +3135,8 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "unicase",
+ "unicode-normalization",
  "url",
  "uuid",
 ]

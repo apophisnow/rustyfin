@@ -100,7 +100,6 @@ fn claim_username_trims_and_needs_text() {
 }
 
 #[test]
-#[ignore = "B21 round 3 fix 1"]
 fn names_match_folds_case_and_compatibility_forms() {
     let same = [
         ("Alice", "alice"),

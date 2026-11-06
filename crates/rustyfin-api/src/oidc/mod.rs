@@ -11,6 +11,8 @@ use rustyfin_model::user::User;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization;
 
 pub mod flow;
 pub mod signin;
@@ -114,10 +116,21 @@ pub fn claim_username(claims: &Value, claim: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Whether two usernames match. ASCII letters match in any case; every other character
-/// matches only as it is (no Unicode case folding or normalization).
+/// The form a username is compared by (Unicode D146): NFD, full case folding, NFKC, then folding
+/// and NFKC again. It is only for comparing, never stored or shown.
+pub fn name_key(name: &str) -> String {
+    let nfd: String = name.nfd().collect();
+    let folded = UniCase::new(nfd.as_str()).to_folded_case();
+    let nfkc: String = folded.as_str().nfkc().collect();
+    let refolded = UniCase::new(nfkc.as_str()).to_folded_case();
+    refolded.as_str().nfkc().collect()
+}
+
+/// Whether two usernames match under Unicode caseless matching (D146): any case, full case
+/// folding (ß matches ss), compatibility forms and composed or decomposed accents all match.
+/// Accents, spaces and digits still count.
 pub fn names_match(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+    name_key(a) == name_key(b)
 }
 
 /// The settings as the admin sees them. The secret shows only as set or not, and the two
