@@ -2524,6 +2524,7 @@ const jiChoice = new Map();     // JellyfinId -> checked; kept across previews o
 let jiPendingNames = new Map(); // UserId -> Name of the pending users (names stay out of onclick attributes)
 const jiShownCodes = new Map(); // UserId -> { name, code } of a new code shown in the pending list
 const jiLayoutKeys = { New: 'jellyfin_import.layout_new', Old: 'jellyfin_import.layout_old' };
+const jiMetadataModeKeys = { FillEmpty: 'jellyfin_import.metadata_fill_empty', Replace: 'jellyfin_import.metadata_replace', None: 'jellyfin_import.metadata_none' };
 const jiStageKeys = {
     Reading: 'jellyfin_import.stage_reading',
     Matching: 'jellyfin_import.stage_matching',
@@ -2562,6 +2563,15 @@ function jiPanelHtml() {
                         <option value="New">${t('jellyfin_import.layout_new')}</option>
                         <option value="Old">${t('jellyfin_import.layout_old')}</option>
                     </select>
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.metadata')}</span>
+                    <select id="ji-metadata" class="jf-input w-full">
+                        <option value="FillEmpty">${t('jellyfin_import.metadata_fill_empty')}</option>
+                        <option value="Replace">${t('jellyfin_import.metadata_replace')}</option>
+                        <option value="None">${t('jellyfin_import.metadata_none')}</option>
+                    </select>
+                    <span class="block text-xs text-white/50 mt-1.5">${t('jellyfin_import.metadata_help')}</span>
                 </label>
             </div>
             <button id="ji-preview-btn" class="jf-btn-primary !py-2 !px-4 text-sm mt-5" onclick="jiPreview()">${t('jellyfin_import.preview')}</button>
@@ -2636,9 +2646,9 @@ function jiPairs() {
         .filter(p => p.From && p.To);
 }
 
-// Preview and Run send the folder and layout; once a preview is on screen they also send the pairs and checked users.
+// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs and checked users.
 function jiRequest() {
-    const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value };
+    const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value, MetadataMode: $('ji-metadata').value };
     if (jiPreviewed) {
         req.PathMappings = jiPairs();
         req.UserIds = [...document.querySelectorAll('#ji-users .ji-user:checked:not(:disabled)')].map(el => el.value);
@@ -2716,11 +2726,17 @@ function jiActionText(u) {
 
 // Counts are numbers and are not escaped: escapeHtml(0) would be ''.
 function jiCountsHtml(r) {
-    const { Items: i, WatchData: w, Tracks: k } = r;
+    const { Items: i, WatchData: w, Tracks: k, Metadata: m } = r;
+    let metadata = '';
+    if (m && m.Mode === 'None') {
+        metadata = `<p>${t('jellyfin_import.metadata_summary_none')}</p>`;
+    } else if (m) {
+        metadata = `<p>${t('jellyfin_import.metadata_summary', { mode: t(jiMetadataModeKeys[m.Mode]), items: m.Items, fields: m.Fields, people: m.People, images: m.Images, missing: m.ImagesMissing, locked: m.Locked })}</p>`;
+    }
     return `
         <p>${t('jellyfin_import.items_summary', { total: i.Total, by_path: i.MatchedByPath, by_id: i.MatchedById, unmatched: i.Unmatched })}</p>
         <p>${t('jellyfin_import.watch_summary', { rows: w.Rows, imported: w.Imported, unchanged: w.Unchanged, unmatched: w.Unmatched })}</p>
-        <p>${t('jellyfin_import.tracks_summary', { audio: k.Audio, subtitle: k.Subtitle, off: k.SubtitleOff, unmapped: k.Unmapped })}</p>`;
+        <p>${t('jellyfin_import.tracks_summary', { audio: k.Audio, subtitle: k.Subtitle, off: k.SubtitleOff, unmapped: k.Unmapped })}</p>${metadata}`;
 }
 
 function jiUnpairedHtml(r) {
