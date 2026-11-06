@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
@@ -9,6 +11,7 @@ use rustyfin_model::quick_connect::QuickConnectResult;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::middleware::resolve_client;
 use crate::state::AppState;
 
 /// Expiry duration for quick connect codes (5 minutes).
@@ -16,6 +19,9 @@ const EXPIRY_SECS: i64 = 300;
 
 /// Most live requests stored at once. Initiate answers 429 beyond it.
 const MAX_PENDING: usize = 100;
+
+/// Most live requests one client (limiter key) has at once. Initiate answers 429 beyond it.
+const MAX_PENDING_PER_CLIENT: usize = 5;
 
 /// Whether a request is live at `now`: younger than `EXPIRY_SECS`.
 fn is_live(request: &QuickConnectResult, now: DateTime<Utc>) -> bool {
@@ -45,15 +51,28 @@ async fn quick_connect_enabled() -> Json<bool> {
 }
 
 /// `POST /QuickConnect/Initiate` – create a new quick connect request. Answers 429 when
-/// `MAX_PENDING` live requests are stored or no code is free.
-async fn initiate(State(state): State<AppState>) -> Result<Json<QuickConnectResult>, ApiError> {
+/// `MAX_PENDING` live requests are stored, when `MAX_PENDING_PER_CLIENT` are stored for the
+/// caller's limiter key (AC47), or when no code is free.
+async fn initiate(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<QuickConnectResult>, ApiError> {
     let secret = Uuid::new_v4().to_string().replace("-", "");
+    let client_key = resolve_client(peer.ip(), &headers, &state.known_proxies).limiter_key();
 
     // Purge expired entries while holding the lock. A refused request stores nothing.
     let mut store = state.quick_connect.write().await;
     let now = Utc::now();
     store.retain(|_, v| is_live(v, now));
     if store.len() >= MAX_PENDING {
+        return Err(ApiError::RateLimited);
+    }
+    let pending_for_client = store
+        .values()
+        .filter(|v| v.client_key == client_key)
+        .count();
+    if pending_for_client >= MAX_PENDING_PER_CLIENT {
         return Err(ApiError::RateLimited);
     }
     // A short 6-digit code for the user to enter, unique among live requests.
@@ -69,6 +88,7 @@ async fn initiate(State(state): State<AppState>) -> Result<Json<QuickConnectResu
         app_version: String::new(),
         date_added: now,
         user_id: None,
+        client_key,
     };
     store.insert(secret, result.clone());
 

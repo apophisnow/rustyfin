@@ -21,6 +21,7 @@ fn stored(requests: &[(&str, i64)], now: DateTime<Utc>) -> HashMap<String, Quick
                 app_version: String::new(),
                 date_added: now - Duration::seconds(age),
                 user_id: None,
+                client_key: String::new(),
             };
             (request.secret.clone(), request)
         })

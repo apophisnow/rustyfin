@@ -5610,7 +5610,6 @@ async fn b21_links_survive_renames() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 2"]
 async fn b21_quick_connect_caps_live_requests_per_client() {
     let state = test_state().await;
     let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
