@@ -116,9 +116,10 @@ pub fn claim_username(claims: &Value, claim: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Whether two usernames are the same ignoring case (Unicode lowercase). Nothing else is ignored.
+/// Whether two usernames match. ASCII letters match in any case; every other character
+/// matches only as it is (no Unicode case folding or normalization).
 pub fn names_match(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+    a.eq_ignore_ascii_case(b)
 }
 
 /// The settings as the admin sees them. The secret shows only as set or not, and the two

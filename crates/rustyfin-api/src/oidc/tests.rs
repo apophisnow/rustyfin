@@ -100,7 +100,6 @@ fn claim_username_trims_and_needs_text() {
 }
 
 #[test]
-#[ignore = "B21 fix 3"]
 fn names_match_ignores_ascii_case_only() {
     assert!(names_match("Alice", "alice"));
     assert!(names_match("ÄRGER", "ÄRGER"));

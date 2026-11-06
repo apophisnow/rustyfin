@@ -5368,7 +5368,6 @@ async fn b21_quick_connect_authorize_skips_expired_requests() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 3"]
 async fn b21_names_match_in_ascii_case_only() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "kelvin", "pw-kelvin", false).await;
