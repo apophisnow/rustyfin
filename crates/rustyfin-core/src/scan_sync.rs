@@ -696,7 +696,8 @@ pub async fn reconcile_movie_groups(
 
 /// One episode's files in version order, and the fields that the episode gives its item. `series_id` is the
 /// series that holds `season_id`. With a season number, the episode takes over a gone episode of that series
-/// with the same numbers, whatever the name of its season folder was.
+/// with the same numbers, whatever the name of its season folder was. The season of each is the one in its
+/// file name, else its folder's, so a special in a season folder is no episode of that season.
 pub struct EpisodeGroup {
     pub files: Vec<PathBuf>,
     pub season_id: Uuid,
@@ -968,8 +969,9 @@ fn owners_of<'a>(
 /// Whether the gone item `item` is the unit of `group`, so that the group takes it over. A movie is the
 /// unit when its old file is in the folder of `primary`, with the title and year of the group. The title
 /// and year may match the item's stored ones or those of its old file name, read by `naming::clean_name`,
-/// since metadata can rename an item. An episode is the unit when it has the group's episode and season
-/// numbers, and is in the group's series, or, when the group has no season number, in the group's season.
+/// since metadata can rename an item. An episode is the unit when it has the group's episode number and
+/// season, each by [`episode_season`], and is in the group's series, or, when the group has no season
+/// number, in the group's season.
 fn takes_over(item: &ItemRow, group: &WantedGroup, primary: &str) -> bool {
     match &group.wanted {
         Wanted::Movie { title, year } => {
@@ -999,10 +1001,22 @@ fn takes_over(item: &ItemRow, group: &WantedGroup, primary: &str) -> bool {
             };
             item.index_number.is_some()
                 && item.index_number == *index_number
-                && item.parent_index_number == *parent_index_number
                 && same_place
+                && episode_season(&item.path, item.parent_index_number)
+                    == episode_season(primary, *parent_index_number)
         }
     }
+}
+
+/// The season of the episode at `path`, as [`naming::group_episode_files`] keys it: the season in its
+/// file name, else `stored`, the season number of its item, which comes from its folder. A special
+/// `S00E01` in `Season 1` is in season 0.
+fn episode_season(path: &str, stored: Option<i32>) -> Option<i32> {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| naming::parse_episode(&stem.to_string_lossy()))
+        .and_then(|numbers| numbers.season)
+        .or(stored)
 }
 
 /// Settles one group whose owners are known. Merges the other owners into the survivor, writes the

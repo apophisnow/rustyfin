@@ -5195,3 +5195,138 @@ async fn b18_rescans_give_no_gone_item_to_a_trailer_or_sample() {
         "the new file and its trailer take the movie over"
     );
 }
+
+/// What [`b18_ids`] gives when the item at each of `rels`, in path order, is the one at the same
+/// place in `ids`.
+fn b18_ids_at(rels: &[String], ids: &[Uuid]) -> Vec<(String, String)> {
+    rels.iter()
+        .zip(ids)
+        .map(|(rel, id)| (rel.clone(), id.to_string()))
+        .collect()
+}
+
+/// B18 fix round 3, scenario 1: Jellyfin allows specials in a season folder. Such a special has its
+/// season in its file name, as `S00E01`, and the season's own first episode has the same episode
+/// number. Each keeps its item and its users' data when the season folder is renamed, and when both
+/// files are renamed in one scan.
+#[tokio::test]
+async fn b18_tv_rescans_keep_a_special_and_an_episode_of_one_season_folder_apart() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let at = |season: &str, names: [&str; 2]| names.map(|name| format!("Show/{season}/{name}"));
+    let names = [
+        "Show (2020) - S00E01 - Special WEBDL-720p.mkv",
+        "Show (2020) - S01E01 - Pilot WEBDL-720p.mkv",
+    ];
+    let renamed = [
+        "Show (2020) - S00E01 - Special [Bluray-1080p].mkv",
+        "Show (2020) - S01E01 - Pilot [Bluray-1080p].mkv",
+    ];
+    let first = at("Season 1", names);
+    for rel in &first {
+        touch(&root, rel);
+    }
+    scan(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let marks = [
+        Marks {
+            position: 7,
+            plays: 2,
+            last_played: Some(LATE.to_string()),
+            rating: Some(8),
+            ..Marks::default()
+        },
+        b18_watched(),
+    ];
+    let mut ids = Vec::new();
+    for (rel, marks) in first.iter().zip(&marks) {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, marks).await;
+        ids.push(item);
+    }
+    let check = async |rels: [String; 2]| {
+        assert_eq!(
+            b18_ids(pool, &lib, "Episode").await,
+            b18_ids_at(&rels, &ids),
+            "the special and the episode keep their own items"
+        );
+        for (item, marks) in ids.iter().zip(&marks) {
+            assert_eq!(
+                marks_of(pool, &user, *item).await.as_ref(),
+                Some(marks),
+                "each keeps its own user data"
+            );
+        }
+    };
+
+    // A rescan of the show after its season folder is renamed, then a full scan after both files are.
+    std::fs::rename(root.join("Show/Season 1"), root.join("Show/Season 01")).unwrap();
+    b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Show"))).await;
+    check(at("Season 01", names)).await;
+    for (name, new) in names.iter().zip(renamed) {
+        std::fs::rename(
+            root.join(format!("Show/Season 01/{name}")),
+            root.join(format!("Show/Season 01/{new}")),
+        )
+        .unwrap();
+    }
+    scan(pool, &lib).await;
+    check(at("Season 01", renamed)).await;
+}
+
+/// B18 fix round 3, scenario 2: the files in the root of a TV library all go to one series and one
+/// season. Two shows' episodes there with one episode number, in different seasons by their file
+/// names, keep their own items and their users' data when both files are renamed in one scan.
+#[tokio::test]
+async fn b18_tv_rescans_keep_loose_episodes_of_two_shows_apart() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let old = ["Alpha (2020) S02E03.mkv", "Beta (2021) S01E03.mkv"];
+    let new = [
+        "Alpha (2020) - S02E03 - Third [WEBDL-720p].mkv".to_string(),
+        "Beta (2021) - S01E03 - Three [WEBDL-720p].mkv".to_string(),
+    ];
+    for rel in old {
+        touch(&root, rel);
+    }
+    scan(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let marks = [
+        b18_watched(),
+        Marks {
+            position: 7,
+            plays: 2,
+            last_played: Some(LATE.to_string()),
+            rating: Some(8),
+            ..Marks::default()
+        },
+    ];
+    let mut ids = Vec::new();
+    for (rel, marks) in old.iter().zip(&marks) {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, marks).await;
+        ids.push(item);
+    }
+
+    for (old, new) in old.iter().zip(&new) {
+        std::fs::rename(root.join(old), root.join(new)).unwrap();
+    }
+    scan(pool, &lib).await;
+
+    assert_eq!(
+        b18_ids(pool, &lib, "Episode").await,
+        b18_ids_at(&new, &ids),
+        "each show's episode keeps its own item"
+    );
+    for (item, marks) in ids.iter().zip(&marks) {
+        assert_eq!(
+            marks_of(pool, &user, *item).await.as_ref(),
+            Some(marks),
+            "each keeps its own user data"
+        );
+    }
+}
