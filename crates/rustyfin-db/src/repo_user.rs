@@ -241,13 +241,17 @@ pub async fn update_policy(
 
 /// Makes the user an administrator through the admin group (AC17). The flag records that the group
 /// gave the rights. An existing administrator is left as it is, flag and all.
-pub async fn grant_group_admin(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn grant_group_admin<'e, E>(executor: E, id: Uuid) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "UPDATE users SET is_administrator = 1, admin_from_group = 1 \
          WHERE id = ? AND is_administrator = 0",
     )
     .bind(id.to_string())
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

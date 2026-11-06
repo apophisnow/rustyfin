@@ -6139,7 +6139,6 @@ fn b21_ipv6_clients_are_keyed_by_their_slash56() {
 // Fix round 4: the re-check of 7f7caf3 (spec §13, AC55-AC58).
 
 #[tokio::test]
-#[ignore = "B21 round 4 fix 1"]
 async fn b21_a_sign_in_cannot_undo_an_unlink() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;

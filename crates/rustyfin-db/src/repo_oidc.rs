@@ -129,23 +129,65 @@ where
     Ok(())
 }
 
-/// Records a sign-in through the link. The username changes only when the claim gave one.
-pub async fn touch_link(
+/// What `settle_sign_in` did.
+pub enum Settled {
+    /// The sign-in or the link is settled, and the admin group applied.
+    Done,
+    /// The admin rights stay: the owner or the last enabled administrator keeps them.
+    AdminKept,
+    /// The link was gone, so nothing was written.
+    LinkGone,
+}
+
+/// Settles a sign-in or a profile link in one IMMEDIATE transaction (AC55). When the link to
+/// `issuer` and `subject` is gone, nothing is written and the result is `LinkGone`. Otherwise
+/// `signed_in` records the sign-in through the link (the username changes only when the claim
+/// gave one), and the admin group applies as `admin_member` says (AC17-AC19).
+pub async fn settle_sign_in(
     pool: &SqlitePool,
     user_id: Uuid,
-    username: Option<&str>,
-    now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE user_oidc_links SET last_sign_in_at = ?, username = COALESCE(?, username) \
-         WHERE user_id = ?",
+    issuer: &str,
+    subject: &str,
+    signed_in: Option<(DateTime<Utc>, Option<&str>)>,
+    admin_member: bool,
+) -> Result<Settled, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let linked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM user_oidc_links \
+         WHERE user_id = ? AND issuer = ? AND subject = ?)",
     )
-    .bind(now.to_rfc3339())
-    .bind(username)
     .bind(user_id.to_string())
-    .execute(pool)
+    .bind(issuer)
+    .bind(subject)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(())
+    if !linked {
+        tx.rollback().await?;
+        return Ok(Settled::LinkGone);
+    }
+    if let Some((now, username)) = signed_in {
+        sqlx::query(
+            "UPDATE user_oidc_links SET last_sign_in_at = ?, username = COALESCE(?, username) \
+             WHERE user_id = ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(username)
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
+    let settled = if admin_member {
+        crate::repo_user::grant_group_admin(&mut *tx, user_id).await?;
+        Settled::Done
+    } else if crate::repo_user::admin_from_group(&mut *tx, user_id).await?
+        && !crate::repo_user::revoke_group_admin(&mut *tx, user_id).await?
+    {
+        Settled::AdminKept
+    } else {
+        Settled::Done
+    };
+    tx.commit().await?;
+    Ok(settled)
 }
 
 /// Creates a user and links it to a provider account in one IMMEDIATE transaction, so a failed link

@@ -184,7 +184,30 @@ pub(crate) async fn sign_in(
             link_profile(pool, config, caller, linked, &subject, &claims).await?
         }
     };
-    settle_admin_group(pool, config, user_id, &claims).await?;
+    // Only a sign-in through an existing link records a sign-in (AC55).
+    let username = claim_username(&claims, &config.username_claim);
+    let signed_in = if matches!(flow.kind, FlowKind::SignIn) && linked.is_some() {
+        Some((Utc::now(), username.as_deref()))
+    } else {
+        None
+    };
+    let settled = repo_oidc::settle_sign_in(
+        pool,
+        user_id,
+        &config.issuer_url,
+        &subject,
+        signed_in,
+        in_group(&claims, &config.group_claim, &config.admin_group),
+    )
+    .await?;
+    match settled {
+        repo_oidc::Settled::Done => {}
+        repo_oidc::Settled::AdminKept => tracing::warn!(
+            user_id = %user_id,
+            "admin rights kept: the admin group no longer grants them, and this user is the owner or the last enabled administrator"
+        ),
+        repo_oidc::Settled::LinkGone => return Err(SignInError::Refused("server_error")),
+    }
     Ok(user_id)
 }
 
@@ -203,8 +226,6 @@ async fn sign_in_account(
         if repo_user::is_disabled(pool, user_id).await? {
             return Err(SignInError::Refused("account_disabled"));
         }
-        let username = claim_username(claims, &config.username_claim);
-        repo_oidc::touch_link(pool, user_id, username.as_deref(), Utc::now()).await?;
         return Ok(user_id);
     }
 
@@ -299,29 +320,6 @@ async fn link_profile(
     )
     .await?;
     Ok(caller)
-}
-
-/// Applies the admin group to a settled account (AC17-AC19). A member who is not an administrator is
-/// made one, and the flag records that the group gave the rights. A flagged account that is no
-/// longer a member loses them, unless it is the owner or the last enabled administrator: then the
-/// rights stay and a warning says so. Rights given by hand (no flag) are never taken back here.
-async fn settle_admin_group(
-    pool: &SqlitePool,
-    config: &OidcConfig,
-    user_id: Uuid,
-    claims: &Value,
-) -> Result<(), sqlx::Error> {
-    if in_group(claims, &config.group_claim, &config.admin_group) {
-        repo_user::grant_group_admin(pool, user_id).await?;
-    } else if repo_user::admin_from_group(pool, user_id).await?
-        && !repo_user::revoke_group_admin(pool, user_id).await?
-    {
-        tracing::warn!(
-            user_id = %user_id,
-            "admin rights kept: the admin group no longer grants them, and this user is the owner or the last enabled administrator"
-        );
-    }
-    Ok(())
 }
 
 /// Whether the body of a failed token request holds an ID token: the provider answered, but the
