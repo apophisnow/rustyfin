@@ -148,8 +148,10 @@ pub async fn touch_link(
     Ok(())
 }
 
-/// Creates a user and links it to a provider account in one transaction, so a failed link leaves
-/// no user behind.
+/// Creates a user and links it to a provider account in one IMMEDIATE transaction, so a failed link
+/// leaves no user behind. `taken` runs again over every user name inside that transaction, so two
+/// simultaneous sign-ins cannot both take one name (AC52). It returns false, writing nothing, when
+/// `taken` matches a name; true once the user and the link are committed.
 pub async fn create_linked_user(
     pool: &SqlitePool,
     user: &User,
@@ -157,11 +159,20 @@ pub async fn create_linked_user(
     subject: &str,
     username: &str,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    taken: impl Fn(&str) -> bool,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users")
+        .fetch_all(&mut *tx)
+        .await?;
+    if names.iter().any(|name| taken(name)) {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     crate::repo_user::create_user(&mut *tx, user).await?;
     create_link(&mut *tx, user.id, issuer, subject, username, now, Some(now)).await?;
-    tx.commit().await
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// What an unlink did: whether the account had a link, and whether it kept its administrator rights.

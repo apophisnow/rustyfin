@@ -211,11 +211,7 @@ async fn sign_in_account(
     let username = claim_username(claims, &config.username_claim)
         .ok_or(SignInError::Refused("no_username"))?;
     let now = Utc::now();
-    let same_name: Vec<User> = repo_user::get_all_users(pool)
-        .await?
-        .into_iter()
-        .filter(|user| names_match(&user.name, &username))
-        .collect();
+    let same_name = users_named(pool, &username).await?;
     if same_name.is_empty() {
         let user = User {
             id: Uuid::new_v4(),
@@ -226,12 +222,44 @@ async fn sign_in_account(
             last_login_date: None,
             configuration: Value::Object(Map::new()),
         };
-        repo_oidc::create_linked_user(pool, &user, &config.issuer_url, subject, &username, now)
-            .await?;
-        return Ok(user.id);
+        let created = repo_oidc::create_linked_user(
+            pool,
+            &user,
+            &config.issuer_url,
+            subject,
+            &username,
+            now,
+            |name: &str| names_match(name, &username),
+        )
+        .await?;
+        if created {
+            return Ok(user.id);
+        }
+        // The name was taken between the first look and the insert (AC52): nothing was written.
+        let matching = users_named(pool, &username).await?;
+        return refuse_taken(pool, config, &matching).await;
     }
     // A taken name is refused whole (AC44): nothing is created, linked or granted here.
-    for user in &same_name {
+    refuse_taken(pool, config, &same_name).await
+}
+
+/// The users whose name matches `username` (`names_match`), disabled ones included.
+async fn users_named(pool: &SqlitePool, username: &str) -> Result<Vec<User>, sqlx::Error> {
+    Ok(repo_user::get_all_users(pool)
+        .await?
+        .into_iter()
+        .filter(|user| names_match(&user.name, username))
+        .collect())
+}
+
+/// Refuses a taken name: `name_taken` when one of the matching accounts is enabled, has a password
+/// and may use it; otherwise `name_taken_ask_admin`, also for an empty list. Writes nothing.
+async fn refuse_taken(
+    pool: &SqlitePool,
+    config: &OidcConfig,
+    same_name: &[User],
+) -> Result<Uuid, SignInError> {
+    for user in same_name {
         if !repo_user::is_disabled(pool, user.id).await?
             && !user.password_hash.is_empty()
             && password_allowed(pool, config, user).await?

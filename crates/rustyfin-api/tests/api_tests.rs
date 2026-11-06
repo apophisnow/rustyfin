@@ -6062,7 +6062,6 @@ async fn b21_unlinking_keeps_the_last_admin() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 3 fix 3"]
 async fn b21_simultaneous_sign_ins_take_a_name_once() {
     let t = b21_on(serde_json::json!({})).await;
     // Sign-ins as "BobN" and "bobN" at the same moment. Both pass the first check whenever both
