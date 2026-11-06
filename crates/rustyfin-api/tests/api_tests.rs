@@ -2289,6 +2289,12 @@ struct B21OpState {
     discovery_fetches: usize,
     jwks_fetches: usize,
     userinfo_calls: usize,
+    /// When set, the next userinfo request reports through the sender that it arrived, then waits
+    /// until the receiver fires.
+    userinfo_hold: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     /// Every endpoint answers 503.
     down: bool,
 }
@@ -2330,6 +2336,7 @@ fn b21_op_state(base: &str) -> B21OpState {
         discovery_fetches: 0,
         jwks_fetches: 0,
         userinfo_calls: 0,
+        userinfo_hold: None,
         down: false,
     }
 }
@@ -2549,12 +2556,18 @@ async fn b21_op_token(
     .into_response()
 }
 
-/// Userinfo: the grant's claims without the token-only ones, or `userinfo` when set.
+/// Userinfo: the grant's claims without the token-only ones, or `userinfo` when set. It waits first
+/// when `userinfo_hold` is set.
 async fn b21_op_userinfo(
     axum::extract::State(op): axum::extract::State<B21Op>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let hold = op.st.lock().unwrap().userinfo_hold.take();
+    if let Some((arrived, release)) = hold {
+        let _ = arrived.send(());
+        let _ = release.await;
+    }
     let mut st = op.st.lock().unwrap();
     st.userinfo_calls += 1;
     if st.down {
@@ -6120,6 +6133,357 @@ fn b21_ipv6_clients_are_keyed_by_their_slash56() {
         key("192.0.2.7"),
         key("192.0.2.8"),
         "IPv4 is keyed by address"
+    );
+}
+
+// Fix round 4: the re-check of 7f7caf3 (spec §13, AC55-AC58).
+
+#[tokio::test]
+#[ignore = "B21 round 4 fix 1"]
+async fn b21_a_sign_in_cannot_undo_an_unlink() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+
+    // The next ID token has no group claim, so the sign-in asks userinfo after it found the link.
+    // Userinfo answers with the group, but only once gus's Unlink has committed.
+    let (arrived, at_userinfo) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    t.op.with(|st| {
+        st.userinfo = Some(serde_json::json!({
+            "sub": "gus-sub", "preferred_username": "gus", "groups": ["admins"]
+        }));
+        st.userinfo_hold = Some((arrived, released));
+    });
+    let flow = t.start().await;
+    let code =
+        t.op.approve(&flow, b21_user("gus-sub", "gus"), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let ((location, _), ()) = tokio::join!(t.callback(Some(&flow.cookie), &query), async {
+        at_userinfo.await.expect("the sign-in asks userinfo");
+        assert_eq!(
+            send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+            StatusCode::NO_CONTENT,
+            "gus's Unlink, while the sign-in waits"
+        );
+        release.send(()).unwrap();
+    });
+    assert_eq!(
+        location,
+        b21_login_error("server_error"),
+        "the sign-in whose link went is refused"
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "and gets no session"
+    );
+    assert!(!t.is_admin("gus").await, "the group gave no rights back");
+    assert!(!t.admin_from_group("gus").await, "and no flag");
+    assert_eq!(t.link_row("gus").await, None, "and no link");
+
+    let claims =
+        serde_json::json!({ "sub": "gus-sub", "preferred_username": "gus", "groups": ["admins"] });
+    assert_eq!(
+        t.sign_in(claims).await.err().as_deref(),
+        Some("name_taken"),
+        "a new attempt takes the normal path"
+    );
+    assert!(!t.is_admin("gus").await);
+}
+
+/// `POST /Users/AuthenticateByName`: the status and the whole answer.
+async fn b21_password_answer(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    send(app, req).await
+}
+
+/// `POST /Users/New` as the token's user.
+async fn b21_new_user(
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name, "Password": "pw-new" });
+    send(app, request("POST", "/Users/New", Some(token), Some(body))).await
+}
+
+/// `PUT /Users/{id}`, a rename, as the token's user.
+async fn b21_rename(
+    app: &axum::Router,
+    token: &str,
+    id: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name });
+    let req = request("PUT", &format!("/Users/{id}"), Some(token), Some(body));
+    send(app, req).await
+}
+
+#[tokio::test]
+#[ignore = "B21 round 4 fix 3"]
+async fn b21_password_sign_in_finds_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ"] {
+        let (status, body) = b21_password_answer(&t.app, name, "pw-alice").await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], "alice", "{name:?} signs in as alice");
+    }
+    let wrong = b21_password_answer(&t.app, "alice", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        b21_password_answer(&t.app, "ALICE", "pw-wrong").await,
+        wrong,
+        "a wrong password in another case"
+    );
+    assert_eq!(
+        b21_password_answer(&t.app, "alice2", "pw-alice").await,
+        wrong,
+        "another name"
+    );
+}
+
+#[tokio::test]
+async fn b21_case_variant_accounts_sign_in_by_exact_name() {
+    let t = b21().await;
+    // Two accounts whose names differ only in case, as older servers may hold.
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    for (name, password) in [("bob", "pw-bob"), ("Bob", "pw-Bob")] {
+        let (status, body) = b21_password_answer(&t.app, name, password).await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], name, "{name:?} signs in as itself");
+    }
+    let wrong = b21_password_answer(&t.app, "bob", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    for password in ["pw-bob", "pw-Bob"] {
+        assert_eq!(
+            b21_password_answer(&t.app, "BOB", password).await,
+            wrong,
+            "BOB names neither account"
+        );
+    }
+    assert_eq!(
+        b21_password_answer(&t.app, "Bob", "pw-bob").await,
+        wrong,
+        "Bob is not bob"
+    );
+}
+
+#[tokio::test]
+#[ignore = "B21 round 4 fix 3"]
+async fn b21_new_users_refuse_taken_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let exact = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(exact.0, StatusCode::BAD_REQUEST, "{}", exact.1);
+    for name in ["Alice", "ALICE", "ＡＬＩＣＥ", "OWNER"] {
+        assert_eq!(
+            b21_new_user(&t.app, &t.admin, name).await,
+            exact,
+            "{name:?} is taken"
+        );
+    }
+    assert_eq!(t.user_count().await, 2, "no new account");
+    let (status, body) = b21_new_user(&t.app, &t.admin, "alice2").await;
+    assert_eq!(status, StatusCode::OK, "a free name: {body}");
+    assert_eq!(body["Name"], "alice2");
+}
+
+#[tokio::test]
+#[ignore = "B21 round 4 fix 3"]
+async fn b21_renames_refuse_other_users_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    let taken = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(taken.0, StatusCode::BAD_REQUEST, "{}", taken.1);
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ", "Owner"] {
+        assert_eq!(
+            b21_rename(&t.app, &carol, &carol_id, name).await,
+            taken,
+            "{name:?}: carol's own rename"
+        );
+        assert_eq!(
+            b21_rename(&t.app, &t.admin, &carol_id, name).await,
+            taken,
+            "{name:?}: an administrator's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "her own name in another case: {body}"
+    );
+    assert!(user_flags(&t.state, "Carol").await.is_some(), "now Carol");
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(status, StatusCode::OK, "her own name unchanged: {body}");
+    let nobody = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        b21_rename(&t.app, &t.admin, &nobody, "nobody").await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+#[ignore = "B21 round 4 fix 3"]
+async fn b21_simultaneous_new_users_take_a_name_once() {
+    let t = b21().await;
+    // Users/New as "DanN" and "danN" at the same moment: only a check inside the insert's
+    // transaction can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..5 {
+        let (upper_name, lower_name) = (format!("Dan{i}"), format!("dan{i}"));
+        let (upper, lower) = tokio::join!(
+            b21_new_user(&t.app, &t.admin, &upper_name),
+            b21_new_user(&t.app, &t.admin, &lower_name)
+        );
+        let mut statuses = [upper.0, lower.0];
+        statuses.sort();
+        if statuses == [StatusCode::OK, StatusCode::OK] {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::BAD_REQUEST],
+            "pair {i}"
+        );
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both got an account"
+    );
+    assert_eq!(
+        t.user_count().await,
+        6,
+        "the owner and one account per pair"
+    );
+}
+
+#[tokio::test]
+#[ignore = "B21 round 4 fix 3"]
+async fn b21_password_resets_find_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let pin = b21_reset_pin(&t.app, "ALICE")
+        .await
+        .expect("a PIN for alice");
+    let body =
+        serde_json::json!({ "Pin": pin, "Username": "Alice", "TempPassword": "b21-temp-pw" });
+    let (status, answer) = send(
+        &t.app,
+        request("POST", "/Users/ResetPassword", None, Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        login(&t.app, "alice", "b21-temp-pw").await.is_some(),
+        "alice's new password"
+    );
+
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    assert_eq!(
+        b21_reset_pin(&t.app, "BOB").await,
+        None,
+        "BOB names neither account"
+    );
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_case_variants() {
+    let t = b21().await;
+    for name in ["owner", "OWNER", "Owner"] {
+        assert_eq!(
+            post_startup_user(&t.app, Some(&t.admin), name, "pw-x").await,
+            StatusCode::FORBIDDEN,
+            "{name:?}"
+        );
+    }
+    assert_eq!(t.user_count().await, 1);
+}
+
+#[test]
+#[ignore = "B21 round 4 fix 2"]
+fn b21_web_client_follows_a_demotion() {
+    let found = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        println!("b21_web_client_follows_a_demotion: skipped, node is not on PATH");
+        return;
+    }
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let out = std::process::Command::new("node")
+        .arg(format!("{dir}/tests/web/b21_admin_recheck.mjs"))
+        .arg(format!("{dir}/../rustyfin-web/src/api.js"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "B21 round 4 fix 2"]
+fn b21_dashboard_follows_a_demotion() {
+    let app_js = std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/app.js",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    // A top-level function of app.js, from its head to its closing brace.
+    let function = |head: &str| -> String {
+        let start = app_js
+            .find(head)
+            .unwrap_or_else(|| panic!("app.js has {head}"));
+        let rest = &app_js[start..];
+        rest[..rest.find("\n}\n").unwrap()].to_string()
+    };
+    let follow = function("function followAdminLoss() {");
+    for part in [
+        "updateAuthUI()",
+        "toast(t('admin.rights_removed')",
+        "currentPage === 'admin'",
+        "navigate('home')",
+    ] {
+        assert!(follow.contains(part), "followAdminLoss: {part}");
+    }
+    assert!(
+        app_js.contains("\nAPI.onAdminLost = followAdminLoss;\n"),
+        "app.js hands followAdminLoss to the API"
+    );
+    let render = function("async function renderAdmin() {");
+    let recheck = render
+        .find("await API.recheckAdmin()")
+        .expect("renderAdmin re-reads the user");
+    let requests = render.find("Promise.all").expect("renderAdmin's requests");
+    assert!(recheck < requests, "the re-read comes before the requests");
+    assert_eq!(
+        b21_translation("en", "admin.rights_removed").as_deref(),
+        Some("This account no longer has administrator rights.")
+    );
+    assert_eq!(
+        b21_translation("de", "admin.rights_removed").as_deref(),
+        Some("Dieses Konto hat keine Administratorrechte mehr.")
     );
 }
 
