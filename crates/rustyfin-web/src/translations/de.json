@@ -372,7 +372,7 @@
         "metadata_fill_empty": "Leere Felder füllen",
         "metadata_replace": "Durch Jellyfins ersetzen",
         "metadata_none": "Keine Metadaten übernehmen",
-        "metadata_help": "Felder, Personen und Bilder der zugeordneten Einträge. Füllen behält jeden Wert, den Rustyfin schon hat; Ersetzen überschreibt ihn mit dem von Jellyfin. Bilder werden in Rustyfins Datenordner kopiert.",
+        "metadata_help": "Felder, Personen und Bilder der zugeordneten Einträge. Füllen behält jeden Wert, den Rustyfin schon hat; Ersetzen überschreibt ihn mit dem von Jellyfin, behält aber Rustyfins TMDB- und TVDB-IDs, nach denen zugeordnet wird. Bilder werden in Rustyfins Datenordner kopiert.",
         "metadata_summary": "Metadaten ({{mode}}): {{items}} Einträge geändert, {{fields}} Felder, {{people}} Personen, {{images}} Bilder, {{missing}} Bilder fehlen, {{locked}} gesperrte Einträge übersprungen",
         "metadata_summary_none": "Metadaten: nicht übernommen",
         "samples_title": "Beispiele nicht gefundener Elemente:",

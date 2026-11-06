@@ -372,7 +372,7 @@
         "metadata_fill_empty": "Fill empty fields",
         "metadata_replace": "Replace with Jellyfin's",
         "metadata_none": "Don't import metadata",
-        "metadata_help": "Fields, people and images of the matched items. Filling keeps every value Rustyfin already has; replacing overwrites them with Jellyfin's. Images are copied into Rustyfin's data folder.",
+        "metadata_help": "Fields, people and images of the matched items. Filling keeps every value Rustyfin already has; replacing overwrites them with Jellyfin's but keeps Rustyfin's TMDB and TVDB IDs, which decide what matches. Images are copied into Rustyfin's data folder.",
         "metadata_summary": "Metadata ({{mode}}): {{items}} items changed, {{fields}} fields, {{people}} people, {{images}} images, {{missing}} images missing, {{locked}} locked items skipped",
         "metadata_summary_none": "Metadata: not imported",
         "samples_title": "Examples of items not found:",
