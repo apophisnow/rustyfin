@@ -4430,3 +4430,413 @@ async fn b18_scoped_rescans_rebuild_the_filter_tables_only_after_a_change() {
         "a rescan that added a movie did not rebuild the filter tables"
     );
 }
+
+/// B18 fix F2: a movie whose file gives way to a file with another name in the same folder, as a
+/// Radarr upgrade does, keeps its item, with its id and its users' data, through a full scan and
+/// through rescans of its folder and of the files in the library path. The item takes the new path
+/// and is probed again.
+#[tokio::test]
+async fn b18_rescans_move_a_renamed_movie_to_its_new_file() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let old = [
+        "Argo (2012)/Argo (2012) WEBDL-1080p.mkv",
+        "Heat (1995)/Heat (1995) WEBDL-720p.mkv",
+        "Loose (2003) DVD.mkv",
+    ];
+    let new = [
+        "Argo (2012)/Argo (2012) Bluray-2160p.mkv",
+        "Heat (1995)/Heat (1995) Remux-2160p.mkv",
+        "Loose (2003) Bluray-1080p.mkv",
+    ];
+    for rel in old {
+        touch(&root, rel);
+    }
+    scan(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let mut ids = Vec::new();
+    for rel in old {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, &b18_watched()).await;
+        ids.push(item);
+    }
+    let upgrade = |at: usize| {
+        std::fs::remove_file(root.join(old[at])).unwrap();
+        touch(&root, new[at]);
+    };
+
+    upgrade(0);
+    scan(pool, &lib).await;
+    upgrade(1);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Heat (1995)"))).await,
+        (0, 0, 1),
+        "the folder rescan re-reads Heat's item, and adds and removes nothing"
+    );
+    upgrade(2);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::RootFiles(root.clone())).await,
+        (0, 0, 1),
+        "the rescan of the root files re-reads Loose's item, and adds and removes nothing"
+    );
+
+    let check = async || {
+        assert_eq!(paths(pool, &lib, "Movie").await, new);
+        for (rel, &item) in new.iter().zip(&ids) {
+            assert_eq!(
+                item_at(pool, &lib, rel).await,
+                item,
+                "{rel} keeps the item of the file it replaced"
+            );
+            assert_eq!(
+                marks_of(pool, &user, item).await,
+                Some(b18_watched()),
+                "{rel} keeps its user data"
+            );
+        }
+    };
+    check().await;
+    scan(pool, &lib).await;
+    check().await;
+}
+
+/// B18 fix F2: a new file takes over only the item of a missing file of the same movie in the same
+/// folder, with the same title and year. A version added next to a movie's file joins its item.
+/// The missing file of another movie, or of the same title in another year, goes with its item.
+#[tokio::test]
+async fn b18_rescans_give_a_new_file_no_item_of_another_movie() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    for rel in [
+        "Alpha (2001).mkv",
+        "Argo (2012)/Argo (2012) - 1080p.mkv",
+        "Collection/Alien (1979).mkv",
+        "Collection/Aliens (1986).mkv",
+        "Dune (1984).mkv",
+    ] {
+        touch(&root, rel);
+    }
+    scan(pool, &lib).await;
+    let before = b18_ids(pool, &lib, "Movie").await;
+
+    touch(&root, "Argo (2012)/Argo (2012) - 2160p.mkv");
+    for (gone, added) in [
+        ("Alpha (2001).mkv", "Beta (2002).mkv"),
+        (
+            "Collection/Alien (1979).mkv",
+            "Collection/Alien 3 (1992).mkv",
+        ),
+        ("Dune (1984).mkv", "Dune (2021).mkv"),
+    ] {
+        std::fs::remove_file(root.join(gone)).unwrap();
+        touch(&root, added);
+    }
+    scan(pool, &lib).await;
+
+    let after = b18_ids(pool, &lib, "Movie").await;
+    let id_of = |ids: &[(String, String)], rel: &str| {
+        ids.iter()
+            .find(|(path, _)| path == rel)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| panic!("no item at {rel}"))
+    };
+    assert_eq!(
+        after
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Argo (2012)/Argo (2012) - 2160p.mkv",
+            "Beta (2002).mkv",
+            "Collection/Alien 3 (1992).mkv",
+            "Collection/Aliens (1986).mkv",
+            "Dune (2021).mkv",
+        ]
+    );
+    assert_eq!(
+        id_of(&after, "Argo (2012)/Argo (2012) - 2160p.mkv"),
+        id_of(&before, "Argo (2012)/Argo (2012) - 1080p.mkv"),
+        "the new version joins Argo's item"
+    );
+    assert_eq!(
+        id_of(&after, "Collection/Aliens (1986).mkv"),
+        id_of(&before, "Collection/Aliens (1986).mkv")
+    );
+    let old_ids: Vec<String> = before.into_iter().map(|(_, id)| id).collect();
+    for rel in [
+        "Beta (2002).mkv",
+        "Collection/Alien 3 (1992).mkv",
+        "Dune (2021).mkv",
+    ] {
+        assert!(
+            !old_ids.contains(&id_of(&after, rel)),
+            "{rel} took over the item of another movie"
+        );
+    }
+}
+
+/// B18 fix F2: an item behind a dangling link is not missing, so a new file next to the link does
+/// not take it over: the link keeps its item, and the new file gets one of its own.
+#[cfg(unix)]
+#[tokio::test]
+async fn b18_rescans_give_a_new_file_no_item_behind_a_dangling_link() {
+    use std::os::unix::fs::symlink;
+    let fx = Fixture::new().await;
+    let store = fx.path("store");
+    touch(&store, "Linked.mkv");
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let link = "Linked (2006)/Linked (2006).mkv";
+    std::fs::create_dir_all(root.join("Linked (2006)")).unwrap();
+    symlink(store.join("Linked.mkv"), root.join(link)).unwrap();
+    scan(pool, &lib).await;
+    let linked = item_at(pool, &lib, link).await;
+
+    std::fs::remove_dir_all(&store).unwrap();
+    let added = "Linked (2006)/Linked (2006) Bluray-1080p.mkv";
+    touch(&root, added);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Linked (2006)"))).await,
+        (1, 0, 0)
+    );
+    assert_eq!(item_at(pool, &lib, link).await, linked);
+    assert_ne!(item_at(pool, &lib, added).await, linked);
+}
+
+/// B18 fix F2: an episode whose file gives way to a file with another name in its show's folder, as
+/// a Sonarr upgrade or rename does, keeps its item, with its id and its users' data, through a full
+/// scan and a rescan of the show's folder. The file of another episode gets an item of its own.
+#[tokio::test]
+async fn b18_tv_rescans_move_a_renamed_episode_to_its_new_file() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let e1 = "Show/Season 1/Show - S01E01 - Pilot WEBDL-720p.mkv";
+    let e2 = "Show/Season 1/Show - S01E02 - Second WEBDL-720p.mkv";
+    let e3 = "Show/Season 1/Show - S01E03 - Third WEBDL-720p.mkv";
+    for rel in [e1, e2, e3] {
+        touch(&root, rel);
+    }
+    scan(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let mut ids = Vec::new();
+    for rel in [e1, e2, e3] {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, &b18_watched()).await;
+        ids.push(item);
+    }
+
+    // A full scan after an upgrade of E01.
+    let n1 = "Show/Season 1/Show - S01E01 - Pilot Bluray-1080p.mkv";
+    std::fs::remove_file(root.join(e1)).unwrap();
+    touch(&root, n1);
+    scan(pool, &lib).await;
+    assert_eq!(item_at(pool, &lib, n1).await, ids[0]);
+
+    // A rescan of the show after a rename of E02, while E03 gives way to E04.
+    let n2 = "Show/Season 1/Show - S01E02 - The Second WEBDL-720p.mkv";
+    let e4 = "Show/Season 1/Show - S01E04 - Fourth WEBDL-720p.mkv";
+    std::fs::rename(root.join(e2), root.join(n2)).unwrap();
+    std::fs::remove_file(root.join(e3)).unwrap();
+    touch(&root, e4);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Show"))).await,
+        (1, 1, 1),
+        "the show's rescan adds E04, removes E03 and re-reads E02"
+    );
+    assert_eq!(item_at(pool, &lib, n2).await, ids[1]);
+    assert!(
+        !ids.contains(&item_at(pool, &lib, e4).await),
+        "E04 took over the item of another episode"
+    );
+    assert_eq!(paths(pool, &lib, "Episode").await, [n1, n2, e4]);
+    for item in &ids[..2] {
+        assert_eq!(
+            marks_of(pool, &user, *item).await,
+            Some(b18_watched()),
+            "a renamed episode keeps its user data"
+        );
+    }
+}
+
+/// Writes a FLAC tone of 1 s to `<root>/<rel>`, with its parent folders, tagged with the track
+/// number `track` and the title `title`.
+fn b18_tagged_tone(root: &Path, rel: &str, track: u32, title: &str) -> PathBuf {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "flac"])
+        .args(["-metadata", &format!("track={track}")])
+        .args(["-metadata", &format!("title={title}")])
+        .arg(&path)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg could not write {}",
+        path.display()
+    );
+    path
+}
+
+/// ffmpeg. B18 fix F2: a track whose file gives way to a file with another name in its album's
+/// folder, with the same track number, as a Lidarr upgrade or rename does, keeps its item, with its
+/// id and its users' data, through a full scan and a rescan of its artist's folder, and its new file
+/// is probed. A file with another track number gets an item of its own.
+#[tokio::test]
+async fn b18_music_rescans_move_a_renamed_track_to_its_new_file() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let a1 = "Artist A/Album A/01 - Song.flac";
+    let a2 = "Artist A/Album A/02 - Other.flac";
+    let b1 = "Artist B/Album B/01 - Tune.flac";
+    b18_tagged_tone(&root, a1, 1, "Song");
+    b18_tagged_tone(&root, a2, 2, "Other");
+    b18_tagged_tone(&root, b1, 1, "Tune");
+    scan(pool, &lib).await;
+    b18_tracks_probed(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let mut ids = Vec::new();
+    for rel in [a1, a2, b1] {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, &b18_watched()).await;
+        ids.push(item);
+    }
+
+    // A full scan after a rename of Artist A's first track.
+    let n1 = "Artist A/Album A/01 - Song (Remastered).flac";
+    std::fs::rename(root.join(a1), root.join(n1)).unwrap();
+    scan(pool, &lib).await;
+    b18_track_probed(pool, &root.join(n1), &[]).await;
+    assert_eq!(item_at(pool, &lib, n1).await, ids[0]);
+
+    // A rescan of Artist B after a rename of its track.
+    let nb1 = "Artist B/Album B/01 - Tune [Remaster].flac";
+    std::fs::rename(root.join(b1), root.join(nb1)).unwrap();
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Artist B"))).await,
+        (0, 0, 1),
+        "the rescan of Artist B re-reads its track, and adds and removes nothing"
+    );
+    b18_track_probed(pool, &root.join(nb1), &[]).await;
+    assert_eq!(item_at(pool, &lib, nb1).await, ids[2]);
+
+    // In Album A, track 2 gives way to track 3.
+    let a3 = "Artist A/Album A/03 - Third.flac";
+    std::fs::remove_file(root.join(a2)).unwrap();
+    b18_tagged_tone(&root, a3, 3, "Third");
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Artist A"))).await,
+        (1, 1, 0),
+        "the rescan of Artist A adds track 3 and removes track 2"
+    );
+    assert!(
+        !ids.contains(&item_at(pool, &lib, a3).await),
+        "track 3 took over the item of another track"
+    );
+
+    assert_eq!(paths(pool, &lib, "Audio").await, [n1, a3, nb1]);
+    for item in [ids[0], ids[2]] {
+        assert_eq!(
+            marks_of(pool, &user, item).await,
+            Some(b18_watched()),
+            "a renamed track keeps its user data"
+        );
+    }
+}
+
+/// ffmpeg. B18 fix F2: the tracks of one album folder can share a track number, as an album's discs
+/// do. A new file with that number takes over the gone track with its title, and none of them when
+/// none has its title. A track taken over keeps its name and year, as one whose file is replaced in
+/// place does.
+#[tokio::test]
+async fn b18_music_rescans_give_a_new_file_no_track_of_another_disc() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let intro = "Artist/Album/1-01 - Intro.flac";
+    let song = "Artist/Album/1-02 - Song.flac";
+    let outro = "Artist/Album/2-01 - Outro.flac";
+    b18_tagged_tone(&root, intro, 1, "Intro");
+    b18_tagged_tone(&root, song, 2, "Song");
+    b18_tagged_tone(&root, outro, 1, "Outro");
+    scan(pool, &lib).await;
+    b18_tracks_probed(pool, &lib).await;
+    let mut ids = Vec::new();
+    for rel in [intro, song, outro] {
+        ids.push(item_at(pool, &lib, rel).await);
+    }
+    exec(
+        pool,
+        "UPDATE media_items SET name = 'My Song', production_year = 1999 WHERE id = ?1",
+        &[&ids[1].to_string()],
+    )
+    .await;
+
+    // Every track gives way to a remastered file.
+    let renamed = [
+        "Artist/Album/1-01 - Intro (Remastered).flac",
+        "Artist/Album/1-02 - Song (Remastered).flac",
+        "Artist/Album/2-01 - Outro (Remastered).flac",
+    ];
+    for (old, new) in [intro, song, outro].iter().zip(renamed) {
+        std::fs::rename(root.join(old), root.join(new)).unwrap();
+    }
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Artist"))).await,
+        (0, 0, 3),
+        "the rescan re-reads the three tracks, and adds and removes nothing"
+    );
+    for (rel, id) in renamed.iter().zip(&ids) {
+        assert_eq!(
+            item_at(pool, &lib, rel).await,
+            *id,
+            "{rel} took another item"
+        );
+    }
+    let (name, year): (String, Option<i32>) =
+        sqlx::query_as("SELECT name, production_year FROM media_items WHERE id = ?1")
+            .bind(ids[1].to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (name.as_str(), year),
+        ("My Song", Some(1999)),
+        "a track taken over keeps its name and year"
+    );
+
+    // Both tracks 1 go, and a track 1 with another title comes.
+    for rel in [renamed[0], renamed[2]] {
+        std::fs::remove_file(root.join(rel)).unwrap();
+    }
+    let prelude = "Artist/Album/1-01 - Prelude.flac";
+    b18_tagged_tone(&root, prelude, 1, "Prelude");
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Artist"))).await,
+        (1, 2, 0),
+        "the rescan adds the new track 1 and removes both old ones"
+    );
+    assert!(
+        !ids.contains(&item_at(pool, &lib, prelude).await),
+        "the new track 1 took over the item of another track"
+    );
+}

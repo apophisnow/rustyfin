@@ -470,8 +470,11 @@ async fn scan_flat_library(
             .any(|p| Path::new(p) == folder.as_path());
         movie_groups.extend(naming::group_movie_files(folder, files, is_library_root));
     }
+    // The items whose file is gone are read first: a group with no owner may take one over.
+    let gone =
+        scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
     let outcomes =
-        scan_sync::reconcile_movie_groups(pool, library.id, &filter, &movie_groups).await?;
+        scan_sync::reconcile_movie_groups(pool, library.id, &filter, &movie_groups, &gone).await?;
     for (group, outcome) in movie_groups.iter().zip(outcomes) {
         match outcome {
             scan_sync::GroupOutcome::Existing { item_id, steps } => {
@@ -826,8 +829,12 @@ async fn scan_tv_library(
             });
         }
     }
+    // The items whose file is gone are read first: a group with no owner may take one over.
+    let gone =
+        scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
     let outcomes =
-        scan_sync::reconcile_episode_groups(pool, library.id, &filter, &episode_groups).await?;
+        scan_sync::reconcile_episode_groups(pool, library.id, &filter, &episode_groups, &gone)
+            .await?;
     let mut new_episodes: Vec<MediaItem> = Vec::new();
     let mut new_episode_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     for (group, outcome) in episode_groups.iter().zip(outcomes) {
@@ -990,6 +997,9 @@ async fn scan_music_library(
         roots.push((path, files));
     }
     ticket.add_total(roots.iter().map(|(_, files)| files.len()).sum());
+    // The tracks whose file is gone are read before the new files settle: a new file may take one over.
+    let mut gone_tracks =
+        scan_sync::gone_tracks(pool, library, &filter, &collected, &unreadable, &loops).await?;
 
     for (path, files) in roots {
         // Collect new items for batch insert in a single transaction
@@ -1203,6 +1213,24 @@ async fn scan_music_library(
 
             // Use tag title if available, otherwise file stem
             let item_name = title_from_tag.clone().unwrap_or(file_name.clone());
+
+            // A new file in the folder of a missing track, with that track's number, takes the track over:
+            // the track keeps its id and user data, and it is probed again instead of a new item being made.
+            if let Some(index) =
+                scan_sync::heir_track(&gone_tracks, &file_path_buf, track_number, &item_name)
+            {
+                let track = gone_tracks.swap_remove(index);
+                scan_sync::take_over_track(pool, &track, &file_path, &item_name).await?;
+                tracing::info!(
+                    "Audio {} takes the new file {} of {}",
+                    track.id,
+                    file_path,
+                    track.path
+                );
+                reread += 1;
+                probe::spawn_probe_and_save(pool.clone(), track.id, file_path.clone());
+                continue;
+            }
 
             let item = MediaItem {
                 id: Uuid::new_v4(),

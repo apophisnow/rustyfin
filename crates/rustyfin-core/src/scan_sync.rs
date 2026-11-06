@@ -13,7 +13,7 @@ use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
-use crate::naming::{VersionGroup, is_ignored_dir, is_ignored_file};
+use crate::naming::{self, VersionGroup, is_ignored_dir, is_ignored_file};
 use crate::probe::ProbeStep;
 use crate::scanner::parse_year;
 
@@ -89,69 +89,29 @@ pub async fn remove_not_collected(
     loops: &[PathBuf],
 ) -> Result<u32, sqlx::Error> {
     let library_id = library.id.to_string();
-    let roots: Vec<PathBuf> = library.paths.iter().map(PathBuf::from).collect();
-    // Looked up by each item's ancestors: with a dangling link per item, as when a mount of links
-    // drops, the list is as long as the library.
-    let unreadable: HashSet<&Path> = unreadable.iter().map(PathBuf::as_path).collect();
-    // Whether each root lists something, looked up once per root, and the roots already warned about.
-    let mut listed: HashMap<usize, bool> = HashMap::new();
+    let mut removal = Removal::new(library, collected, unreadable, loops);
+    // The roots already warned about.
     let mut warned: HashSet<usize> = HashSet::new();
     // The parents of the items that step 1 deletes.
     let mut parents: HashSet<String> = HashSet::new();
     let mut removed = 0;
 
-    for &media_type in scanned_types(&library.content_type) {
-        let rows: Vec<(String, String, Option<String>)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT id, path, parent_id FROM media_items
-                 WHERE library_id = ?1 AND media_type = ?2 AND {}",
-                scope.sql("path", 3)
-            )))
-            .bind(library_id.as_str())
-            .bind(media_type)
-            .bind(scope.param())
-            .fetch_all(pool)
-            .await?;
-        for (id, path, parent_id) in rows {
-            let item = Path::new(&path);
-            let Some(root) = roots
-                .iter()
-                .position(|candidate| item.starts_with(candidate))
-            else {
-                continue;
-            };
-            let unlisted = item.ancestors().any(|dir| unreadable.contains(dir));
-            if unlisted || collected.contains(&path) {
-                continue;
-            }
-            let in_loop = loops.iter().any(|dir| item.starts_with(dir));
-            // A path that is neither a regular file nor under a loop stays, unless its file is
-            // missing and its root lists something.
-            if !in_loop && !is_regular_file(item).await {
-                if !is_gone(item).await {
-                    continue;
-                }
-                let root_listed = match listed.get(&root) {
-                    Some(&known) => known,
-                    None => {
-                        let known = root_is_listed(&roots[root]).await;
-                        listed.insert(root, known);
-                        known
-                    }
-                };
-                if !root_listed {
-                    if warned.insert(root) {
-                        tracing::warn!(
-                            "not removing the missing items under {}: the folder lists nothing, so it may not be mounted",
-                            roots[root].display()
-                        );
-                    }
-                    continue;
+    for (id, parent_id, verdict) in judge_in_scope(pool, library, scope, &mut removal).await? {
+        match verdict {
+            Verdict::Keep => {}
+            Verdict::Unlisted(root) => {
+                if warned.insert(root) {
+                    tracing::warn!(
+                        "not removing the missing items under {}: the folder lists nothing, so it may not be mounted",
+                        removal.root(root).display()
+                    );
                 }
             }
-            if delete_item(pool, &id).await? {
-                removed += 1;
-                parents.extend(parent_id);
+            Verdict::Uncollected | Verdict::Gone => {
+                if delete_item(pool, &id).await? {
+                    removed += 1;
+                    parents.extend(parent_id);
+                }
             }
         }
     }
@@ -295,6 +255,267 @@ async fn root_is_listed(root: &Path) -> bool {
         }
     }
     false
+}
+
+/// What a scan decides about a stored item whose path it did not collect.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The item stays: it is collected, or its path is outside the roots or under an unreadable folder,
+    /// or it is neither a regular file nor under a symlink loop, and its file is not missing.
+    Keep,
+    /// The item is removed: the scan did not collect it, and its file is there or it lies under a loop.
+    Uncollected,
+    /// The item is removed: its file is missing, and its root lists something.
+    Gone,
+    /// The item stays: its file is missing, but the root with this index lists nothing, so it may not be
+    /// mounted. The caller warns once for each such root.
+    Unlisted(usize),
+}
+
+/// The inputs of the removal verdicts for one scan, and whether each root lists something, which is
+/// looked up once per root.
+struct Removal<'a> {
+    roots: Vec<PathBuf>,
+    collected: &'a HashSet<String>,
+    // Looked up by each item's ancestors: with a dangling link per item, as when a mount of links
+    // drops, the list is as long as the library.
+    unreadable: HashSet<&'a Path>,
+    loops: &'a [PathBuf],
+    listed: HashMap<usize, bool>,
+}
+
+impl<'a> Removal<'a> {
+    fn new(
+        library: &Library,
+        collected: &'a HashSet<String>,
+        unreadable: &'a [PathBuf],
+        loops: &'a [PathBuf],
+    ) -> Self {
+        Self {
+            roots: library.paths.iter().map(PathBuf::from).collect(),
+            collected,
+            unreadable: unreadable.iter().map(PathBuf::as_path).collect(),
+            loops,
+            listed: HashMap::new(),
+        }
+    }
+
+    /// The library root with index `index`.
+    fn root(&self, index: usize) -> &Path {
+        &self.roots[index]
+    }
+
+    /// Whether the root with index `index` lists something.
+    async fn root_listed(&mut self, index: usize) -> bool {
+        if let Some(&known) = self.listed.get(&index) {
+            return known;
+        }
+        let known = root_is_listed(&self.roots[index]).await;
+        self.listed.insert(index, known);
+        known
+    }
+
+    /// The verdict on the stored item at `path`.
+    async fn verdict(&mut self, path: &str) -> Verdict {
+        let item = Path::new(path);
+        let Some(root) = self
+            .roots
+            .iter()
+            .position(|candidate| item.starts_with(candidate))
+        else {
+            return Verdict::Keep;
+        };
+        let under_unreadable = item.ancestors().any(|dir| self.unreadable.contains(dir));
+        if under_unreadable || self.collected.contains(path) {
+            return Verdict::Keep;
+        }
+        let in_loop = self.loops.iter().any(|dir| item.starts_with(dir));
+        // A path that is neither a regular file nor under a loop stays, unless its file is missing and
+        // its root lists something.
+        if !in_loop && !is_regular_file(item).await {
+            if !is_gone(item).await {
+                return Verdict::Keep;
+            }
+            if !self.root_listed(root).await {
+                return Verdict::Unlisted(root);
+            }
+            return Verdict::Gone;
+        }
+        Verdict::Uncollected
+    }
+}
+
+/// The stored items of `library` in `scope`, each with its parent's id and its verdict. It reads the
+/// items of the media types that the library's content type scans, as [`remove_not_collected`] does,
+/// and writes nothing.
+async fn judge_in_scope(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &PathScope,
+    removal: &mut Removal<'_>,
+) -> Result<Vec<(String, Option<String>, Verdict)>, sqlx::Error> {
+    let library_id = library.id.to_string();
+    let mut judged = Vec::new();
+    for &media_type in scanned_types(&library.content_type) {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT id, path, parent_id FROM media_items
+                 WHERE library_id = ?1 AND media_type = ?2 AND {}",
+                scope.sql("path", 3)
+            )))
+            .bind(library_id.as_str())
+            .bind(media_type)
+            .bind(scope.param())
+            .fetch_all(pool)
+            .await?;
+        for (id, path, parent_id) in rows {
+            let verdict = removal.verdict(&path).await;
+            judged.push((id, parent_id, verdict));
+        }
+    }
+    Ok(judged)
+}
+
+/// The ids of the stored items of `library` in `scope` that are gone: their file is missing, and their
+/// root lists something. [`remove_not_collected`] removes these items unless a group takes them over,
+/// so this is read before the groups of a scan are reconciled.
+pub async fn gone_items(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &PathScope,
+    collected: &HashSet<String>,
+    unreadable: &[PathBuf],
+    loops: &[PathBuf],
+) -> Result<HashSet<String>, sqlx::Error> {
+    let mut removal = Removal::new(library, collected, unreadable, loops);
+    Ok(judge_in_scope(pool, library, scope, &mut removal)
+        .await?
+        .into_iter()
+        .filter(|(_, _, verdict)| *verdict == Verdict::Gone)
+        .map(|(id, _, _)| id)
+        .collect())
+}
+
+/// A stored track whose file is gone. A new file in the track's folder may take it over.
+pub struct GoneTrack {
+    pub id: Uuid,
+    pub path: String,
+    pub name: String,
+    pub sort_name: Option<String>,
+    pub index_number: Option<i32>,
+}
+
+/// The tracks of `library` in `scope` that are gone (see [`gone_items`]). A music scan reads them
+/// before it settles its files.
+pub async fn gone_tracks(
+    pool: &SqlitePool,
+    library: &Library,
+    scope: &PathScope,
+    collected: &HashSet<String>,
+    unreadable: &[PathBuf],
+    loops: &[PathBuf],
+) -> Result<Vec<GoneTrack>, sqlx::Error> {
+    let gone = gone_items(pool, library, scope, collected, unreadable, loops).await?;
+    if gone.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[derive(sqlx::FromRow)]
+    struct TrackRow {
+        id: String,
+        path: String,
+        name: String,
+        sort_name: Option<String>,
+        index_number: Option<i32>,
+    }
+    let rows: Vec<TrackRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, path, name, sort_name, index_number FROM media_items
+         WHERE library_id = ?1 AND media_type = ?2 AND {}",
+        scope.sql("path", 3)
+    )))
+    .bind(library.id.to_string())
+    .bind("Audio")
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    let mut tracks = Vec::new();
+    for row in rows {
+        if gone.contains(&row.id) {
+            tracks.push(GoneTrack {
+                id: parse_id(&row.id)?,
+                path: row.path,
+                name: row.name,
+                sort_name: row.sort_name,
+                index_number: row.index_number,
+            });
+        }
+    }
+    Ok(tracks)
+}
+
+/// The index in `tracks` of the track that a new file at `file`, with the track number `track_number`
+/// and the name `name`, takes over: the only one in the same folder with that number, or else the only
+/// one of those with that name. The discs of an album can share track numbers, so a file that matches
+/// several tracks and the name of none takes over none, as does a file with no track number.
+pub fn heir_track(
+    tracks: &[GoneTrack],
+    file: &Path,
+    track_number: Option<i32>,
+    name: &str,
+) -> Option<usize> {
+    let number = track_number?;
+    let folder = file.parent()?;
+    let candidates: Vec<usize> = (0..tracks.len())
+        .filter(|&index| {
+            let track = &tracks[index];
+            track.index_number == Some(number) && Path::new(&track.path).parent() == Some(folder)
+        })
+        .collect();
+    if let [only] = candidates[..] {
+        return Some(only);
+    }
+    match candidates
+        .into_iter()
+        .filter(|&index| tracks[index].name == name)
+        .collect::<Vec<_>>()[..]
+    {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// Gives the gone track `track` the new file at `path`. The track keeps its id, its user data and its
+/// metadata, as a track whose file is replaced in place does, except that a name or sort name read from
+/// the old file name gives way to `name` or the new file name. The caller probes the file.
+pub async fn take_over_track(
+    pool: &SqlitePool,
+    track: &GoneTrack,
+    path: &str,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    let stem = |path: &str| {
+        Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let old_stem = stem(&track.path);
+    let name = if track.name == old_stem {
+        name
+    } else {
+        track.name.as_str()
+    };
+    let sort_name = match &track.sort_name {
+        Some(sort_name) if *sort_name != old_stem.to_lowercase() => sort_name.clone(),
+        _ => stem(path).to_lowercase(),
+    };
+    sqlx::query("UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3 WHERE id = ?4")
+        .bind(path)
+        .bind(name)
+        .bind(sort_name)
+        .bind(track.id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// The size and modification time of the file at `path`, the modification time in whole seconds
@@ -450,12 +671,14 @@ pub enum GroupOutcome {
 /// Matches each movie version group with its item, merges the other owners of a group into the
 /// survivor, updates the survivor's path and names, and says what to probe. The outcomes are in the
 /// order of `groups`. `scope` is the part of the library that the scan collected: only the items in it
-/// are read. Call this before the removal of items that are no longer collected.
+/// are read. `gone` is the set that [`gone_items`] returns: a group with no owner takes over the first of
+/// these items that it matches. Call this before the removal of items that are no longer collected.
 pub async fn reconcile_movie_groups(
     pool: &SqlitePool,
     library_id: Uuid,
     scope: &PathScope,
     groups: &[VersionGroup],
+    gone: &HashSet<String>,
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let wanted: Vec<WantedGroup> = groups
         .iter()
@@ -467,7 +690,7 @@ pub async fn reconcile_movie_groups(
             },
         })
         .collect();
-    reconcile_groups(pool, library_id, "Movie", scope, &wanted).await
+    reconcile_groups(pool, library_id, "Movie", scope, &wanted, gone).await
 }
 
 /// One episode's files in version order, and the fields that the episode gives its item.
@@ -481,12 +704,14 @@ pub struct EpisodeGroup {
 /// Matches each episode group with its item, as [`reconcile_movie_groups`] does for movies. The
 /// outcomes are in the order of `groups`. The name and sort name of an episode come from the stem
 /// of its first file. `scope` is the part of the library that the scan collected: only the items in it
-/// are read. Call this before the removal of items that are no longer collected.
+/// are read, and `gone` is as in [`reconcile_movie_groups`]. Call this before the removal of items that
+/// are no longer collected.
 pub async fn reconcile_episode_groups(
     pool: &SqlitePool,
     library_id: Uuid,
     scope: &PathScope,
     groups: &[EpisodeGroup],
+    gone: &HashSet<String>,
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let wanted: Vec<WantedGroup> = groups
         .iter()
@@ -505,7 +730,7 @@ pub async fn reconcile_episode_groups(
             },
         })
         .collect();
-    reconcile_groups(pool, library_id, "Episode", scope, &wanted).await
+    reconcile_groups(pool, library_id, "Episode", scope, &wanted, gone).await
 }
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
@@ -513,12 +738,16 @@ pub async fn reconcile_episode_groups(
 /// Groups are handled in order of their first file, and the writes for one group run in one
 /// transaction. Only the items with a path or a source in `scope` are read, with all the sources of
 /// those items. Only the probe failures in `scope` are read, since every file of `groups` is in `scope`.
+/// The groups with an owner settle first. A group with no owner then takes over the first item of `gone`
+/// that it matches (see [`takes_over`]) and that no owned group claims, so that the item keeps its id.
+/// A group that takes none gets a new item.
 async fn reconcile_groups(
     pool: &SqlitePool,
     library_id: Uuid,
     media_type: &str,
     scope: &PathScope,
     groups: &[WantedGroup],
+    gone: &HashSet<String>,
 ) -> Result<Vec<GroupOutcome>, sqlx::Error> {
     let library = library_id.to_string();
     // An item is loaded when its path is in `scope`, or when one of its sources is.
@@ -597,6 +826,9 @@ async fn reconcile_groups(
     order.sort_by_key(|&idx| groups[idx].files.first());
     let mut claimed: HashSet<&str> = HashSet::new();
     let mut outcomes: Vec<(usize, GroupOutcome)> = Vec::with_capacity(groups.len());
+    // The groups with no owner, with their probeable files. They settle after the owned groups, so that
+    // a gone item that an owned group claims is not taken over.
+    let mut unowned: Vec<(usize, Vec<String>)> = Vec::new();
     for idx in order {
         let group = &groups[idx];
         // The files that are not known failures, in order. The primary is the first of them, or the
@@ -616,28 +848,60 @@ async fn reconcile_groups(
             &group_paths,
             &claimed,
         );
-        let outcome = match owners.split_first() {
+        let Some((&survivor, others)) = owners.split_first() else {
+            unowned.push((idx, probeable));
+            continue;
+        };
+        claimed.extend(owners.iter().map(|owner| owner.id.as_str()));
+        let survivor_sources = sources_of
+            .get(survivor.id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let outcome = settle_group(
+            pool,
+            group,
+            &probeable,
+            primary,
+            survivor,
+            others,
+            survivor_sources,
+        )
+        .await?;
+        outcomes.push((idx, outcome));
+    }
+
+    // The gone items, oldest first. A group with no owner takes over the first of them that it matches.
+    let mut gone_order: Vec<&ItemRow> = items
+        .iter()
+        .filter(|item| gone.contains(item.id.as_str()))
+        .collect();
+    gone_order.sort_by(|a, b| {
+        (created_at(&a.date_created), &a.id).cmp(&(created_at(&b.date_created), &b.id))
+    });
+    for (idx, probeable) in unowned {
+        let group = &groups[idx];
+        let primary = probeable.first().unwrap_or(&group.files[0]);
+        // A group whose files all failed to probe makes a new item: a taken-over item keeps its old
+        // sources, since the probe that replaces them does not run.
+        let heir = gone_order.iter().copied().find(|item| {
+            !probeable.is_empty()
+                && !claimed.contains(item.id.as_str())
+                && takes_over(item, group, primary)
+        });
+        let outcome = match heir {
+            Some(item) => {
+                claimed.insert(item.id.as_str());
+                tracing::info!(
+                    "{media_type} {} takes the new file {primary} of {}",
+                    item.id,
+                    item.path
+                );
+                settle_group(pool, group, &probeable, primary, item, &[], &[]).await?
+            }
             None => GroupOutcome::New {
                 path: primary.clone(),
                 steps: group_steps(&probeable),
             },
-            Some((&survivor, others)) => {
-                claimed.extend(owners.iter().map(|owner| owner.id.as_str()));
-                let survivor_sources = sources_of
-                    .get(survivor.id.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                settle_group(
-                    pool,
-                    group,
-                    &probeable,
-                    primary,
-                    survivor,
-                    others,
-                    survivor_sources,
-                )
-                .await?
-            }
         };
         outcomes.push((idx, outcome));
     }
@@ -674,6 +938,37 @@ fn owners_of<'a>(
     });
     owners.dedup_by(|a, b| a.id == b.id);
     owners
+}
+
+/// Whether the gone item `item` is the unit of `group`, so that the group takes it over. A movie is the
+/// unit when its old file is in the folder of `primary`, with the title and year of the group. The title
+/// and year may match the item's stored ones or those of its old file name, read by `naming::clean_name`,
+/// since metadata can rename an item. An episode is the unit when it has the group's episode number in
+/// the group's season.
+fn takes_over(item: &ItemRow, group: &WantedGroup, primary: &str) -> bool {
+    match &group.wanted {
+        Wanted::Movie { title, year } => {
+            let old = Path::new(&item.path);
+            let Some(stem) = old.file_stem() else {
+                return false;
+            };
+            let from_name = naming::clean_name(&stem.to_string_lossy());
+            let key = naming::title_key(title);
+            old.parent() == Path::new(primary).parent()
+                && (naming::title_key(&item.name) == key
+                    || naming::title_key(&from_name.title) == key)
+                && (item.production_year == *year || from_name.year == *year)
+        }
+        Wanted::Episode {
+            index_number,
+            parent_id,
+            ..
+        } => {
+            item.index_number.is_some()
+                && item.index_number == *index_number
+                && item.parent_id.as_deref() == Some(parent_id.to_string().as_str())
+        }
+    }
 }
 
 /// Settles one group whose owners are known. Merges the other owners into the survivor, writes the
