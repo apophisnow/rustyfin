@@ -3091,15 +3091,25 @@ fn b21_qc_sign_in(secret: Option<&str>) -> Request<Body> {
         .unwrap()
 }
 
-/// Asks for a password reset and reads the PIN from the PIN file; None when none was written.
+/// Asks for a password reset and reads the PIN from the PIN file; None when none was written within
+/// 2 s. The reset work may finish after the 250 ms answer under load, so the file is awaited.
 async fn b21_reset_pin(app: &axum::Router, name: &str) -> Option<String> {
     let body = serde_json::json!({ "EnteredUsername": name });
     let req = request("POST", "/Users/ForgotPassword", None, Some(body));
     let (status, answer) = send(app, req).await;
     assert_eq!(status, StatusCode::OK);
-    let text = std::fs::read_to_string(answer["PinFile"].as_str()?).ok()?;
-    let file: serde_json::Value = serde_json::from_str(&text).unwrap();
-    file["Pin"].as_str().map(str::to_string)
+    let path = answer["PinFile"].as_str()?.to_string();
+    for _ in 0..20 {
+        // The file is created before it is written, so an empty or partial file is read again.
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(file) = file {
+            return file["Pin"].as_str().map(str::to_string);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    None
 }
 
 /// Password sign-in. Returns the status and the Detail.
