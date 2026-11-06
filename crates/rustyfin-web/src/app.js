@@ -380,6 +380,9 @@ const clickActions = {
     'oidc-sign-in': () => startOidcSignIn(),
     'oidc-link': () => startOidcLink(),
     'oidc-unlink': el => unlinkOidc(el.dataset.id),
+    'oidc-remove-link': el => removeOidcLinkAsAdmin(el),
+    'oidc-copy-callback': () => copyOidcCallbackUrl(),
+    'oidc-save-settings': () => saveOidcAdminSettings(),
 };
 document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');
@@ -2374,6 +2377,9 @@ async function handleSaveConfig(e) {
 }
 
 // --- Admin Dashboard Renderer ---
+// AccountStatus.UserId has hyphens and a user's Id may not, so account ids are compared without case and hyphens.
+function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, ''); }
+
 async function renderAdmin() {
     const page = $('page-admin');
     if (!API.isAdmin) {
@@ -2385,17 +2391,19 @@ async function renderAdmin() {
 
     try {
         let libsError = null;
-        const [users, libs, tasks, plugins, info, sessions] = await Promise.all([
+        const [users, libs, tasks, plugins, info, sessions, accounts] = await Promise.all([
             API.getUsers().catch(() => []),
             API.getLibraries().catch(err => { libsError = err; return []; }),
             API.getTasks().catch(() => []),
             API.getPlugins().catch(() => []),
             API.getFullInfo().catch(() => ({})),
-            API.getSessions().catch(() => [])
+            API.getSessions().catch(() => []),
+            API.oidcAccounts().catch(() => [])
         ]);
+        const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2467,19 +2475,26 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('oidc.provider_column'))}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
-                            ${users.map(u => `
+                            ${users.map(u => {
+                                const name = u.Name || u.name;
+                                const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
+                                const account = accountById.get(oidcAccountKey(u.Id || u.id));
+                                return `
                             <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(u.Name || u.name)}</td>
-                                <td class="py-3">${(u.Policy?.IsAdministrator || u.policy?.is_administrator) ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${t('admin.role_admin')}</span>` : `<span class="text-white/40">${t('admin.role_user')}</span>`}</td>
+                                <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
+                                <td class="py-3">${isAdmin ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_admin'))}</span>${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span>` : ''}` : `<span class="text-white/40">${escapeHtml(t('admin.role_user'))}</span>`}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
+                                <td class="py-3 text-white/60">${account?.Linked ? `${escapeHtml(account.ProviderUsername || '—')} <button type="button" class="ml-2 text-[#00a4dc] hover:text-[#38bdf8] font-semibold" data-action="oidc-remove-link" data-id="${escapeHtml(account.UserId)}" data-name="${escapeHtml(name)}">${escapeHtml(t('oidc.remove_link'))}</button>` : '<span class="text-white/40">—</span>'}</td>
                                 <td class="py-3 text-right">
                                     <button class="text-red-400 hover:text-red-300 font-semibold" data-action="delete-user" data-id="${escapeHtml(u.Id || u.id)}">${t('common.delete')}</button>
                                 </td>
-                            </tr>`).join('')}
+                            </tr>`;
+                            }).join('')}
                         </tbody>
                     </table>
                 </div>
@@ -2588,6 +2603,9 @@ async function renderAdmin() {
                     <p class="text-[10px] text-white/20 mt-2">${t('admin.live_log_hint')}</p>
                 </div>
             </div>
+
+            <!-- Tab 7: Sign-in (OpenID Connect settings, filled by loadOidcAdminTab) -->
+            <div id="admin-signin" class="hidden jf-settings-card"></div>
         </div>`;
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
@@ -2600,13 +2618,180 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+    if (tabId === 'admin-signin') loadOidcAdminTab();
+}
+
+// An administrator removes another user's provider link. The users tab is shown again after the page is rendered.
+async function removeOidcLinkAsAdmin(el) {
+    if (!confirm(t('oidc.remove_link_confirm', { name: el.dataset.name }))) return;
+    try {
+        await API.oidcUnlink(el.dataset.id);
+    } catch (err) {
+        toast(err.message, 'error');
+        return;
+    }
+    toast(t('oidc.unlinked'));
+    await renderAdmin();
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
+}
+
+// --- OpenID Connect settings (admin "Sign-in" tab) ---
+
+async function loadOidcAdminTab() {
+    let settings;
+    try {
+        settings = await API.oidcSettings();
+    } catch {
+        const box = $('admin-signin');
+        if (box) box.innerHTML = `<p class="text-xs text-red-400">${escapeHtml(t('oidc.load_failed'))}</p>`;
+        return;
+    }
+    renderOidcAdminSettings(settings);
+}
+
+// Renders the form from an OidcSettings object. The client secret field is always empty: a saved secret shows only in the placeholder.
+function renderOidcAdminSettings(s) {
+    const box = $('admin-signin');
+    if (!box) return;
+    const label = (id, key) => `<label for="${id}" class="block text-xs font-semibold text-white/70 mb-1.5">${escapeHtml(t(key))}</label>`;
+    const hint = key => `<p class="text-xs text-white/40 mt-1">${escapeHtml(t(key))}</p>`;
+    const warn = key => `<p class="text-xs text-amber-300/80 mt-1">${escapeHtml(t(key))}</p>`;
+    const check = (id, key, checked = false) => `
+            <div class="flex items-center gap-3">
+                <input type="checkbox" id="${id}" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"${checked ? ' checked' : ''}>
+                <label for="${id}" class="text-sm text-white/70">${escapeHtml(t(key))}</label>
+            </div>`;
+    const callbackRow = s.CallbackUrl
+        ? `<div class="flex gap-2">
+                <input id="oidc-callback-url" class="jf-input w-full" value="${escapeHtml(s.CallbackUrl)}" readonly>
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs whitespace-nowrap" data-action="oidc-copy-callback">${escapeHtml(t('oidc.copy'))}</button>
+            </div>`
+        : hint('oidc.callback_after_save');
+
+    box.innerHTML = `
+        <h3 class="font-bold text-white text-base mb-4">${escapeHtml(t('oidc.settings_title'))}</h3>
+        <div class="space-y-4 max-w-2xl">
+            ${check('oidc-enabled', 'oidc.enabled', s.Enabled)}
+            <div>
+                ${label('oidc-issuer-url', 'oidc.issuer_url')}
+                <input id="oidc-issuer-url" type="text" class="jf-input w-full" value="${escapeHtml(s.IssuerUrl)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-id', 'oidc.client_id')}
+                <input id="oidc-client-id" type="text" class="jf-input w-full" value="${escapeHtml(s.ClientId)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-secret', 'oidc.client_secret')}
+                <input id="oidc-client-secret" type="password" class="jf-input w-full" autocomplete="new-password" placeholder="${escapeHtml(t(s.HasClientSecret ? 'oidc.secret_saved_placeholder' : 'oidc.secret_none_placeholder'))}">
+                ${s.HasClientSecret ? `<div class="mt-2">${check('oidc-remove-secret', 'oidc.remove_secret')}</div>` : ''}
+            </div>
+            <div>
+                ${label('oidc-scopes', 'oidc.scopes')}
+                <input id="oidc-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.Scopes)}" spellcheck="false" autocomplete="off">
+                ${hint('oidc.scopes_hint')}
+                <div class="mt-3">
+                    ${label('oidc-effective-scopes', 'oidc.effective_scopes')}
+                    <input id="oidc-effective-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.EffectiveScopes)}" readonly>
+                </div>
+            </div>
+            <div>
+                ${label('oidc-button-label', 'oidc.button_label')}
+                <input id="oidc-button-label" type="text" class="jf-input w-full" value="${escapeHtml(s.ButtonLabel)}" placeholder="${escapeHtml(t('oidc.sign_in_default'))}">
+            </div>
+            <div>
+                ${label('oidc-username-claim', 'oidc.username_claim')}
+                <input id="oidc-username-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.UsernameClaim)}">
+                ${warn('oidc.warn_username')}
+            </div>
+            <div>
+                ${label('oidc-group-claim', 'oidc.group_claim')}
+                <input id="oidc-group-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.GroupClaim)}">
+            </div>
+            <div>
+                ${label('oidc-allowed-group', 'oidc.allowed_group')}
+                <input id="oidc-allowed-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AllowedGroup)}">
+                ${hint('oidc.allowed_group_hint')}
+            </div>
+            <div>
+                ${label('oidc-admin-group', 'oidc.admin_group')}
+                <input id="oidc-admin-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AdminGroup)}">
+                ${hint('oidc.admin_group_hint')}
+                ${warn('oidc.warn_groups')}
+            </div>
+            <div>
+                ${label('oidc-public-url', 'oidc.public_url')}
+                <input id="oidc-public-url" type="text" class="jf-input w-full" value="${escapeHtml(s.PublicUrl || location.origin)}">
+            </div>
+            <div>
+                ${label('oidc-callback-url', 'oidc.callback_url')}
+                ${callbackRow}
+            </div>
+            <div>
+                ${check('oidc-allow-password', 'oidc.allow_password', s.AllowPasswordSignIn)}
+                ${warn('oidc.warn_password_off')}
+            </div>
+            <div id="oidc-settings-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-end">
+                <button type="button" class="jf-btn-primary text-xs" data-action="oidc-save-settings">${escapeHtml(t('oidc.save'))}</button>
+            </div>
+        </div>`;
+}
+
+// Copies the callback URL. navigator.clipboard is missing on plain-http LAN addresses, so the field is selected for execCommand.
+async function copyOidcCallbackUrl() {
+    const input = $('oidc-callback-url');
+    if (!input) return;
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+        copied = await navigator.clipboard.writeText(input.value).then(() => true, () => false);
+    }
+    if (!copied) {
+        input.select();
+        copied = document.execCommand('copy');
+    }
+    if (copied) toast(t('oidc.copied'));
+    else toast(t('oidc.copy_failed'), 'error');
+}
+
+// The form stays as typed when the server refuses the save: the error text goes into the card, not over the form.
+async function saveOidcAdminSettings() {
+    const text = id => $(id).value;
+    const body = {
+        Enabled: $('oidc-enabled').checked,
+        IssuerUrl: text('oidc-issuer-url'),
+        ClientId: text('oidc-client-id'),
+        Scopes: text('oidc-scopes'),
+        ButtonLabel: text('oidc-button-label'),
+        UsernameClaim: text('oidc-username-claim'),
+        GroupClaim: text('oidc-group-claim'),
+        AllowedGroup: text('oidc-allowed-group'),
+        AdminGroup: text('oidc-admin-group'),
+        PublicUrl: text('oidc-public-url'),
+        AllowPasswordSignIn: $('oidc-allow-password').checked,
+    };
+    const secret = text('oidc-client-secret');
+    if ($('oidc-remove-secret')?.checked) body.ClientSecret = '';
+    else if (secret) body.ClientSecret = secret;
+
+    hide('oidc-settings-error');
+    let saved;
+    try {
+        saved = await API.saveOidcSettings(body);
+    } catch (err) {
+        $('oidc-settings-error').textContent = err.message;
+        show('oidc-settings-error');
+        return;
+    }
+    toast(t('oidc.settings_saved'));
+    renderOidcAdminSettings(saved);
 }
 
 // --- Scheduled Tasks UI ---
