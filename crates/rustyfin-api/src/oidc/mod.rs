@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use flow::FlowStore;
 use openidconnect::core::{CoreJsonWebKeySet, CoreProviderMetadata};
 use rustyfin_model::oidc::{OidcConfig, OidcSettings};
+use rustyfin_model::user::User;
 use serde_json::Value;
+use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
 pub mod flow;
@@ -16,10 +18,10 @@ pub mod signin;
 #[cfg(test)]
 mod tests;
 
-/// The refusal for a non-administrator's password sign-in while the switch is off (AC21).
+/// The refusal for a password sign-in that the switch refuses, whoever the user is (AC21, AC41).
 pub const PASSWORD_SIGN_IN_OFF: &str = "Password sign-in is turned off for this account.";
 
-/// The refusal for a non-administrator's password reset while the switch is off (AC22).
+/// The refusal for a password reset that the switch refuses, whoever the user is (AC22, AC41).
 pub const PASSWORD_RESET_OFF: &str = "Password reset is turned off for this account.";
 
 /// The refusal for a non-administrator's rename while sign-in through the provider is on (AC38).
@@ -141,6 +143,22 @@ pub fn settings_answer(config: &OidcConfig) -> OidcSettings {
         callback_url: callback_url(&config.public_url),
         allow_password_sign_in: config.allow_password_sign_in,
     }
+}
+
+/// Whether the password switch lets `user` use a password (AC21, AC22, AC41): always while the
+/// switch is on; otherwise only an administrator whose rights were given by hand.
+pub async fn password_allowed(
+    pool: &SqlitePool,
+    config: &OidcConfig,
+    user: &User,
+) -> Result<bool, sqlx::Error> {
+    if config.allow_password_sign_in {
+        return Ok(true);
+    }
+    if !user.is_administrator {
+        return Ok(false);
+    }
+    Ok(!rustyfin_db::repo_user::admin_from_group(pool, user.id).await?)
 }
 
 /// How long a fetched discovery document is kept before a sign-in fetches it again.

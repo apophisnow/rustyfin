@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::middleware::resolve_client;
-use crate::oidc::{PASSWORD_RESET_OFF, RENAME_OFF};
+use crate::oidc::{PASSWORD_RESET_OFF, RENAME_OFF, password_allowed};
 use crate::state::AppState;
 
 pub fn public_routes() -> Router<AppState> {
@@ -324,10 +324,14 @@ async fn issue_reset_pin(db: SqlitePool, name: String, pin_path: PathBuf, expire
             return;
         }
     };
-    // While password sign-in is off, only an administrator gets a reset PIN.
-    match rustyfin_db::repo_oidc::get_settings(&db).await {
-        Ok(config) if config.allow_password_sign_in || user.is_administrator => {}
-        Ok(_) => return,
+    // While password sign-in is off, only a user the switch allows gets a reset PIN (AC22, AC41).
+    let allowed = match rustyfin_db::repo_oidc::get_settings(&db).await {
+        Ok(config) => password_allowed(&db, &config, &user).await,
+        Err(e) => Err(e),
+    };
+    match allowed {
+        Ok(true) => {}
+        Ok(false) => return,
         Err(e) => {
             tracing::warn!(error = %e, "reset PIN: could not read the sign-in settings");
             return;
@@ -386,10 +390,10 @@ async fn reset_password_pin(
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
 
-    // While password sign-in is off, only an administrator may reset a password by PIN. The PIN is
-    // already spent here, so its file goes too.
+    // While password sign-in is off, only a user the switch allows may reset a password by PIN
+    // (AC22, AC41). The PIN is already spent here, so its file goes too.
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
-    if !config.allow_password_sign_in && !user.is_administrator {
+    if !password_allowed(&state.db, &config, &user).await? {
         let _ = std::fs::remove_file(
             state
                 .data_dir
@@ -435,9 +439,10 @@ async fn reset_password(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::BadRequest("invalid or expired PIN".to_string()))?;
 
-    // While password sign-in is off, only an administrator may reset a password.
+    // While password sign-in is off, only a user the switch allows may reset a password
+    // (AC22, AC41).
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
-    if !config.allow_password_sign_in && !user.is_administrator {
+    if !password_allowed(&state.db, &config, &user).await? {
         return Err(ApiError::Forbidden(PASSWORD_RESET_OFF.to_string()));
     }
 

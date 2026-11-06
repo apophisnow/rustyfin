@@ -174,7 +174,8 @@ pub async fn delete_link(pool: &SqlitePool, user_id: Uuid) -> Result<bool, sqlx:
 }
 
 /// The link status of every account, by name, or of the one account `only` names (AC30).
-/// `allow_password_sign_in` is the setting the CanUnlink rule reads.
+/// The CanUnlink rule (AC31, AC41) reads `allow_password_sign_in` and each account's
+/// admin-group flag.
 pub async fn account_statuses(
     pool: &SqlitePool,
     allow_password_sign_in: bool,
@@ -212,12 +213,13 @@ impl AccountRow {
     fn into_status(self, allow_password_sign_in: bool) -> AccountStatus {
         let linked = self.username.is_some();
         let is_administrator = self.is_administrator != 0;
+        let admin_from_group = self.admin_from_group != 0;
         let has_password = self.has_password != 0;
         AccountStatus {
             user_id: Uuid::parse_str(&self.id).unwrap_or_default(),
             user_name: self.name,
             is_administrator,
-            admin_from_group: self.admin_from_group != 0,
+            admin_from_group,
             has_password,
             linked,
             provider_username: self.username,
@@ -227,7 +229,9 @@ impl AccountRow {
             last_sign_in_at: self
                 .last_sign_in_at
                 .and_then(|at| at.parse::<DateTime<Utc>>().ok()),
-            can_unlink: linked && has_password && (allow_password_sign_in || is_administrator),
+            can_unlink: linked
+                && has_password
+                && (allow_password_sign_in || (is_administrator && !admin_from_group)),
         }
     }
 }

@@ -5396,7 +5396,6 @@ async fn b21_names_match_in_ascii_case_only() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 4"]
 async fn b21_password_switch_refuses_group_granted_admins() {
     let t =
         b21_on(serde_json::json!({ "AdminGroup": "admins", "AllowPasswordSignIn": false })).await;
@@ -5454,7 +5453,6 @@ async fn b21_password_switch_refuses_group_granted_admins() {
 }
 
 #[tokio::test]
-#[ignore = "B21 fix 4"]
 async fn b21_password_switch_stops_reset_pins_for_group_granted_admins() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     for name in ["hal", "ivy"] {
