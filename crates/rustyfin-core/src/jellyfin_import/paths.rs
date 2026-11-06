@@ -1,6 +1,7 @@
 //! Path pairs (spec 2.8): translation by the longest component prefix, and the suggested pairs
 //! from Jellyfin's library folders.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rustyfin_model::library::Library;
@@ -16,9 +17,12 @@ pub struct PathMapping {
     pub to: String,
 }
 
-/// Translates a Jellyfin path by the pair with the longest `From` that is a component-wise prefix
-/// of `path` (trailing slashes ignored); `None` when no pair applies.
-pub fn translate_path(path: &str, pairs: &[PathMapping]) -> Option<String> {
+/// The pair with the longest `From` that is a component-wise prefix of `path` (trailing slashes
+/// ignored; the first of equal lengths), and the rest of `path` below that prefix.
+pub(super) fn pair_for<'a>(
+    path: &str,
+    pairs: &'a [PathMapping],
+) -> Option<(&'a PathMapping, String)> {
     let path = path.trim_end_matches('/');
     let mut best: Option<(&PathMapping, usize, &str)> = None;
     for pair in pairs.iter().filter(|pair| !pair.from.is_empty()) {
@@ -30,7 +34,13 @@ pub fn translate_path(path: &str, pairs: &[PathMapping]) -> Option<String> {
             best = Some((pair, from.len(), rest));
         }
     }
-    let (pair, _, rest) = best?;
+    best.map(|(pair, _, rest)| (pair, rest.to_string()))
+}
+
+/// Translates a Jellyfin path by the pair with the longest `From` that is a component-wise prefix
+/// of `path` (trailing slashes ignored); `None` when no pair applies.
+pub fn translate_path(path: &str, pairs: &[PathMapping]) -> Option<String> {
+    let (pair, rest) = pair_for(path, pairs)?;
     let translated = format!("{}{rest}", pair.to.trim_end_matches('/'));
     Some(if translated.is_empty() {
         "/".to_string()
@@ -133,4 +143,42 @@ fn last_component(path: &str) -> &str {
         .rsplit('/')
         .next()
         .unwrap_or_default()
+}
+
+/// The pair for Jellyfin's metadata folder (spec 5.9): among `image_paths` (absolute, without `..`),
+/// the prefix up to and including the first component named `metadata` that most paths share (ties:
+/// the shortest, then the smallest). Only when `<program data>/metadata` is a folder and no pair
+/// covers that prefix.
+pub fn suggest_metadata(
+    image_paths: &[&str],
+    program_data: &Path,
+    pairs: &[PathMapping],
+) -> Option<PathMapping> {
+    let local = program_data.join("metadata");
+    if !local.is_dir() {
+        return None;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for path in image_paths {
+        if !path.starts_with('/') || path.split('/').any(|part| part == "..") {
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        if let Some(index) = parts.iter().position(|part| *part == "metadata") {
+            *counts.entry(parts[..=index].join("/")).or_default() += 1;
+        }
+    }
+    let (prefix, _) = counts.into_iter().max_by(|(a, count_a), (b, count_b)| {
+        count_a
+            .cmp(count_b)
+            .then_with(|| b.len().cmp(&a.len()))
+            .then_with(|| b.cmp(a))
+    })?;
+    if translate_path(&prefix, pairs).is_some() {
+        return None;
+    }
+    Some(PathMapping {
+        from: prefix,
+        to: local.display().to_string(),
+    })
 }

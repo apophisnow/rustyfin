@@ -1,8 +1,10 @@
 //! Import from Jellyfin (B20): users, watch data and track choices from a Jellyfin data folder,
 //! read read-only. Spec: the B20 brief and spec, Stage 2.
 
+pub mod images;
 pub mod job;
 pub mod merge;
+pub mod metadata;
 pub mod paths;
 pub mod plan;
 pub mod source;
@@ -12,10 +14,11 @@ pub mod tracks;
 mod tests;
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 pub use job::{ImportJob, ImportStage, ImportStatus, JobHandle, JobState};
+pub use metadata::{MetadataMode, MetadataReport};
 use paths::PathMapping;
 use rustyfin_auth::{generate_setup_code, hash_setup_code, unusable_password_hash};
 use rustyfin_db::repo_jellyfin_import::{
@@ -58,7 +61,7 @@ pub enum Layout {
     Old,
 }
 
-/// An import request (spec 2.17). Unknown fields, such as `MetadataMode`, are ignored.
+/// An import request (spec 2.17). Unknown fields are ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImportRequest {
@@ -69,9 +72,12 @@ pub struct ImportRequest {
     pub path_mappings: Option<Vec<PathMapping>>,
     /// Jellyfin user ids to import; absent means all users.
     pub user_ids: Option<Vec<Uuid>>,
+    /// How existing metadata is treated (spec 5.1); absent means `FillEmpty`.
+    #[serde(default)]
+    pub metadata_mode: MetadataMode,
 }
 
-/// The preview's answer (spec 2.20). `Metadata` comes in a later stage.
+/// The preview's answer (spec 2.20), and a run's report. `Metadata` is the spec 5 part.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImportReport {
@@ -84,6 +90,7 @@ pub struct ImportReport {
     pub items: ItemReport,
     pub watch_data: WatchDataReport,
     pub tracks: TrackReport,
+    pub metadata: MetadataReport,
 }
 
 /// The watch data of the report (spec 2.20, 2.32): `imported + unchanged + unmatched` is `rows`.
@@ -166,10 +173,14 @@ pub struct UnmatchedSample {
 }
 
 /// Reads the Jellyfin data folder named by `req` and reports what an import would do. Writes
-/// nothing, here or in the source.
-pub async fn preview(db: &SqlitePool, req: &ImportRequest) -> Result<ImportReport, ImportError> {
+/// nothing, here or in the source. `data_dir` is Rustyfin's data folder (spec 5.9).
+pub async fn preview(
+    db: &SqlitePool,
+    req: &ImportRequest,
+    data_dir: &Path,
+) -> Result<ImportReport, ImportError> {
     let prepared = prepare(req).await?;
-    let report = plan_report(db, req, &prepared, None).await?;
+    let report = plan_report(db, req, &prepared, data_dir, None).await?;
 
     let layout = report.layout;
     let source = &req.source_path;
@@ -186,8 +197,17 @@ pub async fn preview(db: &SqlitePool, req: &ImportRequest) -> Result<ImportRepor
         report.watch_data.unchanged,
         report.watch_data.unmatched,
     );
+    let (mode, items, fields, people, images, missing, locked) = (
+        report.metadata.mode,
+        report.metadata.items,
+        report.metadata.fields,
+        report.metadata.people,
+        report.metadata.images,
+        report.metadata.images_missing,
+        report.metadata.locked,
+    );
     tracing::info!(
-        "jellyfin import preview: source {source}, layout {layout:?}, {user_count} users, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched), {rows} watch rows ({imported} imported, {unchanged} unchanged, {watch_unmatched} unmatched)"
+        "jellyfin import preview: source {source}, layout {layout:?}, {user_count} users, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched), {rows} watch rows ({imported} imported, {unchanged} unchanged, {watch_unmatched} unmatched), metadata {mode:?} ({items} items, {fields} fields, {people} people, {images} images, {missing} missing, {locked} locked)"
     );
     Ok(report)
 }
@@ -218,6 +238,7 @@ async fn plan_report(
     db: &SqlitePool,
     req: &ImportRequest,
     prepared: &Prepared,
+    data_dir: &Path,
     handle: Option<&JobHandle>,
 ) -> Result<ImportReport, ImportError> {
     if let Some(handle) = handle {
@@ -233,13 +254,13 @@ async fn plan_report(
         .await
         .map_err(ImportError::Db)?;
 
-    let suggested = paths::suggest(
+    let mut suggested = paths::suggest(
         &prepared.folders,
         &libraries,
         &prepared.location.program_data_path,
         &prepared.location.data_path,
     );
-    let path_mappings = req
+    let mut path_mappings = req
         .path_mappings
         .clone()
         .unwrap_or_else(|| suggested.pairs.clone());
@@ -270,6 +291,33 @@ async fn plan_report(
     let (watch_data, track_counts) =
         plan_watch_data(db, prepared, &targets, &users, &path_mappings, handle).await?;
 
+    // Metadata (spec 5.9): the metadata folder's pair is suggested from the matched items' images.
+    let matched = plan::matched_items(&prepared.snapshot.items, &targets, &path_mappings);
+    let image_paths = metadata_image_paths(&prepared.snapshot, &matched);
+    if let Some(pair) = paths::suggest_metadata(
+        &image_paths,
+        &prepared.location.program_data_path,
+        &suggested.pairs,
+    ) {
+        suggested.pairs.push(pair.clone());
+        if req.path_mappings.is_none() {
+            path_mappings.push(pair);
+        }
+    }
+    let metadata_report = metadata::import(
+        db,
+        &metadata::MetadataInput {
+            mode: req.metadata_mode,
+            snapshot: &prepared.snapshot,
+            matched: &matched,
+            pairs: &path_mappings,
+            program_data: &prepared.location.program_data_path,
+            data_dir,
+        },
+        handle,
+    )
+    .await?;
+
     Ok(ImportReport {
         layout: prepared.snapshot.layout,
         data_path: prepared.location.data_path.display().to_string(),
@@ -280,7 +328,28 @@ async fn plan_report(
         items,
         watch_data,
         tracks: track_counts,
+        metadata: metadata_report,
     })
+}
+
+/// The image paths of the matched items and of the people credited on them (spec 5.9): the
+/// inputs of the metadata folder's suggested pair.
+fn metadata_image_paths<'a>(
+    snapshot: &'a source::Snapshot,
+    matched: &HashMap<Uuid, Uuid>,
+) -> Vec<&'a str> {
+    let mut paths = Vec::new();
+    for jf_id in matched.keys() {
+        if let Some(meta) = snapshot.metadata.items.get(jf_id) {
+            paths.extend(meta.images.iter().map(|image| image.path.as_str()));
+        }
+        for credit in snapshot.metadata.credits.get(jf_id).into_iter().flatten() {
+            if let Some(images) = snapshot.metadata.person_images.get(credit.name.trim()) {
+                paths.extend(images.iter().map(|image| image.path.as_str()));
+            }
+        }
+    }
+    paths
 }
 
 /// The watch-data step of the planning (spec 2.32): merges each importing user's rows into the
@@ -531,9 +600,17 @@ async fn create_users(
 }
 
 /// Runs a prepared import in the background (spec 2.18-2.21, 2.26): creates the planned users and
-/// reports through `handle`. One INFO line on success; a WARN line and the error on failure.
-pub async fn run(db: SqlitePool, req: ImportRequest, prepared: Prepared, handle: JobHandle) {
-    match plan_report(&db, &req, &prepared, Some(&handle)).await {
+/// reports through `handle`. `on_written` runs when metadata was written (spec 5.10), before the
+/// report is completed. One INFO line on success; a WARN line and the error on failure.
+pub async fn run(
+    db: SqlitePool,
+    req: ImportRequest,
+    prepared: Prepared,
+    handle: JobHandle,
+    data_dir: PathBuf,
+    on_written: impl FnOnce() + Send + 'static,
+) {
+    match plan_report(&db, &req, &prepared, &data_dir, Some(&handle)).await {
         Ok(report) => {
             let layout = report.layout;
             let source = &req.source_path;
@@ -555,9 +632,21 @@ pub async fn run(db: SqlitePool, req: ImportRequest, prepared: Prepared, handle:
                 report.watch_data.unchanged,
                 report.watch_data.unmatched,
             );
-            tracing::info!(
-                "jellyfin import run: source {source}, layout {layout:?}, {user_count} users, {created} created, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched), {rows} watch rows ({imported} imported, {unchanged} unchanged, {watch_unmatched} unmatched)"
+            let (mode, items, fields, people, images, missing, locked) = (
+                report.metadata.mode,
+                report.metadata.items,
+                report.metadata.fields,
+                report.metadata.people,
+                report.metadata.images,
+                report.metadata.images_missing,
+                report.metadata.locked,
             );
+            tracing::info!(
+                "jellyfin import run: source {source}, layout {layout:?}, {user_count} users, {created} created, {total} items ({by_path} by path, {by_id} by id, {unmatched} unmatched), {rows} watch rows ({imported} imported, {unchanged} unchanged, {watch_unmatched} unmatched), metadata {mode:?} ({items} items, {fields} fields, {people} people, {images} images, {missing} missing, {locked} locked)"
+            );
+            if report.metadata.written {
+                on_written();
+            }
             handle.complete(report);
         }
         Err(error) => {

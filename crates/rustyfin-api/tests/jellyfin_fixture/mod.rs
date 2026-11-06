@@ -65,6 +65,112 @@ pub struct JfItem {
     pub providers: Vec<(&'static str, String)>,
     /// The old layout's `UserDataKey`.
     pub user_data_key: String,
+    pub meta: JfMeta,
+    /// Credits in the order written (`PeopleBaseItemMap`; old layout `People`).
+    pub people: Vec<JfCredit>,
+    /// Image rows in the order written (`BaseItemImageInfos`; old layout `TypedBaseItems.Images`).
+    pub images: Vec<JfImage>,
+}
+
+/// Jellyfin's metadata columns of an item, as stored (dates as text, lists pipe-joined).
+#[derive(Clone, Debug, Default)]
+pub struct JfMeta {
+    pub forced_sort_name: Option<&'static str>,
+    pub original_title: Option<&'static str>,
+    pub overview: Option<&'static str>,
+    pub tagline: Option<&'static str>,
+    pub official_rating: Option<&'static str>,
+    pub community_rating: Option<f64>,
+    pub critic_rating: Option<f64>,
+    /// New layout text, e.g. "2001-05-04 00:00:00"; the old layout gets a trailing "Z".
+    pub premiere_date: Option<&'static str>,
+    pub end_date: Option<&'static str>,
+    pub production_year: Option<i32>,
+    pub genres: Option<&'static str>,
+    pub studios: Option<&'static str>,
+    pub tags: Option<&'static str>,
+}
+
+/// One credit of an item.
+#[derive(Clone, Debug)]
+pub struct JfCredit {
+    pub name: &'static str,
+    /// `PersonType`, e.g. "Actor", "Director"; None stores NULL.
+    pub kind: Option<&'static str>,
+    /// "" means none, as Jellyfin stores it.
+    pub role: &'static str,
+    pub list_order: Option<i32>,
+    pub sort_order: Option<i32>,
+}
+
+/// One image row of an item.
+#[derive(Clone, Debug)]
+pub struct JfImage {
+    /// As Jellyfin stores it: absolute, or starting with `%MetadataPath%`.
+    pub path: String,
+    /// Jellyfin's `ImageType` number: 0 Primary, 1 Art, 2 Backdrop, 3 Banner, 4 Logo, 5 Thumb,
+    /// 6 Disc, 7 Box, 8 Screenshot, 9 Menu, 10 Chapter, 11 BoxRear, 12 Profile.
+    pub kind: i32,
+    pub width: i32,
+    pub height: i32,
+    pub blurhash: Option<&'static str>,
+}
+
+/// The start of a JPEG file; synthetic images are this plus a marker.
+pub const JPEG_HEAD: &[u8] = &[
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
+];
+/// The start of a PNG file.
+pub const PNG_HEAD: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00,
+];
+
+/// Writes a synthetic image `head` + `marker` at `path`, with its parent folders; returns the bytes.
+pub fn write_image(path: &Path, head: &[u8], marker: &str) -> Vec<u8> {
+    let mut bytes = head.to_vec();
+    bytes.extend_from_slice(marker.as_bytes());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+fn image_type_name(kind: i32) -> &'static str {
+    [
+        "Primary",
+        "Art",
+        "Backdrop",
+        "Banner",
+        "Logo",
+        "Thumb",
+        "Disc",
+        "Box",
+        "Screenshot",
+        "Menu",
+        "Chapter",
+        "BoxRear",
+        "Profile",
+    ][kind as usize]
+}
+
+/// The old layout's `Images` text: `Path*Ticks*Type*Width*Height*Blurhash` entries joined by `|`,
+/// with `*` and `|` in a blurhash written as `/` and `\`.
+fn old_images(images: &[JfImage]) -> Option<String> {
+    let entries: Vec<String> = images
+        .iter()
+        .map(|i| {
+            let hash = i
+                .blurhash
+                .unwrap_or("")
+                .replace('*', "/")
+                .replace('|', "\\");
+            let kind = image_type_name(i.kind);
+            format!(
+                "{}*637000000000000000*{kind}*{}*{}*{hash}",
+                i.path, i.width, i.height
+            )
+        })
+        .collect();
+    (!entries.is_empty()).then(|| entries.join("|"))
 }
 
 impl JfItem {
@@ -82,7 +188,50 @@ impl JfItem {
             parent_index: None,
             providers: Vec::new(),
             user_data_key: id.simple().to_string(),
+            meta: JfMeta::default(),
+            people: Vec::new(),
+            images: Vec::new(),
         }
+    }
+
+    pub fn meta(mut self, meta: JfMeta) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    /// Adds a credit with `ListOrder` `list_order` and no `SortOrder`.
+    pub fn credit(
+        mut self,
+        name: &'static str,
+        kind: Option<&'static str>,
+        role: &'static str,
+        list_order: Option<i32>,
+    ) -> Self {
+        self.people.push(JfCredit {
+            name,
+            kind,
+            role,
+            list_order,
+            sort_order: None,
+        });
+        self
+    }
+
+    pub fn image(
+        mut self,
+        path: &str,
+        kind: i32,
+        size: (i32, i32),
+        blurhash: Option<&'static str>,
+    ) -> Self {
+        self.images.push(JfImage {
+            path: path.to_string(),
+            kind,
+            width: size.0,
+            height: size.1,
+            blurhash,
+        });
+        self
     }
 
     pub fn parent(mut self, parent: Uuid) -> Self {
@@ -311,9 +460,12 @@ impl JfSource {
             .execute(&mut *conn)
             .await
             .unwrap();
+        let mut people: std::collections::HashMap<(&str, Option<&str>), Uuid> =
+            std::collections::HashMap::new();
         for it in &self.items {
+            let m = &it.meta;
             sqlx::query(
-                r#"INSERT INTO "BaseItems" ("Id", "Type", "Name", "Path", "ParentId", "SeriesId", "SeasonId", "IndexNumber", "ParentIndexNumber") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                r#"INSERT INTO "BaseItems" ("Id", "Type", "Name", "Path", "ParentId", "SeriesId", "SeasonId", "IndexNumber", "ParentIndexNumber", "ForcedSortName", "OriginalTitle", "Overview", "Tagline", "OfficialRating", "CommunityRating", "CriticRating", "PremiereDate", "EndDate", "ProductionYear", "Genres", "Studios", "Tags") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(upper(it.id))
             .bind(dotnet_type(it.kind))
@@ -324,9 +476,51 @@ impl JfSource {
             .bind(it.season.map(upper))
             .bind(it.index)
             .bind(it.parent_index)
+            .bind(m.forced_sort_name)
+            .bind(m.original_title)
+            .bind(m.overview)
+            .bind(m.tagline)
+            .bind(m.official_rating)
+            .bind(m.community_rating)
+            .bind(m.critic_rating)
+            .bind(m.premiere_date)
+            .bind(m.end_date)
+            .bind(m.production_year)
+            .bind(m.genres)
+            .bind(m.studios)
+            .bind(m.tags)
             .execute(&mut *conn)
             .await
             .unwrap();
+            for img in &it.images {
+                sqlx::query(
+                    r#"INSERT INTO "BaseItemImageInfos" ("Id", "Path", "DateModified", "ImageType", "Width", "Height", "Blurhash", "ItemId") VALUES (?, ?, '2025-01-01 00:00:00', ?, ?, ?, ?, ?)"#,
+                )
+                .bind(upper(Uuid::new_v4()))
+                .bind(&img.path)
+                .bind(img.kind)
+                .bind(img.width)
+                .bind(img.height)
+                .bind(img.blurhash.map(|b| b.as_bytes().to_vec()))
+                .bind(upper(it.id))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            }
+            for c in &it.people {
+                let person = *people.entry((c.name, c.kind)).or_insert_with(Uuid::new_v4);
+                sqlx::query(
+                    r#"INSERT INTO "PeopleBaseItemMap" ("SortOrder", "ListOrder", "Role", "ItemId", "PeopleId") VALUES (?, ?, ?, ?, ?)"#,
+                )
+                .bind(c.sort_order)
+                .bind(c.list_order)
+                .bind(c.role)
+                .bind(upper(it.id))
+                .bind(upper(person))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            }
             for (provider, value) in &it.providers {
                 sqlx::query(
                     r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue") VALUES (?, ?, ?)"#,
@@ -338,6 +532,15 @@ impl JfSource {
                 .await
                 .unwrap();
             }
+        }
+        for ((name, kind), id) in &people {
+            sqlx::query(r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?, ?, ?)"#)
+                .bind(upper(*id))
+                .bind(*name)
+                .bind(*kind)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
         }
         for ud in &self.user_data {
             let key = ud
@@ -398,8 +601,18 @@ impl JfSource {
                 .iter()
                 .map(|(p, v)| format!("{p}={v}"))
                 .collect();
+            let m = &it.meta;
+            let old_date = |d: Option<&str>| {
+                d.map(|d| {
+                    if d.ends_with('Z') {
+                        d.to_string()
+                    } else {
+                        format!("{d}Z")
+                    }
+                })
+            };
             sqlx::query(
-                "INSERT INTO TypedBaseItems (guid, type, Path, ParentId, Name, IndexNumber, ParentIndexNumber, IsVirtualItem, UserDataKey, SeasonId, SeriesId, ProviderIds) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                "INSERT INTO TypedBaseItems (guid, type, Path, ParentId, Name, IndexNumber, ParentIndexNumber, IsVirtualItem, UserDataKey, SeasonId, SeriesId, ProviderIds, ForcedSortName, OriginalTitle, Overview, Tagline, OfficialRating, CommunityRating, CriticRating, PremiereDate, EndDate, ProductionYear, Genres, Studios, Tags, Images) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(it.id.to_bytes_le().to_vec())
             .bind(dotnet_type(it.kind))
@@ -412,9 +625,37 @@ impl JfSource {
             .bind(it.season.map(upper))
             .bind(it.series.map(upper))
             .bind((!providers.is_empty()).then(|| providers.join("|")))
+            .bind(m.forced_sort_name)
+            .bind(m.original_title)
+            .bind(m.overview)
+            .bind(m.tagline)
+            .bind(m.official_rating)
+            .bind(m.community_rating)
+            .bind(m.critic_rating)
+            .bind(old_date(m.premiere_date))
+            .bind(old_date(m.end_date))
+            .bind(m.production_year)
+            .bind(m.genres)
+            .bind(m.studios)
+            .bind(m.tags)
+            .bind(old_images(&it.images))
             .execute(&mut conn)
             .await
             .unwrap();
+            for c in &it.people {
+                sqlx::query(
+                    "INSERT INTO People (ItemId, Name, Role, PersonType, SortOrder, ListOrder) VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(it.id.to_bytes_le().to_vec())
+                .bind(c.name)
+                .bind(c.role)
+                .bind(c.kind)
+                .bind(c.sort_order)
+                .bind(c.list_order)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            }
         }
         for ud in &self.user_data {
             let user = self.users.iter().find(|u| u.id == ud.user).unwrap();
@@ -482,14 +723,18 @@ const USERS_DDL: &[&str] = &[
 ];
 
 const NEW_LIBRARY_DDL: &[&str] = &[
-    r#"CREATE TABLE "BaseItems" ("Id" TEXT NOT NULL PRIMARY KEY, "Type" TEXT NOT NULL, "Name" TEXT NULL, "Path" TEXT NULL, "ParentId" TEXT NULL, "SeriesId" TEXT NULL, "SeasonId" TEXT NULL, "IndexNumber" INTEGER NULL, "ParentIndexNumber" INTEGER NULL, "IsVirtualItem" INTEGER NOT NULL DEFAULT 0)"#,
+    r#"CREATE TABLE "BaseItems" ("Id" TEXT NOT NULL PRIMARY KEY, "Type" TEXT NOT NULL, "Name" TEXT NULL, "Path" TEXT NULL, "ParentId" TEXT NULL, "SeriesId" TEXT NULL, "SeasonId" TEXT NULL, "IndexNumber" INTEGER NULL, "ParentIndexNumber" INTEGER NULL, "IsVirtualItem" INTEGER NOT NULL DEFAULT 0, "ForcedSortName" TEXT NULL, "OriginalTitle" TEXT NULL, "Overview" TEXT NULL, "Tagline" TEXT NULL, "OfficialRating" TEXT NULL, "CommunityRating" REAL NULL, "CriticRating" REAL NULL, "PremiereDate" TEXT NULL, "EndDate" TEXT NULL, "ProductionYear" INTEGER NULL, "Genres" TEXT NULL, "Studios" TEXT NULL, "Tags" TEXT NULL, "IsLocked" INTEGER NOT NULL DEFAULT 0)"#,
+    r#"CREATE TABLE "BaseItemImageInfos" ("Id" TEXT NOT NULL PRIMARY KEY, "Path" TEXT NOT NULL, "DateModified" TEXT NULL, "ImageType" INTEGER NOT NULL, "Width" INTEGER NOT NULL, "Height" INTEGER NOT NULL, "Blurhash" BLOB NULL, "ItemId" TEXT NOT NULL)"#,
+    r#"CREATE TABLE "Peoples" ("Id" TEXT NOT NULL PRIMARY KEY, "Name" TEXT NOT NULL, "PersonType" TEXT NULL)"#,
+    r#"CREATE TABLE "PeopleBaseItemMap" ("SortOrder" INTEGER NULL, "ListOrder" INTEGER NULL, "Role" TEXT NOT NULL, "ItemId" TEXT NOT NULL, "PeopleId" TEXT NOT NULL, PRIMARY KEY ("ItemId", "PeopleId", "Role"))"#,
     r#"CREATE TABLE "BaseItemProviders" ("ItemId" TEXT NOT NULL, "ProviderId" TEXT NOT NULL, "ProviderValue" TEXT NOT NULL, PRIMARY KEY ("ItemId", "ProviderId"))"#,
     r#"CREATE TABLE "UserData" ("CustomDataKey" TEXT NOT NULL, "UserId" TEXT NOT NULL, "ItemId" TEXT NOT NULL, "Rating" REAL NULL, "PlaybackPositionTicks" INTEGER NOT NULL, "PlayCount" INTEGER NOT NULL, "IsFavorite" INTEGER NOT NULL, "LastPlayedDate" TEXT NULL, "Played" INTEGER NOT NULL, "AudioStreamIndex" INTEGER NULL, "SubtitleStreamIndex" INTEGER NULL, "Likes" INTEGER NULL, PRIMARY KEY ("ItemId", "UserId", "CustomDataKey"))"#,
     r#"CREATE TABLE "MediaStreamInfos" ("ItemId" TEXT NOT NULL, "StreamIndex" INTEGER NOT NULL, "StreamType" INTEGER NOT NULL, "Codec" TEXT NULL, "Language" TEXT NULL, "Title" TEXT NULL, "IsExternal" INTEGER NOT NULL, "Path" TEXT NULL, "IsDefault" INTEGER NOT NULL, "IsForced" INTEGER NOT NULL, PRIMARY KEY ("ItemId", "StreamIndex"))"#,
 ];
 
 const OLD_LIBRARY_DDL: &[&str] = &[
-    "CREATE TABLE TypedBaseItems (guid GUID primary key NOT NULL, type TEXT NOT NULL, Path TEXT, ParentId GUID, Name Text, IndexNumber INT, ParentIndexNumber INT, IsVirtualItem BIT, UserDataKey Text, SeasonId GUID, SeriesId GUID, ProviderIds Text)",
+    "CREATE TABLE TypedBaseItems (guid GUID primary key NOT NULL, type TEXT NOT NULL, Path TEXT, ParentId GUID, Name Text, IndexNumber INT, ParentIndexNumber INT, IsVirtualItem BIT, UserDataKey Text, SeasonId GUID, SeriesId GUID, ProviderIds Text, ForcedSortName Text, OriginalTitle Text, Overview Text, Tagline Text, OfficialRating Text, CommunityRating Float, CriticRating Float, PremiereDate DATETIME, EndDate DATETIME, ProductionYear INT, Genres Text, Studios Text, Tags Text, IsLocked BIT, LockedFields Text, Images Text)",
+    "CREATE TABLE People (ItemId GUID, Name TEXT NOT NULL, Role TEXT, PersonType TEXT, SortOrder int, ListOrder int)",
     "CREATE TABLE UserDatas (key nvarchar not null, userId INT not null, rating float null, played bit not null, playCount int not null, isFavorite bit not null, playbackPositionTicks bigint not null, lastPlayedDate datetime null, AudioStreamIndex INT, SubtitleStreamIndex INT)",
     "CREATE UNIQUE INDEX UserDatasIndex1 ON UserDatas (key, userId)",
     "CREATE TABLE mediastreams (ItemId GUID, StreamIndex INT, StreamType TEXT, Codec TEXT, Language TEXT, Title TEXT, IsExternal BIT, Path TEXT, IsDefault BIT, IsForced BIT, PRIMARY KEY (ItemId, StreamIndex))",

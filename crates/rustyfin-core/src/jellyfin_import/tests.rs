@@ -4,15 +4,17 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use rustyfin_db::repo_jellyfin_import::{SourceStreams, StreamRow, UserDataRow};
+use rustyfin_model::image::ImageType;
 use uuid::Uuid;
 
+use super::images::{resolve, signature};
 use super::job::{ImportJob, ImportStage, ImportStatus, JobState};
 use super::merge::{MappedTracks, convert_rating, harmonize, merge};
-use super::paths::{PathMapping, translate_path};
+use super::paths::{PathMapping, suggest_metadata, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
-    JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob, guid_from_text, locate,
-    parse_jellyfin_date, parse_provider_ids,
+    JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob, guid_from_text, locate,
+    parse_jellyfin_date, parse_old_images, parse_provider_ids,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -286,6 +288,7 @@ fn b20_report_with_code(code: &str) -> ImportReport {
         },
         watch_data: WatchDataReport::default(),
         tracks: TrackReport::default(),
+        metadata: Default::default(),
     }
 }
 
@@ -1095,4 +1098,161 @@ fn b20_map_external_tracks() {
         None,
         "file names compare exactly"
     );
+}
+
+// 5.8: the old layout's `Images` text: `Path*Ticks*Type[*Width*Height[*Blurhash]]` entries joined
+// by `|`, with `/` and `\` standing for `*` and `|` in a blurhash. Sizes of 0 or less and an empty
+// blurhash are none; malformed entries and ignored or unknown types are skipped.
+#[test]
+fn b20_old_layout_image_entries() {
+    let text = "/m/poster.jpg*637000000000000000*Primary*1000*1500*LEHV/nWB\\yk8\
+                |%MetadataPath%/b.jpg*1*Backdrop\
+                |/m/box.jpg*1*Box*10*10*x\
+                |/m/s.png*1*Screenshot*0*-1*\
+                |garbage\
+                |/m/odd.jpg*1*NoSuchType*1*1*h";
+    let image =
+        |path: &str, image_type, size: Option<(i32, i32)>, blurhash: Option<&str>| JfImage {
+            path: path.to_string(),
+            image_type,
+            width: size.map(|s| s.0),
+            height: size.map(|s| s.1),
+            blurhash: blurhash.map(str::to_string),
+        };
+    assert_eq!(
+        parse_old_images(text),
+        vec![
+            image(
+                "/m/poster.jpg",
+                ImageType::Primary,
+                Some((1000, 1500)),
+                Some("LEHV*nWB|yk8")
+            ),
+            image("%MetadataPath%/b.jpg", ImageType::Backdrop, None, None),
+            image("/m/s.png", ImageType::Screenshot, None, None),
+        ]
+    );
+    assert_eq!(parse_old_images(""), Vec::new());
+}
+
+// 5.9: a copy's type comes from the file's first bytes; anything else is unusable.
+#[test]
+fn b20_image_signatures() {
+    assert_eq!(
+        signature(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]),
+        Some("jpg")
+    );
+    assert_eq!(signature(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), Some("png"));
+    assert_eq!(signature(b"RIFF\x24\0\0\0WEBPVP8 "), Some("webp"));
+    assert_eq!(signature(b"RIFF\0\0\0\0WEBP"), Some("webp"));
+    assert_eq!(signature(b"GIF87a\x01\0"), Some("gif"));
+    assert_eq!(signature(b"GIF89a\x01\0"), Some("gif"));
+    let others: [&[u8]; 7] = [
+        b"SQLite format 3\0",
+        b"RIFF\x24\0\0\0WAVEfmt ",
+        b"RIFF\0\0\0\0WEB",
+        b"GIF88a",
+        &[0xFF, 0xD8],
+        b"<html>",
+        b"",
+    ];
+    for other in others {
+        assert_eq!(signature(other), None, "{other:?}");
+    }
+}
+
+// 5.9: image paths resolve through the pairs (root: the pair's local side), else the placeholders
+// under Jellyfin's program data; `..`, relative paths and URLs are missing.
+#[test]
+fn b20_resolve_image_paths() {
+    let program_data = Path::new("/srv/jf");
+    let pairs = vec![
+        pair("/config/metadata", "/srv/jf/metadata"),
+        pair("/data/movies", "/media/movies"),
+    ];
+    let resolved = |path: &str| resolve(path, program_data, &pairs);
+    let found = |file: &str, root: &str| Some((PathBuf::from(file), PathBuf::from(root)));
+    assert_eq!(
+        resolved("%MetadataPath%/library/ab/x/poster.jpg"),
+        found(
+            "/srv/jf/metadata/library/ab/x/poster.jpg",
+            "/srv/jf/metadata"
+        )
+    );
+    assert_eq!(
+        resolved("%AppDataPath%/collections/c/poster.jpg"),
+        found("/srv/jf/data/collections/c/poster.jpg", "/srv/jf/data")
+    );
+    assert_eq!(
+        resolved("/config/metadata/People/A/Ann/folder.jpg"),
+        found(
+            "/srv/jf/metadata/People/A/Ann/folder.jpg",
+            "/srv/jf/metadata"
+        )
+    );
+    assert_eq!(
+        resolved("/data/movies/Alpha (2001)/logo.png"),
+        found("/media/movies/Alpha (2001)/logo.png", "/media/movies")
+    );
+    for missing in [
+        "/elsewhere/x.jpg",
+        "%MetadataPath%/../data/jellyfin.db",
+        "/config/metadata/../outside.jpg",
+        "/data/movies/../../etc/passwd",
+        "https://image.example/a.jpg",
+        "metadata/library/x.jpg",
+        "",
+    ] {
+        assert_eq!(resolved(missing), None, "{missing}");
+    }
+
+    // A pair for a placeholder wins over program data.
+    let moved = vec![pair("%MetadataPath%", "/mnt/jfmeta")];
+    assert_eq!(
+        resolve("%MetadataPath%/library/x.jpg", program_data, &moved),
+        found("/mnt/jfmeta/library/x.jpg", "/mnt/jfmeta")
+    );
+}
+
+// 5.9: the suggested pair for Jellyfin's metadata folder: the prefix up to a `metadata` component
+// that most paths share (ties: shortest, then smallest), only when `<program data>/metadata`
+// exists and no pair covers the prefix.
+#[test]
+fn b20_suggest_metadata_pair() {
+    let tmp = TempDir::new();
+    let paths = [
+        "/config/metadata/library/ab/x/poster.jpg",
+        "/config/metadata/People/A/Ann/folder.jpg",
+        "/other/metadata/library/x.jpg",
+        "%MetadataPath%/library/y.jpg",
+        "/data/movies/A/poster.jpg",
+    ];
+    assert_eq!(
+        suggest_metadata(&paths, &tmp.0, &[]),
+        None,
+        "no local metadata folder"
+    );
+    let local = tmp.0.join("metadata");
+    std::fs::create_dir_all(&local).unwrap();
+    let local = local.display().to_string();
+    assert_eq!(
+        suggest_metadata(&paths, &tmp.0, &[]),
+        Some(pair("/config/metadata", &local))
+    );
+    let covered = [pair("/config", "/srv/config")];
+    assert_eq!(
+        suggest_metadata(&paths, &tmp.0, &covered),
+        None,
+        "a pair covers the prefix"
+    );
+    let tie = [
+        "/b/metadata/x.jpg",
+        "/a/metadata/y.jpg",
+        "/long/er/metadata/z.jpg",
+    ];
+    assert_eq!(
+        suggest_metadata(&tie, &tmp.0, &[]),
+        Some(pair("/a/metadata", &local))
+    );
+    assert_eq!(suggest_metadata(&[], &tmp.0, &[]), None);
 }

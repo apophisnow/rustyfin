@@ -11821,3 +11821,897 @@ async fn b20_setting_a_password_ends_the_code() {
     assert_eq!(status, StatusCode::CONFLICT, "reissue");
     assert!(login(&w.app, "bob", "set by admin").await.is_some());
 }
+
+// B20 5: metadata for matched items.
+
+/// Replaces the world's Jellyfin item `name` with `edit` of it.
+fn b20_edit(w: &mut B20World, name: &str, edit: impl FnOnce(jf::JfItem) -> jf::JfItem) {
+    let at = w.source.items.iter().position(|i| i.name == name);
+    let at = at.unwrap_or_else(|| panic!("no Jellyfin item {name}"));
+    w.source.items[at] = edit(w.source.items[at].clone());
+}
+
+/// The metadata world's install, Rustyfin's item ids (taken before an import renames anything)
+/// and the bytes of the usable Jellyfin images.
+struct B20Meta {
+    install: std::path::PathBuf,
+    alpha: uuid::Uuid,
+    beta: uuid::Uuid,
+    show: uuid::Uuid,
+    e1: uuid::Uuid,
+    e3: uuid::Uuid,
+    poster: Vec<u8>,
+    backdrop: Vec<u8>,
+    logo: Vec<u8>,
+    show_poster: Vec<u8>,
+    ann: Vec<u8>,
+}
+
+/// The B20 world with Jellyfin metadata, installed into the folder `name` in `layout`.
+///
+/// Jellyfin's Alpha, renamed "Alpha: Jellyfin Cut", has every field, TMDB and IMDb ids, four
+/// credits (Ann twice) and ten image rows: a poster; a missing backdrop before a usable one, so
+/// indexes have no gap; a logo beside the media; a Box (ignored); and five unusable rows: a `..`
+/// path to a JPEG, a URL, a text file, a symlink to a JPEG outside the metadata folder, and the
+/// database through `%AppDataPath%`. Beta has some fields, an IMDb id and a credit; Rustyfin's
+/// Beta already has an overview, genres and a rating. The Show has an overview, a studio, a
+/// creator and a poster; Rustyfin's Show already has a person and a local poster. S01E01 has an
+/// overview and a date. Jellyfin's Ann (with a portrait) and Dan (whose portrait file is missing)
+/// are Person items.
+async fn b20_meta_world(name: &str, layout: jf::Layout) -> (B20World, B20Meta) {
+    let mut w = b20_world().await;
+    let dir = "/config/metadata/library/a1/alpha";
+    b20_edit(&mut w, "Alpha", |i| {
+        let mut alpha = i
+            .provider("Tmdb", "111")
+            .provider("Imdb", "tt0000111")
+            .meta(jf::JfMeta {
+                forced_sort_name: Some("Alpha, The"),
+                original_title: Some("Alfa"),
+                overview: Some("Jellyfin overview of Alpha."),
+                tagline: Some("First of all."),
+                official_rating: Some("PG-13"),
+                community_rating: Some(7.5),
+                critic_rating: Some(88.0),
+                premiere_date: Some("2001-05-04 00:00:00"),
+                production_year: Some(2001),
+                genres: Some("Drama| Comedy |Drama"),
+                studios: Some("Acme Pictures|Big Studio"),
+                tags: Some("favourite"),
+                ..Default::default()
+            })
+            .credit("Ann Actor", Some("Actor"), "Hero", Some(1))
+            .credit("Dan Director", Some("Director"), "", Some(0))
+            .credit("Ann Actor", Some("Actor"), "Cameo", Some(2))
+            .credit("Nora Nobody", None, "", None)
+            .image(
+                &format!("{dir}/poster.jpg"),
+                0,
+                (1000, 1500),
+                Some("LEHV*nWB|yk8"),
+            )
+            .image(&format!("{dir}/backdrop1.jpg"), 2, (1920, 1080), None)
+            .image(
+                "%MetadataPath%/library/a1/alpha/backdrop.png",
+                2,
+                (1920, 1080),
+                None,
+            )
+            .image("/data/movies/Alpha (2001)/logo.png", 4, (0, 0), None)
+            .image(&format!("{dir}/box.jpg"), 7, (100, 100), None)
+            .image("/config/metadata/../outside.jpg", 5, (100, 100), None)
+            .image("https://image.example/banner.jpg", 3, (100, 100), None)
+            .image(&format!("{dir}/notimage.jpg"), 1, (100, 100), None)
+            .image(&format!("{dir}/disc.jpg"), 6, (100, 100), None)
+            .image("%AppDataPath%/jellyfin.db", 8, (100, 100), None);
+        alpha.name = "Alpha: Jellyfin Cut".to_string();
+        alpha
+    });
+    b20_edit(&mut w, "Beta", |i| {
+        i.provider("Imdb", "tt0000222")
+            .meta(jf::JfMeta {
+                overview: Some("Jellyfin overview of Beta."),
+                community_rating: Some(6.0),
+                production_year: Some(2002),
+                genres: Some("Thriller"),
+                ..Default::default()
+            })
+            .credit("Bea Star", Some("Actor"), "Lead", Some(0))
+    });
+    b20_edit(&mut w, "Show", |i| {
+        i.meta(jf::JfMeta {
+            overview: Some("A show."),
+            studios: Some("Acme TV"),
+            ..Default::default()
+        })
+        .credit("Sam Showrunner", Some("Creator"), "", Some(0))
+        .image(
+            "%MetadataPath%/library/b2/show/poster.jpg",
+            0,
+            (680, 1000),
+            None,
+        )
+    });
+    b20_edit(&mut w, "Show S01E01", |i| {
+        i.meta(jf::JfMeta {
+            overview: Some("Pilot."),
+            premiere_date: Some("2025-01-10 00:00:00"),
+            ..Default::default()
+        })
+    });
+    let ann_dir = "%MetadataPath%/People/A/Ann Actor";
+    let ann = jf::JfItem::new("Person", "Ann Actor", Some(ann_dir)).image(
+        &format!("{ann_dir}/folder.jpg"),
+        0,
+        (300, 450),
+        Some("LKO2?U%2Tw=w"),
+    );
+    let dan = jf::JfItem::new("Person", "Dan Director", None).image(
+        "/config/metadata/People/D/Dan Director/folder.jpg",
+        0,
+        (300, 450),
+        None,
+    );
+    w.source.items.extend([ann, dan]);
+    let install = b20_install(&w, name, layout).await;
+
+    let library = install.join("metadata/library");
+    let alpha_dir = library.join("a1/alpha");
+    let poster = jf::write_image(&alpha_dir.join("poster.jpg"), jf::JPEG_HEAD, "alpha poster");
+    let backdrop = jf::write_image(&alpha_dir.join("backdrop.png"), jf::PNG_HEAD, "backdrop");
+    jf::write_image(&alpha_dir.join("box.jpg"), jf::JPEG_HEAD, "alpha box");
+    std::fs::write(alpha_dir.join("notimage.jpg"), "not an image").unwrap();
+    jf::write_image(&install.join("outside.jpg"), jf::JPEG_HEAD, "outside");
+    let escaped = w.jf_root.join("escaped.jpg");
+    jf::write_image(&escaped, jf::JPEG_HEAD, "escaped");
+    std::os::unix::fs::symlink(&escaped, alpha_dir.join("disc.jpg")).unwrap();
+    let logo_path = format!("{}/Alpha (2001)/logo.png", w.movies);
+    let logo = jf::write_image(std::path::Path::new(&logo_path), jf::PNG_HEAD, "alpha logo");
+    let show_poster = jf::write_image(&library.join("b2/show/poster.jpg"), jf::JPEG_HEAD, "show");
+    let ann_file = install.join("metadata/People/A/Ann Actor/folder.jpg");
+    let ann_bytes = jf::write_image(&ann_file, jf::JPEG_HEAD, "ann portrait");
+
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let show = b20_item(&w.state, "Show").await;
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    sqlx::query(
+        "UPDATE media_items SET overview = 'Rustyfin overview', genres = 'Action', \
+         official_rating = 'R' WHERE id = ?",
+    )
+    .bind(beta.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_images (item_id, image_type, image_index, path, provider) \
+         VALUES (?, 'Primary', 0, '/nowhere/show.jpg', 'local')",
+    )
+    .bind(show.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO people (id, name, type) VALUES ('old-actor', 'Old Actor', 'Actor')")
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO item_people (item_id, person_id, type) VALUES (?, 'old-actor', 'Actor')",
+    )
+    .bind(show.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    let meta = B20Meta {
+        install,
+        alpha,
+        beta,
+        show,
+        e1,
+        e3,
+        poster,
+        backdrop,
+        logo,
+        show_poster,
+        ann: ann_bytes,
+    };
+    (w, meta)
+}
+
+/// A report's metadata counts: [Items, Fields, People, Images, ImagesMissing, Locked].
+fn b20_meta_counts(report: &serde_json::Value) -> [i64; 6] {
+    [
+        "Items",
+        "Fields",
+        "People",
+        "Images",
+        "ImagesMissing",
+        "Locked",
+    ]
+    .map(|key| report["Metadata"][key].as_i64().unwrap_or(-1))
+}
+
+/// The metadata of `item`: its fields, its extras and its studios (names sorted, joined by `|`).
+async fn b20_fields(state: &AppState, item: uuid::Uuid) -> serde_json::Value {
+    let text: String = sqlx::query_scalar(
+        "SELECT json_object('name', m.name, 'sort_name', m.sort_name, 'overview', m.overview, \
+         'tagline', m.tagline, 'official_rating', m.official_rating, \
+         'community_rating', m.community_rating, 'premiere_date', m.premiere_date, \
+         'end_date', m.end_date, 'production_year', m.production_year, 'genres', m.genres, \
+         'tags', m.tags, 'tmdb_id', m.tmdb_id, 'tvdb_id', m.tvdb_id, \
+         'original_title', x.original_title, 'critic_rating', x.critic_rating, \
+         'imdb_id', x.imdb_id, 'studios', (SELECT group_concat(name, '|') FROM \
+         (SELECT s.name FROM item_studios i JOIN studios s ON s.id = i.studio_id \
+         WHERE i.item_id = m.id ORDER BY s.name))) \
+         FROM media_items m LEFT JOIN item_metadata_extras x ON x.item_id = m.id WHERE m.id = ?",
+    )
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// What `b20_fields` gives for an item named `name` with no metadata, with `changes` applied.
+fn b20_expect(name: &str, changes: serde_json::Value) -> serde_json::Value {
+    let mut fields = serde_json::json!({
+        "name": name,
+        "sort_name": null,
+        "overview": null,
+        "tagline": null,
+        "official_rating": null,
+        "community_rating": null,
+        "premiere_date": null,
+        "end_date": null,
+        "production_year": null,
+        "genres": "[]",
+        "tags": "",
+        "tmdb_id": null,
+        "tvdb_id": null,
+        "original_title": null,
+        "critic_rating": null,
+        "imdb_id": null,
+        "studios": null,
+    });
+    for (key, value) in changes.as_object().unwrap() {
+        assert!(fields.get(key).is_some(), "no field {key}");
+        fields[key] = value.clone();
+    }
+    fields
+}
+
+/// Alpha's fields after an import of the metadata world, where Rustyfin names it `name`.
+fn b20_alpha_fields(name: &str) -> serde_json::Value {
+    let changes = serde_json::json!({
+        "sort_name": "alpha, the",
+        "overview": "Jellyfin overview of Alpha.",
+        "tagline": "First of all.",
+        "official_rating": "PG-13",
+        "community_rating": 7.5,
+        "premiere_date": "2001-05-04T00:00:00+00:00",
+        "production_year": 2001,
+        "genres": "Drama|Comedy",
+        "tags": "favourite",
+        "tmdb_id": 111,
+        "original_title": "Alfa",
+        "critic_rating": 88.0,
+        "imdb_id": "tt0000111",
+        "studios": "Acme Pictures|Big Studio",
+    });
+    b20_expect(name, changes)
+}
+
+/// The Show's fields after an import of the metadata world.
+fn b20_show_fields() -> serde_json::Value {
+    let changes =
+        serde_json::json!({ "overview": "A show.", "tvdb_id": 333, "studios": "Acme TV" });
+    b20_expect("Show", changes)
+}
+
+/// S01E01's fields after an import of the metadata world.
+fn b20_e1_fields() -> serde_json::Value {
+    let changes = serde_json::json!({
+        "overview": "Pilot.",
+        "premiere_date": "2025-01-10T00:00:00+00:00",
+    });
+    b20_expect("Show S01E01", changes)
+}
+
+/// Beta's fields after an import of the metadata world, with the overview and genres given.
+fn b20_beta_fields(overview: &str, genres: &str) -> serde_json::Value {
+    let changes = serde_json::json!({
+        "overview": overview,
+        "official_rating": "R",
+        "genres": genres,
+        "community_rating": 6.0,
+        "production_year": 2002,
+        "tmdb_id": 222,
+        "imdb_id": "tt0000222",
+    });
+    b20_expect("Beta", changes)
+}
+
+/// `GET /Items/{id}` as the admin; expects 200.
+async fn b20_get_item(w: &B20World, id: uuid::Uuid) -> serde_json::Value {
+    let uri = format!("/Items/{id}");
+    let (status, item) = send_authed(&w.app, "GET", &uri, &w.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    item
+}
+
+/// A person of an item answer: (Name, Type, Role, PrimaryImageTag).
+type B20Person = (String, String, Option<String>, Option<String>);
+
+fn b20_person(name: &str, kind: &str, role: Option<&str>, tag: Option<&str>) -> B20Person {
+    let text = |s: Option<&str>| s.map(str::to_string);
+    (name.to_string(), kind.to_string(), text(role), text(tag))
+}
+
+/// The `People` of an item answer, in order.
+fn b20_people(item: &serde_json::Value) -> Vec<B20Person> {
+    let text = |p: &serde_json::Value, key: &str| p[key].as_str().map(str::to_string);
+    let people = item["People"].as_array().cloned().unwrap_or_default();
+    people
+        .iter()
+        .map(|p| {
+            (
+                text(p, "Name").unwrap_or_default(),
+                text(p, "Type").unwrap_or_default(),
+                text(p, "Role"),
+                text(p, "PrimaryImageTag"),
+            )
+        })
+        .collect()
+}
+
+/// Alpha's people after an import of the metadata world: in Jellyfin's list order, Ann once (her
+/// first credit), Nora without a kind, and only Ann with a portrait.
+fn b20_alpha_people() -> Vec<B20Person> {
+    vec![
+        b20_person("Dan Director", "Director", None, None),
+        b20_person("Ann Actor", "Actor", Some("Hero"), Some("Primary_0")),
+        b20_person("Nora Nobody", "Unknown", None, None),
+    ]
+}
+
+/// The id of the Rustyfin person `name`.
+async fn b20_person_id(state: &AppState, name: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM people WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// An image row: (type, index, path, provider, width, height, blurhash).
+type B20Image = (
+    String,
+    i64,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// The image rows of the item `id` (`person`: of the person `id`), by type and index.
+async fn b20_images(state: &AppState, id: &str, person: bool) -> Vec<B20Image> {
+    let sql = if person {
+        "SELECT image_type, image_index, path, provider, width, height, blurhash \
+         FROM person_images WHERE person_id = ? ORDER BY image_type, image_index"
+    } else {
+        "SELECT image_type, image_index, path, provider, width, height, blurhash \
+         FROM item_images WHERE item_id = ? ORDER BY image_type, image_index"
+    };
+    sqlx::query_as(sql)
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Image rows without their path and provider: (type, index, width, height, blurhash).
+/// An image row without its path and provider: type, index, width, height, blurhash.
+type B20ImageShape<'a> = (&'a str, i64, Option<i64>, Option<i64>, Option<&'a str>);
+
+fn b20_image_shapes(rows: &[B20Image]) -> Vec<B20ImageShape<'_>> {
+    rows.iter()
+        .map(|(kind, index, _, _, width, height, hash)| {
+            (kind.as_str(), *index, *width, *height, hash.as_deref())
+        })
+        .collect()
+}
+
+/// Rustyfin's own poster of the Show in the metadata world.
+fn b20_local_poster() -> B20Image {
+    let path = "/nowhere/show.jpg".to_string();
+    (
+        "Primary".to_string(),
+        0,
+        path,
+        "local".to_string(),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Checks that `row` is an imported copy `<data_dir>/images/<folder>/jf-<Type>-<index>-<16 hex>.<ext>`
+/// and returns the copy's bytes.
+fn b20_copy(state: &AppState, folder: &str, row: &B20Image, ext: &str) -> Vec<u8> {
+    let (kind, index, path, provider, ..) = row;
+    assert_eq!(provider, "jellyfin", "{row:?}");
+    let path = std::path::Path::new(path);
+    let parent = state.data_dir.join("images").join(folder);
+    assert_eq!(path.parent(), Some(parent.as_path()), "{row:?}");
+    let file = path.file_name().unwrap().to_str().unwrap();
+    let hex = file
+        .strip_prefix(&format!("jf-{kind}-{index}-"))
+        .and_then(|rest| rest.strip_suffix(&format!(".{ext}")));
+    let lower_hex = |h: &str| h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    assert!(
+        hex.is_some_and(|h| h.len() == 16 && lower_hex(h)),
+        "copy name {file}"
+    );
+    std::fs::read(path).unwrap()
+}
+
+/// GETs `uri` as the admin; returns the status and the body.
+async fn b20_get_bytes(w: &B20World, uri: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {}", w.token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = w.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+/// The regular files under `dir`, recursively, sorted; none when `dir` doesn't exist.
+fn b20_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The rows of the tables the metadata import writes, as JSON arrays, sorted per table.
+async fn b20_meta_rows(state: &AppState) -> Vec<String> {
+    let image = "image_type, image_index, path, provider, width, height, blurhash";
+    let tables = [
+        ("item_images", format!("item_id, {image}")),
+        ("people", "id, name, type".to_string()),
+        (
+            "item_people",
+            "item_id, person_id, type, role, sort_order".to_string(),
+        ),
+        ("studios", "id, name".to_string()),
+        ("item_studios", "item_id, studio_id".to_string()),
+        (
+            "item_metadata_extras",
+            "item_id, original_title, critic_rating, imdb_id, lock_data, locked_fields".to_string(),
+        ),
+        ("person_images", format!("person_id, {image}")),
+    ];
+    let mut rows = Vec::new();
+    for (table, columns) in tables {
+        let sql = format!("SELECT json_array({columns}) FROM {table} ORDER BY 1");
+        let found: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        rows.push(format!("{table}: {}", found.join(" ")));
+    }
+    rows
+}
+
+/// The fields of every item, then `b20_meta_rows`.
+async fn b20_meta_digest(state: &AppState) -> Vec<String> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items ORDER BY id")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    let mut digest = Vec::new();
+    for id in ids {
+        let id = uuid::Uuid::parse_str(&id).unwrap();
+        digest.push(b20_fields(state, id).await.to_string());
+    }
+    digest.extend(b20_meta_rows(state).await);
+    digest
+}
+
+#[tokio::test]
+async fn b20_import_metadata_fills_empty_fields() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, m) = b20_meta_world(name, layout).await;
+        let before = jf::listing(&m.install);
+        let body = serde_json::json!({ "SourcePath": m.install });
+        let log = jf::LogCapture::start();
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body.clone()).await;
+        let status = b20_status(&w).await;
+        let text = log.text();
+        drop(log);
+        let counts = [4, 21, 4, 4, 7, 0];
+        assert_eq!(
+            b20_meta_counts(&preview),
+            counts,
+            "{name}: preview {preview}"
+        );
+        assert_eq!(b20_meta_counts(&report), counts, "{name}: {report}");
+        assert_eq!(report["Metadata"]["Mode"], "FillEmpty", "{name}");
+
+        assert_eq!(
+            b20_fields(&w.state, m.alpha).await,
+            b20_alpha_fields("Alpha"),
+            "{name}: Alpha"
+        );
+        assert_eq!(
+            b20_fields(&w.state, m.beta).await,
+            b20_beta_fields("Rustyfin overview", "Action"),
+            "{name}: Beta keeps its own"
+        );
+        let show_fields = b20_fields(&w.state, m.show).await;
+        assert_eq!(show_fields, b20_show_fields(), "{name}: Show");
+        assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields(), "{name}");
+        assert_eq!(
+            b20_fields(&w.state, m.e3).await,
+            b20_expect("Show S01E03", serde_json::json!({})),
+            "{name}: a name is never empty"
+        );
+
+        let alpha = b20_get_item(&w, m.alpha).await;
+        assert_eq!(b20_people(&alpha), b20_alpha_people(), "{name}");
+        assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
+        assert_eq!(alpha["CriticRating"], 88.0, "{name}");
+        assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
+        assert_eq!(alpha["ProviderIds"]["imdb"], "tt0000111", "{name}");
+        assert_eq!(alpha["LockData"], false, "{name}");
+        assert_eq!(alpha["LockedFields"], serde_json::json!([]), "{name}");
+        let beta = b20_get_item(&w, m.beta).await;
+        let bea = b20_person("Bea Star", "Actor", Some("Lead"), None);
+        assert_eq!(b20_people(&beta), vec![bea], "{name}");
+        let show = b20_get_item(&w, m.show).await;
+        let old = b20_person("Old Actor", "Actor", None, None);
+        assert_eq!(
+            b20_people(&show),
+            vec![old],
+            "{name}: the Show keeps its people"
+        );
+        assert_eq!(
+            b20_images(&w.state, &m.show.to_string(), false).await,
+            vec![b20_local_poster()],
+            "{name}: the Show keeps its poster"
+        );
+
+        for answer in [&preview, &report, &status] {
+            assert!(
+                !answer.to_string().contains(jf::CANARY),
+                "{name}: secret in an answer"
+            );
+        }
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let db = w.state.data_dir.join("test.db");
+        let mut files = vec![
+            db.clone(),
+            db.with_extension("db-wal"),
+            db.with_extension("db-shm"),
+        ];
+        files.extend(b20_files(&w.state.data_dir.join("images")));
+        assert!(
+            !jf::files_hold_canary(&files),
+            "{name}: secret in Rustyfin's files"
+        );
+        assert_eq!(
+            jf::listing(&m.install),
+            before,
+            "{name}: the source changed"
+        );
+
+        let digest = b20_meta_digest(&w.state).await;
+        let again = b20_run(&w, body).await;
+        assert_eq!(
+            b20_meta_counts(&again)[..4],
+            [0, 0, 0, 0],
+            "{name}: {again}"
+        );
+        assert_eq!(
+            b20_meta_digest(&w.state).await,
+            digest,
+            "{name}: the second run wrote"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_copies_images() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, m) = b20_meta_world(name, layout).await;
+        let report = b20_run(&w, serde_json::json!({ "SourcePath": m.install })).await;
+        assert_eq!(b20_meta_counts(&report)[3..5], [4, 7], "{name}: {report}");
+        let alpha = m.alpha.to_string();
+        let rows = b20_images(&w.state, &alpha, false).await;
+        let shapes = vec![
+            ("Backdrop", 0, Some(1920), Some(1080), None),
+            ("Logo", 0, None, None, None),
+            ("Primary", 0, Some(1000), Some(1500), Some("LEHV*nWB|yk8")),
+        ];
+        assert_eq!(b20_image_shapes(&rows), shapes, "{name}: Alpha's rows");
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[0], "png"),
+            m.backdrop,
+            "{name}"
+        );
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[1], "png"),
+            m.logo,
+            "{name}"
+        );
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[2], "jpg"),
+            m.poster,
+            "{name}"
+        );
+
+        let ann = b20_person_id(&w.state, "Ann Actor").await;
+        let rows = b20_images(&w.state, &ann, true).await;
+        let shapes = vec![("Primary", 0, Some(300), Some(450), Some("LKO2?U%2Tw=w"))];
+        assert_eq!(b20_image_shapes(&rows), shapes, "{name}: Ann's rows");
+        let folder = format!("people/{ann}");
+        assert_eq!(
+            b20_copy(&w.state, &folder, &rows[0], "jpg"),
+            m.ann,
+            "{name}"
+        );
+        let dan = b20_person_id(&w.state, "Dan Director").await;
+        assert!(
+            b20_images(&w.state, &dan, true).await.is_empty(),
+            "{name}: Dan's portrait is missing"
+        );
+        let copies = b20_files(&w.state.data_dir.join("images"));
+        assert_eq!(copies.len(), 4, "{name}: {copies:?}");
+
+        for (uri, bytes) in [
+            (format!("/Items/{alpha}/Images/Primary"), &m.poster),
+            (format!("/Items/{alpha}/Images/Backdrop/0"), &m.backdrop),
+            (format!("/Items/{ann}/Images/Primary"), &m.ann),
+        ] {
+            let (status, body) = b20_get_bytes(&w, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {uri}");
+            assert_eq!(&body, bytes, "{name}: {uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_replaces_with_jellyfins() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_meta_counts(&report), [5, 25, 5, 5, 7, 0], "{report}");
+    assert_eq!(report["Metadata"]["Mode"], "Replace");
+    assert_eq!(
+        b20_fields(&w.state, m.alpha).await,
+        b20_alpha_fields("Alpha: Jellyfin Cut")
+    );
+    assert_eq!(
+        b20_fields(&w.state, m.beta).await,
+        b20_beta_fields("Jellyfin overview of Beta.", "Thriller"),
+        "Jellyfin has no rating for Beta, so its R stays"
+    );
+    assert_eq!(b20_fields(&w.state, m.show).await, b20_show_fields());
+    assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields());
+    let e3 = serde_json::json!({ "sort_name": "show 1x03" });
+    assert_eq!(
+        b20_fields(&w.state, m.e3).await,
+        b20_expect("Show 1x03", e3),
+        "the sort name follows a new name"
+    );
+
+    let alpha = b20_get_item(&w, m.alpha).await;
+    assert_eq!(b20_people(&alpha), b20_alpha_people());
+    let show = b20_get_item(&w, m.show).await;
+    let sam = b20_person("Sam Showrunner", "Creator", None, None);
+    assert_eq!(
+        b20_people(&show),
+        vec![sam],
+        "Jellyfin's people replace the Show's"
+    );
+    let show = m.show.to_string();
+    let rows = b20_images(&w.state, &show, false).await;
+    let shapes = vec![("Primary", 0, Some(680), Some(1000), None)];
+    assert_eq!(
+        b20_image_shapes(&rows),
+        shapes,
+        "Jellyfin's poster replaces the Show's"
+    );
+    assert_eq!(b20_copy(&w.state, &show, &rows[0], "jpg"), m.show_poster);
+    let images = w.state.data_dir.join("images");
+    assert_eq!(b20_files(&images).len(), 5);
+
+    let digest = b20_meta_digest(&w.state).await;
+    let again = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&again)[..4], [0, 0, 0, 0], "{again}");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        digest,
+        "the second run wrote"
+    );
+    assert_eq!(b20_files(&images).len(), 5, "the second run copied");
+}
+
+#[tokio::test]
+async fn b20_import_metadata_skips_locked_items_and_fields() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    for (item, lock_data, locked_fields) in [(m.show, 1, ""), (m.beta, 0, "Overview|Genres|Cast")] {
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, lock_data, locked_fields) VALUES (?, ?, ?)",
+        )
+        .bind(item.to_string())
+        .bind(lock_data)
+        .bind(locked_fields)
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    let show_fields = b20_fields(&w.state, m.show).await;
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&report), [4, 21, 3, 4, 7, 1], "{report}");
+
+    assert_eq!(
+        b20_fields(&w.state, m.beta).await,
+        b20_beta_fields("Rustyfin overview", "Action"),
+        "Beta's locked fields changed"
+    );
+    let beta = b20_get_item(&w, m.beta).await;
+    assert!(b20_people(&beta).is_empty(), "Beta's cast is locked");
+    assert_eq!(beta["LockData"], false);
+    let locked = serde_json::json!(["Overview", "Genres", "Cast"]);
+    assert_eq!(beta["LockedFields"], locked);
+
+    assert_eq!(
+        b20_fields(&w.state, m.show).await,
+        show_fields,
+        "the locked Show changed"
+    );
+    let show = b20_get_item(&w, m.show).await;
+    let old = b20_person("Old Actor", "Actor", None, None);
+    assert_eq!(b20_people(&show), vec![old]);
+    assert_eq!(show["LockData"], true);
+    assert_eq!(show["LockedFields"], serde_json::json!([]));
+    assert_eq!(
+        b20_images(&w.state, &m.show.to_string(), false).await,
+        vec![b20_local_poster()]
+    );
+    let created: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM people WHERE name IN ('Sam Showrunner', 'Bea Star')",
+    )
+    .fetch_one(&w.state.db)
+    .await
+    .unwrap();
+    assert_eq!(created, 0, "people of locked casts were created");
+    assert_eq!(
+        b20_fields(&w.state, m.alpha).await,
+        b20_alpha_fields("Alpha: Jellyfin Cut")
+    );
+}
+
+#[tokio::test]
+async fn b20_import_metadata_preview_and_mode_none_write_nothing() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let before = b20_db_digest(&w.state).await;
+    let meta = b20_meta_digest(&w.state).await;
+    let fill = b20_preview(&w, serde_json::json!({ "SourcePath": m.install })).await;
+    assert_eq!(b20_meta_counts(&fill), [4, 21, 4, 4, 7, 0], "{fill}");
+    assert_eq!(fill["Metadata"]["Mode"], "FillEmpty");
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let replace = b20_preview(&w, body).await;
+    assert_eq!(b20_meta_counts(&replace), [5, 25, 5, 5, 7, 0], "{replace}");
+    assert_eq!(replace["Metadata"]["Mode"], "Replace");
+    let pair = (
+        "/config/metadata".to_string(),
+        m.install.join("metadata").display().to_string(),
+    );
+    let pairs = b20_pairs(&fill, "SuggestedPathMappings");
+    assert_eq!(pairs.last(), Some(&pair), "{pairs:?}");
+    assert_eq!(b20_db_digest(&w.state).await, before, "the preview wrote");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "the preview wrote metadata"
+    );
+    let images = w.state.data_dir.join("images");
+    assert!(!images.exists(), "the preview copied images");
+
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "None" });
+    let none = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&none), [0; 6], "{none}");
+    assert_eq!(none["Metadata"]["Mode"], "None");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "mode None wrote metadata"
+    );
+    assert!(!images.exists(), "mode None copied images");
+}
+
+/// What a rescan must keep after a Replace import of the metadata world: Alpha's fields, the
+/// imported fields of the others (a rescan may give Beta and the Show the sort name they lack)
+/// and the metadata rows.
+async fn b20_imported(state: &AppState, m: &B20Meta) -> Vec<String> {
+    let picks: [(uuid::Uuid, &[&str]); 4] = [
+        (
+            m.beta,
+            &[
+                "overview",
+                "community_rating",
+                "production_year",
+                "genres",
+                "imdb_id",
+            ],
+        ),
+        (m.show, &["overview", "studios"]),
+        (m.e1, &["overview", "premiere_date"]),
+        (m.e3, &["name", "sort_name"]),
+    ];
+    let mut kept = vec![b20_fields(state, m.alpha).await.to_string()];
+    for (item, keys) in picks {
+        let fields = b20_fields(state, item).await;
+        kept.extend(keys.iter().map(|k| format!("{item} {k} {}", fields[*k])));
+    }
+    kept.extend(b20_meta_rows(state).await);
+    kept
+}
+
+#[tokio::test]
+async fn b20_import_metadata_survives_a_rescan() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM media_items WHERE media_type IN ('Movie', 'Episode')")
+            .fetch_all(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(paths.len(), 5);
+    for path in &paths {
+        let path = std::path::Path::new(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&report), [5, 25, 5, 5, 7, 0], "{report}");
+    let imported = b20_imported(&w.state, &m).await;
+
+    let libraries = rustyfin_db::repo_library::get_all_libraries(&w.state.db)
+        .await
+        .unwrap();
+    assert_eq!(libraries.len(), 2);
+    for library in &libraries {
+        rustyfin_core::scanner::scan_library(&w.state.db, library)
+            .await
+            .unwrap();
+    }
+    rustyfin_core::scanner::wait_for_idle().await;
+    assert_eq!(
+        b20_imported(&w.state, &m).await,
+        imported,
+        "the rescan lost imported data"
+    );
+}

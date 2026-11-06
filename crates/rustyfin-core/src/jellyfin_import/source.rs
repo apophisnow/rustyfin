@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use rustyfin_model::image::ImageType;
 use rustyfin_model::media::MediaType;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Acquire, ConnectOptions, SqliteConnection};
@@ -225,6 +226,63 @@ pub struct Snapshot {
     pub user_data: Vec<JfUserData>,
     /// The media streams of the items that have a track choice (spec 2.28).
     pub streams: Vec<JfStream>,
+    /// The metadata of the importable items and their people (spec 5.4, 5.7, 5.8).
+    pub metadata: JfMetadata,
+}
+
+/// One image of an item or a person (spec 5.8, 5.12).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JfImage {
+    /// Jellyfin's path: a local path, or a `%MetadataPath%` or `%AppDataPath%` form.
+    pub path: String,
+    pub image_type: ImageType,
+    /// Jellyfin's size; `None` when it is not positive.
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub blurhash: Option<String>,
+}
+
+/// A credit of an item (spec 5.7): the raw values, in source row order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JfCredit {
+    /// The person's name; "" when the source has none.
+    pub name: String,
+    /// The person's `PersonType`.
+    pub kind: Option<String>,
+    pub role: Option<String>,
+    pub list_order: Option<i64>,
+    pub sort_order: Option<i64>,
+}
+
+/// The metadata of a Jellyfin item (spec 5.4, 5.8): raw values, which the importer trims and checks.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct JfItemMeta {
+    pub forced_sort_name: Option<String>,
+    pub original_title: Option<String>,
+    pub overview: Option<String>,
+    pub tagline: Option<String>,
+    pub official_rating: Option<String>,
+    pub community_rating: Option<f64>,
+    pub critic_rating: Option<f64>,
+    pub premiere_date: Option<String>,
+    pub end_date: Option<String>,
+    pub production_year: Option<i64>,
+    /// Jellyfin's pipe-joined lists.
+    pub genres: Option<String>,
+    pub studios: Option<String>,
+    pub tags: Option<String>,
+    pub images: Vec<JfImage>,
+}
+
+/// The metadata of a source (spec 5.4, 5.7, 5.8).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct JfMetadata {
+    /// The importable items (spec 2.9), by Jellyfin id.
+    pub items: HashMap<Uuid, JfItemMeta>,
+    /// The credits of the importable items, in source row order.
+    pub credits: HashMap<Uuid, Vec<JfCredit>>,
+    /// The images of Jellyfin's person items by trimmed name; for a repeated name, the first row.
+    pub person_images: HashMap<String, Vec<JfImage>>,
 }
 
 /// A Jellyfin library folder `root/default/<name>/` (spec 2.8): the type its `<type>.collection`
@@ -320,6 +378,49 @@ type LibraryRows = (
 );
 /// Items, user-data rows and streams of one layout.
 type ItemRows = (Vec<JfItem>, Vec<JfUserData>, Vec<JfStream>);
+/// An item row of `BaseItems` (new) or `TypedBaseItems` (old), with its columns aliased to the field
+/// names. Only the old layout has `Images`; the new one's images come from `BaseItemImageInfos`.
+#[derive(sqlx::FromRow)]
+struct MetaDbRow {
+    id: Option<Vec<u8>>,
+    type_name: String,
+    name: Option<String>,
+    forced_sort_name: Option<String>,
+    original_title: Option<String>,
+    overview: Option<String>,
+    tagline: Option<String>,
+    official_rating: Option<String>,
+    community_rating: Option<f64>,
+    critic_rating: Option<f64>,
+    premiere_date: Option<String>,
+    end_date: Option<String>,
+    production_year: Option<i64>,
+    genres: Option<String>,
+    studios: Option<String>,
+    tags: Option<String>,
+    #[sqlx(default)]
+    images: Option<String>,
+}
+/// `BaseItemImageInfos`: ItemId, Path, ImageType, Width, Height, Blurhash.
+type ImageDbRow = (
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+/// A credit: ItemId, Name, PersonType, Role, ListOrder, SortOrder.
+type CreditDbRow = (
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+/// The metadata rows of one layout: items, image rows (new layout only), and credits.
+type MetadataRows = (Vec<MetaDbRow>, Vec<ImageDbRow>, Vec<CreditDbRow>);
 
 /// Reads the source's users and importable items (spec 2.2, 2.3). The new layout comes from
 /// `jellyfin.db`; the old one from `library.db`, else `library.db.old`. Users always come from
@@ -340,12 +441,14 @@ pub async fn read_snapshot(
         Layout::New => (db.items, db.user_data, db.streams),
         Layout::Old => read_old_layout(&location.data_path, &db.users).await?,
     };
+    let metadata = read_metadata(location, db.layout).await?;
     Ok(Snapshot {
         layout: db.layout,
         users: db.users,
         items,
         user_data,
         streams,
+        metadata,
     })
 }
 
@@ -607,6 +710,231 @@ async fn read_library_db(conn: &mut SqliteConnection) -> Result<LibraryRows, sql
     .fetch_all(&mut *conn)
     .await?;
     Ok((items, data, streams))
+}
+
+/// A Jellyfin person item's type (spec 5.8): its images are the person's, not an item's.
+const PERSON_TYPE: &str = "MediaBrowser.Controller.Entities.Person";
+
+/// The images of the old layout's `Images` text (spec 5.8): entries split on `|`, each
+/// `Path*Ticks*Type[*Width*Height[*Blurhash]]`, the ticks not read. Fewer than three fields or an
+/// empty path is malformed; an ignored or unknown type is skipped. In a blurhash `/` and `\` stand
+/// for `*` and `|`.
+pub fn parse_old_images(text: &str) -> Vec<JfImage> {
+    text.split('|')
+        .filter_map(|entry| {
+            let fields: Vec<&str> = entry.split('*').collect();
+            if fields.len() < 3 || fields[0].is_empty() {
+                return None;
+            }
+            Some(JfImage {
+                path: fields[0].to_string(),
+                image_type: old_image_type(fields[2])?,
+                width: fields
+                    .get(3)
+                    .and_then(|size| size.parse::<i64>().ok())
+                    .and_then(positive_size),
+                height: fields
+                    .get(4)
+                    .and_then(|size| size.parse::<i64>().ok())
+                    .and_then(positive_size),
+                blurhash: fields
+                    .get(5)
+                    .map(|hash| hash.replace('/', "*").replace('\\', "|"))
+                    .filter(|hash| !hash.is_empty()),
+            })
+        })
+        .collect()
+}
+
+/// The metadata rows of the layout's database (spec 5.4, 5.7, 5.8): `jellyfin.db` for the new
+/// layout, `library.db` (else `library.db.old`) for the old one. Only metadata columns are read.
+async fn read_metadata(
+    location: &SourceLocation,
+    layout: Layout,
+) -> Result<JfMetadata, ImportError> {
+    let file = match layout {
+        Layout::New => location.data_path.join(JELLYFIN_DB),
+        Layout::Old => library_file(&location.data_path)?,
+    };
+    let mut conn = open_read_only(&file).await?;
+    let mut tx = conn.begin().await.map_err(|e| unreadable(&file, &e))?;
+    let rows = match layout {
+        Layout::New => read_new_metadata(&mut tx).await,
+        Layout::Old => read_library_metadata(&mut tx).await,
+    }
+    .map_err(|e| unreadable(&file, &e))?;
+    tx.rollback().await.map_err(|e| unreadable(&file, &e))?;
+    Ok(metadata_of(rows, layout))
+}
+
+/// The new layout's metadata rows: items, image rows and credits (spec 5.4, 5.7, 5.8).
+async fn read_new_metadata(conn: &mut SqliteConnection) -> Result<MetadataRows, sqlx::Error> {
+    let items: Vec<MetaDbRow> = sqlx::query_as(
+        "SELECT Id AS id, Type AS type_name, Name AS name, ForcedSortName AS forced_sort_name, \
+         OriginalTitle AS original_title, Overview AS overview, Tagline AS tagline, \
+         OfficialRating AS official_rating, CommunityRating AS community_rating, \
+         CriticRating AS critic_rating, PremiereDate AS premiere_date, EndDate AS end_date, \
+         ProductionYear AS production_year, Genres AS genres, Studios AS studios, Tags AS tags \
+         FROM BaseItems ORDER BY rowid",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let images: Vec<ImageDbRow> = sqlx::query_as(
+        "SELECT ItemId, Path, ImageType, Width, Height, Blurhash FROM BaseItemImageInfos \
+         ORDER BY rowid",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let credits: Vec<CreditDbRow> = sqlx::query_as(
+        "SELECT m.ItemId, p.Name, p.PersonType, m.Role, m.ListOrder, m.SortOrder FROM \
+         PeopleBaseItemMap m JOIN Peoples p ON p.Id = m.PeopleId ORDER BY m.rowid",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok((items, images, credits))
+}
+
+/// The old layout's metadata rows: `TypedBaseItems`, its `Images` text included, and `People`
+/// (spec 5.4, 5.7, 5.8). The old layout has no image rows of its own.
+async fn read_library_metadata(conn: &mut SqliteConnection) -> Result<MetadataRows, sqlx::Error> {
+    let items: Vec<MetaDbRow> = sqlx::query_as(
+        "SELECT guid AS id, type AS type_name, Name AS name, ForcedSortName AS forced_sort_name, \
+         OriginalTitle AS original_title, Overview AS overview, Tagline AS tagline, \
+         OfficialRating AS official_rating, CommunityRating AS community_rating, \
+         CriticRating AS critic_rating, PremiereDate AS premiere_date, EndDate AS end_date, \
+         ProductionYear AS production_year, Genres AS genres, Studios AS studios, Tags AS tags, \
+         Images AS images FROM TypedBaseItems ORDER BY rowid",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let credits: Vec<CreditDbRow> = sqlx::query_as(
+        "SELECT ItemId, Name, PersonType, Role, ListOrder, SortOrder FROM People ORDER BY rowid",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok((items, Vec::new(), credits))
+}
+
+/// The image type of a new-layout `ImageType` number (spec 5.8); other numbers are ignored.
+fn new_image_type(number: i64) -> Option<ImageType> {
+    Some(match number {
+        0 => ImageType::Primary,
+        1 => ImageType::Art,
+        2 => ImageType::Backdrop,
+        3 => ImageType::Banner,
+        4 => ImageType::Logo,
+        5 => ImageType::Thumb,
+        6 => ImageType::Disc,
+        8 => ImageType::Screenshot,
+        _ => return None,
+    })
+}
+
+/// The image type of an old-layout type name, in exact case (spec 5.8); other names are ignored.
+fn old_image_type(name: &str) -> Option<ImageType> {
+    Some(match name {
+        "Primary" => ImageType::Primary,
+        "Art" => ImageType::Art,
+        "Backdrop" => ImageType::Backdrop,
+        "Banner" => ImageType::Banner,
+        "Logo" => ImageType::Logo,
+        "Thumb" => ImageType::Thumb,
+        "Disc" => ImageType::Disc,
+        "Screenshot" => ImageType::Screenshot,
+        _ => return None,
+    })
+}
+
+/// A size as an `i32`, when it is positive (spec 5.8: 0 or less is none).
+fn positive_size(value: i64) -> Option<i32> {
+    i32::try_from(value).ok().filter(|size| *size > 0)
+}
+
+/// The metadata of one layout's rows (spec 5.4, 5.7, 5.8): the importable items with their images,
+/// their credits in row order, and the person items' images by trimmed name (the first row of a
+/// repeated name).
+fn metadata_of(rows: MetadataRows, layout: Layout) -> JfMetadata {
+    let (item_rows, image_rows, credit_rows) = rows;
+    let mut owned_images: HashMap<Uuid, Vec<JfImage>> = HashMap::new();
+    for (owner, path, image_type, width, height, blurhash) in image_rows {
+        let Some(owner) = guid_column(owner.as_deref()) else {
+            continue;
+        };
+        let Some(path) = path.filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        let Some(image_type) = image_type.and_then(new_image_type) else {
+            continue;
+        };
+        owned_images.entry(owner).or_default().push(JfImage {
+            path,
+            image_type,
+            width: width.and_then(positive_size),
+            height: height.and_then(positive_size),
+            blurhash: blurhash
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|hash| !hash.is_empty()),
+        });
+    }
+
+    let mut items: HashMap<Uuid, JfItemMeta> = HashMap::new();
+    let mut person_images: HashMap<String, Vec<JfImage>> = HashMap::new();
+    for row in item_rows {
+        let Some(id) = guid_column(row.id.as_deref()) else {
+            continue;
+        };
+        let images = match layout {
+            Layout::New => owned_images.remove(&id).unwrap_or_default(),
+            Layout::Old => parse_old_images(row.images.as_deref().unwrap_or_default()),
+        };
+        if row.type_name == PERSON_TYPE {
+            let name = row.name.as_deref().map(str::trim).unwrap_or_default();
+            if !name.is_empty() {
+                person_images.entry(name.to_string()).or_insert(images);
+            }
+        } else if importable(&row.type_name).is_some() {
+            items.insert(
+                id,
+                JfItemMeta {
+                    forced_sort_name: row.forced_sort_name,
+                    original_title: row.original_title,
+                    overview: row.overview,
+                    tagline: row.tagline,
+                    official_rating: row.official_rating,
+                    community_rating: row.community_rating,
+                    critic_rating: row.critic_rating,
+                    premiere_date: row.premiere_date,
+                    end_date: row.end_date,
+                    production_year: row.production_year,
+                    genres: row.genres,
+                    studios: row.studios,
+                    tags: row.tags,
+                    images,
+                },
+            );
+        }
+    }
+
+    let mut credits: HashMap<Uuid, Vec<JfCredit>> = HashMap::new();
+    for (item, name, kind, role, list_order, sort_order) in credit_rows {
+        let Some(item) = guid_column(item.as_deref()) else {
+            continue;
+        };
+        if items.contains_key(&item) {
+            credits.entry(item).or_default().push(JfCredit {
+                name: name.unwrap_or_default(),
+                kind,
+                role,
+                list_order,
+                sort_order,
+            });
+        }
+    }
+    JfMetadata {
+        items,
+        credits,
+        person_images,
+    }
 }
 
 /// `StreamType` of the new layout: an INTEGER, 0 Audio, 1 Video, 2 Subtitle, else Other.

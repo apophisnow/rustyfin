@@ -42,7 +42,9 @@ async fn preview_route(
     State(state): State<AppState>,
     Json(req): Json<ImportRequest>,
 ) -> Result<Json<ImportReport>, ApiError> {
-    let report = preview(&state.db_ro, &req).await.map_err(import_error)?;
+    let report = preview(&state.db_ro, &req, &state.data_dir)
+        .await
+        .map_err(import_error)?;
     Ok(Json(report))
 }
 
@@ -57,7 +59,19 @@ async fn run_route(
         .jellyfin_import
         .try_start()
         .ok_or_else(|| ApiError::Conflict("An import is already running.".to_string()))?;
-    tokio::spawn(run(state.db.clone(), req, prepared, handle));
+    // Written metadata changes what the item and image caches serve, so they're cleared then.
+    let cache_state = state.clone();
+    tokio::spawn(run(
+        state.db.clone(),
+        req,
+        prepared,
+        handle,
+        (*state.data_dir).clone(),
+        move || {
+            cache_state.cache.invalidate_on_scan();
+            cache_state.image_cache.invalidate_all();
+        },
+    ));
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "State": "Running" })),
