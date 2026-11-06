@@ -168,13 +168,21 @@ const API = {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.Message || err.message || t('login.failed'));
+            const error = new Error(err.Message || err.message || t('login.failed'));
+            error.status = res.status;
+            throw error;
         }
         const data = await res.json();
+        this._storeSession(data, username);
+        return data;
+    },
+
+    // Keeps the session that an AuthenticateByName-style answer carries (password or OpenID Connect sign-in).
+    _storeSession(data, fallbackName = '') {
         this.token = data.AccessToken || data.access_token;
         const userObj = data.User || data.user || {};
         this.userId = userObj.Id || userObj.id || '';
-        this.userName = userObj.Name || userObj.name || username;
+        this.userName = userObj.Name || userObj.name || fallbackName;
         this.isAdmin = Boolean(
             userObj.IsAdministrator ??
             userObj.is_administrator ??
@@ -187,7 +195,19 @@ const API = {
         localStorage.setItem('rustyfin_user_id', this.userId);
         localStorage.setItem('rustyfin_user_name', this.userName);
         localStorage.setItem('rustyfin_is_admin', this.isAdmin.toString());
-        return data;
+    },
+
+    // Ends an OpenID Connect sign-in. The flow cookie from oidcStart() picks the flow. The device header is sent as login() sends it, so the token belongs to this browser.
+    async oidcComplete() {
+        const res = await fetch(this.base + '/Auth/Oidc/Complete', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Authorization': this.authHeader()
+            }
+        });
+        if (!res.ok) throw await this._requestError('POST', '/Auth/Oidc/Complete', res);
+        this._storeSession(await res.json());
     },
 
     logout() {
@@ -204,6 +224,16 @@ const API = {
     isLoggedIn() {
         return !!this.token;
     },
+
+    // OpenID Connect. Start and Link answer with the provider's AuthorizationUrl.
+    oidcInfo() { return this.get('/Auth/Oidc/Info'); },
+    oidcStart() { return this.post('/Auth/Oidc/Start'); },
+    oidcLink() { return this.post('/Auth/Oidc/Link'); },
+    oidcAccount(userId) { return this.get(`/Auth/Oidc/Accounts/${encodeURIComponent(userId)}`); },
+    oidcAccounts() { return this.get('/Auth/Oidc/Accounts'); },
+    oidcUnlink(userId) { return this.del(`/Auth/Oidc/Accounts/${encodeURIComponent(userId)}/Link`); },
+    oidcSettings() { return this.get('/Auth/Oidc/Settings'); },
+    saveOidcSettings(body) { return this.post('/Auth/Oidc/Settings', body); },
 
     // System
     getPublicInfo() { return this.get('/System/Info/Public'); },

@@ -336,5 +336,37 @@
     "search": {
         "no_results": "No results for “{{term}}”",
         "results_for": "Search Results for “{{term}}” ({{count}})"
+    },
+    "oidc": {
+        "sign_in_default": "Sign in with single sign-on",
+        "complete_failed": "The sign-in could not be completed. Please try again.",
+        "password_sign_in_off": "Password sign-in is turned off on this server. Sign in with the provider instead, or ask an administrator.",
+        "no_current_password": "This account has no password yet, so the current password is not needed.",
+        "account_title": "Single sign-on",
+        "link": "Link account",
+        "linked_as": "Linked as {{name}} since {{date}}.",
+        "linked": "Linked to the sign-in provider.",
+        "unlink": "Unlink",
+        "unlink_confirm": "Remove the link to the sign-in provider? After that you can only sign in with your password.",
+        "unlinked": "The link to the sign-in provider was removed.",
+        "not_linked": "This account is not linked to the sign-in provider.",
+        "unlink_needs_password": "Set a password first. The link can only be removed when the account has a password.",
+        "unlink_password_off": "Password sign-in is turned off, so the link cannot be removed.",
+        "error": {
+            "cancelled": "The sign-in was cancelled.",
+            "state_mismatch": "The sign-in could not be verified. Please start it again.",
+            "expired": "The sign-in has expired. Please start it again.",
+            "disabled": "Sign-in with the provider is turned off on this server.",
+            "provider_error": "The provider reported an error or could not be reached. Please try again.",
+            "invalid_token": "The provider's answer could not be verified. Please try again.",
+            "no_username": "The provider did not send a usable username.",
+            "not_allowed": "Your provider account is not allowed to sign in here. Ask an administrator.",
+            "admin_link_required": "This name belongs to an administrator. Sign in with your password and link the account on your profile first.",
+            "already_linked": "This provider login or account is already linked to another account.",
+            "ambiguous_user": "More than one account has this name. Ask an administrator.",
+            "account_disabled": "This account is disabled. Ask an administrator.",
+            "server_error": "The server could not finish the sign-in. Please try again.",
+            "unknown": "The sign-in with the provider failed."
+        }
     }
 }

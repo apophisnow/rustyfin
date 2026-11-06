@@ -336,5 +336,37 @@
     "search": {
         "no_results": "Keine Treffer für „{{term}}\"",
         "results_for": "Suchergebnisse für „{{term}}\" ({{count}})"
+    },
+    "oidc": {
+        "sign_in_default": "Mit Single Sign-on anmelden",
+        "complete_failed": "Die Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen.",
+        "password_sign_in_off": "Die Anmeldung mit Passwort ist auf diesem Server ausgeschaltet. Bitte über den Anbieter anmelden oder einen Administrator fragen.",
+        "no_current_password": "Dieses Konto hat noch kein Passwort. Das aktuelle Passwort ist daher nicht nötig.",
+        "account_title": "Single Sign-on",
+        "link": "Konto verknüpfen",
+        "linked_as": "Verknüpft als {{name}} seit {{date}}.",
+        "linked": "Mit dem Anbieter verknüpft.",
+        "unlink": "Verknüpfung lösen",
+        "unlink_confirm": "Verknüpfung mit dem Anbieter wirklich lösen? Danach ist nur noch die Anmeldung mit Passwort möglich.",
+        "unlinked": "Die Verknüpfung mit dem Anbieter wurde gelöst.",
+        "not_linked": "Dieses Konto ist nicht mit dem Anbieter verknüpft.",
+        "unlink_needs_password": "Zuerst ein Passwort festlegen. Die Verknüpfung lässt sich nur lösen, wenn das Konto ein Passwort hat.",
+        "unlink_password_off": "Die Anmeldung mit Passwort ist ausgeschaltet. Die Verknüpfung lässt sich daher nicht lösen.",
+        "error": {
+            "cancelled": "Die Anmeldung beim Anbieter wurde abgebrochen.",
+            "state_mismatch": "Die Anmeldung konnte nicht überprüft werden. Bitte von vorn beginnen.",
+            "expired": "Die Anmeldung ist abgelaufen. Bitte von vorn beginnen.",
+            "disabled": "Die Anmeldung über den Anbieter ist auf diesem Server ausgeschaltet.",
+            "provider_error": "Der Anbieter hat einen Fehler gemeldet oder ist nicht erreichbar. Bitte erneut versuchen.",
+            "invalid_token": "Die Antwort des Anbieters konnte nicht überprüft werden. Bitte erneut versuchen.",
+            "no_username": "Der Anbieter hat keinen verwendbaren Benutzernamen gesendet.",
+            "not_allowed": "Dieses Anbieter-Konto darf sich hier nicht anmelden. Bitte einen Administrator fragen.",
+            "admin_link_required": "Dieser Name gehört zu einem Administrator. Bitte zuerst mit dem Passwort anmelden und das Konto im Profil verknüpfen.",
+            "already_linked": "Diese Anmeldung oder dieses Konto ist bereits mit einem anderen Konto verknüpft.",
+            "ambiguous_user": "Mehrere Konten haben diesen Namen. Bitte einen Administrator fragen.",
+            "account_disabled": "Dieses Konto ist deaktiviert. Bitte einen Administrator fragen.",
+            "server_error": "Der Server konnte die Anmeldung nicht abschließen. Bitte erneut versuchen.",
+            "unknown": "Die Anmeldung beim Anbieter ist fehlgeschlagen."
+        }
     }
 }

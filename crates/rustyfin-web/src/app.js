@@ -314,12 +314,12 @@ function navigate(page, data) {
     const pages = {
         home: renderHome,
         favorites: renderFavorites,
-        login: renderLogin,
+        login: () => renderLogin(data),
         library: () => renderLibrary(data),
         detail: () => renderDetail(data),
         search: () => renderSearch(data),
         person: () => renderPerson(data),
-        settings: renderSettings,
+        settings: () => renderSettings(data),
         admin: renderAdmin
     };
 
@@ -377,6 +377,9 @@ const clickActions = {
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'dir-open': el => navigateDirectoryPicker(el.dataset.path),
     'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
+    'oidc-sign-in': () => startOidcSignIn(),
+    'oidc-link': () => startOidcLink(),
+    'oidc-unlink': el => unlinkOidc(el.dataset.id),
 };
 document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');
@@ -1985,8 +1988,142 @@ async function togglePlayed(id, current) {
     }
 }
 
+// --- OpenID Connect: helpers for the sign-in page and the profile ---
+// The redirect codes of the OIDC flows, each mapped to its translation key. A code not listed here gets the
+// generic message; the code itself never reaches t().
+const OIDC_ERROR_KEYS = new Map([
+    ['cancelled', 'oidc.error.cancelled'],
+    ['state_mismatch', 'oidc.error.state_mismatch'],
+    ['expired', 'oidc.error.expired'],
+    ['disabled', 'oidc.error.disabled'],
+    ['provider_error', 'oidc.error.provider_error'],
+    ['invalid_token', 'oidc.error.invalid_token'],
+    ['no_username', 'oidc.error.no_username'],
+    ['not_allowed', 'oidc.error.not_allowed'],
+    ['admin_link_required', 'oidc.error.admin_link_required'],
+    ['already_linked', 'oidc.error.already_linked'],
+    ['ambiguous_user', 'oidc.error.ambiguous_user'],
+    ['account_disabled', 'oidc.error.account_disabled'],
+    ['server_error', 'oidc.error.server_error'],
+]);
+
+// The code of an 'oidc-error/<code>' route, or null for any other route.
+function oidcErrorCode(data) {
+    const match = /^oidc-error\/(.*)$/.exec(data || '');
+    return match ? match[1] : null;
+}
+
+function oidcErrorText(code) {
+    return t(OIDC_ERROR_KEYS.get(code) || 'oidc.error.unknown');
+}
+
+// Sends the browser to the provider. Only http(s) links are followed; anything else is an error.
+function goToOidcProvider(url) {
+    if (!/^https?:\/\//i.test(url || '')) throw new Error(t('oidc.error.provider_error'));
+    window.location.href = url;
+}
+
+function showLoginError(message) {
+    $('login-error').textContent = message;
+    show('login-error');
+}
+
+// Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
+async function loadOidcSignIn() {
+    const info = await API.oidcInfo().catch(() => null);
+    const box = $('oidc-sign-in');
+    if (!info?.Enabled || !box) return;
+    const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
+    box.innerHTML = `<button type="button" class="jf-btn-ghost w-full !py-3 !font-semibold text-sm mt-4" data-action="oidc-sign-in">${escapeHtml(label)}</button>`;
+}
+
+async function startOidcSignIn() {
+    try {
+        const { AuthorizationUrl } = await API.oidcStart();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        showLoginError(err.message);
+    }
+}
+
+// The flow is single-use, so the browser's return to #login/oidc is completed once per page load.
+let oidcCompleteStarted = false;
+
+async function completeOidcSignIn() {
+    if (oidcCompleteStarted) return;
+    oidcCompleteStarted = true;
+    const completed = await API.oidcComplete().then(() => true, () => false);
+    if (!completed) {
+        showLoginError(t('oidc.complete_failed'));
+        history.replaceState(null, '', '#login');
+        return;
+    }
+    await finishSignIn();
+}
+
+// Starts linking the signed-in account. The provider's callback returns to #settings.
+async function startOidcLink() {
+    try {
+        const { AuthorizationUrl } = await API.oidcLink();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+async function unlinkOidc(userId) {
+    if (!confirm(t('oidc.unlink_confirm'))) return;
+    try {
+        await API.oidcUnlink(userId);
+        toast(t('oidc.unlinked'));
+        renderSettings();
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+// The profile gets the result of a link as #settings/oidc-linked or #settings/oidc-error/<code>. It is toasted
+// once, then the hash is cleared so that a reload does not repeat it.
+function showOidcLinkResult(data) {
+    const code = oidcErrorCode(data);
+    if (code !== null) toast(oidcErrorText(code), 'error');
+    else if (data === 'oidc-linked') toast(t('oidc.linked'));
+    else return;
+    history.replaceState(null, '', '#settings');
+}
+
+// The profile's "Single sign-on" card. Not linked: a link button, when OIDC is on. Linked: the provider login
+// and Unlink, which is disabled with the reason when the server says CanUnlink is false.
+function oidcCardHtml(enabled, account) {
+    let body;
+    if (account?.Linked) {
+        const linkedAt = account.LinkedAt ? new Date(account.LinkedAt).toLocaleString() : '—';
+        const canUnlink = Boolean(account.CanUnlink);
+        const reason = account.HasPassword ? t('oidc.unlink_password_off') : t('oidc.unlink_needs_password');
+        const linkedAs = t('oidc.linked_as', { name: account.ProviderUsername || '', date: linkedAt });
+        body = `
+            <p class="text-sm text-white/80">${escapeHtml(linkedAs)}</p>
+            <div class="flex flex-wrap items-center gap-3 mt-4">
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs${canUnlink ? '' : ' !cursor-not-allowed !opacity-50 disabled:pointer-events-none'}" data-action="oidc-unlink" data-id="${escapeHtml(account.UserId)}"${canUnlink ? '' : ' disabled'}>${t('oidc.unlink')}</button>
+                ${canUnlink ? '' : `<span class="text-xs text-white/40">${escapeHtml(reason)}</span>`}
+            </div>`;
+    } else {
+        body = `
+            <p class="text-sm text-white/60">${t('oidc.not_linked')}</p>
+            ${enabled ? `<button type="button" class="jf-btn-primary !py-2 !px-4 text-xs mt-4" data-action="oidc-link">${t('oidc.link')}</button>` : ''}`;
+    }
+    return `
+        <div class="jf-settings-card">
+            <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-[#38bdf8]"></span>
+                ${t('oidc.account_title')}
+            </h3>
+            ${body}
+        </div>`;
+}
+
 // --- Login Page Renderer ---
-function renderLogin() {
+function renderLogin(data) {
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
@@ -2009,25 +2146,35 @@ function renderLogin() {
                 </button>
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
+            <div id="oidc-sign-in"></div>
         </div>
     </div>`);
+    loadOidcSignIn();
+    const oidcError = oidcErrorCode(data);
+    if (data === 'oidc') completeOidcSignIn();
+    else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
+}
+
+// The steps after any sign-in, password or OpenID Connect.
+async function finishSignIn() {
+    updateAuthUI();
+    // Replace a socket or retry left from an earlier session, so the new token is used now
+    stopScanProgressWebSocket();
+    initScanProgressWebSocket();
+    await loadSidebar();
+    navigate('home');
+    toast(t('login.welcome_back', { name: API.userName }));
 }
 
 async function handleLogin(e) {
     e.preventDefault();
     try {
         await API.login($('login-user').value, $('login-pass').value);
-        updateAuthUI();
-        // Replace a socket or retry left from an earlier session, so the new token is used now
-        stopScanProgressWebSocket();
-        initScanProgressWebSocket();
-        await loadSidebar();
-        navigate('home');
-        toast(t('login.welcome_back', { name: API.userName }));
     } catch (err) {
-        $('login-error').textContent = err.message;
-        show('login-error');
+        showLoginError(err.status === 403 ? t('oidc.password_sign_in_off') : err.message);
+        return;
     }
+    await finishSignIn();
 }
 
 function doLogout() {
@@ -2062,14 +2209,17 @@ async function authorizeQuickConnect() {
 }
 
 // --- Settings Page Renderer ---
-async function renderSettings() {
+async function renderSettings(data) {
+    showOidcLinkResult(data);
     const page = $('page-settings');
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
-        const [me, config] = await Promise.all([
+        const [me, config, ssoInfo, ssoAccount] = await Promise.all([
             API.getMe().catch(() => ({})),
-            API.getConfig().catch(() => null)
+            API.getConfig().catch(() => null),
+            API.oidcInfo().catch(() => null),
+            API.oidcAccount(API.userId).catch(() => null)
         ]);
 
         const name = me.Name || me.name || API.userName || '';
@@ -2119,6 +2269,10 @@ async function renderSettings() {
             </div>`;
         }
 
+        // Without the account (its request failed) the current password stays required.
+        const hasPassword = ssoAccount?.HasPassword ?? true;
+        const ssoHtml = (ssoInfo?.Enabled || ssoAccount?.Linked) ? oidcCardHtml(Boolean(ssoInfo?.Enabled), ssoAccount) : '';
+
         page.innerHTML = `
         <div class="max-w-3xl mx-auto jf-page">
             <h1 class="text-2xl lg:text-3xl font-extrabold text-white mb-6">${t('settings.title')}</h1>
@@ -2156,13 +2310,16 @@ async function renderSettings() {
                     ${t('settings.change_password')}
                 </h3>
                 <form id="change-password-form" class="space-y-3">
-                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" required>
+                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" ${hasPassword ? 'required' : ''}>
+                    ${hasPassword ? '' : `<p class="text-xs text-white/40">${t('oidc.no_current_password')}</p>`}
                     <input type="password" id="pw-new" class="jf-input w-full" placeholder="${escapeHtml(t('settings.new_password'))}" required>
                     <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="${escapeHtml(t('settings.confirm_new_password'))}" required>
                     <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_password')}</button>
                     <span id="pw-msg" class="text-xs ml-3 hidden"></span>
                 </form>
             </div>
+
+            ${ssoHtml}
 
             ${serverCfgHtml}
         </div>`;
