@@ -1,7 +1,488 @@
-//! Choosing between watching and polling a library path, by the filesystem it is on.
+//! Choosing between watching and polling a library path, by the filesystem it is on, and the
+//! manager that monitors the library paths of the libraries with real-time monitoring on.
 
 mod mounts;
 mod poll;
 
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use rustyfin_db::repo_library;
+use rustyfin_model::library::Library;
+use sqlx::SqlitePool;
+use tokio::sync::{Notify, watch};
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::library_monitor::{ChangeQueue, unit_for};
+
 pub use mounts::{fs_type_from_mountinfo, fs_type_of, is_local_fs_type};
 pub use poll::FolderPoller;
+
+/// The poll interval until `set_poll_interval` changes it.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The reason of a path that is missing when its monitor starts. That monitor polls the path, and
+/// the next reload after the path has appeared replaces it.
+const PATH_NOT_FOUND: &str = "path not found";
+
+/// How a library path is monitored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    /// Kernel change notifications (inotify).
+    Watch,
+    /// Folder timestamps, read at the poll interval.
+    Poll,
+}
+
+/// A monitored library path, as `LibraryWatcher::monitored` lists it. Until its monitor has
+/// checked the path, `method`, `fs_type` and `reason` are placeholders and `ready` is false.
+#[derive(Clone, Debug)]
+pub struct MonitoredPath {
+    pub library_id: Uuid,
+    pub library_name: String,
+    pub path: PathBuf,
+    pub method: Method,
+    /// The filesystem type, or `unknown` when the path cannot be found.
+    pub fs_type: String,
+    /// Why the path is not watched.
+    pub reason: Option<String>,
+    /// Folders the monitor sees under the path.
+    pub folders: usize,
+    /// Kernel watches in place; 0 when polled.
+    pub watches: usize,
+    /// True once the watches or the baseline exist.
+    pub ready: bool,
+}
+
+/// Monitors the library paths of the libraries with real-time monitoring on, and reports their
+/// changes to a `ChangeQueue`. Clones share one manager.
+#[derive(Clone)]
+pub struct LibraryWatcher {
+    inner: Arc<Inner>,
+}
+
+/// A monitor is keyed by its library id and its path.
+type MonitorKey = (Uuid, PathBuf);
+
+struct Inner {
+    pool: SqlitePool,
+    changes: ChangeQueue,
+    data_dir: PathBuf,
+    /// Notified by `libraries_changed`; the manager then reloads the libraries.
+    reload: Notify,
+    /// The poll interval. Every poll monitor subscribes to it.
+    interval: watch::Sender<Duration>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    /// Bumped by `start` and `stop`. A manager reconciles only while its generation is current.
+    generation: u64,
+    manager: Option<JoinHandle<()>>,
+    force_poll: bool,
+    next_id: u64,
+    monitors: BTreeMap<MonitorKey, Monitor>,
+}
+
+struct Monitor {
+    /// Tells this monitor apart from an earlier one for the same key that may still be running.
+    id: u64,
+    info: MonitoredPath,
+    /// All paths of the library: a report is coalesced by them.
+    library_paths: Vec<String>,
+    task: JoinHandle<()>,
+}
+
+/// How a monitor starts: its method, the filesystem type (`unknown` when the path cannot be
+/// found) and why the path is polled.
+struct Choice {
+    method: Method,
+    fs_type: String,
+    reason: &'static str,
+}
+
+impl LibraryWatcher {
+    /// A watcher that is not running yet. Reports go to `changes`. Every walk leaves out
+    /// `data_dir` and everything under it.
+    pub fn new(pool: SqlitePool, changes: ChangeQueue, data_dir: PathBuf) -> Self {
+        let (interval, _) = watch::channel(DEFAULT_POLL_INTERVAL);
+        Self {
+            inner: Arc::new(Inner {
+                pool,
+                changes,
+                data_dir,
+                reload: Notify::new(),
+                interval,
+                state: Mutex::new(State::default()),
+            }),
+        }
+    }
+
+    /// Starts the manager, which starts the monitors in the background. Returns at once, and
+    /// does nothing while a manager runs. Needs a tokio runtime.
+    pub fn start(&self) {
+        let mut state = self.inner.lock();
+        if state.manager.is_none() {
+            state.generation += 1;
+            let generation = state.generation;
+            state.manager = Some(tokio::spawn(run_manager(
+                Arc::clone(&self.inner),
+                generation,
+            )));
+        }
+    }
+
+    /// Aborts the manager and every monitor, and forgets the monitors.
+    pub fn stop(&self) {
+        let mut state = self.inner.lock();
+        // A reconcile still running on another thread must not start monitors after this.
+        state.generation += 1;
+        if let Some(manager) = state.manager.take() {
+            manager.abort();
+        }
+        for (_, monitor) in std::mem::take(&mut state.monitors) {
+            monitor.task.abort();
+            tracing::info!(
+                "library monitor: stopped '{}' of '{}'",
+                monitor.info.path.display(),
+                monitor.info.library_name
+            );
+        }
+    }
+
+    /// Asks the manager to reload the libraries. Never blocks.
+    pub fn libraries_changed(&self) {
+        self.inner.reload.notify_one();
+    }
+
+    /// Sets the poll interval. Monitors that are sleeping apply it at once.
+    pub fn set_poll_interval(&self, interval: Duration) {
+        self.inner.interval.send_replace(interval);
+    }
+
+    /// The poll interval, 60 s by default.
+    pub fn poll_interval(&self) -> Duration {
+        *self.inner.interval.borrow()
+    }
+
+    /// Makes the monitors started from now on poll, whatever their filesystem.
+    pub fn set_force_poll(&self, on: bool) {
+        self.inner.lock().force_poll = on;
+    }
+
+    /// The monitored library paths, sorted by library name, then path.
+    pub fn monitored(&self) -> Vec<MonitoredPath> {
+        let mut paths: Vec<MonitoredPath> = self
+            .inner
+            .lock()
+            .monitors
+            .values()
+            .map(|monitor| monitor.info.clone())
+            .collect();
+        paths.sort_by(|a, b| (&a.library_name, &a.path).cmp(&(&b.library_name, &b.path)));
+        paths
+    }
+}
+
+impl Inner {
+    /// The state. A poisoned lock is used anyway, since no step leaves it half-changed.
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `f` on monitor `id` of `key`, unless that monitor is no longer listed.
+    fn with_monitor<T>(
+        &self,
+        key: &MonitorKey,
+        id: u64,
+        f: impl FnOnce(&mut Monitor) -> T,
+    ) -> Option<T> {
+        let mut state = self.lock();
+        let monitor = state
+            .monitors
+            .get_mut(key)
+            .filter(|monitor| monitor.id == id)?;
+        Some(f(monitor))
+    }
+}
+
+/// Reconciles the monitors with the libraries, then waits for `libraries_changed`, for ever.
+async fn run_manager(inner: Arc<Inner>, generation: u64) {
+    loop {
+        reconcile(&inner, generation).await;
+        inner.reload.notified().await;
+    }
+}
+
+/// Stops the monitor of `key`, if it has one: aborts its task and logs the stop.
+fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) {
+    if let Some(monitor) = monitors.remove(key) {
+        monitor.task.abort();
+        tracing::info!(
+            "library monitor: stopped '{}' of '{}'",
+            key.1.display(),
+            monitor.info.library_name
+        );
+    }
+}
+
+/// Brings the monitors in line with the libraries: stops the ones not wanted any more, starts
+/// the missing ones and updates the library names and paths of the others. A monitor whose task
+/// ended early, or whose path was missing at start and has appeared since, is replaced by a new
+/// one for its key. A database error keeps the monitors as they are.
+async fn reconcile(inner: &Arc<Inner>, generation: u64) {
+    let libraries = match monitored_libraries(&inner.pool).await {
+        Ok(libraries) => libraries,
+        Err(err) => {
+            tracing::warn!(
+                "library monitor: could not load the libraries ({err}); keeping the current monitors"
+            );
+            return;
+        }
+    };
+    let mut guard = inner.lock();
+    let state = &mut *guard;
+    if state.generation != generation {
+        return; // stopped while the libraries were loaded
+    }
+    let wanted: HashSet<MonitorKey> = libraries
+        .iter()
+        .flat_map(|library| {
+            library
+                .paths
+                .iter()
+                .map(|path| (library.id, PathBuf::from(path)))
+        })
+        .collect();
+    let gone: Vec<MonitorKey> = state
+        .monitors
+        .keys()
+        .filter(|key| !wanted.contains(*key))
+        .cloned()
+        .collect();
+    for key in gone {
+        stop_monitor(&mut state.monitors, &key);
+    }
+    for library in &libraries {
+        for path in &library.paths {
+            let key = (library.id, PathBuf::from(path));
+            if let Some(monitor) = state.monitors.get_mut(&key) {
+                let replaced = monitor.task.is_finished()
+                    || (monitor.info.reason.as_deref() == Some(PATH_NOT_FOUND)
+                        && monitor.info.ready);
+                if !replaced {
+                    monitor.info.library_name.clone_from(&library.name);
+                    monitor.library_paths.clone_from(&library.paths);
+                    continue;
+                }
+            }
+            stop_monitor(&mut state.monitors, &key);
+            let id = state.next_id;
+            state.next_id += 1;
+            // Spawned and inserted under one lock, so the monitor finds its entry when it runs.
+            let task = tokio::spawn(run_monitor(
+                Arc::clone(inner),
+                key.clone(),
+                library.name.clone(),
+                id,
+                state.force_poll,
+                inner.interval.subscribe(),
+            ));
+            let info = MonitoredPath {
+                library_id: library.id,
+                library_name: library.name.clone(),
+                path: key.1.clone(),
+                method: Method::Poll,
+                fs_type: "unknown".to_string(),
+                reason: None,
+                folders: 0,
+                watches: 0,
+                ready: false,
+            };
+            state.monitors.insert(
+                key,
+                Monitor {
+                    id,
+                    info,
+                    library_paths: library.paths.clone(),
+                    task,
+                },
+            );
+        }
+    }
+}
+
+/// The libraries with real-time monitoring on.
+async fn monitored_libraries(pool: &SqlitePool) -> Result<Vec<Library>, sqlx::Error> {
+    let mut monitored = Vec::new();
+    for library in repo_library::get_all_libraries(pool).await? {
+        if repo_library::get_library_options(pool, library.id)
+            .await?
+            .enable_realtime_monitor
+        {
+            monitored.push(library);
+        }
+    }
+    Ok(monitored)
+}
+
+/// Sets up the monitor of one library path, then polls the path until the monitor is aborted. A
+/// failed setup or poll ends the task instead, and the next reload replaces the monitor.
+async fn run_monitor(
+    inner: Arc<Inner>,
+    key: MonitorKey,
+    library_name: String,
+    id: u64,
+    force_poll: bool,
+    mut interval: watch::Receiver<Duration>,
+) {
+    let path = key.1.clone();
+    // Canonicalizing can hang on a dead share, so the setup runs on a blocking thread.
+    let setup_path = path.clone();
+    let data_dir = inner.data_dir.clone();
+    let setup = tokio::task::spawn_blocking(move || {
+        let choice = choose(&setup_path, force_poll);
+        (choice, FolderPoller::new(setup_path, Some(data_dir)))
+    })
+    .await;
+    let (choice, mut poller) = match setup {
+        Ok(setup) => setup,
+        Err(err) => {
+            tracing::warn!(
+                "library monitor: could not set up '{}': {err}; restarting it at the next library change",
+                path.display()
+            );
+            return;
+        }
+    };
+    let Choice {
+        method,
+        fs_type,
+        reason,
+    } = choice;
+    let listed = inner.with_monitor(&key, id, |monitor| {
+        monitor.info.method = method;
+        monitor.info.fs_type.clone_from(&fs_type);
+        monitor.info.reason = Some(reason.to_string());
+    });
+    if listed.is_none() {
+        return;
+    }
+
+    let mut logged_baseline = false;
+    loop {
+        let (returned, reported, took) = match tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let reported = poller.poll();
+            (poller, reported, started.elapsed())
+        })
+        .await
+        {
+            Ok(done) => done,
+            Err(err) => {
+                inner.with_monitor(&key, id, |monitor| monitor.info.ready = false);
+                tracing::warn!(
+                    "library monitor: polling '{}' failed: {err}; restarting it at the next library change",
+                    path.display()
+                );
+                return;
+            }
+        };
+        poller = returned;
+        // The interval counts from the end of the poll.
+        let finished = tokio::time::Instant::now();
+        let folders = poller.folders();
+        let ready = poller.has_baseline();
+        let listed = inner.with_monitor(&key, id, |monitor| {
+            monitor.info.folders = folders;
+            monitor.info.ready = ready;
+        });
+        if listed.is_none() {
+            return;
+        }
+        let ms = took.as_millis();
+        tracing::debug!(
+            "library monitor: polled '{}': {folders} folders in {ms} ms, {} reported",
+            path.display(),
+            reported.len()
+        );
+        if ready && !logged_baseline {
+            logged_baseline = true;
+            tracing::info!(
+                "library monitor: polling '{}' of '{}' ({fs_type}, {reason}): {folders} folders, every {:?}, baseline in {ms} ms",
+                path.display(),
+                library_name,
+                *interval.borrow()
+            );
+        }
+        if !reported.is_empty() {
+            let Some(library_paths) =
+                inner.with_monitor(&key, id, |monitor| monitor.library_paths.clone())
+            else {
+                return;
+            };
+            let units = coalesce(&library_paths, &reported);
+            if !units.is_empty() {
+                inner.changes.report_all(&units).await;
+            }
+        }
+        sleep_between_polls(finished, &mut interval).await;
+    }
+}
+
+/// Sleeps until `interval` has passed since `last`, at once if it already has. A change of the
+/// interval wakes the sleep, which then counts from `last` again.
+async fn sleep_between_polls(last: tokio::time::Instant, interval: &mut watch::Receiver<Duration>) {
+    loop {
+        let every = *interval.borrow_and_update();
+        tokio::select! {
+            () = tokio::time::sleep_until(last + every) => return,
+            changed = interval.changed() => {
+                if changed.is_err() {
+                    // The sender lives in the same `Inner` as this monitor, so this does not
+                    // happen. If it did, the current interval still applies.
+                    tokio::time::sleep_until(last + every).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// How a path is monitored, and why, and its filesystem type. It reads the disk, so it runs on a
+/// blocking thread. Until `kernel.rs` exists, a path that could be watched is polled instead.
+fn choose(path: &Path, force_poll: bool) -> Choice {
+    let canonical = std::fs::canonicalize(path).ok();
+    let fs_type = canonical.as_deref().and_then(fs_type_of);
+    let reason = if force_poll {
+        "forced"
+    } else if !cfg!(target_os = "linux") {
+        "no kernel watching on this OS"
+    } else if canonical.is_none() {
+        PATH_NOT_FOUND
+    } else if !fs_type.as_deref().is_some_and(is_local_fs_type) {
+        "network or unknown filesystem"
+    } else {
+        "kernel watching not built yet"
+    };
+    Choice {
+        method: Method::Poll,
+        fs_type: fs_type.unwrap_or_else(|| "unknown".to_string()),
+        reason,
+    }
+}
+
+/// The paths to report for a poll: the first path of each unit, in input order. A unit is what
+/// `unit_for` says a change rescans. A path with no unit is dropped.
+pub fn coalesce(library_paths: &[String], paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut units = HashSet::new();
+    paths
+        .iter()
+        .filter(|path| unit_for(library_paths, path).is_some_and(|unit| units.insert(unit)))
+        .cloned()
+        .collect()
+}

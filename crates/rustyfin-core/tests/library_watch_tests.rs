@@ -1,13 +1,20 @@
 // B18 part 2: watching library folders for changes. These tests cover choosing the method (the
-// filesystem type of a library path) and polling folder timestamps (`FolderPoller`).
+// filesystem type of a library path), polling folder timestamps (`FolderPoller`), and the
+// manager that monitors the library paths whose libraries have real-time monitoring on
+// (`LibraryWatcher`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use rustyfin_core::library_monitor::ChangeQueue;
 use rustyfin_core::library_watch::{
-    FolderPoller, fs_type_from_mountinfo, fs_type_of, is_local_fs_type,
+    FolderPoller, LibraryWatcher, Method, MonitoredPath, coalesce, fs_type_from_mountinfo,
+    fs_type_of, is_local_fs_type,
 };
+use rustyfin_core::scanner::ScanScope;
+use rustyfin_model::library::{Library, LibraryContentType, LibraryOptions};
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 // ── Helpers ──
@@ -63,9 +70,9 @@ fn tick() {
     std::thread::sleep(Duration::from_millis(60));
 }
 
-fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    paths.sort();
-    paths
+fn sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+    items.sort();
+    items
 }
 
 /// Everything any test in this binary logs from now on, at every level.
@@ -106,6 +113,21 @@ fn log_lines(needles: &[&str]) -> Vec<String> {
         .filter(|line| needles.iter().all(|needle| line.contains(needle)))
         .map(str::to_string)
         .collect()
+}
+
+/// Waits up to 20 s for a log line that contains every one of `needles`.
+async fn wait_for_log(needles: &[&str]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(line) = log_lines(needles).into_iter().next() {
+            return line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no log line with {needles:?} within 20 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // ── Filesystem types ──
@@ -666,6 +688,574 @@ fn symlink_loops_and_two_links_to_one_folder_are_walked_once() {
     tick();
     std::fs::create_dir(tree.at("Up (2009)")).unwrap();
     assert_eq!(poller.poll(), vec![tree.at("Up (2009)")]);
+}
+
+// ── Manager ──
+
+/// A database in `tree`, and a queue on it whose settle delay of an hour keeps every report
+/// pending.
+async fn manager_fixture(tree: &Tree) -> (SqlitePool, ChangeQueue) {
+    let db = tree.outside("test.db");
+    let pool = rustyfin_db::init_db(db.to_str().unwrap()).await.unwrap();
+    let changes = ChangeQueue::new(pool.clone());
+    changes.set_delay(Duration::from_secs(3600));
+    (pool, changes)
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_str().unwrap().to_string()
+}
+
+/// Creates the movie library `name` with `paths`, and their folders.
+async fn add_library(pool: &SqlitePool, name: &str, paths: &[PathBuf]) -> Library {
+    for path in paths {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let lib = Library {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: LibraryContentType::Movies,
+        paths: paths.iter().map(|path| path_string(path)).collect(),
+    };
+    rustyfin_db::repo_library::create_library(pool, &lib)
+        .await
+        .unwrap();
+    lib
+}
+
+/// Turns real-time monitoring of `lib` on or off, and tells `watcher`.
+async fn set_monitoring(pool: &SqlitePool, watcher: &LibraryWatcher, lib: &Library, on: bool) {
+    let options = LibraryOptions {
+        enable_realtime_monitor: on,
+        ..LibraryOptions::default()
+    };
+    rustyfin_db::repo_library::set_library_options(pool, lib.id, &options)
+        .await
+        .unwrap();
+    watcher.libraries_changed();
+}
+
+/// A started watcher that polls every library path every 100 ms, whatever its filesystem.
+fn polling_watcher(pool: &SqlitePool, changes: &ChangeQueue, data_dir: PathBuf) -> LibraryWatcher {
+    let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), data_dir);
+    watcher.set_force_poll(true);
+    watcher.set_poll_interval(Duration::from_millis(100));
+    watcher.start();
+    watcher
+}
+
+/// Waits up to 20 s until `check` holds for the monitored paths, and returns them.
+async fn wait_monitored(
+    watcher: &LibraryWatcher,
+    what: &str,
+    check: impl Fn(&[MonitoredPath]) -> bool,
+) -> Vec<MonitoredPath> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let monitored = watcher.monitored();
+        if check(&monitored) {
+            return monitored;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not within 20 s: {monitored:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The paths whose monitors are ready, in the order `monitored` lists them.
+fn ready_paths(monitored: &[MonitoredPath]) -> Vec<PathBuf> {
+    monitored
+        .iter()
+        .filter(|path| path.ready)
+        .map(|path| path.path.clone())
+        .collect()
+}
+
+/// The monitored path `path`, if it is listed.
+fn monitor_of<'a>(monitored: &'a [MonitoredPath], path: &Path) -> Option<&'a MonitoredPath> {
+    monitored.iter().find(|m| m.path.as_path() == path)
+}
+
+/// Waits up to 20 s until every one of `units` is pending.
+async fn wait_pending(changes: &ChangeQueue, units: &[(Uuid, ScanScope)]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let pending = changes.pending();
+        if units.iter().all(|unit| pending.contains(unit)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{units:?} not all pending within 20 s: {pending:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Gives the monitors time for several polls, so that a report that should not come would have.
+async fn several_polls() {
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+#[test]
+fn coalesce_keeps_the_first_path_of_each_unit_in_order() {
+    let library_paths = vec!["/media/movies".to_string()];
+    let paths = [
+        "/media/movies/Heat (1995)/Heat (1995).srt",
+        "/media/movies/Up (2009)",
+        "/media/movies/Heat (1995)",
+        "/elsewhere/Heat (1995)",
+        "/media/movies/.recycle/Heat (1995)",
+        "/media/movies/Alien (1979).mkv",
+        "/media/movies/Brazil (1985).mkv",
+        "/media/movies/Up (2009)/Up (2009).mkv",
+        "/media/movies",
+    ]
+    .map(PathBuf::from);
+    assert_eq!(
+        coalesce(&library_paths, &paths),
+        [
+            "/media/movies/Heat (1995)/Heat (1995).srt",
+            "/media/movies/Up (2009)",
+            "/media/movies/Alien (1979).mkv",
+            "/media/movies",
+        ]
+        .map(PathBuf::from)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_polled_library_path_is_logged_and_its_changes_are_queued_by_unit() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
+    write(&tree.at("Brazil (1985)/Brazil (1985).mkv"), 10);
+    // The data dir lies inside the library path here.
+    write(&tree.at("rustyfin-data/images/poster.jpg"), 10);
+    let lib = add_library(&pool, "Watch B Films", &[tree.root()]).await;
+    let watcher = polling_watcher(&pool, &changes, tree.at("rustyfin-data"));
+
+    let monitored = wait_monitored(&watcher, "the library path is ready", |m| {
+        m.len() == 1 && m[0].ready
+    })
+    .await;
+    let fs = fs_type_of(&tree.root().canonicalize().unwrap()).unwrap_or_else(|| "unknown".into());
+    let path = &monitored[0];
+    assert_eq!(
+        (path.library_id, path.library_name.as_str(), &path.path),
+        (lib.id, "Watch B Films", &tree.root())
+    );
+    assert_eq!(
+        (path.method, path.fs_type.as_str(), path.reason.as_deref()),
+        (Method::Poll, fs.as_str(), Some("forced"))
+    );
+    assert_eq!(
+        (path.folders, path.watches),
+        (3, 0),
+        "the library path, Heat (1995) and Brazil (1985)"
+    );
+    let polling = format!(
+        "library monitor: polling '{}' of 'Watch B Films' ({fs}, forced): 3 folders, every 100ms, \
+         baseline in ",
+        tree.root().display()
+    );
+    wait_for_log(&[&polling, " ms"]).await;
+    let polled = format!(
+        "library monitor: polled '{}': 3 folders in ",
+        tree.root().display()
+    );
+    wait_for_log(&[&polled, " ms, 0 reported"]).await;
+
+    // Starting again starts nothing more.
+    watcher.start();
+    several_polls().await;
+    assert_eq!(log_lines(&[&polling]).len(), 1, "one monitor for the path");
+    assert_eq!(watcher.monitored().len(), 1);
+
+    tick();
+    write(&tree.at("Heat (1995)/Heat (1995).srt"), 10);
+    write(&tree.at("Up (2009)/Up (2009).mkv"), 10);
+    write(&tree.at("Alien (1979).mkv"), 10);
+    std::fs::remove_dir_all(tree.at("Brazil (1985)")).unwrap();
+    write(&tree.at("rustyfin-data/images/backdrop.jpg"), 10);
+    write(&tree.at("rustyfin-data/transcodes/1/segment0.ts"), 10);
+    let expected = sorted(vec![
+        (lib.id, ScanScope::Folder(tree.at("Heat (1995)"))),
+        (lib.id, ScanScope::Folder(tree.at("Up (2009)"))),
+        (lib.id, ScanScope::Folder(tree.at("Brazil (1985)"))),
+        (lib.id, ScanScope::RootFiles(tree.root())),
+    ]);
+    wait_pending(&changes, &expected).await;
+    // Nothing else: not the data dir, and never the whole library.
+    several_polls().await;
+    assert_eq!(changes.pending(), expected);
+
+    watcher.stop();
+    wait_monitored(&watcher, "nothing is monitored after stop", |m| {
+        m.is_empty()
+    })
+    .await;
+    tick();
+    write(&tree.at("Dune (2021)/Dune (2021).mkv"), 10);
+    several_polls().await;
+    assert_eq!(
+        changes.pending(),
+        expected,
+        "nothing is reported after stop"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_library_path_is_monitored_and_quiet_until_it_appears() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    let lib = add_library(&pool, "Watch C Films", &[tree.root()]).await;
+    std::fs::remove_dir(tree.root()).unwrap();
+    let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+
+    let missing = format!(
+        "library monitor: '{}' is missing or unreadable",
+        tree.root().display()
+    );
+    wait_for_log(&[&missing]).await;
+    let monitored = watcher.monitored();
+    assert_eq!(monitored.len(), 1, "{monitored:#?}");
+    let path = &monitored[0];
+    assert_eq!(
+        (path.method, path.fs_type.as_str(), path.reason.as_deref()),
+        (Method::Poll, "unknown", Some("forced"))
+    );
+    assert!(!path.ready, "no baseline yet");
+    several_polls().await;
+    assert_eq!(log_lines(&[&missing]).len(), 1, "warned once");
+    assert!(changes.pending().is_empty());
+
+    write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
+    wait_monitored(&watcher, "the path is ready once it appears", |m| {
+        m.len() == 1 && m[0].ready && m[0].folders == 2
+    })
+    .await;
+    let polling = format!(
+        "library monitor: polling '{}' of 'Watch C Films' (",
+        tree.root().display()
+    );
+    wait_for_log(&[&polling, ": 2 folders, every 100ms, baseline in "]).await;
+    assert!(
+        changes.pending().is_empty(),
+        "the first poll that works only records the baseline"
+    );
+
+    tick();
+    write(&tree.at("Up (2009)/Up (2009).mkv"), 10);
+    wait_pending(
+        &changes,
+        &[(lib.id, ScanScope::Folder(tree.at("Up (2009)")))],
+    )
+    .await;
+    wait_monitored(&watcher, "the new folder is counted", |m| {
+        m.len() == 1 && m[0].folders == 3
+    })
+    .await;
+    watcher.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_missing_at_start_is_checked_again_at_the_next_reload_once_it_appears() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    let late = tree.root();
+    let gone = tree.outside("never there");
+    add_library(&pool, "Watch H Films", &[late.clone(), gone.clone()]).await;
+    std::fs::remove_dir(&late).unwrap();
+    std::fs::remove_dir(&gone).unwrap();
+    // Not forced: each path gets the method its filesystem calls for.
+    let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), tree.outside("data"));
+    watcher.set_poll_interval(Duration::from_millis(100));
+    watcher.start();
+
+    let missing = |path: &Path| {
+        format!(
+            "library monitor: '{}' is missing or unreadable",
+            path.display()
+        )
+    };
+    let stopped = |path: &Path| {
+        format!(
+            "library monitor: stopped '{}' of 'Watch H Films'",
+            path.display()
+        )
+    };
+    wait_for_log(&[&missing(&late)]).await;
+    wait_for_log(&[&missing(&gone)]).await;
+    let monitored = watcher.monitored();
+    assert_eq!(monitored.len(), 2, "{monitored:#?}");
+    for path in &monitored {
+        assert_eq!(
+            (
+                path.method,
+                path.fs_type.as_str(),
+                path.reason.as_deref(),
+                path.ready
+            ),
+            (Method::Poll, "unknown", Some("path not found"), false),
+            "{path:#?}"
+        );
+    }
+
+    write(&late.join("Heat (1995)/Heat (1995).mkv"), 10);
+    let monitored = wait_monitored(&watcher, "the path that appeared is polled", |m| {
+        monitor_of(m, &late).is_some_and(|p| p.ready && p.folders == 2)
+    })
+    .await;
+    assert_eq!(
+        monitor_of(&monitored, &late).unwrap().reason.as_deref(),
+        Some("path not found"),
+        "polled as it was until the next reload"
+    );
+
+    watcher.libraries_changed();
+    let fs_type = fs_type_of(&std::fs::canonicalize(&late).unwrap()).unwrap();
+    let monitored = wait_monitored(&watcher, "the path that appeared is checked again", |m| {
+        monitor_of(m, &late).is_some_and(|p| {
+            p.ready && p.fs_type == fs_type && p.reason.as_deref() != Some("path not found")
+        })
+    })
+    .await;
+    assert_eq!(monitored.len(), 2, "{monitored:#?}");
+    assert_eq!(
+        log_lines(&[&stopped(&late)]).len(),
+        1,
+        "its first monitor is stopped"
+    );
+
+    several_polls().await;
+    let monitored = watcher.monitored();
+    let kept = monitor_of(&monitored, &gone).unwrap();
+    assert_eq!(
+        (kept.fs_type.as_str(), kept.reason.as_deref(), kept.ready),
+        ("unknown", Some("path not found"), false)
+    );
+    assert!(
+        log_lines(&[&stopped(&gone)]).is_empty(),
+        "a path still missing keeps its monitor"
+    );
+    assert_eq!(
+        log_lines(&[&missing(&gone)]).len(),
+        1,
+        "and is not warned about again"
+    );
+    assert!(
+        changes.pending().is_empty(),
+        "a path that appears is not reported"
+    );
+    watcher.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_monitoring_off_and_on_stops_and_restarts_the_monitors_of_that_library() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    let films_paths = [tree.outside("films"), tree.outside("more films")];
+    let films = add_library(&pool, "Watch D Films", &films_paths).await;
+    let shows = add_library(&pool, "Watch D Shows", &[tree.outside("shows")]).await;
+    let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+    let all = [
+        tree.outside("films"),
+        tree.outside("more films"),
+        tree.outside("shows"),
+    ];
+    let monitored =
+        wait_monitored(&watcher, "three paths are ready", |m| ready_paths(m) == all).await;
+    // Sorted by library name, then path.
+    assert_eq!(
+        monitored.iter().map(|p| p.library_id).collect::<Vec<_>>(),
+        vec![films.id, films.id, shows.id]
+    );
+
+    set_monitoring(&pool, &watcher, &films, false).await;
+    wait_monitored(&watcher, "only the shows are monitored", |m| {
+        m.len() == 1 && ready_paths(m) == [tree.outside("shows")]
+    })
+    .await;
+    for path in &films_paths {
+        let stopped = format!(
+            "library monitor: stopped '{}' of 'Watch D Films'",
+            path.display()
+        );
+        wait_for_log(&[&stopped]).await;
+    }
+    tick();
+    write(&tree.outside("films/Heat (1995)/Heat (1995).mkv"), 10);
+    write(&tree.outside("shows/Lost/Season 1/S01E01.mkv"), 10);
+    let lost = (shows.id, ScanScope::Folder(tree.outside("shows/Lost")));
+    wait_pending(&changes, std::slice::from_ref(&lost)).await;
+    several_polls().await;
+    assert_eq!(
+        changes.pending(),
+        vec![lost.clone()],
+        "nothing from the films"
+    );
+
+    set_monitoring(&pool, &watcher, &films, true).await;
+    wait_monitored(&watcher, "the films are monitored again", |m| {
+        ready_paths(m) == all
+    })
+    .await;
+    tick();
+    write(&tree.outside("more films/Up (2009)/Up (2009).mkv"), 10);
+    let up = (
+        films.id,
+        ScanScope::Folder(tree.outside("more films/Up (2009)")),
+    );
+    wait_pending(&changes, std::slice::from_ref(&up)).await;
+    // What changed while monitoring was off is in the new baseline; the scheduled scan takes it in.
+    several_polls().await;
+    assert_eq!(changes.pending(), sorted(vec![lost, up]));
+    watcher.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_and_removing_libraries_and_paths_changes_what_is_monitored() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    let films = add_library(&pool, "Watch E Films", &[tree.outside("films")]).await;
+    let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+    wait_monitored(&watcher, "the films path", |m| {
+        ready_paths(m) == [tree.outside("films")]
+    })
+    .await;
+
+    let shows = add_library(&pool, "Watch E Shows", &[tree.outside("shows")]).await;
+    watcher.libraries_changed();
+    wait_monitored(&watcher, "the shows library is added", |m| {
+        ready_paths(m) == [tree.outside("films"), tree.outside("shows")]
+    })
+    .await;
+
+    std::fs::create_dir_all(tree.outside("more films")).unwrap();
+    let both = [
+        path_string(&tree.outside("films")),
+        path_string(&tree.outside("more films")),
+    ];
+    rustyfin_db::repo_library::update_library_paths(&pool, films.id, &both)
+        .await
+        .unwrap();
+    watcher.libraries_changed();
+    wait_monitored(&watcher, "a films path is added", |m| {
+        ready_paths(m)
+            == [
+                tree.outside("films"),
+                tree.outside("more films"),
+                tree.outside("shows"),
+            ]
+    })
+    .await;
+
+    let second = [path_string(&tree.outside("more films"))];
+    rustyfin_db::repo_library::update_library_paths(&pool, films.id, &second)
+        .await
+        .unwrap();
+    watcher.libraries_changed();
+    wait_monitored(&watcher, "the first films path is removed", |m| {
+        m.len() == 2 && ready_paths(m) == [tree.outside("more films"), tree.outside("shows")]
+    })
+    .await;
+    let stopped = format!(
+        "library monitor: stopped '{}' of 'Watch E Films'",
+        tree.outside("films").display()
+    );
+    wait_for_log(&[&stopped]).await;
+
+    rustyfin_db::repo_library::delete_library(&pool, shows.id)
+        .await
+        .unwrap();
+    watcher.libraries_changed();
+    wait_monitored(&watcher, "the shows library is removed", |m| {
+        m.len() == 1 && ready_paths(m) == [tree.outside("more films")]
+    })
+    .await;
+    let stopped = format!(
+        "library monitor: stopped '{}' of 'Watch E Shows'",
+        tree.outside("shows").display()
+    );
+    wait_for_log(&[&stopped]).await;
+
+    tick();
+    write(&tree.outside("films/Heat (1995)/Heat (1995).mkv"), 10);
+    write(&tree.outside("shows/Lost/S01E01.mkv"), 10);
+    write(&tree.outside("more films/Up (2009)/Up (2009).mkv"), 10);
+    let up = (
+        films.id,
+        ScanScope::Folder(tree.outside("more films/Up (2009)")),
+    );
+    wait_pending(&changes, std::slice::from_ref(&up)).await;
+    several_polls().await;
+    assert_eq!(changes.pending(), vec![up]);
+    watcher.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_error_keeps_the_current_monitors() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    add_library(&pool, "Watch F Films", &[tree.root()]).await;
+    let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+    wait_monitored(&watcher, "the library path is ready", |m| {
+        m.len() == 1 && m[0].ready
+    })
+    .await;
+
+    pool.close().await;
+    watcher.libraries_changed();
+    wait_for_log(&[
+        "library monitor: could not load the libraries (",
+        "); keeping the current monitors",
+    ])
+    .await;
+    assert_eq!(ready_paths(&watcher.monitored()), [tree.root()]);
+    watcher.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_poll_interval_applies_at_once() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    let lib = add_library(&pool, "Watch G Films", &[tree.root()]).await;
+    let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), tree.outside("data"));
+    assert_eq!(
+        watcher.poll_interval(),
+        Duration::from_secs(60),
+        "the default"
+    );
+    watcher.set_force_poll(true);
+    watcher.set_poll_interval(Duration::from_secs(3600));
+    watcher.start();
+    wait_monitored(&watcher, "the baseline", |m| m.len() == 1 && m[0].ready).await;
+
+    tick();
+    write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
+    several_polls().await;
+    assert!(
+        changes.pending().is_empty(),
+        "the next poll is an hour away"
+    );
+    watcher.set_poll_interval(Duration::from_millis(100));
+    assert_eq!(watcher.poll_interval(), Duration::from_millis(100));
+    wait_pending(
+        &changes,
+        &[(lib.id, ScanScope::Folder(tree.at("Heat (1995)")))],
+    )
+    .await;
+    watcher.stop();
 }
 
 /// Measures polling a real library, which it only reads:
