@@ -106,9 +106,29 @@ async fn get_user_views_no_user(State(state): State<AppState>) -> Result<Json<Va
     Ok(Json(views))
 }
 
-async fn get_libraries(State(state): State<AppState>) -> Result<Json<Vec<Library>>, ApiError> {
+/// A library in `GET /Library/VirtualFolders`, with its saved options.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LibraryWithOptions {
+    #[serde(flatten)]
+    library: Library,
+    library_options: LibraryOptions,
+}
+
+async fn get_libraries(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<LibraryWithOptions>>, ApiError> {
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-    Ok(Json(libs))
+    let mut items = Vec::with_capacity(libs.len());
+    for library in libs {
+        let library_options =
+            rustyfin_db::repo_library::get_library_options(&state.db_ro, library.id).await?;
+        items.push(LibraryWithOptions {
+            library,
+            library_options,
+        });
+    }
+    Ok(Json(items))
 }
 
 /// Checks each library folder path, in request order. Returns one sentence for
@@ -165,6 +185,9 @@ async fn create_library(
     };
     rustyfin_db::repo_library::create_library(&state.db, &lib).await?;
     state.cache.invalidate_library_lists();
+    if let Some(options) = &req.library_options {
+        rustyfin_db::repo_library::set_library_options(&state.db, lib.id, options).await?;
+    }
     Ok(Json(lib))
 }
 
@@ -458,22 +481,8 @@ async fn get_library_options(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LibraryOptions>, ApiError> {
-    let key = format!("library_options_{}", id);
-    let value: Option<String> =
-        sqlx::query_scalar("SELECT value FROM configuration WHERE key = ?1")
-            .bind(&key)
-            .fetch_optional(&state.db_ro)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    match value {
-        Some(json) => {
-            let options: LibraryOptions =
-                serde_json::from_str(&json).map_err(|e| ApiError::Internal(e.to_string()))?;
-            Ok(Json(options))
-        }
-        None => Ok(Json(LibraryOptions::default())),
-    }
+    let options = rustyfin_db::repo_library::get_library_options(&state.db_ro, id).await?;
+    Ok(Json(options))
 }
 
 /// POST /Library/{id}/Options — Update library options.
@@ -482,19 +491,7 @@ async fn update_library_options(
     Path(id): Path<Uuid>,
     Json(options): Json<LibraryOptions>,
 ) -> Result<Json<Value>, ApiError> {
-    let key = format!("library_options_{}", id);
-    let json = serde_json::to_string(&options).map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    sqlx::query(
-        "INSERT INTO configuration (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(&key)
-    .bind(&json)
-    .execute(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
+    rustyfin_db::repo_library::set_library_options(&state.db, id, &options).await?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
