@@ -8989,6 +8989,30 @@ fn b18_movie(folder: &str, name: &str) -> std::path::PathBuf {
     movie
 }
 
+/// Records a failed probe of `file`, with its size and modification time, unless one is on record.
+/// With ffprobe, the probe of an empty file fails and records just that, so later scans leave the
+/// file alone until it changes. Without ffprobe, as on CI's runner, the probe cannot start and
+/// records nothing, so every later scan would read the file again.
+async fn b18_probe_failed(state: &AppState, file: &std::path::Path) {
+    let meta = std::fs::metadata(file).unwrap();
+    let modified = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO probe_failures (path, size, modified, failed_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path) DO NOTHING",
+    )
+    .bind(file.to_str().unwrap())
+    .bind(i64::try_from(meta.len()).unwrap())
+    .bind(i64::try_from(modified.as_secs()).unwrap())
+    .bind("2000-01-01T00:00:00+00:00")
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn b18_monitor_rescan_clears_the_caches_then_sends_library_changed() {
     let state = test_state().await;
@@ -9053,6 +9077,7 @@ async fn b18_monitor_rescan_that_changes_nothing_sends_no_library_changed() {
     let (status, body) = send_authed(&app, "POST", &uri, &token, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     rustyfin_core::scanner::wait_for_idle().await;
+    b18_probe_failed(&state, &quiet_movie.join("B18 Quiet (2004).mkv")).await;
     let busy_movie = b18_movie(&media_folder(&state, "b18 busy"), "B18 Busy (2005)");
 
     let mut events = state.ws_broadcast.subscribe();
