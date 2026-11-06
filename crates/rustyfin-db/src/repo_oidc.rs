@@ -164,13 +164,36 @@ pub async fn create_linked_user(
     tx.commit().await
 }
 
-/// Removes the link of a user. Returns whether there was one.
-pub async fn delete_link(pool: &SqlitePool, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    let done = sqlx::query("DELETE FROM user_oidc_links WHERE user_id = ?")
+/// What an unlink did: whether the account had a link, and whether it kept its administrator rights.
+pub struct Unlinked {
+    pub had_link: bool,
+    pub admin_kept: bool,
+}
+
+/// Removes the link of a user and takes back the administrator rights the admin group gave it, in
+/// one IMMEDIATE transaction (AC51). The owner and the last enabled administrator keep those rights,
+/// and `admin_kept` says so. Rights given by hand stay.
+pub async fn unlink_account(pool: &SqlitePool, user_id: Uuid) -> Result<Unlinked, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let deleted = sqlx::query("DELETE FROM user_oidc_links WHERE user_id = ?")
         .bind(user_id.to_string())
-        .execute(pool)
-        .await?;
-    Ok(done.rows_affected() > 0)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if deleted == 0 {
+        tx.commit().await?;
+        return Ok(Unlinked {
+            had_link: false,
+            admin_kept: false,
+        });
+    }
+    let revoked = crate::repo_user::revoke_group_admin(&mut *tx, user_id).await?;
+    let admin_kept = !revoked && crate::repo_user::admin_from_group(&mut *tx, user_id).await?;
+    tx.commit().await?;
+    Ok(Unlinked {
+        had_link: true,
+        admin_kept,
+    })
 }
 
 /// The link status of every account, by name, or of the one account `only` names (AC30).

@@ -254,7 +254,11 @@ pub async fn grant_group_admin(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::
 
 /// Takes back the administrator rights the admin group gave the user (AC18). They stay when the user
 /// is the owner, or when no other enabled administrator would be left. Returns whether they went.
-pub async fn revoke_group_admin(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn revoke_group_admin<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let done = sqlx::query(
         "UPDATE users SET is_administrator = 0, admin_from_group = 0 \
          WHERE id = ?1 AND admin_from_group = 1 AND is_owner = 0 \
@@ -262,18 +266,22 @@ pub async fn revoke_group_admin(pool: &SqlitePool, id: Uuid) -> Result<bool, sql
          WHERE other.is_administrator = 1 AND other.is_disabled = 0 AND other.id <> ?1)",
     )
     .bind(id.to_string())
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// Whether the admin group gave the user its administrator rights (AC17).
-pub async fn admin_from_group(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn admin_from_group<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let flagged: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND admin_from_group = 1)",
     )
     .bind(id.to_string())
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(flagged)
 }

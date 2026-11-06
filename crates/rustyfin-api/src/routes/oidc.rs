@@ -360,7 +360,13 @@ async fn unlink(
         };
         return Err(ApiError::Conflict(reason.to_string()));
     }
-    rustyfin_db::repo_oidc::delete_link(&state.db, user_id).await?;
+    let unlinked = rustyfin_db::repo_oidc::unlink_account(&state.db, user_id).await?;
+    if unlinked.admin_kept {
+        tracing::warn!(
+            user_id = %user_id,
+            "admin rights kept after unlinking: the admin group gave them, and this user is the owner or the last enabled administrator"
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

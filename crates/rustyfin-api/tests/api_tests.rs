@@ -5974,7 +5974,6 @@ async fn b21_group_admin(t: &B21, sub: &str, name: &str) -> (String, String) {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 3 fix 2"]
 async fn b21_unlinking_takes_back_group_admin() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
 
@@ -6034,7 +6033,6 @@ async fn b21_unlinking_takes_back_group_admin() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 3 fix 2"]
 async fn b21_unlinking_keeps_the_last_admin() {
     let (log, _guard) = b21_capture();
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
