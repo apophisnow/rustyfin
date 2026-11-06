@@ -70,7 +70,7 @@ pub async fn delete_item_in(conn: &mut SqliteConnection, id: &str) -> Result<boo
 ///
 /// Step 1 covers the media types that the library's content type scans. An item is deleted only
 /// when all of these hold: its path is under a library root; its path is not in `collected`; no
-/// folder in `unreadable` contains it; and either its path is under a folder the scan skipped as a
+/// path in `unreadable` contains it; and either its path is under a folder the scan skipped as a
 /// symlink loop (such a path is never collected again and may not resolve), or its file is a
 /// regular file, or its file is missing. A missing file is deleted only while its root lists
 /// something that naming does not ignore: a root that lists nothing may be unmounted, so nothing
@@ -90,6 +90,9 @@ pub async fn remove_not_collected(
 ) -> Result<u32, sqlx::Error> {
     let library_id = library.id.to_string();
     let roots: Vec<PathBuf> = library.paths.iter().map(PathBuf::from).collect();
+    // Looked up by each item's ancestors: with a dangling link per item, as when a mount of links
+    // drops, the list is as long as the library.
+    let unreadable: HashSet<&Path> = unreadable.iter().map(PathBuf::as_path).collect();
     // Whether each root lists something, looked up once per root, and the roots already warned about.
     let mut listed: HashMap<usize, bool> = HashMap::new();
     let mut warned: HashSet<usize> = HashSet::new();
@@ -117,7 +120,7 @@ pub async fn remove_not_collected(
             else {
                 continue;
             };
-            let unlisted = unreadable.iter().any(|dir| item.starts_with(dir));
+            let unlisted = item.ancestors().any(|dir| unreadable.contains(dir));
             if unlisted || collected.contains(&path) {
                 continue;
             }
@@ -266,16 +269,17 @@ async fn is_regular_file(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file())
 }
 
-/// Whether the file at `path` is gone: `fs::metadata` says that it does not exist. A dangling link
-/// is gone too. Any other error leaves the file in place.
+/// Whether the file at `path` is gone: `fs::symlink_metadata` says that the entry does not exist. A
+/// dangling link is not gone, since the link itself is there. Any other error leaves the file in place.
 async fn is_gone(path: &Path) -> bool {
-    tokio::fs::metadata(path)
+    tokio::fs::symlink_metadata(path)
         .await
         .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Whether the library folder `root` looks mounted: it lists at least one entry that naming does not
-/// ignore. A missing or unreadable folder does not, and nor does a folder with only ignored entries.
+/// ignore and that resolves, so a dangling link does not count. A missing or unreadable folder does
+/// not, and nor does a folder with only ignored entries or only dangling links.
 async fn root_is_listed(root: &Path) -> bool {
     let Ok(mut entries) = tokio::fs::read_dir(root).await else {
         return false;
@@ -283,7 +287,10 @@ async fn root_is_listed(root: &Path) -> bool {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_ignored_dir(&name) && !is_ignored_file(&name) {
+        if !is_ignored_dir(&name)
+            && !is_ignored_file(&name)
+            && tokio::fs::metadata(entry.path()).await.is_ok()
+        {
             return true;
         }
     }
@@ -302,9 +309,16 @@ pub(crate) fn file_stamp(path: &str) -> Option<(i64, i64)> {
 }
 
 /// Whether the file at `path` no longer has the size and modification time stored with its source.
-/// A source with no stored modification time is not changed: it is stamped without a probe.
+/// A source with no stored modification time is not changed: it is stamped without a probe. A file
+/// that cannot be read now is not changed either, so its sources are kept.
 pub(crate) fn source_changed(path: &str, size: Option<i64>, modified: Option<i64>) -> bool {
-    modified.is_some_and(|modified| size.map(|size| (size, modified)) != file_stamp(path))
+    let Some(modified) = modified else {
+        return false;
+    };
+    let Some(stamp) = file_stamp(path) else {
+        return false;
+    };
+    size.map(|size| (size, modified)) != Some(stamp)
 }
 
 /// Whether `file` is a known failure: it has a probe failure on record, and it is still the file

@@ -1380,7 +1380,7 @@ enum EntryKind {
     Dir,
     /// A file, which a scan collects unless its name is ignored.
     File,
-    /// A dangling symlink, which names no file or folder, so it is skipped and its item is gone.
+    /// A dangling symlink, whose target is missing. It is unreadable, not gone, so its item is kept.
     Dangling,
 }
 
@@ -1426,6 +1426,7 @@ async fn walk_from(
         };
 
         let mut children = Vec::new();
+        let mut dangling = 0;
         loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
@@ -1443,16 +1444,27 @@ async fn walk_from(
                                 result.push(path);
                             }
                         }
-                        EntryKind::Dangling => {}
+                        EntryKind::Dangling => {
+                            dangling += 1;
+                            unreadable.push(path);
+                        }
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
                     tracing::warn!("cannot read directory {}: {}", current.display(), err);
-                    unreadable.push(current);
+                    unreadable.push(current.clone());
                     break;
                 }
             }
+        }
+
+        if dangling > 0 {
+            tracing::warn!(
+                "{} dangling symlinks in {}: their targets are missing, so their items are kept",
+                dangling,
+                current.display()
+            );
         }
 
         // Queue the subdirectories, skipping any that loop back to an ancestor.
@@ -1481,12 +1493,13 @@ async fn walk_from(
 
 /// Recursively collects the file paths under `root`, using async I/O and an iterative work queue.
 ///
-/// Returns three lists. The first is the files, sorted by path. The second is the directories that
-/// could not be listed completely, from a failed `read_dir` or an error part way through one. The
-/// third is the subdirectories skipped as symlink loops: a subdirectory whose identity is already
-/// among its ancestors. Entries that `naming` ignores are skipped, and so are dangling symlinks,
-/// which name no file or folder. Two links to one folder are both followed. The root's own name is
-/// never checked.
+/// Returns three lists. The first is the files, sorted by path. The second is the paths that could
+/// not be read: the directories that could not be listed completely, from a failed `read_dir` or an
+/// error part way through one, and the dangling symlinks, whose targets are missing. A dangling
+/// symlink is unreadable, not gone, so its item is kept. The third is the subdirectories skipped as
+/// symlink loops: a subdirectory whose identity is already among its ancestors. Entries that `naming`
+/// ignores are skipped. Two links to one folder are both followed. The root's own name is never
+/// checked.
 async fn collect_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     match dir_id(root).await {
         Ok(root_id) => walk_from(root.to_path_buf(), vec![root_id]).await,
@@ -1530,9 +1543,17 @@ async fn collect_folder(root: &Path, folder: &Path) -> (Vec<PathBuf>, Vec<PathBu
     };
     let folder_id = match dir_id(folder).await {
         Ok(id) => id,
-        // A folder that is gone collects nothing, and its items are removed.
+        // A folder that is itself a dangling link is unreadable, so its items are kept. A folder that
+        // is gone collects nothing, and its items are removed.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return (Vec::new(), Vec::new(), Vec::new());
+            if fs::symlink_metadata(folder).await.is_err() {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+            tracing::warn!(
+                "dangling symlink {}: its target is missing, so its items are kept",
+                folder.display()
+            );
+            return (Vec::new(), vec![folder.to_path_buf()], Vec::new());
         }
         Err(err) => {
             tracing::warn!("cannot read directory {}: {}", folder.display(), err);
@@ -1547,20 +1568,27 @@ async fn collect_folder(root: &Path, folder: &Path) -> (Vec<PathBuf>, Vec<PathBu
 }
 
 /// Lists the files directly in `root`, a library path, as `collect_files` keeps them: the same ignore
-/// rules, and no folders or dangling links. A `read_dir` error, even part way, makes `root` unreadable.
+/// rules, and no folders. A dangling link is unreadable, not gone, so it is listed as unreadable and
+/// its item is kept. A `read_dir` error, even part way, makes `root` unreadable.
 async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut result = Vec::new();
     let mut unreadable = Vec::new();
+    let mut dangling = 0;
     match fs::read_dir(root).await {
         Ok(mut entries) => loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
                     let file_name = entry.file_name();
                     let name = file_name.to_string_lossy();
-                    if matches!(entry_kind(&entry).await, EntryKind::File)
-                        && !naming::is_ignored_file(&name)
-                    {
-                        result.push(entry.path());
+                    match entry_kind(&entry).await {
+                        EntryKind::File if !naming::is_ignored_file(&name) => {
+                            result.push(entry.path());
+                        }
+                        EntryKind::Dangling => {
+                            dangling += 1;
+                            unreadable.push(entry.path());
+                        }
+                        _ => {}
                     }
                 }
                 Ok(None) => break,
@@ -1575,6 +1603,13 @@ async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBu
             tracing::warn!("cannot read directory {}: {}", root.display(), err);
             unreadable.push(root.to_path_buf());
         }
+    }
+    if dangling > 0 {
+        tracing::warn!(
+            "{} dangling symlinks in {}: their targets are missing, so their items are kept",
+            dangling,
+            root.display()
+        );
     }
     result.sort();
     (result, unreadable, Vec::new())

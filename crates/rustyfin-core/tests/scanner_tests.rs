@@ -3642,16 +3642,53 @@ async fn b18_gone_files_stay_while_their_library_path_looks_unmounted() {
     );
 }
 
-/// B18 criterion 5: a link whose target is gone is a missing file, whether the link is the file
-/// or a folder above it.
+/// The ids of the library's items of `media_type`, by path relative to its root, sorted.
+async fn b18_ids(pool: &SqlitePool, lib: &Library, media_type: &str) -> Vec<(String, String)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT path, id FROM media_items WHERE library_id = ?1 AND media_type = ?2",
+    )
+    .bind(lib.id.to_string())
+    .bind(media_type)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut out: Vec<(String, String)> = rows
+        .into_iter()
+        .map(|(path, id)| (rel(&root, &path), id))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Played, with a position, and a favorite.
+fn b18_watched() -> Marks {
+    Marks {
+        position: 42,
+        plays: 1,
+        favorite: true,
+        played: true,
+        last_played: Some(EARLY.to_string()),
+        ..Marks::default()
+    }
+}
+
+/// B18 fix F1: a link whose target is gone is unreadable, not gone. Its item stays with its user
+/// data through full scans and scoped rescans, whether the link is the file, a folder above it, or
+/// a file directly in the library path, and the items come back unchanged with their targets. A
+/// link that is itself removed is a missing file, so its item goes.
 #[cfg(unix)]
 #[tokio::test]
-async fn b18_rescan_removes_items_behind_dangling_links() {
+async fn b18_rescan_keeps_items_behind_dangling_links() {
     use std::os::unix::fs::symlink;
     let fx = Fixture::new().await;
     let store = fx.path("store");
-    touch(&store, "Linked.mkv");
-    touch(&store, "Folder (2007)/Folder (2007).mkv");
+    let make_targets = || {
+        touch(&store, "Linked.mkv");
+        touch(&store, "Loose.mkv");
+        touch(&store, "Folder (2007)/Folder (2007).mkv");
+    };
+    make_targets();
     let lib = fx.library("film", LibraryContentType::Movies).await;
     let pool = &fx.pool;
     let root = root_of(&lib);
@@ -3663,23 +3700,151 @@ async fn b18_rescan_removes_items_behind_dangling_links() {
     )
     .unwrap();
     symlink(store.join("Folder (2007)"), root.join("Folder (2007)")).unwrap();
+    symlink(store.join("Loose.mkv"), root.join("Loose (2003).mkv")).unwrap();
+    scan(pool, &lib).await;
+    let all = [
+        "Folder (2007)/Folder (2007).mkv",
+        "Here (2000)/Here (2000).mkv",
+        "Linked (2006)/Linked (2006).mkv",
+        "Loose (2003).mkv",
+    ];
+    assert_eq!(paths(pool, &lib, "Movie").await, all);
+    let ids = b18_ids(pool, &lib, "Movie").await;
+    let user = insert_user(pool).await;
+    let linked = [
+        "Folder (2007)/Folder (2007).mkv",
+        "Linked (2006)/Linked (2006).mkv",
+        "Loose (2003).mkv",
+    ];
+    for rel in linked {
+        insert_marks(pool, &user, item_at(pool, &lib, rel).await, &b18_watched()).await;
+    }
+
+    // The store drops, as an rclone or debrid mount does.
+    std::fs::remove_dir_all(&store).unwrap();
     scan(pool, &lib).await;
     assert_eq!(
         paths(pool, &lib, "Movie").await,
-        [
-            "Folder (2007)/Folder (2007).mkv",
-            "Here (2000)/Here (2000).mkv",
-            "Linked (2006)/Linked (2006).mkv",
-        ]
+        all,
+        "a full scan keeps the items behind dangling links"
     );
+    for scope in [
+        ScanScope::Folder(root.join("Folder (2007)")),
+        ScanScope::Folder(root.join("Linked (2006)")),
+        ScanScope::RootFiles(root.clone()),
+    ] {
+        assert_eq!(
+            b18_rescan(pool, &lib, &scope).await,
+            (0, 0, 0),
+            "a rescan of {scope:?} changes nothing"
+        );
+    }
+    assert_eq!(b18_ids(pool, &lib, "Movie").await, ids);
+    for rel in linked {
+        assert_eq!(
+            marks_of(pool, &user, item_at(pool, &lib, rel).await).await,
+            Some(b18_watched()),
+            "{rel} keeps its user data"
+        );
+    }
 
-    std::fs::remove_dir_all(&store).unwrap();
+    // The store comes back: the same items, nothing new.
+    make_targets();
     scan(pool, &lib).await;
+    assert_eq!(b18_ids(pool, &lib, "Movie").await, ids);
 
+    // A link that is removed is a missing file.
+    std::fs::remove_file(root.join("Linked (2006)/Linked (2006).mkv")).unwrap();
+    std::fs::remove_file(root.join("Folder (2007)")).unwrap();
+    std::fs::remove_file(root.join("Loose (2003).mkv")).unwrap();
+    scan(pool, &lib).await;
     assert_eq!(
         paths(pool, &lib, "Movie").await,
         ["Here (2000)/Here (2000).mkv"]
     );
+}
+
+/// B18 fix F1: a library path that lists only dangling links lists nothing, so a missing file under
+/// it stays, as under an empty one.
+#[cfg(unix)]
+#[tokio::test]
+async fn b18_gone_files_stay_while_their_library_path_lists_only_dangling_links() {
+    use std::os::unix::fs::symlink;
+    let fx = Fixture::new().await;
+    let store = fx.path("store");
+    touch(&store, "Away (2001)/Away (2001).mkv");
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    touch(&root, "Gone (1999)/Gone (1999).mkv");
+    symlink(store.join("Away (2001)"), root.join("Away (2001)")).unwrap();
+    scan(pool, &lib).await;
+    let both = ["Away (2001)/Away (2001).mkv", "Gone (1999)/Gone (1999).mkv"];
+    assert_eq!(paths(pool, &lib, "Movie").await, both);
+
+    std::fs::remove_dir_all(&store).unwrap();
+    std::fs::remove_dir_all(root.join("Gone (1999)")).unwrap();
+    scan(pool, &lib).await;
+    assert_eq!(
+        paths(pool, &lib, "Movie").await,
+        both,
+        "the library path lists only a dangling link"
+    );
+}
+
+/// B18 fix F4: a file that the scan lists but cannot stat (its folder lacks search permission)
+/// has not changed, so its sources stay and it is not probed again.
+#[cfg(unix)]
+#[tokio::test]
+async fn b18_rescan_keeps_the_sources_of_a_file_it_cannot_stat() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Sets a folder's permission bits on drop, so the temp dir can be removed.
+    struct Mode(PathBuf, u32);
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    if !have_ffmpeg() {
+        eprintln!("skip: no ffmpeg");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let file = clip(&fx, &root, "Argo (2012)/Argo (2012).mkv", 2);
+    scan_idle(pool, &lib).await;
+    let sources = b18_source_ids(pool, &lib).await;
+    assert_eq!(sources.len(), 1, "{sources:?}");
+
+    // Listing works without search permission; a stat of the file in it fails.
+    let folder = root.join("Argo (2012)");
+    let _restore = Mode(folder.clone(), 0o755);
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if std::fs::metadata(&file).is_ok() {
+        eprintln!("skip: the file can still be stat'ed (running as root?)");
+        return;
+    }
+    assert!(std::fs::read_dir(&folder).is_ok());
+    scan_idle(pool, &lib).await;
+    assert_eq!(
+        paths(pool, &lib, "Movie").await,
+        ["Argo (2012)/Argo (2012).mkv"]
+    );
+    assert_eq!(
+        b18_source_ids(pool, &lib).await,
+        sources,
+        "a full scan keeps the sources"
+    );
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(folder.clone())).await,
+        (0, 0, 0),
+        "a rescan of the folder re-reads nothing"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, sources);
 }
 
 /// B18 criterion 5: a TV rescan removes the episodes of a removed season folder, then the season,
