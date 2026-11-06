@@ -4079,6 +4079,28 @@ async fn b18_rescan(pool: &SqlitePool, lib: &Library, scope: &ScanScope) -> (u32
     (changes.added, changes.removed, changes.reread)
 }
 
+/// Records a failed probe of each of `files`, with the file's size and modification time, unless
+/// one is on record. With ffprobe, the probe of these empty files fails and records just that, so
+/// later scans leave them alone until they change. Without ffprobe, as on CI's runner, the probe
+/// cannot start and records nothing, so every later scan would read them again.
+async fn b18_probes_failed(pool: &SqlitePool, files: &[&Path]) {
+    for file in files {
+        let (size, modified) = stat(file);
+        exec(
+            pool,
+            "INSERT INTO probe_failures (path, size, modified, failed_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO NOTHING",
+            &[
+                file.to_str().unwrap(),
+                &size.to_string(),
+                &modified.to_string(),
+                LONG_AGO,
+            ],
+        )
+        .await;
+    }
+}
+
 /// Waits up to 30 s until every track of `lib` has a stamped source: music probes run after their
 /// scan has returned, and a probe stores the stamp last.
 async fn b18_tracks_probed(pool: &SqlitePool, lib: &Library) {
@@ -4248,15 +4270,16 @@ async fn b18_scoped_rescans_stay_in_their_scope() {
     let heat = touch(&root, "Heat (1995)/Heat (1995).mkv");
     // Its folder's name starts with that of Heat's folder, so a prefix match takes it for Heat's.
     let extended = touch(&root, "Heat (1995) Extended/Heat (1995) Extended.mkv");
-    touch(&root, "Ronin (1998)/Ronin (1998).mkv");
+    let ronin = touch(&root, "Ronin (1998)/Ronin (1998).mkv");
     let loose = touch(&root, "Loose (2001).mkv");
     scan_idle(&fx.pool, &lib).await;
+    b18_probes_failed(&fx.pool, &[&heat, &extended, &ronin, &loose]).await;
     assert_eq!(paths(&fx.pool, &lib, "Movie").await.len(), 4);
 
     std::fs::remove_file(&heat).unwrap();
     std::fs::remove_file(&extended).unwrap();
     std::fs::remove_file(&loose).unwrap();
-    touch(&root, "New (2010)/New (2010).mkv");
+    let new = touch(&root, "New (2010)/New (2010).mkv");
 
     let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Heat (1995)"))).await;
     assert_eq!(changes, (0, 1, 0), "Heat's folder");
@@ -4283,6 +4306,7 @@ async fn b18_scoped_rescans_stay_in_their_scope() {
 
     let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("New (2010)"))).await;
     assert_eq!(changes, (1, 0, 0), "the new folder");
+    b18_probes_failed(&fx.pool, &[&new]).await;
 
     let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Library).await;
     assert_eq!(changes, (0, 1, 0), "the whole library");
@@ -4441,8 +4465,9 @@ async fn b18_scoped_rescans_rebuild_the_filter_tables_only_after_a_change() {
     let fx = Fixture::new().await;
     let lib = fx.library("films", LibraryContentType::Movies).await;
     let root = root_of(&lib);
-    touch(&root, "Ronin (1998)/Ronin (1998).mkv");
+    let ronin = touch(&root, "Ronin (1998)/Ronin (1998).mkv");
     scan_idle(&fx.pool, &lib).await;
+    b18_probes_failed(&fx.pool, &[&ronin]).await;
     // No item has this year, so a rebuild removes the row.
     exec(
         &fx.pool,
@@ -4664,6 +4689,7 @@ async fn b18_tv_rescans_move_a_renamed_episode_to_its_new_file() {
         touch(&root, rel);
     }
     scan(pool, &lib).await;
+    b18_probes_failed(pool, &[&root.join(e1), &root.join(e2), &root.join(e3)]).await;
     let user = insert_user(pool).await;
     let mut ids = Vec::new();
     for rel in [e1, e2, e3] {
@@ -4678,6 +4704,7 @@ async fn b18_tv_rescans_move_a_renamed_episode_to_its_new_file() {
     touch(&root, n1);
     scan(pool, &lib).await;
     assert_eq!(item_at(pool, &lib, n1).await, ids[0]);
+    b18_probes_failed(pool, &[&root.join(n1)]).await;
 
     // A rescan of the show after a rename of E02, while E03 gives way to E04.
     let n2 = "Show/Season 1/Show - S01E02 - The Second WEBDL-720p.mkv";
