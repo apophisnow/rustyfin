@@ -5691,7 +5691,6 @@ async fn b21_quick_connect_caps_live_requests_per_client() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 2 fix 5"]
 async fn b21_quick_connect_wrong_codes_count_against_the_login_limit() {
     let mut state = test_state().await;
     state.rate_limiter = RateLimiter::new(3, 60);

@@ -135,19 +135,37 @@ struct AuthorizeQuery {
 }
 
 /// `POST /QuickConnect/Authorize?code=` – authorize a pending quick connect request (authenticated).
+/// Wrong codes count against the sign-in rate limit, and a client over that limit gets 429
+/// before its code is looked at.
 async fn authorize(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Extension(claims): Extension<Claims>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Result<Json<bool>, ApiError> {
+    let client = resolve_client(peer.ip(), &headers, &state.known_proxies);
+    let counted = !client.is_exempt();
+    let key = client.limiter_key();
+
+    // AC49: the limit check, the code lookup and any miss record share this one store lock.
     let mut store = state.quick_connect.write().await;
+    if counted && state.rate_limiter.is_limited(&key).await {
+        tracing::warn!(ip = %client.ip, "rate limit exceeded");
+        return Err(ApiError::RateLimited);
+    }
     let now = Utc::now();
 
     // Approve the live request with the code. An expired one counts as unknown.
-    let entry = store
+    let Some(entry) = store
         .values_mut()
         .find(|v| v.code == q.code && is_live(v, now))
-        .ok_or_else(|| ApiError::NotFound("Unknown code".to_string()))?;
+    else {
+        if counted {
+            state.rate_limiter.record(&key).await;
+        }
+        return Err(ApiError::NotFound("Unknown code".to_string()));
+    };
 
     entry.authenticated = true;
     entry.user_id = Some(claims.sub);

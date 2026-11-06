@@ -211,6 +211,35 @@ impl RateLimiter {
         entry.push(now);
         true
     }
+
+    /// Whether the key's budget is used up. Prunes its expired timestamps, creates no entry for an
+    /// unknown key and records nothing. A budget of 0 never limits.
+    pub async fn is_limited(&self, key: &str) -> bool {
+        if self.max_requests == 0 {
+            return false;
+        }
+
+        let now = Instant::now();
+        match self.state.get_mut(key) {
+            Some(mut entry) => {
+                entry.retain(|t| now.duration_since(*t) < self.window);
+                entry.len() >= self.max_requests
+            }
+            None => false,
+        }
+    }
+
+    /// Counts one request against the key without refusing it. A budget of 0 counts nothing.
+    pub async fn record(&self, key: &str) {
+        if self.max_requests == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut entry = self.state.entry(key.to_string()).or_default();
+        entry.retain(|t| now.duration_since(*t) < self.window);
+        entry.push(now);
+    }
 }
 
 /// Default login-endpoint budget: requests per window, per resolved client IP.
