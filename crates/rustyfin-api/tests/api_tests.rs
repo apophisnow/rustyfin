@@ -4072,33 +4072,42 @@ async fn b21_sign_in_again_follows_the_link() {
 }
 
 #[tokio::test]
-async fn b21_sign_in_links_a_user_with_the_same_name() {
+#[ignore = "B21 round 2 fix 1"]
+async fn b21_sign_in_refuses_a_taken_name() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "Alice", "pw-alice", false).await;
     let count = t.user_count().await;
-    let result = t.sign_in(b21_user("alice-sub", "alice")).await.unwrap();
-    assert_eq!(result["User"]["Name"], "Alice", "names match without case");
+    for name in ["Alice", "alice", "ALICE", "aLiCe"] {
+        let result = t.sign_in(b21_user("alice-sub", name)).await;
+        assert_eq!(result.err().as_deref(), Some("name_taken"), "{name}");
+    }
     assert_eq!(t.user_count().await, count, "no new user");
-    assert_eq!(
-        t.link_row("Alice").await,
-        Some((
-            t.op.base.clone(),
-            "alice-sub".to_string(),
-            "alice".to_string()
-        ))
-    );
-    assert!(
-        login(&t.app, "Alice", "pw-alice").await.is_some(),
-        "the password still works"
-    );
+    assert_eq!(t.link_count().await, 0, "no link");
+
+    let (alice, _) = login(&t.app, "Alice", "pw-alice")
+        .await
+        .expect("the password still works");
+    t.link(&alice, b21_user("alice-sub", "alice"))
+        .await
+        .expect("Alice links from the profile");
+    let result = t
+        .sign_in(b21_user("alice-sub", "alice"))
+        .await
+        .expect("from then on the link signs Alice in");
+    assert_eq!(result["User"]["Name"], "Alice");
+    assert_eq!(t.user_count().await, count);
 }
 
 #[tokio::test]
-async fn b21_sign_in_refuses_unsafe_name_matches() {
+#[ignore = "B21 round 2 fix 1"]
+async fn b21_sign_in_refuses_taken_names() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "ada", "pw-ada", true).await;
     add_user(&t.state, "linked", "pw-linked", false).await;
-    t.sign_in(b21_user("first-sub", "linked")).await.unwrap();
+    let (linked, _) = login(&t.app, "linked", "pw-linked").await.unwrap();
+    t.link(&linked, b21_user("first-sub", "linked"))
+        .await
+        .unwrap();
     add_user(&t.state, "dis", "pw-dis", false).await;
     b21_exec(
         &t.state,
@@ -4111,10 +4120,10 @@ async fn b21_sign_in_refuses_unsafe_name_matches() {
     let count = t.user_count().await;
 
     let cases = [
-        (b21_user("ada-sub", "ada"), "admin_link_required"),
-        (b21_user("other-sub", "Linked"), "already_linked"),
-        (b21_user("dis-sub", "dis"), "account_disabled"),
-        (b21_user("sam-sub", "SAM"), "ambiguous_user"),
+        (b21_user("ada-sub", "ada"), "name_taken"),
+        (b21_user("other-sub", "Linked"), "name_taken"),
+        (b21_user("dis-sub", "dis"), "name_taken_ask_admin"),
+        (b21_user("sam-sub", "SAM"), "name_taken"),
         (
             serde_json::json!({ "sub": "anon-sub", "preferred_username": null }),
             "no_username",
@@ -5160,6 +5169,7 @@ async fn b21_unlink_needs_another_way_in() {
 // Fix round 1: the review of 9cc903a (spec §10, AC37-AC42).
 
 #[tokio::test]
+#[ignore = "B21 round 2 fix 1"]
 async fn b21_admin_group_member_links_from_the_profile() {
     let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
     add_user(&t.state, "bob", "pw-bob", false).await;
@@ -5170,7 +5180,7 @@ async fn b21_admin_group_member_links_from_the_profile() {
 
     assert_eq!(
         t.sign_in(boss.clone()).await.err().as_deref(),
-        Some("admin_link_required"),
+        Some("name_taken"),
         "an admin-group member doesn't get a user by name"
     );
     assert_eq!(t.user_count().await, count, "nothing created");
@@ -5188,11 +5198,11 @@ async fn b21_admin_group_member_links_from_the_profile() {
 
     let cy =
         serde_json::json!({ "sub": "cy-sub", "preferred_username": "cy", "groups": ["users"] });
-    let result = t
-        .sign_in(cy)
-        .await
-        .expect("outside the admin group a name still links");
-    assert_eq!(result["User"]["Name"], "cy");
+    assert_eq!(
+        t.sign_in(cy).await.err().as_deref(),
+        Some("name_taken"),
+        "outside the admin group a taken name is refused too"
+    );
     assert_eq!(t.user_count().await, count);
 
     let dee =
@@ -5206,7 +5216,8 @@ async fn b21_admin_group_member_links_from_the_profile() {
 }
 
 #[tokio::test]
-async fn b21_rename_is_for_administrators_while_oidc_is_on() {
+#[ignore = "B21 round 2 fix 1"]
+async fn b21_self_rename_works_with_oidc_on() {
     let t = b21_on(serde_json::json!({})).await;
     let bob_id = add_user(&t.state, "bob", "pw-bob", false).await;
     let ada_id = add_user(&t.state, "ada", "pw-ada", true).await;
@@ -5217,41 +5228,20 @@ async fn b21_rename_is_for_administrators_while_oidc_is_on() {
         request("PUT", &format!("/Users/{id}"), Some(token), Some(body))
     };
 
-    let (status, body) = send(&t.app, rename(bob_id, &bob, "gus")).await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a user doesn't rename themselves"
-    );
-    assert_eq!(
-        body["Detail"],
-        "Usernames can't be changed while sign-in through the provider is on. Ask an administrator."
-    );
-    assert_eq!(
-        b21_me(&t.app, &bob).await,
-        Ok("bob".to_string()),
-        "the name stays"
-    );
-    let (status, body) = send(&t.app, rename(ada_id, &bob, "gus")).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "nor anyone else");
-    assert_eq!(body["Detail"], "User update not allowed.");
-
-    let (status, _) = send(&t.app, rename(bob_id, &ada, "robert")).await;
-    assert_eq!(status, StatusCode::OK, "an administrator renames a user");
-    assert_eq!(b21_me(&t.app, &bob).await, Ok("robert".to_string()));
-    let (status, _) = send(&t.app, rename(ada_id, &ada, "adele")).await;
-    assert_eq!(status, StatusCode::OK, "and themselves");
-    assert_eq!(b21_me(&t.app, &ada).await, Ok("adele".to_string()));
-
-    let (status, _) = t.save(serde_json::json!({ "Enabled": false })).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = send(&t.app, rename(bob_id, &bob, "bob")).await;
+    let (status, _) = send(&t.app, rename(bob_id, &bob, "gus")).await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "with OIDC off users rename themselves again"
+        "a user renames themselves with OIDC on"
     );
-    assert_eq!(b21_me(&t.app, &bob).await, Ok("bob".to_string()));
+    assert_eq!(b21_me(&t.app, &bob).await, Ok("gus".to_string()));
+    let (status, body) = send(&t.app, rename(ada_id, &bob, "bob")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "but nobody else");
+    assert_eq!(body["Detail"], "User update not allowed.");
+
+    let (status, _) = send(&t.app, rename(bob_id, &ada, "robert")).await;
+    assert_eq!(status, StatusCode::OK, "an administrator renames anyone");
+    assert_eq!(b21_me(&t.app, &bob).await, Ok("robert".to_string()));
 }
 
 #[tokio::test]
@@ -5290,22 +5280,26 @@ async fn b21_quick_connect_initiate_shares_the_login_limit() {
 #[tokio::test]
 async fn b21_quick_connect_caps_live_requests() {
     let state = test_state().await;
-    let app = app(state.clone());
     let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
-    let (status, body) = send(&app, initiate()).await;
-    assert_eq!(status, StatusCode::OK);
-    let first = body["Secret"].as_str().unwrap().to_string();
-    let mut codes = std::collections::HashSet::from([body["Code"].as_str().unwrap().to_string()]);
-    for _ in 1..100 {
-        let (status, body) = send(&app, initiate()).await;
-        assert_eq!(status, StatusCode::OK);
-        codes.insert(body["Code"].as_str().unwrap().to_string());
+    let mut first = String::new();
+    let mut codes = std::collections::HashSet::new();
+    for client in 1..=20 {
+        let app = g2f_app_from(state.clone(), &format!("192.0.2.{client}:40000"));
+        for _ in 0..5 {
+            let (status, body) = send(&app, initiate()).await;
+            assert_eq!(status, StatusCode::OK, "client {client}");
+            if first.is_empty() {
+                first = body["Secret"].as_str().unwrap().to_string();
+            }
+            codes.insert(body["Code"].as_str().unwrap().to_string());
+        }
     }
     assert_eq!(codes.len(), 100, "live requests have different codes");
+    let app = g2f_app_from(state.clone(), "192.0.2.21:40000");
     assert_eq!(
         send(&app, initiate()).await.0,
         StatusCode::TOO_MANY_REQUESTS,
-        "a 101st live request"
+        "a 101st live request, from a new client"
     );
     assert_eq!(
         state.quick_connect.read().await.len(),
@@ -5368,6 +5362,7 @@ async fn b21_quick_connect_authorize_skips_expired_requests() {
 }
 
 #[tokio::test]
+#[ignore = "B21 round 2 fix 1"]
 async fn b21_names_match_in_ascii_case_only() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "kelvin", "pw-kelvin", false).await;
@@ -5387,12 +5382,16 @@ async fn b21_names_match_in_ascii_case_only() {
     assert_eq!(result["User"]["Name"], "änne", "a new user");
     assert_eq!(t.user_count().await, count + 2);
 
-    let result = t
-        .sign_in(b21_user("kelvin-sub", "KELVIN"))
-        .await
-        .expect("ASCII letters match in any case");
-    assert_eq!(result["User"]["Name"], "kelvin");
+    assert_eq!(
+        t.sign_in(b21_user("kelvin-sub", "KELVIN"))
+            .await
+            .err()
+            .as_deref(),
+        Some("name_taken"),
+        "ASCII letters match in any case"
+    );
     assert_eq!(t.user_count().await, count + 2, "no new user");
+    assert_eq!(t.link_row("kelvin").await, None, "kelvin stays unlinked");
 }
 
 #[tokio::test]
@@ -5509,6 +5508,398 @@ async fn b21_resending_the_policy_keeps_the_group_flag() {
         !t.is_admin("gus").await,
         "leaving the group still takes them back"
     );
+}
+
+// Fix round 2: the re-check of fd5f398 (spec §11, AC44-AC49).
+
+#[tokio::test]
+#[ignore = "B21 round 2 fix 1"]
+async fn b21_taken_name_without_a_password_says_ask_an_administrator() {
+    let t = b21_on(serde_json::json!({ "AllowPasswordSignIn": false })).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    add_user(&t.state, "gus", "pw-gus", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_administrator = 1, admin_from_group = 1 WHERE name = ?",
+        "gus",
+    )
+    .await;
+    add_user(&t.state, "nopw", "pw-nopw", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET password_hash = '' WHERE name = ?",
+        "nopw",
+    )
+    .await;
+    add_user(&t.state, "dis", "pw-dis", true).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "dis",
+    )
+    .await;
+    add_user(&t.state, "Rex", "pw-rex", false).await;
+    add_user(&t.state, "rex", "pw-rex", true).await;
+    let count = t.user_count().await;
+    // The code for each provider name, with passwords off and then on.
+    let cases = [
+        ("bob", "name_taken_ask_admin", "name_taken"),
+        ("gus", "name_taken_ask_admin", "name_taken"),
+        ("ada", "name_taken", "name_taken"),
+        ("nopw", "name_taken_ask_admin", "name_taken_ask_admin"),
+        ("dis", "name_taken_ask_admin", "name_taken_ask_admin"),
+        ("REX", "name_taken", "name_taken"),
+    ];
+
+    for (name, off, _) in cases {
+        let result = t.sign_in(b21_user(&format!("{name}-sub"), name)).await;
+        assert_eq!(result.err().as_deref(), Some(off), "{name}, passwords off");
+    }
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (name, _, on) in cases {
+        let result = t.sign_in(b21_user(&format!("{name}-sub"), name)).await;
+        assert_eq!(result.err().as_deref(), Some(on), "{name}, passwords on");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+}
+
+#[tokio::test]
+#[ignore = "B21 round 2 fix 1"]
+async fn b21_links_survive_renames() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = first["User"]["Id"].as_str().unwrap().to_string();
+    let pat = first["AccessToken"].as_str().unwrap().to_string();
+    let rename = |token: &str, name: &str| {
+        let body = serde_json::json!({ "Name": name });
+        request("PUT", &format!("/Users/{pat_id}"), Some(token), Some(body))
+    };
+
+    let (status, _) = send(&t.app, rename(&pat, "patrick")).await;
+    assert_eq!(status, StatusCode::OK, "a linked user renames themselves");
+    let again = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the link signs the renamed user in");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(again["User"]["Name"], "patrick", "the Rustyfin name stays");
+
+    let again = t
+        .sign_in(b21_user("pat-sub", "bob"))
+        .await
+        .expect("a link wins over a provider name that another user has");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(t.link_row("patrick").await.expect("still linked").2, "bob");
+
+    let count = t.user_count().await;
+    let other = t
+        .sign_in(b21_user("new-sub", "pat"))
+        .await
+        .expect("the old name is free again");
+    assert_ne!(other["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(other["User"]["Name"], "pat");
+    assert_eq!(t.user_count().await, count + 1);
+
+    let (status, _) = send(&t.app, rename(&t.admin, "rick")).await;
+    assert_eq!(status, StatusCode::OK, "an administrator renames the user");
+    let again = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the link still signs in, though pat is taken now");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(again["User"]["Name"], "rick");
+}
+
+#[tokio::test]
+#[ignore = "B21 round 2 fix 2"]
+async fn b21_quick_connect_caps_live_requests_per_client() {
+    let state = test_state().await;
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let one = remote_app(state.clone());
+    let mut secrets = Vec::new();
+    for i in 0..5 {
+        let (status, body) = send(&one, initiate()).await;
+        assert_eq!(status, StatusCode::OK, "request {i}");
+        secrets.push(body["Secret"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a sixth live request from one client"
+    );
+    assert_eq!(
+        state.quick_connect.read().await.len(),
+        5,
+        "the refused request is not stored"
+    );
+    let other = g2f_app_from(state.clone(), "192.0.2.11:40000");
+    assert_eq!(
+        send(&other, initiate()).await.0,
+        StatusCode::OK,
+        "another client has its own five"
+    );
+
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&secrets[0])
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::OK,
+        "an expired request makes room"
+    );
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    for i in 1..=5 {
+        let v6 = g2f_app_from(state.clone(), &format!("[2001:db8:1:1::{i}]:40000"));
+        assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "::{i}");
+    }
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:1::99]:40000");
+    assert_eq!(
+        send(&v6, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "one IPv6 /64 is one client"
+    );
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:2::1]:40000");
+    assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "another /64");
+
+    let local = app(state.clone());
+    for _ in 0..5 {
+        assert_eq!(send(&local, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&local, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "loopback is spared the login limit, not this cap"
+    );
+
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(0, 60);
+    let remote = remote_app(state);
+    for _ in 0..5 {
+        assert_eq!(send(&remote, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&remote, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the cap holds with the login limit off"
+    );
+}
+
+#[tokio::test]
+#[ignore = "B21 round 2 fix 5"]
+async fn b21_quick_connect_wrong_codes_count_against_the_login_limit() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    add_user(&state, "alice", "pw-alice", false).await;
+    let local = app(state.clone());
+    let (alice, _) = login(&local, "alice", "pw-alice").await.unwrap();
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let (status, init) = send(&local, initiate()).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap().to_string();
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let authorize = |code: &str| {
+        let uri = format!("/QuickConnect/Authorize?code={code}");
+        request("POST", &uri, Some(alice.as_str()), None)
+    };
+
+    let remote = remote_app(state.clone());
+    for _ in 0..4 {
+        assert_eq!(
+            send(&remote, authorize(&code)).await.0,
+            StatusCode::OK,
+            "a right code doesn't count"
+        );
+    }
+    for i in 0..3 {
+        let (status, body) = send(&remote, authorize(wrong)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "miss {i}");
+        assert_eq!(body["Detail"], "Unknown code");
+    }
+    assert_eq!(
+        send(&remote, authorize(wrong)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth miss in a minute"
+    );
+    assert_eq!(
+        send(&remote, authorize(&code)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a limited client tries no more codes"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "misses use the sign-in budget"
+    );
+    let other = g2f_app_from(state.clone(), "192.0.2.11:40000");
+    assert_eq!(
+        send(&other, authorize(&code)).await.0,
+        StatusCode::OK,
+        "another client has its own budget"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            send(&local, authorize(wrong)).await.0,
+            StatusCode::NOT_FOUND,
+            "loopback is exempt"
+        );
+    }
+
+    let third = g2f_app_from(state.clone(), "192.0.2.12:40000");
+    for _ in 0..2 {
+        assert_eq!(send(&third, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&third, authorize(wrong)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&third, authorize(wrong)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "two Initiates and a miss use a budget of 3"
+    );
+    assert_eq!(
+        send(&third, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(0, 60);
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app(state.clone()), "alice", "pw-alice")
+        .await
+        .unwrap();
+    let remote = remote_app(state);
+    let uri = format!("/QuickConnect/Authorize?code={wrong}");
+    for _ in 0..5 {
+        let req = request("POST", &uri, Some(alice.as_str()), None);
+        assert_eq!(
+            send(&remote, req).await.0,
+            StatusCode::NOT_FOUND,
+            "a limit of 0 turns it off"
+        );
+    }
+}
+
+/// The text at the dotted `path` in the web client's `lang` translations, if there is one.
+fn b21_translation(lang: &str, path: &str) -> Option<String> {
+    let file = format!(
+        "{}/../rustyfin-web/src/translations/{lang}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    path.split('.')
+        .try_fold(&json, |value, key| value.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+#[ignore = "B21 round 2 fix 1 web"]
+fn b21_web_explains_taken_names() {
+    let texts = [
+        (
+            "en",
+            "oidc.error.name_taken",
+            "An account with this name already exists. Sign in with your password and link the provider from your profile, or ask an administrator.",
+        ),
+        (
+            "en",
+            "oidc.error.name_taken_ask_admin",
+            "An account with this name already exists. Ask an administrator.",
+        ),
+        (
+            "de",
+            "oidc.error.name_taken",
+            "Ein Konto mit diesem Namen gibt es schon. Bitte mit dem Passwort anmelden und den Anbieter im Profil verknüpfen, oder einen Administrator fragen.",
+        ),
+        (
+            "de",
+            "oidc.error.name_taken_ask_admin",
+            "Ein Konto mit diesem Namen gibt es schon. Bitte einen Administrator fragen.",
+        ),
+    ];
+    for (lang, key, text) in texts {
+        assert_eq!(
+            b21_translation(lang, key).as_deref(),
+            Some(text),
+            "{lang} {key}"
+        );
+    }
+    let gone = ["admin_link_required", "ambiguous_user", "warn_username"];
+    for lang in ["en", "de"] {
+        for key in [
+            "oidc.error.admin_link_required",
+            "oidc.error.ambiguous_user",
+            "oidc.warn_username",
+        ] {
+            assert_eq!(b21_translation(lang, key), None, "{lang} {key} is gone");
+        }
+    }
+    let app_js = std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/app.js",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    for code in ["name_taken", "name_taken_ask_admin"] {
+        assert!(
+            app_js.contains(&format!("['{code}', 'oidc.error.{code}']")),
+            "app.js shows {code}"
+        );
+    }
+    for word in gone {
+        assert!(!app_js.contains(word), "app.js no longer uses {word}");
+    }
+}
+
+#[test]
+#[ignore = "B21 round 2 fix 4"]
+fn b21_web_password_switch_names_hand_granted_admins() {
+    let texts = [
+        (
+            "en",
+            "oidc.allow_password",
+            "Allow password sign-in for users other than administrators given rights by hand",
+        ),
+        (
+            "en",
+            "oidc.warn_password_off",
+            "With password sign-in off, only administrators given rights by hand sign in with a password. Other users, including administrators from the admin group, need a link to sign in.",
+        ),
+        (
+            "de",
+            "oidc.allow_password",
+            "Anmeldung mit Passwort für Benutzer erlauben, die keine von Hand ernannten Administratoren sind",
+        ),
+        (
+            "de",
+            "oidc.warn_password_off",
+            "Ist die Anmeldung mit Passwort ausgeschaltet, melden sich nur von Hand ernannte Administratoren mit Passwort an. Alle anderen, auch Administratoren aus der Administratorgruppe, brauchen zur Anmeldung eine Verknüpfung.",
+        ),
+    ];
+    for (lang, key, text) in texts {
+        assert_eq!(
+            b21_translation(lang, key).as_deref(),
+            Some(text),
+            "{lang} {key}"
+        );
+    }
 }
 
 // ── Environment Tests ──
