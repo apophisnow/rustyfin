@@ -5368,35 +5368,59 @@ async fn b21_quick_connect_authorize_skips_expired_requests() {
 }
 
 #[tokio::test]
-async fn b21_names_match_in_ascii_case_only() {
+#[ignore = "B21 round 3 fix 1"]
+async fn b21_taken_names_fold_case_and_compatibility_forms() {
     let t = b21_on(serde_json::json!({})).await;
     add_user(&t.state, "kelvin", "pw-kelvin", false).await;
     add_user(&t.state, "Änne", "pw-anne", false).await;
+    add_user(&t.state, "strauss", "pw-strauss", false).await;
     let count = t.user_count().await;
 
-    let result = t
-        .sign_in(b21_user("sign-sub", "\u{212A}elvin"))
-        .await
-        .expect("the Kelvin sign matches nobody");
-    assert_eq!(result["User"]["Name"], "\u{212A}elvin", "a new user");
-    assert_eq!(t.link_row("kelvin").await, None, "kelvin stays unlinked");
-    let result = t
-        .sign_in(b21_user("anne-sub", "änne"))
-        .await
-        .expect("other letters match only as they are");
-    assert_eq!(result["User"]["Name"], "änne", "a new user");
-    assert_eq!(t.user_count().await, count + 2);
+    let variants = [
+        "\u{212A}elvin",
+        "KELVIN",
+        "ｋｅｌｖｉｎ",
+        "änne",
+        "A\u{0308}nne",
+        "ÄNNE",
+        "Strauß",
+        "STRAUß",
+    ];
+    for (i, name) in variants.into_iter().enumerate() {
+        assert_eq!(
+            t.sign_in(b21_user(&format!("variant-{i}-sub"), name))
+                .await
+                .err()
+                .as_deref(),
+            Some("name_taken"),
+            "{name:?} is a form of a taken name"
+        );
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "nobody is linked");
 
+    let result = t
+        .sign_in(b21_user("anne-sub", "anne"))
+        .await
+        .expect("a name without the umlaut is another name");
+    assert_eq!(result["User"]["Name"], "anne");
+    let result = t
+        .sign_in(b21_user("fiona-sub", "\u{FB01}ona"))
+        .await
+        .expect("a free name");
     assert_eq!(
-        t.sign_in(b21_user("kelvin-sub", "KELVIN"))
+        result["User"]["Name"], "\u{FB01}ona",
+        "the account gets the name as sent"
+    );
+    assert_eq!(
+        t.sign_in(b21_user("fiona2-sub", "FIONA"))
             .await
             .err()
             .as_deref(),
-        Some("name_taken"),
-        "ASCII letters match in any case"
+        Some("name_taken_ask_admin"),
+        "a stored name is folded too; that account has no password"
     );
-    assert_eq!(t.user_count().await, count + 2, "no new user");
-    assert_eq!(t.link_row("kelvin").await, None, "kelvin stays unlinked");
+    assert_eq!(t.user_count().await, count + 2);
 }
 
 #[tokio::test]
@@ -5620,6 +5644,7 @@ async fn b21_links_survive_renames() {
 }
 
 #[tokio::test]
+#[ignore = "B21 round 3 fix 4"]
 async fn b21_quick_connect_caps_live_requests_per_client() {
     let state = test_state().await;
     let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
@@ -5668,14 +5693,14 @@ async fn b21_quick_connect_caps_live_requests_per_client() {
         let v6 = g2f_app_from(state.clone(), &format!("[2001:db8:1:1::{i}]:40000"));
         assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "::{i}");
     }
-    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:1::99]:40000");
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:2::99]:40000");
     assert_eq!(
         send(&v6, initiate()).await.0,
         StatusCode::TOO_MANY_REQUESTS,
-        "one IPv6 /64 is one client"
+        "one IPv6 /56 is one client"
     );
-    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:2::1]:40000");
-    assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "another /64");
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:100::1]:40000");
+    assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "another /56");
 
     let local = app(state.clone());
     for _ in 0..5 {
@@ -5899,6 +5924,209 @@ fn b21_web_password_switch_names_hand_granted_admins() {
             "{lang} {key}"
         );
     }
+}
+
+// Fix round 3: the re-check of 15b3e92 (spec §12, AC50-AC53).
+
+fn b21_unlink(id: &str, token: &str) -> Request<Body> {
+    request(
+        "DELETE",
+        &format!("/Auth/Oidc/Accounts/{id}/Link"),
+        Some(token),
+        None,
+    )
+}
+
+/// The answer to an admin-only request: 200 for an administrator, 403 for a user.
+async fn b21_settings_status(app: &axum::Router, token: &str) -> StatusCode {
+    send(
+        app,
+        request("GET", "/Auth/Oidc/Settings", Some(token), None),
+    )
+    .await
+    .0
+}
+
+/// Gives the token's passwordless user a first password, so that they may unlink (AC31).
+async fn b21_first_password(app: &axum::Router, id: &str, token: &str) {
+    let body = serde_json::json!({ "NewPw": "pw-first" });
+    let req = request(
+        "POST",
+        &format!("/Users/{id}/Password"),
+        Some(token),
+        Some(body),
+    );
+    let status = send(app, req).await.0;
+    assert!(status.is_success(), "a first password: {status}");
+}
+
+/// A first sign-in as a member of the admin group "admins": the new user's id and token.
+async fn b21_group_admin(t: &B21, sub: &str, name: &str) -> (String, String) {
+    let claims =
+        serde_json::json!({ "sub": sub, "preferred_username": name, "groups": ["admins"] });
+    let result = t.sign_in(claims).await.expect("a first sign-in");
+    assert!(
+        t.admin_from_group(name).await,
+        "{name}: admin from the group"
+    );
+    (
+        result["User"]["Id"].as_str().unwrap().to_string(),
+        result["AccessToken"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+#[ignore = "B21 round 3 fix 2"]
+async fn b21_unlinking_takes_back_group_admin() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+    assert_eq!(b21_settings_status(&t.app, &gus).await, StatusCode::OK);
+    assert_eq!(
+        send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+        StatusCode::NO_CONTENT,
+        "gus's own Unlink"
+    );
+    assert_eq!(t.link_row("gus").await, None);
+    assert!(
+        !t.is_admin("gus").await,
+        "the group's rights go with the link"
+    );
+    assert!(!t.admin_from_group("gus").await, "and so does the flag");
+    assert_eq!(
+        b21_settings_status(&t.app, &gus).await,
+        StatusCode::FORBIDDEN,
+        "at once, in the open session"
+    );
+
+    let (lou_id, lou) = b21_group_admin(&t, "lou-sub", "lou").await;
+    assert_eq!(
+        send(&t.app, b21_unlink(&lou_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT,
+        "an administrator's Remove"
+    );
+    assert!(
+        !t.is_admin("lou").await,
+        "Remove takes the group's rights back too"
+    );
+    assert!(!t.admin_from_group("lou").await);
+    assert_eq!(
+        b21_settings_status(&t.app, &lou).await,
+        StatusCode::FORBIDDEN
+    );
+
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (ada, ada_id) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "ada-sub", "preferred_username": "ada", "groups": ["admins"] });
+    t.link(&ada, claims)
+        .await
+        .expect("ada links from the profile");
+    assert!(
+        !t.admin_from_group("ada").await,
+        "ada's rights were given by hand"
+    );
+    assert_eq!(
+        send(&t.app, b21_unlink(&ada_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(t.is_admin("ada").await, "rights given by hand stay");
+    assert_eq!(b21_settings_status(&t.app, &ada).await, StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "B21 round 3 fix 2"]
+async fn b21_unlinking_keeps_the_last_admin() {
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "owner",
+    )
+    .await;
+    let before = log.text().len();
+    assert_eq!(
+        send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_row("gus").await, None, "the link goes");
+    assert!(
+        t.is_admin("gus").await,
+        "the last enabled admin keeps the rights"
+    );
+    assert!(t.admin_from_group("gus").await, "and the flag");
+    let warned = log.text()[before..]
+        .lines()
+        .any(|line| line.contains("WARN") && line.to_lowercase().contains("admin"));
+    assert!(warned, "a warning says why");
+}
+
+#[tokio::test]
+#[ignore = "B21 round 3 fix 3"]
+async fn b21_simultaneous_sign_ins_take_a_name_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    // Sign-ins as "BobN" and "bobN" at the same moment. Both pass the first check whenever both
+    // read `users` before either inserts; then only the check inside the insert's transaction
+    // can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..10 {
+        let count = t.user_count().await;
+        let (upper, lower) = tokio::join!(
+            t.sign_in(b21_user(&format!("upper-{i}-sub"), &format!("Bob{i}"))),
+            t.sign_in(b21_user(&format!("lower-{i}-sub"), &format!("bob{i}")))
+        );
+        let refused: Vec<String> = [upper, lower].into_iter().filter_map(Result::err).collect();
+        if refused.is_empty() {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(refused, ["name_taken_ask_admin"], "pair {i}");
+        assert_eq!(t.user_count().await, count + 1, "pair {i}: one account");
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both sign-ins got an account"
+    );
+    assert_eq!(t.link_count().await, 10, "one link per pair");
+}
+
+#[test]
+#[ignore = "B21 round 3 fix 4"]
+fn b21_ipv6_clients_are_keyed_by_their_slash56() {
+    let key = |ip: &str| {
+        rustyfin_api::middleware::resolve_client(
+            ip.parse().unwrap(),
+            &axum::http::HeaderMap::new(),
+            &[],
+        )
+        .limiter_key()
+    };
+    assert_eq!(key("2001:db8:1:2::10"), key("2001:db8:1:2::20"), "one /64");
+    assert_eq!(
+        key("2001:db8:1:2::10"),
+        key("2001:db8:1:3::20"),
+        "two /64s of one /56"
+    );
+    assert_eq!(
+        key("2001:db8:1::1"),
+        key("2001:db8:1:ff:ffff:ffff:ffff:ffff"),
+        "both ends of one /56"
+    );
+    assert_ne!(
+        key("2001:db8:1:2::10"),
+        key("2001:db8:1:100::10"),
+        "another /56"
+    );
+    assert_ne!(
+        key("192.0.2.7"),
+        key("192.0.2.8"),
+        "IPv4 is keyed by address"
+    );
 }
 
 // ── Environment Tests ──
@@ -10512,23 +10740,24 @@ async fn g2f_mapped_proxy_peer_is_trusted() {
 }
 
 #[tokio::test]
-async fn g2f_ipv6_clients_share_a_slash64_budget() {
-    // One host rotating through its /64 must not get a fresh budget per address. 90c99b5 keyed
-    // every full IPv6 address separately.
+#[ignore = "B21 round 3 fix 4"]
+async fn g2f_ipv6_clients_share_a_slash56_budget() {
+    // One site rotating through its /56 must not get a fresh budget per address or per /64.
+    // 90c99b5 keyed every full IPv6 address separately, G2f each /64 (B21 round 3: the /56).
     let state = g2f_state("").await;
     let a = g2f_app_from(state.clone(), "[2001:db8:1:2::10]:6116");
-    let b = g2f_app_from(state.clone(), "[2001:db8:1:2::20]:6117");
-    let other = g2f_app_from(state, "[2001:db8:1:3::10]:6118");
+    let b = g2f_app_from(state.clone(), "[2001:db8:1:3::20]:6117");
+    let other = g2f_app_from(state, "[2001:db8:1:100::10]:6118");
     let _ = g2f_limited(&a, 3, &[]).await;
     assert_eq!(
         g2f_limited(&b, 1, &[]).await,
         1,
-        "a second address in the same /64 shares the budget"
+        "another /64 of the same /56 shares the budget"
     );
     assert_eq!(
         g2f_limited(&other, 1, &[]).await,
         0,
-        "a different /64 keeps its own budget"
+        "a different /56 keeps its own budget"
     );
 }
 

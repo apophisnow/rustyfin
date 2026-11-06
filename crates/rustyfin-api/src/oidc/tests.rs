@@ -100,15 +100,32 @@ fn claim_username_trims_and_needs_text() {
 }
 
 #[test]
-fn names_match_ignores_ascii_case_only() {
-    assert!(names_match("Alice", "alice"));
-    assert!(names_match("ÄRGER", "ÄRGER"));
-    assert!(!names_match("ÄRGER", "ärger"), "only ASCII letters fold");
-    assert!(
-        !names_match("kelvin", "\u{212A}elvin"),
-        "the Kelvin sign is not a k"
-    );
-    assert!(!names_match("alice", "alice2"));
-    assert!(!names_match("alice", " alice"));
-    assert!(!names_match("alice", "alíce"));
+#[ignore = "B21 round 3 fix 1"]
+fn names_match_folds_case_and_compatibility_forms() {
+    let same = [
+        ("Alice", "alice"),
+        ("Änne", "änne"),
+        ("Änne", "A\u{0308}nne"),
+        ("ÄNNE", "änne"),
+        ("kelvin", "KELVIN"),
+        ("kelvin", "\u{212A}elvin"),
+        ("kelvin", "ｋｅｌｖｉｎ"),
+        ("strauss", "Strauß"),
+        ("strauss", "STRAUß"),
+        ("ΟΔΟ\u{03A3}", "οδο\u{03C2}"),
+        ("\u{FB01}ona", "FIONA"),
+        ("\u{3392}", "mhz"),
+    ];
+    for (a, b) in same {
+        assert!(names_match(a, b), "{a:?} and {b:?} are one name");
+        assert!(names_match(b, a), "{b:?} and {a:?} are one name");
+    }
+    for (a, b) in [
+        ("alice", "alice2"),
+        ("alice", " alice"),
+        ("alice", "alíce"),
+        ("anne", "Änne"),
+    ] {
+        assert!(!names_match(a, b), "{a:?} and {b:?} are two names");
+    }
 }
