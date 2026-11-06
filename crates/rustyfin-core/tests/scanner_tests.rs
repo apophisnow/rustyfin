@@ -2939,6 +2939,46 @@ async fn b18_an_unclaimed_run_ends_when_its_last_ticket_drops() {
     assert_eq!(scans.state(lib), None);
 }
 
+/// B18 fix F3: the scheduler claims its runs with `claim`, and sends no Started or Completed. A
+/// caller that sends them claims with `claim_announced`. A share of a run
+/// that a silent caller claimed announces it, so that its caller sends them: one share only, and
+/// none for a run that an announcing caller claimed, that nobody claimed, or that has ended.
+#[tokio::test]
+async fn b18_a_silently_claimed_run_is_announced_once() {
+    let scans = ScanRegistry::new();
+    let lib = Uuid::new_v4();
+    let waiting = scans.queue(lib);
+    assert!(!waiting.announce(), "nobody has claimed the run");
+    let silent = scans.queue(lib);
+    assert!(silent.claim());
+    let first = scans.queue(lib);
+    assert!(
+        !first.claim_announced(),
+        "the silent caller has claimed the run"
+    );
+    assert!(first.announce(), "the first share announces the run");
+    let second = scans.queue(lib);
+    assert!(!second.announce(), "the run has been announced");
+    drop((waiting, silent, first));
+    assert_eq!(scans.state(lib), None, "the run ends with its holder");
+    assert!(!second.announce(), "the run has ended");
+    assert!(!second.claim_announced(), "the run has ended");
+
+    let manual = scans.queue(lib);
+    assert!(manual.claim_announced());
+    let joined = scans.queue(lib);
+    assert!(!joined.claim_announced());
+    assert!(
+        !joined.announce(),
+        "the caller that claimed the run announces it"
+    );
+    assert!(ScanTicket::untracked().claim_announced());
+    assert!(
+        !ScanTicket::untracked().announce(),
+        "an untracked ticket has no run"
+    );
+}
+
 #[tokio::test]
 async fn b18_a_scan_queued_during_a_run_makes_a_new_run() {
     use ScanStatus::{Active, Idle, Queued};

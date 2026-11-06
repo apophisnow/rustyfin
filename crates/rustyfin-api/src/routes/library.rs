@@ -188,9 +188,38 @@ async fn scan_library(
     // The registry lists the scan from here until it ends, its probes included.
     let ticket = state.task_scheduler.scans().queue(lib.id);
     // Claimed here, not when the scan starts, so that a Scan all reaching this library skips it.
-    // A run another caller has claimed is scanned by that caller, so this request waits for it.
-    if !ticket.claim() {
-        ticket.wait_end().await;
+    // A run another caller has claimed is scanned by that caller, so this request answers at once.
+    if !ticket.claim_announced() {
+        // The scheduler claims a run without sending its Started or Completed. The first request
+        // that joins such a run sends them, and its Completed comes when the run ends.
+        if ticket.announce() {
+            broadcast_event(
+                &state,
+                WsEvent::ScheduledTaskStarted {
+                    data: json!({
+                        "Name": format!("Library scan: {}", lib.name),
+                        "State": "Running",
+                        "ItemId": lib.id.to_string(),
+                    }),
+                },
+            )
+            .await;
+            let ws_broadcast = state.ws_broadcast.clone();
+            let lib_name = lib.name.clone();
+            let lib_id = lib.id;
+            tokio::spawn(ticket.wait_end_then(move || {
+                // A send fails only when no socket is listening, which is fine.
+                let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
+                    data: json!({
+                        "Name": format!("Library scan: {}", lib_name),
+                        "State": "Completed",
+                        "ItemId": lib_id.to_string(),
+                        "ItemsScanned": 0,
+                    }),
+                });
+            }));
+        }
+        // Otherwise this request drops its ticket here, and does not wait for the run.
         return Ok(Json(json!({ "items_scanned": 0 })));
     }
 
@@ -299,7 +328,8 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
     let mut ends = Vec::new();
     for (lib, ticket) in libs.iter().zip(tickets) {
         // Only the caller that claimed a library's run scans it, so a claimed library is skipped.
-        if !ticket.claim() {
+        // This request sends the library's Started and Completed, so the claim announces the run.
+        if !ticket.claim_announced() {
             others.push(ticket);
             continue;
         }

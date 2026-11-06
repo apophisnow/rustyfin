@@ -75,6 +75,8 @@ struct Run {
     done: usize,
     /// Whether a ticket has claimed the run. Only a claimed run's holders scan it.
     claimed: bool,
+    /// Whether a caller sends the run's Started and Completed. See `ScanTicket::announce`.
+    announced: bool,
     /// The tickets that claimed the run, clones included.
     holders: usize,
     /// The tickets waiting for the run, clones included.
@@ -264,6 +266,7 @@ impl ScanRegistry {
                     total: 0,
                     done: 0,
                     claimed: false,
+                    announced: false,
                     holders: 0,
                     waiters: 1,
                     ended,
@@ -362,23 +365,31 @@ impl ScanTicket {
     /// the run already and when it is the first share to claim it. False when another share has
     /// claimed the run, or when the run has ended.
     pub fn claim(&self) -> bool {
+        self.claim_run(false)
+    }
+
+    /// `claim`, for a caller that sends the run's Started and Completed. When the claim holds, the
+    /// run is marked as announced, so that `announce` returns false for it.
+    pub fn claim_announced(&self) -> bool {
+        self.claim_run(true)
+    }
+
+    /// Announces a claimed run that no share has announced, for the share that asks first. True for
+    /// that share, which then sends the run's Started now and its Completed at its end. False for a
+    /// run nobody has claimed, a run already announced, a run that has ended, and an untracked
+    /// ticket.
+    pub fn announce(&self) -> bool {
         let Some(inner) = &self.inner else {
-            return true;
+            return false;
         };
         let mut libraries = inner.lock();
         let Some(run) = libraries.run_mut(self.library_id, self.run) else {
             return false;
         };
-        if self.holder.load(Ordering::Relaxed) {
-            return true;
-        }
-        if run.claimed {
+        if !run.claimed || run.announced {
             return false;
         }
-        run.claimed = true;
-        run.waiters = run.waiters.saturating_sub(1);
-        run.holders += 1;
-        self.holder.store(true, Ordering::Relaxed);
+        run.announced = true;
         true
     }
 
@@ -442,5 +453,28 @@ impl ScanTicket {
         if let Some(inner) = &self.inner {
             inner.change(self.library_id, self.run, change);
         }
+    }
+
+    /// `claim`, and when the claim holds, also marks the run as announced if `announces` is set.
+    /// Both happen under one lock acquisition, so no share can announce the run in between.
+    fn claim_run(&self, announces: bool) -> bool {
+        let Some(inner) = &self.inner else {
+            return true;
+        };
+        let mut libraries = inner.lock();
+        let Some(run) = libraries.run_mut(self.library_id, self.run) else {
+            return false;
+        };
+        if !self.holder.load(Ordering::Relaxed) {
+            if run.claimed {
+                return false;
+            }
+            run.claimed = true;
+            run.waiters = run.waiters.saturating_sub(1);
+            run.holders += 1;
+            self.holder.store(true, Ordering::Relaxed);
+        }
+        run.announced |= announces;
+        true
     }
 }

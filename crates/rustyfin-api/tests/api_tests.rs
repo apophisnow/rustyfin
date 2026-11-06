@@ -8603,8 +8603,10 @@ async fn b17_new_socket_lists_the_scans_in_progress() {
 // ── B18: one scan per run, and Scan all's order ──
 // A manual scan of a library that Scan all has queued but not reached runs at once, and Scan all
 // leaves that library to it, so its ring follows one scan and one Completed comes after the 100.
-// A second manual scan of a waiting library joins it. Scan all clears the caches before each
-// library's LibraryChanged, and its own Completed comes after every library's scan has ended.
+// A second manual scan of a waiting library joins it and answers at once, as does a manual scan of a
+// library whose run the scheduler has claimed; such a run gets one Started and one Completed. Scan
+// all clears the caches before each library's LibraryChanged, and its own Completed comes after
+// every library's scan has ended.
 
 /// A scan frame as one line: `<name> <percent> <State>` for RefreshProgress, with the library
 /// named from `names`; `Started <Name>`, `Completed <Name> <State>`, `Changed <LibraryName>`.
@@ -8783,36 +8785,82 @@ async fn b18_second_manual_scan_of_a_waiting_library_joins_the_first() {
         "Started Library scan: B18 Twice",
     )
     .await;
+    // The second request joins the run the first one claimed, and answers while that run waits.
     let second = b18_spawn_request(&app, "POST", uri, &owner);
-    // The second request waits for the end of the run the first one claimed.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while scans.waiting(lib) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the second request did not wait within 30 s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+        .await
+        .expect("the second request answered within 10 s")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["items_scanned"], 0,
+        "the second request left the scan to the first"
+    );
+    assert!(
+        scans.state(lib).is_some(),
+        "it answered before the scan ended"
+    );
     drop(lock);
 
     let (status, body) = first.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["items_scanned"], 2);
-    let (status, body) = second.await.unwrap();
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["items_scanned"], 0,
-        "the second request waited for the first one's scan"
-    );
-    assert_eq!(
-        scans.state(lib),
-        None,
-        "it answered once the scan had ended"
-    );
     let last = "Completed Library scan: B18 Twice Completed";
     b18_read_until(&mut socket, &names, &mut lines, last).await;
     b18_assert_no_more_scan_frames(&state, &mut socket).await;
     b18_assert_one_run(&lines, "Twice");
+}
+
+/// B18 fix F3: the scheduler claims a library's run before it waits for the scan lock, and sends no
+/// Started or Completed. Manual scans of that library join the run and answer at once; the first one
+/// sends the run's Started, and its Completed once the run has ended.
+#[tokio::test]
+async fn b18_manual_scans_of_a_silently_claimed_run_answer_at_once() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let lib = create_library_via_api(&app, &state, &owner, "B18 Silent", "Movies").await;
+    let names = [(lib, "Silent")];
+    let addr = b17_serve(&app).await;
+    let mut socket = G1cSocket::open(addr, &viewer).await;
+    let scans = state.task_scheduler.scans();
+    let uri = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let mut lines = Vec::new();
+
+    let silent = scans.queue(lib);
+    assert!(silent.claim());
+    for _ in 0..2 {
+        let request = b18_spawn_request(&app, "POST", uri.clone(), &owner);
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .expect("a manual scan of a claimed run answered within 10 s")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items_scanned"], 0, "the run's claimer scans");
+    }
+    b18_read_until(
+        &mut socket,
+        &names,
+        &mut lines,
+        "Started Library scan: B18 Silent",
+    )
+    .await;
+    drop(silent);
+
+    let last = "Completed Library scan: B18 Silent Completed";
+    b18_read_until(&mut socket, &names, &mut lines, last).await;
+    b18_assert_no_more_scan_frames(&state, &mut socket).await;
+    let position = |line: &str| lines.iter().position(|l| l == line);
+    let count = |line: &str| lines.iter().filter(|l| *l == line).count();
+    assert_eq!(count("Started Library scan: B18 Silent"), 1, "{lines:#?}");
+    assert_eq!(count(last), 1, "{lines:#?}");
+    assert!(
+        matches!(
+            (position("Silent 100 Idle"), position(last)),
+            (Some(end), Some(completed)) if end < completed
+        ),
+        "Completed comes after the run's end: {lines:#?}"
+    );
 }
 
 #[tokio::test]
