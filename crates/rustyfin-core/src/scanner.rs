@@ -1215,8 +1215,9 @@ async fn scan_music_library(
             // Use tag title if available, otherwise file stem
             let item_name = title_from_tag.clone().unwrap_or(file_name.clone());
 
-            // A new file in the folder of a missing track, with that track's number, takes the track over:
-            // the track keeps its id and user data, and it is probed again instead of a new item being made.
+            // A new file in the folder of a missing track, with that track's number and title, takes the
+            // track over: the track keeps its id and user data, and it is probed again instead of a new
+            // item being made.
             if let Some(index) =
                 scan_sync::heir_track(&gone_tracks, &file_path_buf, track_number, &item_name)
             {

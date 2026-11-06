@@ -4824,9 +4824,10 @@ async fn b18_music_rescans_give_a_new_file_no_track_of_another_disc() {
     for rel in [intro, song, outro] {
         ids.push(item_at(pool, &lib, rel).await);
     }
+    // An edited name with the song's title: a track whose name has another title takes over nothing.
     exec(
         pool,
-        "UPDATE media_items SET name = 'My Song', production_year = 1999 WHERE id = ?1",
+        "UPDATE media_items SET name = 'SONG!', production_year = 1999 WHERE id = ?1",
         &[&ids[1].to_string()],
     )
     .await;
@@ -4860,7 +4861,7 @@ async fn b18_music_rescans_give_a_new_file_no_track_of_another_disc() {
             .unwrap();
     assert_eq!(
         (name.as_str(), year),
-        ("My Song", Some(1999)),
+        ("SONG!", Some(1999)),
         "a track taken over keeps its name and year"
     );
 
@@ -4879,6 +4880,67 @@ async fn b18_music_rescans_give_a_new_file_no_track_of_another_disc() {
         !ids.contains(&item_at(pool, &lib, prelude).await),
         "the new track 1 took over the item of another track"
     );
+}
+
+/// ffmpeg. B18 fix round 2, item 3: another edition of an album, put in the album's folder in place
+/// of the old one, keeps a track's item only where the track number and the title both match. The
+/// other new tracks get items of their own.
+#[tokio::test]
+async fn b18_music_rescans_give_a_new_file_no_track_with_another_title() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let old = [
+        ("Artist/Album/01 - Song.flac", 1, "Song"),
+        ("Artist/Album/02 - Other.flac", 2, "Other"),
+        ("Artist/Album/03 - Third.flac", 3, "Third"),
+    ];
+    for (rel, track, title) in old {
+        b18_tagged_tone(&root, rel, track, title);
+    }
+    scan(pool, &lib).await;
+    b18_tracks_probed(pool, &lib).await;
+    let user = insert_user(pool).await;
+    let mut ids = Vec::new();
+    for (rel, ..) in old {
+        let item = item_at(pool, &lib, rel).await;
+        insert_marks(pool, &user, item, &b18_watched()).await;
+        ids.push(item);
+    }
+
+    // The deluxe edition: track 1 is the same song, track 2 a bonus, and track 3 the old track 2.
+    for (rel, ..) in old {
+        std::fs::remove_file(root.join(rel)).unwrap();
+    }
+    let new = [
+        ("Artist/Album/01 - Song (2011 Remaster).flac", 1, "Song"),
+        ("Artist/Album/02 - Bonus.flac", 2, "Bonus"),
+        ("Artist/Album/03 - Other.flac", 3, "Other"),
+    ];
+    for (rel, track, title) in new {
+        b18_tagged_tone(&root, rel, track, title);
+    }
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Folder(root.join("Artist"))).await,
+        (2, 2, 1),
+        "the rescan re-reads track 1, adds tracks 2 and 3, and removes the old tracks 2 and 3"
+    );
+    b18_track_probed(pool, &root.join(new[0].0), &[]).await;
+    assert_eq!(item_at(pool, &lib, new[0].0).await, ids[0]);
+    assert_eq!(marks_of(pool, &user, ids[0]).await, Some(b18_watched()));
+    for (rel, ..) in &new[1..] {
+        let item = item_at(pool, &lib, rel).await;
+        assert!(
+            !ids.contains(&item),
+            "{rel} took over the item of another song"
+        );
+        assert_eq!(marks_of(pool, &user, item).await, None);
+    }
 }
 
 /// The id of the season item, as text, that holds the episode `item`.

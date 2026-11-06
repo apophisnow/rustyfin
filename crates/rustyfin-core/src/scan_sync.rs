@@ -453,9 +453,10 @@ pub async fn gone_tracks(
 }
 
 /// The index in `tracks` of the track that a new file at `file`, with the track number `track_number`
-/// and the name `name`, takes over: the only one in the same folder with that number, or else the only
-/// one of those with that name. The discs of an album can share track numbers, so a file that matches
-/// several tracks and the name of none takes over none, as does a file with no track number.
+/// and the title `name`, takes over: the only gone track in the same folder with that number and that
+/// title, where titles match by [`naming::title_key`], so case and punctuation do not count. A file with
+/// no track number, or one that matches no track or several, takes over none. So another edition of an
+/// album, put in place of the old one, gives no song's user data to another song with its number.
 pub fn heir_track(
     tracks: &[GoneTrack],
     file: &Path,
@@ -464,20 +465,16 @@ pub fn heir_track(
 ) -> Option<usize> {
     let number = track_number?;
     let folder = file.parent()?;
+    let key = naming::title_key(name);
     let candidates: Vec<usize> = (0..tracks.len())
         .filter(|&index| {
             let track = &tracks[index];
-            track.index_number == Some(number) && Path::new(&track.path).parent() == Some(folder)
+            track.index_number == Some(number)
+                && Path::new(&track.path).parent() == Some(folder)
+                && naming::title_key(&track.name) == key
         })
         .collect();
-    if let [only] = candidates[..] {
-        return Some(only);
-    }
-    match candidates
-        .into_iter()
-        .filter(|&index| tracks[index].name == name)
-        .collect::<Vec<_>>()[..]
-    {
+    match candidates[..] {
         [only] => Some(only),
         _ => None,
     }
