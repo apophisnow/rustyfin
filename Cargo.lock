@@ -3135,8 +3135,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
- "unicase",
- "unicode-normalization",
  "url",
  "uuid",
 ]
@@ -3221,6 +3219,8 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "unicase",
+ "unicode-normalization",
  "uuid",
 ]
 

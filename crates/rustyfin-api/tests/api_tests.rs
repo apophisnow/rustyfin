@@ -6225,7 +6225,6 @@ async fn b21_rename(
 }
 
 #[tokio::test]
-#[ignore = "B21 round 4 fix 3"]
 async fn b21_password_sign_in_finds_names_in_any_case() {
     let t = b21().await;
     add_user(&t.state, "alice", "pw-alice", false).await;
@@ -6276,7 +6275,6 @@ async fn b21_case_variant_accounts_sign_in_by_exact_name() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 4 fix 3"]
 async fn b21_new_users_refuse_taken_names_in_any_case() {
     let t = b21().await;
     add_user(&t.state, "alice", "pw-alice", false).await;
@@ -6296,7 +6294,6 @@ async fn b21_new_users_refuse_taken_names_in_any_case() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 4 fix 3"]
 async fn b21_renames_refuse_other_users_names_in_any_case() {
     let t = b21().await;
     add_user(&t.state, "alice", "pw-alice", false).await;
@@ -6337,7 +6334,6 @@ async fn b21_renames_refuse_other_users_names_in_any_case() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 4 fix 3"]
 async fn b21_simultaneous_new_users_take_a_name_once() {
     let t = b21().await;
     // Users/New as "DanN" and "danN" at the same moment: only a check inside the insert's
@@ -6374,7 +6370,6 @@ async fn b21_simultaneous_new_users_take_a_name_once() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 4 fix 3"]
 async fn b21_password_resets_find_names_in_any_case() {
     let t = b21().await;
     add_user(&t.state, "alice", "pw-alice", false).await;

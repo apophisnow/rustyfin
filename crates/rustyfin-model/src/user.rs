@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,4 +179,21 @@ pub struct UserImageInfo {
     pub user_id: Uuid,
     pub image_type: String,
     pub id: String,
+}
+
+/// The form a username is compared by (Unicode D146): NFD, full case folding, NFKC, then folding
+/// and NFKC again. It is only for comparing, never stored or shown.
+pub fn name_key(name: &str) -> String {
+    let nfd: String = name.nfd().collect();
+    let folded = UniCase::new(nfd.as_str()).to_folded_case();
+    let nfkc: String = folded.as_str().nfkc().collect();
+    let refolded = UniCase::new(nfkc.as_str()).to_folded_case();
+    refolded.as_str().nfkc().collect()
+}
+
+/// Whether two usernames match under Unicode caseless matching (D146): any case, full case
+/// folding (ß matches ss), compatibility forms and composed or decomposed accents all match.
+/// Accents, spaces and digits still count.
+pub fn names_match(a: &str, b: &str) -> bool {
+    name_key(a) == name_key(b)
 }

@@ -243,14 +243,15 @@ pub async fn authenticate(
     issue_login_token(pool, user.id, device).await
 }
 
-/// Checks a user's name and password and returns the user. A user without a password (an OIDC
-/// sign-in makes one, AC23) gets the answer of a wrong password, not a hash error.
+/// Checks a user's name and password and returns the user. The name is found exactly, else by the
+/// one name that matches it caselessly (`repo_user::find_user_for_sign_in`, AC57). A user without a
+/// password (an OIDC sign-in makes one, AC23) gets the answer of a wrong password, not a hash error.
 pub async fn check_password(
     pool: &SqlitePool,
     username: &str,
     password: &str,
 ) -> Result<User, AuthError> {
-    let user = repo_user::get_user_by_name(pool, username)
+    let user = repo_user::find_user_for_sign_in(pool, username)
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
