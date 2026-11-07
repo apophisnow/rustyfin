@@ -2389,6 +2389,7 @@ async function renderAdmin() {
 
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
+    if (!(await API.recheckAdmin())) return;
     try {
         let libsError = null;
         const [users, libs, tasks, plugins, info, sessions, accounts] = await Promise.all([
@@ -3439,6 +3440,14 @@ function updateAuthUI() {
         hide('sidebar');
     }
 }
+
+// Reacts to lost administrator rights: hides the admin UI, says so, and leaves the Dashboard.
+function followAdminLoss() {
+    updateAuthUI();
+    toast(t('admin.rights_removed'), 'error');
+    if (currentPage === 'admin') navigate('home');
+}
+API.onAdminLost = followAdminLoss;
 
 // --- Live Log Functions ---
 let liveLogInitialized = false;

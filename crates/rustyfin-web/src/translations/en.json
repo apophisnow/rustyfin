@@ -187,6 +187,7 @@
         "password_placeholder": "At least 6 characters",
         "create_user": "Create user",
         "access_denied": "Access denied (administrator rights required).",
+        "rights_removed": "This account no longer has administrator rights.",
         "subtitle": "Status & management for {{name}}",
         "scan_all": "📚 Scan all",
         "scanning_all": "Scanning all libraries…",

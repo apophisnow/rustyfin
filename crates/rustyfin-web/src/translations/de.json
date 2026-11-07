@@ -187,6 +187,7 @@
         "password_placeholder": "Mindestens 6 Zeichen",
         "create_user": "Benutzer erstellen",
         "access_denied": "Zugriff verweigert (Administratorrechte erforderlich).",
+        "rights_removed": "Dieses Konto hat keine Administratorrechte mehr.",
         "subtitle": "Status & Verwaltung für {{name}}",
         "scan_all": "📚 Alle scannen",
         "scanning_all": "Alle Bibliotheken werden gescannt…",

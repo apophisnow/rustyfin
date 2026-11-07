@@ -14,6 +14,9 @@ const API = {
     _cache: new Map(),
     _cacheTTL: 30000, // 30 seconds default TTL
     _pendingRequests: new Map(), // Request deduplication: merge identical in-flight requests
+    _cacheGeneration: 0, // Bumped when admin rights are lost, so responses already in flight are not cached
+    _adminCheck: null, // The running /Users/Me re-read, shared by concurrent callers
+    onAdminLost: null, // Set by app.js; called when this account loses administrator rights
 
     /**
      * Get cached response or fetch from server with deduplication.
@@ -32,12 +35,15 @@ const API = {
         }
 
         // Fetch and cache
+        const generation = this._cacheGeneration;
         const promise = this.get(path).then(data => {
-            this._cache.set(path, { data, time: Date.now() });
-            this._pendingRequests.delete(path);
+            if (this._cacheGeneration === generation) {
+                this._cache.set(path, { data, time: Date.now() });
+            }
+            if (this._pendingRequests.get(path) === promise) this._pendingRequests.delete(path);
             return data;
         }).catch(err => {
-            this._pendingRequests.delete(path);
+            if (this._pendingRequests.get(path) === promise) this._pendingRequests.delete(path);
             throw err;
         });
 
@@ -119,6 +125,7 @@ const API = {
                 this.logout();
                 window.location.hash = 'login';
             }
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
             throw await this._requestError('GET', path, res);
         }
         return res.json();
@@ -130,7 +137,10 @@ const API = {
             headers: this.headers(),
             body: body ? JSON.stringify(body) : undefined
         });
-        if (!res.ok) throw await this._requestError('POST', path, res);
+        if (!res.ok) {
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('POST', path, res);
+        }
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -141,7 +151,10 @@ const API = {
             headers: this.headers(),
             body: body ? JSON.stringify(body) : undefined
         });
-        if (!res.ok) throw await this._requestError('PUT', path, res);
+        if (!res.ok) {
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('PUT', path, res);
+        }
         const text = await res.text();
         return text ? JSON.parse(text) : {};
     },
@@ -151,9 +164,47 @@ const API = {
             method: 'DELETE',
             headers: this.headers()
         });
-        if (!res.ok) throw await this._requestError('DELETE', path, res);
+        if (!res.ok) {
+            if (res.status === 403 && this.isAdmin) this.recheckAdmin();
+            throw await this._requestError('DELETE', path, res);
+        }
         const text = await res.text();
         return text ? JSON.parse(text) : {};
+    },
+
+    // Re-reads /Users/Me without the cache; drops administrator rights if the account no longer has them.
+    recheckAdmin() {
+        if (this._adminCheck) return this._adminCheck;
+        this._adminCheck = (async () => {
+            try {
+                const res = await fetch(this.base + '/Users/Me', { headers: this.headers(), cache: 'no-store' });
+                if (res.ok) {
+                    const user = await res.json();
+                    const isAdmin = Boolean(
+                        user.IsAdministrator ??
+                        user.is_administrator ??
+                        user.Policy?.IsAdministrator ??
+                        user.policy?.is_administrator ??
+                        false
+                    );
+                    if (!isAdmin && this.isAdmin) this._loseAdmin();
+                }
+            } catch (err) {
+                console.warn('Admin re-check failed:', err);
+            }
+            return this.isAdmin;
+        })().finally(() => { this._adminCheck = null; });
+        return this._adminCheck;
+    },
+
+    // Drops administrator rights locally and forgets cached and in-flight responses, then tells the UI.
+    _loseAdmin() {
+        this.isAdmin = false;
+        localStorage.setItem('rustyfin_is_admin', 'false');
+        this._cacheGeneration++;
+        this._cache.clear();
+        this._pendingRequests.clear();
+        if (this.onAdminLost) this.onAdminLost();
     },
 
     // Auth

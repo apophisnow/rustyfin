@@ -6412,7 +6412,6 @@ async fn b21_startup_user_refuses_case_variants() {
 }
 
 #[test]
-#[ignore = "B21 round 4 fix 2"]
 fn b21_web_client_follows_a_demotion() {
     let found = std::process::Command::new("node")
         .arg("--version")
@@ -6437,7 +6436,6 @@ fn b21_web_client_follows_a_demotion() {
 }
 
 #[test]
-#[ignore = "B21 round 4 fix 2"]
 fn b21_dashboard_follows_a_demotion() {
     let app_js = std::fs::read_to_string(format!(
         "{}/../rustyfin-web/src/app.js",
