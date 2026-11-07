@@ -53,6 +53,8 @@ pub struct TranscodeQuery {
     pub play_session_id: Option<String>,
     /// Jellyfin device id: the session key when there is no play session id
     pub device_id: Option<String>,
+    /// Where to start, in ticks: the resume or seek point Universal forwards
+    pub start_time_ticks: Option<i64>,
 }
 
 impl TranscodeQuery {
@@ -90,6 +92,9 @@ impl TranscodeQuery {
         }
         if let Some(v) = self.adaptive_bitrate {
             p.adaptive_bitrate = v;
+        }
+        if let Some(v) = self.start_time_ticks {
+            p.start_time_ticks = v;
         }
         p
     }
@@ -438,6 +443,16 @@ mod tests {
             audio_codec: Some("aac,mp3,opus,flac".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_start_time_ticks_reaches_the_profile() {
+        // Universal forwards a resume or seek point as StartTimeTicks
+        let query: TranscodeQuery =
+            serde_json::from_value(serde_json::json!({ "StartTimeTicks": 6_000_000_000_i64 }))
+                .unwrap();
+        assert_eq!(query.into_profile().start_time_ticks, 6_000_000_000);
+        assert_eq!(TranscodeQuery::default().into_profile().start_time_ticks, 0);
     }
 
     #[test]

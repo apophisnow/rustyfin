@@ -56,6 +56,9 @@ pub struct TranscodeProfile {
     pub copy_video: bool,
     /// Copy the source audio (`-c:a copy`) instead of encoding it.
     pub copy_audio: bool,
+    /// Where the transcode starts, in ticks; 0 or less starts at the beginning.
+    /// Output time 0 is this point.
+    pub start_time_ticks: i64,
 }
 
 impl Default for TranscodeProfile {
@@ -76,6 +79,7 @@ impl Default for TranscodeProfile {
             adaptive_bitrate: false,
             copy_video: false,
             copy_audio: false,
+            start_time_ticks: 0,
         }
     }
 }
@@ -640,6 +644,18 @@ fn build_ffmpeg_args(
         }
     }
 
+    // Resume or seek point: an input seek, so output time 0 is the start point
+    if profile.start_time_ticks > 0 {
+        let ticks = profile.start_time_ticks;
+        // Seconds with milliseconds truncated, in integer math
+        let start = format!(
+            "{}.{:03}",
+            ticks / 10_000_000,
+            (ticks % 10_000_000) / 10_000
+        );
+        args.extend(["-ss".to_string(), start]);
+    }
+
     // Input
     args.extend(["-i".to_string(), input.to_string()]);
 
@@ -757,6 +773,11 @@ fn build_ffmpeg_args(
     // Preset for speed (skip for HW accel, audio-only and copied video)
     if profile.hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
         args.extend(["-preset".to_string(), "veryfast".to_string()]);
+    }
+
+    // A copied stream would start with packets from before the start: drop those
+    if profile.start_time_ticks > 0 && (copy_video || profile.copy_audio) {
+        args.extend(["-copypriorss".to_string(), "0".to_string()]);
     }
 
     // Output playlist
@@ -1038,6 +1059,68 @@ mod tests {
         assert!(!args.contains(&"-b:a".to_string()), "{args:?}");
         assert!(!args.contains(&"-ac".to_string()), "{args:?}");
         assert!(has_pair(&args, "-c:v", "libx264"), "{args:?}");
+    }
+
+    fn position(args: &[String], flag: &str) -> usize {
+        args.iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("no {flag} in {args:?}"))
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_start_time_seeks_the_input() {
+        let profile = TranscodeProfile {
+            start_time_ticks: 6_000_000_000,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        // An input option: ffmpeg seeks the input, and output time 0 is the start time
+        assert!(has_pair(&args, "-ss", "600.000"), "{args:?}");
+        assert!(position(&args, "-ss") < position(&args, "-i"), "{args:?}");
+        // Nothing is copied, so nothing before the start can reach the output
+        assert!(!args.contains(&"-copypriorss".to_string()), "{args:?}");
+
+        let profile = TranscodeProfile {
+            start_time_ticks: 12_345_678_901,
+            ..Default::default()
+        };
+        assert!(has_pair(&args_for(&profile), "-ss", "1234.567"));
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_start_time_with_a_copy_drops_earlier_packets() {
+        for (copy_video, copy_audio) in [(true, false), (false, true), (true, true)] {
+            let profile = TranscodeProfile {
+                start_time_ticks: 300_000_000,
+                copy_video,
+                copy_audio,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(has_pair(&args, "-ss", "30.000"), "{args:?}");
+            // Copied packets before the start would start the output before the start time
+            assert!(has_pair(&args, "-copypriorss", "0"), "{args:?}");
+            assert!(
+                position(&args, "-copypriorss") > position(&args, "-i"),
+                "an output option: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_without_start_time_does_not_seek() {
+        for start_time_ticks in [0, -10_000_000] {
+            let profile = TranscodeProfile {
+                start_time_ticks,
+                copy_video: true,
+                copy_audio: true,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            assert!(!args.contains(&"-ss".to_string()), "{args:?}");
+            assert!(!args.contains(&"-copypriorss".to_string()), "{args:?}");
+        }
+        assert_eq!(TranscodeProfile::default().start_time_ticks, 0);
     }
 
     #[tokio::test]
