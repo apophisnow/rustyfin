@@ -1,7 +1,7 @@
 // B18 part 2: watching library folders for changes. These tests cover choosing the method (the
-// filesystem type of a library path), polling folder timestamps (`FolderPoller`), and the
-// manager that monitors the library paths whose libraries have real-time monitoring on
-// (`LibraryWatcher`).
+// filesystem type of a library path), polling folder timestamps (`FolderPoller`), the manager
+// that monitors the library paths whose libraries have real-time monitoring on
+// (`LibraryWatcher`), and watching local paths with the kernel's change notifications.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1256,6 +1256,509 @@ async fn a_new_poll_interval_applies_at_once() {
     )
     .await;
     watcher.stop();
+}
+
+// ── Kernel watching ──
+
+/// Kernel watching exists only on Linux; elsewhere every path is polled.
+#[cfg(target_os = "linux")]
+mod kernel {
+    use std::future::Future;
+    use std::os::unix::fs::symlink;
+    use std::pin::Pin;
+
+    use rustyfin_core::library_monitor::RescanRunner;
+    use rustyfin_core::scanner::ScanChanges;
+
+    use super::*;
+
+    /// A runner that records every rescan and changes nothing.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<(Uuid, ScanScope)>>,
+    }
+
+    impl RescanRunner for Recorder {
+        fn rescan(
+            &self,
+            library: Library,
+            scope: ScanScope,
+        ) -> Pin<Box<dyn Future<Output = Result<ScanChanges, String>> + Send>> {
+            self.calls.lock().unwrap().push((library.id, scope));
+            Box::pin(async { Ok(ScanChanges::default()) })
+        }
+    }
+
+    impl Recorder {
+        /// Every rescan so far, in order.
+        fn calls(&self) -> Vec<(Uuid, ScanScope)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// How many times `unit` has been rescanned.
+        fn count(&self, unit: &(Uuid, ScanScope)) -> usize {
+            self.calls().iter().filter(|call| *call == unit).count()
+        }
+
+        /// Waits up to 20 s until `unit` has been rescanned `n` times.
+        async fn wait_for(&self, unit: &(Uuid, ScanScope), n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while self.count(unit) < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "{unit:?} not rescanned {n} times within 20 s: {:?}",
+                    self.calls()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    /// A database in `tree`, and a queue on it that hands each unit to a `Recorder` 200 ms after its
+    /// last report.
+    async fn kernel_fixture(tree: &Tree) -> (SqlitePool, ChangeQueue, Arc<Recorder>) {
+        let (pool, changes) = manager_fixture(tree).await;
+        let recorder = Arc::new(Recorder::default());
+        changes.set_runner(recorder.clone());
+        changes.set_delay(Duration::from_millis(200));
+        (pool, changes, recorder)
+    }
+
+    /// A started watcher that watches local paths and polls the others every 100 ms.
+    fn kernel_watcher(
+        pool: &SqlitePool,
+        changes: &ChangeQueue,
+        data_dir: PathBuf,
+    ) -> LibraryWatcher {
+        let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), data_dir);
+        watcher.set_poll_interval(Duration::from_millis(100));
+        watcher.start();
+        watcher
+    }
+
+    /// The movies every kernel test starts with: 4 folders with the library path.
+    fn movie_tree(tree: &Tree) {
+        write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
+        write(&tree.at("Up (2009)/Up (2009).mkv"), 10);
+        write(&tree.at("Up (2009)/extras/Making of.mkv"), 10);
+    }
+
+    /// Waits up to 20 s until `path` is watched, ready and holds `watches` watches, and returns it.
+    async fn wait_watched(watcher: &LibraryWatcher, path: &Path, watches: usize) -> MonitoredPath {
+        let what = format!("{} watched with {watches} watches", path.display());
+        let monitored = wait_monitored(watcher, &what, |m| {
+            monitor_of(m, path)
+                .is_some_and(|p| p.method == Method::Watch && p.ready && p.watches == watches)
+        })
+        .await;
+        monitor_of(&monitored, path).unwrap().clone()
+    }
+
+    /// Gives the monitors time to batch, report and rescan what they saw, so that a rescan that
+    /// should not come would have: the 500 ms batch, the 200 ms settle delay and some slack.
+    async fn quiet_period() {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
+    fn folder_unit(lib: &Library, path: PathBuf) -> (Uuid, ScanScope) {
+        (lib.id, ScanScope::Folder(path))
+    }
+
+    /// The rescans after the first `skip`, each of which must be one of `units`; and each of
+    /// `units` must be among them.
+    fn assert_rescans_since(recorder: &Recorder, skip: usize, units: &[(Uuid, ScanScope)]) {
+        let calls = recorder.calls();
+        let since = &calls[skip..];
+        assert!(
+            since.iter().all(|call| units.contains(call))
+                && units.iter().all(|u| since.contains(u)),
+            "expected rescans of {units:?}, got {since:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_library_path_is_watched_with_a_watch_per_folder() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        add_library(&pool, "Kernel A Films", &[tree.root()]).await;
+        let fs_type = fs_type_of(&std::fs::canonicalize(tree.root()).unwrap()).unwrap();
+        assert!(
+            is_local_fs_type(&fs_type),
+            "the kernel tests need the temp dir on a local filesystem, not {fs_type}"
+        );
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+
+        let path = wait_watched(&watcher, &tree.root(), 4).await;
+        assert_eq!(
+            (path.fs_type.as_str(), path.reason.as_deref(), path.folders),
+            (fs_type.as_str(), None, 4)
+        );
+        let watching = format!(
+            "library monitor: watching '{}' of 'Kernel A Films' ({fs_type}): 4 folders, 4 watches, ready in ",
+            tree.root().display()
+        );
+        wait_for_log(&[&watching]).await;
+        quiet_period().await;
+        assert!(
+            recorder.calls().is_empty(),
+            "setting up rescans nothing: {:?}",
+            recorder.calls()
+        );
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_folder_is_watched_and_rescanned_with_what_it_holds() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel B Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+        let alien = folder_unit(&lib, tree.at("Alien (1979)"));
+        recorder.wait_for(&alien, 1).await;
+        wait_watched(&watcher, &tree.root(), 5).await;
+        quiet_period().await;
+
+        // The new folder's own watch reports what happens in it.
+        let seen = recorder.count(&alien);
+        std::fs::create_dir(tree.at("Alien (1979)/extras")).unwrap();
+        recorder.wait_for(&alien, seen + 1).await;
+        wait_watched(&watcher, &tree.root(), 6).await;
+
+        // Folders made at once, each inside the one before: what a walk doesn't list raises an
+        // event, and nothing is watched twice.
+        std::fs::create_dir_all(tree.at("Brazil (1985)/extras/Deleted scenes/Uncut")).unwrap();
+        write(
+            &tree.at("Brazil (1985)/extras/Deleted scenes/Scene 1.mkv"),
+            10,
+        );
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Brazil (1985)")), 1)
+            .await;
+        let path = wait_watched(&watcher, &tree.root(), 10).await;
+        assert_eq!(path.folders, 10);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_created_renamed_or_deleted_rescans_its_unit() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel C Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        let heat = folder_unit(&lib, tree.at("Heat (1995)"));
+        let up = folder_unit(&lib, tree.at("Up (2009)"));
+        let root_files = (lib.id, ScanScope::RootFiles(tree.root()));
+        // In a movie folder, in a subfolder of one, and in the library path.
+        write(&tree.at("Heat (1995)/Heat (1995).en.srt"), 10);
+        write(&tree.at("Up (2009)/extras/Trailer.mkv"), 10);
+        write(&tree.at("Solaris (1972).mkv"), 10);
+        recorder.wait_for(&heat, 1).await;
+        recorder.wait_for(&up, 1).await;
+        recorder.wait_for(&root_files, 1).await;
+        quiet_period().await;
+        assert_rescans_since(
+            &recorder,
+            0,
+            &[heat.clone(), up.clone(), root_files.clone()],
+        );
+
+        let before = recorder.calls().len();
+        std::fs::rename(
+            tree.at("Heat (1995)/Heat (1995).en.srt"),
+            tree.at("Heat (1995)/Heat (1995).de.srt"),
+        )
+        .unwrap();
+        std::fs::remove_file(tree.at("Up (2009)/extras/Trailer.mkv")).unwrap();
+        std::fs::remove_file(tree.at("Solaris (1972).mkv")).unwrap();
+        for unit in [&heat, &up, &root_files] {
+            let seen = recorder.calls()[..before]
+                .iter()
+                .filter(|call| *call == unit)
+                .count();
+            recorder.wait_for(unit, seen + 1).await;
+        }
+        quiet_period().await;
+        assert_rescans_since(&recorder, before, &[heat, up, root_files]);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renamed_or_moved_folder_is_rescanned_under_both_names_and_watched_under_the_new_one()
+    {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        write(&tree.outside("incoming/Alien (1979)/Alien (1979).mkv"), 10);
+        write(
+            &tree.outside("incoming/Alien (1979)/extras/Trailer.mkv"),
+            10,
+        );
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel D Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        // Renamed within the library: both names are rescanned, and the folder and its subfolder
+        // are watched under the new name.
+        let old_up = folder_unit(&lib, tree.at("Up (2009)"));
+        let new_up = folder_unit(&lib, tree.at("Up (2009) [1080p]"));
+        std::fs::rename(tree.at("Up (2009)"), tree.at("Up (2009) [1080p]")).unwrap();
+        recorder.wait_for(&old_up, 1).await;
+        recorder.wait_for(&new_up, 1).await;
+        quiet_period().await;
+        wait_watched(&watcher, &tree.root(), 4).await;
+        let seen = recorder.count(&new_up);
+        write(&tree.at("Up (2009) [1080p]/extras/Deleted scene.mkv"), 10);
+        recorder.wait_for(&new_up, seen + 1).await;
+        quiet_period().await;
+        assert_eq!(recorder.count(&old_up), 1, "{:?}", recorder.calls());
+
+        // Moved in from outside the library, with a subfolder.
+        let alien = folder_unit(&lib, tree.at("Alien (1979)"));
+        std::fs::rename(
+            tree.outside("incoming/Alien (1979)"),
+            tree.at("Alien (1979)"),
+        )
+        .unwrap();
+        recorder.wait_for(&alien, 1).await;
+        wait_watched(&watcher, &tree.root(), 6).await;
+
+        // Moved out of the library: rescanned, then no longer watched.
+        let heat = folder_unit(&lib, tree.at("Heat (1995)"));
+        std::fs::rename(tree.at("Heat (1995)"), tree.outside("Heat (1995)")).unwrap();
+        recorder.wait_for(&heat, 1).await;
+        wait_watched(&watcher, &tree.root(), 5).await;
+        quiet_period().await;
+        let before = recorder.calls().len();
+        write(&tree.outside("Heat (1995)/Heat (1995).en.srt"), 10);
+        quiet_period().await;
+        assert_rescans_since(&recorder, before, &[]);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_folder_is_rescanned_and_its_watches_are_dropped() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel E Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        std::fs::remove_dir_all(tree.at("Up (2009)")).unwrap();
+        let up = folder_unit(&lib, tree.at("Up (2009)"));
+        recorder.wait_for(&up, 1).await;
+        let path = wait_watched(&watcher, &tree.root(), 2).await;
+        assert_eq!(path.folders, 2);
+        quiet_period().await;
+        assert_rescans_since(&recorder, 0, &[up]);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_copy_is_rescanned_when_it_starts_and_again_when_it_ends() {
+        use std::io::Write;
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel F Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        let heat = folder_unit(&lib, tree.at("Heat (1995)"));
+        let mut copy =
+            std::fs::File::create(tree.at("Heat (1995)/Heat (1995) - 2160p.mkv")).unwrap();
+        copy.write_all(&[b'x'; 1024]).unwrap();
+        recorder.wait_for(&heat, 1).await;
+        // The copy goes on: writes raise nothing.
+        for _ in 0..10 {
+            copy.write_all(&[b'x'; 1024]).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        quiet_period().await;
+        assert_eq!(recorder.count(&heat), 1, "{:?}", recorder.calls());
+        // It ends: the file is closed after writing, and its folder is rescanned again.
+        drop(copy);
+        recorder.wait_for(&heat, 2).await;
+        quiet_period().await;
+        assert_eq!(recorder.count(&heat), 2, "{:?}", recorder.calls());
+        assert_rescans_since(&recorder, 0, &[heat]);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ignored_folders_and_the_data_dir_get_no_watch_and_raise_nothing() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        write(&tree.at(".@__thumb/Heat (1995).mkv"), 10);
+        write(&tree.at("Heat (1995)/metadata/poster.jpg"), 10);
+        write(
+            &tree.at("Heat (1995)/Heat (1995).trickplay/320 - 10x10/0.jpg"),
+            10,
+        );
+        write(&tree.at("rustyfin-data/library.db"), 10);
+        write(&tree.at("rustyfin-data/images/a/poster.jpg"), 10);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel G Films", &[tree.root()]).await;
+        // The data dir lies inside the library path.
+        let watcher = kernel_watcher(&pool, &changes, tree.at("rustyfin-data"));
+        let path = wait_watched(&watcher, &tree.root(), 4).await;
+        assert_eq!(path.folders, 4);
+
+        write(&tree.at(".@__thumb/Up (2009).mkv"), 10);
+        write(&tree.at("Heat (1995)/metadata/fanart.jpg"), 10);
+        write(
+            &tree.at("Heat (1995)/Heat (1995).trickplay/320 - 10x10/1.jpg"),
+            10,
+        );
+        write(&tree.at("@eaDir/Up (2009).mkv/SYNOINDEX_MEDIA_INFO"), 10);
+        write(&tree.at("rustyfin-data/library.db-wal"), 10);
+        write(&tree.at("rustyfin-data/images/b/poster.jpg"), 10);
+        write(&tree.at("rustyfin-data/transcodes/x/0.ts"), 10);
+        quiet_period().await;
+        assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
+        assert_eq!(watcher.monitored()[0].watches, 4);
+
+        // A change next to them is rescanned.
+        write(&tree.at("Up (2009)/Up (2009).en.srt"), 10);
+        let up = folder_unit(&lib, tree.at("Up (2009)"));
+        recorder.wait_for(&up, 1).await;
+        quiet_period().await;
+        assert_rescans_since(&recorder, 0, &[up]);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reading_a_file_or_changing_its_times_raises_nothing() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        add_library(&pool, "Kernel H Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        let movie = tree.at("Heat (1995)/Heat (1995).mkv");
+        assert_eq!(std::fs::read(&movie).unwrap().len(), 10);
+        assert!(std::fs::metadata(&movie).unwrap().is_file());
+        assert_eq!(std::fs::read_dir(tree.at("Up (2009)")).unwrap().count(), 2);
+        std::fs::File::open(&movie)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        quiet_period().await;
+        assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queue_overflow_rescans_the_whole_library() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel I Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        watcher.fake_overflow(lib.id);
+        let whole = (lib.id, ScanScope::Library);
+        recorder.wait_for(&whole, 1).await;
+        let overflowed = format!(
+            "library monitor: the event queue of '{}' overflowed; rescanning 'Kernel I Films'",
+            tree.root().display()
+        );
+        wait_for_log(&[&overflowed]).await;
+        quiet_period().await;
+        assert_rescans_since(&recorder, 0, &[whole]);
+        assert_eq!(
+            watcher.monitored()[0].watches,
+            4,
+            "walking again adds no watch twice"
+        );
+
+        // It keeps watching.
+        write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Alien (1979)")), 1)
+            .await;
+        wait_watched(&watcher, &tree.root(), 5).await;
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_symlinked_local_folder_is_watched_and_reported_by_its_path_in_the_library() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        write(
+            &tree.outside("elsewhere/Brazil (1985)/Brazil (1985).mkv"),
+            10,
+        );
+        write(
+            &tree.outside("elsewhere/Solaris (1972)/Solaris (1972).mkv"),
+            10,
+        );
+        symlink(
+            tree.outside("elsewhere/Brazil (1985)"),
+            tree.at("Brazil (1985)"),
+        )
+        .unwrap();
+        // A second link to the same folder: it is watched once, under the name that sorts first.
+        symlink(
+            tree.outside("elsewhere/Brazil (1985)"),
+            tree.at("Brazil (1985) copy"),
+        )
+        .unwrap();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel J Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 5).await;
+
+        write(
+            &tree.outside("elsewhere/Brazil (1985)/Brazil (1985).en.srt"),
+            10,
+        );
+        let brazil = folder_unit(&lib, tree.at("Brazil (1985)"));
+        recorder.wait_for(&brazil, 1).await;
+        quiet_period().await;
+        assert_rescans_since(&recorder, 0, &[brazil]);
+
+        // A link made later is followed too.
+        let before = recorder.calls().len();
+        symlink(
+            tree.outside("elsewhere/Solaris (1972)"),
+            tree.at("Solaris (1972)"),
+        )
+        .unwrap();
+        let solaris = folder_unit(&lib, tree.at("Solaris (1972)"));
+        recorder.wait_for(&solaris, 1).await;
+        wait_watched(&watcher, &tree.root(), 6).await;
+        quiet_period().await;
+        let seen = recorder.count(&solaris);
+        write(
+            &tree.outside("elsewhere/Solaris (1972)/Solaris (1972).en.srt"),
+            10,
+        );
+        recorder.wait_for(&solaris, seen + 1).await;
+        quiet_period().await;
+        assert_rescans_since(&recorder, before, &[solaris]);
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:

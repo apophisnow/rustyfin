@@ -1,6 +1,8 @@
 //! Choosing between watching and polling a library path, by the filesystem it is on, and the
 //! manager that monitors the library paths of the libraries with real-time monitoring on.
 
+#[cfg(target_os = "linux")]
+mod kernel;
 mod mounts;
 mod poll;
 
@@ -94,6 +96,8 @@ struct Monitor {
     info: MonitoredPath,
     /// All paths of the library: a report is coalesced by them.
     library_paths: Vec<String>,
+    /// Notified by `fake_overflow`, which stands in for an overflow of the kernel's queue.
+    overflow: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -102,7 +106,8 @@ struct Monitor {
 struct Choice {
     method: Method,
     fs_type: String,
-    reason: &'static str,
+    /// Why the path is polled; None when it is watched.
+    reason: Option<&'static str>,
 }
 
 impl LibraryWatcher {
@@ -172,6 +177,18 @@ impl LibraryWatcher {
     /// Makes the monitors started from now on poll, whatever their filesystem.
     pub fn set_force_poll(&self, on: bool) {
         self.inner.lock().force_poll = on;
+    }
+
+    /// Makes each watching monitor of `library_id` act as if the kernel's queue had overflowed: it
+    /// rescans its library and walks its folders again. For the tests.
+    #[doc(hidden)]
+    pub fn fake_overflow(&self, library_id: Uuid) {
+        let state = self.inner.lock();
+        for ((id, _), monitor) in &state.monitors {
+            if *id == library_id && monitor.info.method == Method::Watch {
+                monitor.overflow.notify_one();
+            }
+        }
     }
 
     /// The monitored library paths, sorted by library name, then path.
@@ -283,6 +300,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             stop_monitor(&mut state.monitors, &key);
             let id = state.next_id;
             state.next_id += 1;
+            let overflow = Arc::new(Notify::new());
             // Spawned and inserted under one lock, so the monitor finds its entry when it runs.
             let task = tokio::spawn(run_monitor(
                 Arc::clone(inner),
@@ -291,6 +309,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
                 id,
                 state.force_poll,
                 inner.interval.subscribe(),
+                Arc::clone(&overflow),
             ));
             let info = MonitoredPath {
                 library_id: library.id,
@@ -309,6 +328,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
                     id,
                     info,
                     library_paths: library.paths.clone(),
+                    overflow,
                     task,
                 },
             );
@@ -330,8 +350,9 @@ async fn monitored_libraries(pool: &SqlitePool) -> Result<Vec<Library>, sqlx::Er
     Ok(monitored)
 }
 
-/// Sets up the monitor of one library path, then polls the path until the monitor is aborted. A
-/// failed setup or poll ends the task instead, and the next reload replaces the monitor.
+/// Sets up the monitor of one library path, then watches it with the kernel, or polls it, until
+/// the monitor is aborted. A failed setup or poll ends the task instead, and the next reload
+/// replaces the monitor. A watch that the kernel gives up on becomes a poll.
 async fn run_monitor(
     inner: Arc<Inner>,
     key: MonitorKey,
@@ -339,6 +360,7 @@ async fn run_monitor(
     id: u64,
     force_poll: bool,
     mut interval: watch::Receiver<Duration>,
+    overflow: Arc<Notify>,
 ) {
     let path = key.1.clone();
     // Canonicalizing can hang on a dead share, so the setup runs on a blocking thread.
@@ -367,11 +389,33 @@ async fn run_monitor(
     let listed = inner.with_monitor(&key, id, |monitor| {
         monitor.info.method = method;
         monitor.info.fs_type.clone_from(&fs_type);
-        monitor.info.reason = Some(reason.to_string());
+        monitor.info.reason = reason.map(str::to_string);
     });
     if listed.is_none() {
         return;
     }
+    let reason = match reason {
+        Some(reason) => reason.to_string(),
+        None => {
+            let Some(reason) =
+                watch_kernel(&inner, &key, &library_name, &fs_type, id, &overflow).await
+            else {
+                return;
+            };
+            // The kernel gave up on the path: it is polled from now on, for this reason.
+            let listed = inner.with_monitor(&key, id, |monitor| {
+                monitor.info.method = Method::Poll;
+                monitor.info.reason = Some(reason.clone());
+                monitor.info.folders = 0;
+                monitor.info.watches = 0;
+                monitor.info.ready = false;
+            });
+            if listed.is_none() {
+                return;
+            }
+            reason
+        }
+    };
 
     let mut logged_baseline = false;
     loop {
@@ -434,6 +478,34 @@ async fn run_monitor(
     }
 }
 
+/// Watches the path with the kernel's notifications until the kernel gives up on it. Returns the
+/// reason to poll with, or None when the monitor is gone.
+#[cfg(target_os = "linux")]
+async fn watch_kernel(
+    inner: &Inner,
+    key: &MonitorKey,
+    library_name: &str,
+    fs_type: &str,
+    id: u64,
+    overflow: &Notify,
+) -> Option<String> {
+    kernel::watch(inner, key, library_name, fs_type, id, overflow).await
+}
+
+/// Only Linux has kernel watching. `choose` gives every other path a reason to poll, so this is
+/// never reached there.
+#[cfg(not(target_os = "linux"))]
+async fn watch_kernel(
+    _inner: &Inner,
+    _key: &MonitorKey,
+    _library_name: &str,
+    _fs_type: &str,
+    _id: u64,
+    _overflow: &Notify,
+) -> Option<String> {
+    unreachable!("choose polls every path on this OS")
+}
+
 /// Sleeps until `interval` has passed since `last`, at once if it already has. A change of the
 /// interval wakes the sleep, which then counts from `last` again.
 async fn sleep_between_polls(last: tokio::time::Instant, interval: &mut watch::Receiver<Duration>) {
@@ -454,23 +526,28 @@ async fn sleep_between_polls(last: tokio::time::Instant, interval: &mut watch::R
 }
 
 /// How a path is monitored, and why, and its filesystem type. It reads the disk, so it runs on a
-/// blocking thread. Until `kernel.rs` exists, a path that could be watched is polled instead.
+/// blocking thread. A path on a local filesystem is watched on Linux; any other path is polled,
+/// and the reason says why.
 fn choose(path: &Path, force_poll: bool) -> Choice {
     let canonical = std::fs::canonicalize(path).ok();
     let fs_type = canonical.as_deref().and_then(fs_type_of);
     let reason = if force_poll {
-        "forced"
+        Some("forced")
     } else if !cfg!(target_os = "linux") {
-        "no kernel watching on this OS"
+        Some("no kernel watching on this OS")
     } else if canonical.is_none() {
-        PATH_NOT_FOUND
+        Some(PATH_NOT_FOUND)
     } else if !fs_type.as_deref().is_some_and(is_local_fs_type) {
-        "network or unknown filesystem"
+        Some("network or unknown filesystem")
     } else {
-        "kernel watching not built yet"
+        None
     };
     Choice {
-        method: Method::Poll,
+        method: if reason.is_some() {
+            Method::Poll
+        } else {
+            Method::Watch
+        },
         fs_type: fs_type.unwrap_or_else(|| "unknown".to_string()),
         reason,
     }
