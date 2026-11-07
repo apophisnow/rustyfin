@@ -350,6 +350,154 @@ pub(crate) fn filter_cache_key(
     h
 }
 
+/// A SortBy key as Jellyfin names it. Keys match without case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    SortName,
+    Name,
+    DateCreated,
+    PremiereDate,
+    ProductionYear,
+    CommunityRating,
+    Runtime,
+    ParentIndexNumber,
+    IndexNumber,
+    Random,
+    /// Dropped after the keys are paired with the orders, so it never reaches a clause.
+    Default,
+    /// Any other key; it orders by `sort_name`.
+    Other,
+}
+
+impl SortKey {
+    /// Reads one SortBy entry, matched without case.
+    fn parse(entry: &str) -> SortKey {
+        match entry.to_ascii_lowercase().as_str() {
+            "default" => SortKey::Default,
+            "sortname" => SortKey::SortName,
+            "name" => SortKey::Name,
+            "datecreated" | "dateadded" => SortKey::DateCreated,
+            "premieredate" => SortKey::PremiereDate,
+            "productionyear" => SortKey::ProductionYear,
+            "communityrating" | "criticrating" => SortKey::CommunityRating,
+            "runtime" => SortKey::Runtime,
+            "parentindexnumber" => SortKey::ParentIndexNumber,
+            "indexnumber" => SortKey::IndexNumber,
+            "random" => SortKey::Random,
+            _ => SortKey::Other,
+        }
+    }
+
+    /// The SQL expression this key orders by.
+    fn expr(self) -> &'static str {
+        match self {
+            SortKey::SortName | SortKey::Other | SortKey::Default => "sort_name",
+            SortKey::Name => "name",
+            SortKey::DateCreated => "date_created",
+            SortKey::PremiereDate => concat!(
+                "COALESCE(substr(premiere_date, 1, 10), ",
+                "CASE WHEN production_year IS NOT NULL THEN printf('%04d-01-01', production_year) END)"
+            ),
+            SortKey::ProductionYear => "production_year",
+            SortKey::CommunityRating => "community_rating",
+            SortKey::Runtime => "runtime_ticks",
+            SortKey::ParentIndexNumber => "parent_index_number",
+            SortKey::IndexNumber => "index_number",
+            SortKey::Random => "ROWID",
+        }
+    }
+}
+
+/// One sort key with its direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortTerm {
+    key: SortKey,
+    descending: bool,
+}
+
+/// Reads SortBy and SortOrder as Jellyfin does. Both are comma lists, and blank entries and orders
+/// other than Ascending and Descending are dropped. Every key takes the order at its position, with
+/// keys past the orders taking the first order (Ascending when there is none). Only after pairing
+/// do Default and a Random that isn't first go, so later keys keep their orders. With no keys left,
+/// SortName applies with the first order. The result is never empty.
+fn parse_sort(sort_by: &str, sort_order: &str) -> Vec<SortTerm> {
+    let orders: Vec<bool> = sort_order
+        .split(',')
+        .map(str::trim)
+        .filter_map(|order| {
+            if order.eq_ignore_ascii_case("Ascending") {
+                Some(false)
+            } else if order.eq_ignore_ascii_case("Descending") {
+                Some(true)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let first_order = orders.first().copied().unwrap_or(false);
+    // Every non-blank key takes the order at its position, Default and Random included.
+    let paired = sort_by
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+        .map(|(i, entry)| SortTerm {
+            key: SortKey::parse(entry),
+            descending: orders.get(i).copied().unwrap_or(first_order),
+        });
+    // Only then does Default go, and a Random that isn't first of what is left.
+    let mut terms: Vec<SortTerm> = Vec::new();
+    for term in paired {
+        match term.key {
+            SortKey::Default => {}
+            SortKey::Random if !terms.is_empty() => {}
+            _ => terms.push(term),
+        }
+    }
+    if terms.is_empty() {
+        return vec![SortTerm {
+            key: SortKey::SortName,
+            descending: first_order,
+        }];
+    }
+    terms
+}
+
+/// Whether `terms` sort randomly, which holds only when the first key is Random.
+fn is_random_sort(terms: &[SortTerm]) -> bool {
+    terms
+        .first()
+        .is_some_and(|term| term.key == SortKey::Random)
+}
+
+/// The ORDER BY clause for `terms`: each key in its own direction. A first SortName key brings Name
+/// along right after it, in the same direction. Without a SortName or Name key, ties go by
+/// sort_name ascending. The id comes last, in the first key's direction, so every order is total
+/// and pages stay stable.
+fn order_by_clause(terms: &[SortTerm]) -> String {
+    let mut parts = Vec::new();
+    for (i, term) in terms.iter().enumerate() {
+        let dir = if term.descending { "DESC" } else { "ASC" };
+        parts.push(format!("{} {dir}", term.key.expr()));
+        if i == 0 && term.key == SortKey::SortName {
+            parts.push(format!("name {dir}"));
+        }
+    }
+    let has_name_key = terms
+        .iter()
+        .any(|term| matches!(term.key, SortKey::SortName | SortKey::Name));
+    if !has_name_key {
+        parts.push("sort_name ASC".to_string());
+    }
+    let id_dir = if terms.first().is_some_and(|term| term.descending) {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    parts.push(format!("id {id_dir}"));
+    format!("ORDER BY {}", parts.join(", "))
+}
+
 /// Build the SQL query with a static base for single-value params and dynamic
 /// parts only for array filters. Uses the cache to reuse query plans when the
 /// filter array sizes match a previous call.
@@ -506,27 +654,11 @@ fn build_filtered_query(
         format!(" AND {}", where_parts.join(" AND "))
     };
 
-    let is_random = sort_by == "Random";
-    let order_col = match sort_by {
-        "DateCreated" | "DateAdded" => "date_created",
-        "PremiereDate" => "premiere_date",
-        "ProductionYear" => "production_year",
-        "CommunityRating" | "CriticRating" => "community_rating",
-        "Name" => "name",
-        "Random" => "ROWID",
-        "Runtime" => "runtime_ticks",
-        _ => "sort_name",
-    };
-    let dir = if sort_order == "Descending" {
-        "DESC"
-    } else {
-        "ASC"
-    };
-
-    let order_clause = if is_random {
+    let terms = parse_sort(sort_by, sort_order);
+    let order_clause = if is_random_sort(&terms) {
         "ORDER BY ROWID".to_string()
     } else {
-        format!("ORDER BY {} {}", order_col, dir)
+        order_by_clause(&terms)
     };
 
     let count_sql = format!(
@@ -874,7 +1006,7 @@ pub async fn get_items_filtered(
     }
 
     // Pagination
-    let is_random = sort_by_str == "Random";
+    let is_random = is_random_sort(&parse_sort(sort_by_str, sort_order_str));
     if is_random {
         let random_offset = if total > 0 {
             fastrand::u64(0..total as u64) as i64
@@ -2505,5 +2637,66 @@ mod tests {
             "Ascending",
         );
         assert_ne!(key, key2);
+    }
+
+    #[test]
+    fn test_order_by_follows_jellyfin_sort_rules() {
+        let order_by = |sort_by: &str, sort_order: &str| -> String {
+            super::order_by_clause(&super::parse_sort(sort_by, sort_order))
+        };
+        assert_eq!(
+            order_by("DateCreated,SortName,ProductionYear", "Descending"),
+            "ORDER BY date_created DESC, sort_name DESC, production_year DESC, id DESC"
+        );
+        assert_eq!(
+            order_by("SortName,ProductionYear", "Ascending"),
+            "ORDER BY sort_name ASC, name ASC, production_year ASC, id ASC"
+        );
+        assert_eq!(
+            order_by("CommunityRating", "Descending"),
+            "ORDER BY community_rating DESC, sort_name ASC, id DESC"
+        );
+        assert_eq!(
+            order_by("ProductionYear,SortName", "Sideways,Descending"),
+            "ORDER BY production_year DESC, sort_name DESC, id DESC"
+        );
+        // Blank entries and Default are dropped, which leaves the default SortName.
+        assert_eq!(
+            order_by(" Default, ,", ""),
+            "ORDER BY sort_name ASC, name ASC, id ASC"
+        );
+        // Default takes a place when the orders are paired, then goes, so ProductionYear is
+        // Descending. A Random that isn't first is dropped after pairing, so CommunityRating keeps
+        // its own order.
+        assert_eq!(
+            order_by("Default,ProductionYear", "Ascending,Descending"),
+            "ORDER BY production_year DESC, sort_name ASC, id DESC"
+        );
+        assert_eq!(
+            order_by(
+                "ProductionYear,Random,CommunityRating",
+                "Ascending,Ascending,Descending"
+            ),
+            "ORDER BY production_year ASC, community_rating DESC, sort_name ASC, id ASC"
+        );
+        // Once Default is gone, Random is first, so the page is random.
+        assert!(super::is_random_sort(&super::parse_sort(
+            "Default,Random",
+            ""
+        )));
+        // Default alone leaves nothing, so SortName takes the first order.
+        assert_eq!(
+            order_by("Default", "Descending"),
+            "ORDER BY sort_name DESC, name DESC, id DESC"
+        );
+        // Random sorts only as the first key.
+        assert!(super::is_random_sort(&super::parse_sort(
+            "random,SortName",
+            ""
+        )));
+        assert!(!super::is_random_sort(&super::parse_sort(
+            "SortName,Random",
+            ""
+        )));
     }
 }
