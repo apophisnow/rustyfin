@@ -1779,15 +1779,17 @@ pub(super) fn open_regular(path: &Path) -> Result<Option<File>, ImportError> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unreadable_path(path, &e)),
     }
-    use std::os::unix::fs::OpenOptionsExt;
-    // O_NONBLOCK so a FIFO or device swapped in for the file after the stat above returns from the
-    // open at once instead of waiting for a writer forever; the handle check below still rejects
-    // it. A regular file ignores the flag, on the open and on later reads.
-    let handle = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // On unix, O_NONBLOCK so a FIFO or device swapped in for the file after the stat above returns
+    // from the open at once instead of waiting for a writer forever; the handle check below still
+    // rejects it. A regular file ignores the flag, on the open and on later reads.
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let handle = match options.open(path) {
         Ok(handle) => handle,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unreadable_path(path, &e)),
@@ -2316,11 +2318,29 @@ impl Pages for CopyPages {
 /// Reads up to `buf.len()` bytes at `offset` with `pread`, returning how many; a short read is not an
 /// error (the caller decides). Retries on `EINTR`. The file offset is never moved, so this is safe on
 /// a shared `&File`.
+#[cfg(unix)]
 fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     let mut read = 0;
     while read < buf.len() {
         match file.read_at(&mut buf[read..], offset + read as u64) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(read)
+}
+
+/// `read_at` on Windows, by `seek_read`. That moves the handle's file offset, but every read here
+/// names its own offset, so nothing depends on where the handle was left.
+#[cfg(windows)]
+fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    let mut read = 0;
+    while read < buf.len() {
+        match file.seek_read(&mut buf[read..], offset + read as u64) {
             Ok(0) => break,
             Ok(n) => read += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
