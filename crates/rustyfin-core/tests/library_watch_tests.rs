@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use rustyfin_core::library_monitor::ChangeQueue;
 use rustyfin_core::library_watch::{
-    FolderPoller, LibraryWatcher, Method, MonitoredPath, coalesce, fs_type_from_mountinfo,
-    fs_type_of, is_local_fs_type,
+    FolderPoller, LibraryWatcher, Method, MonitoredPath, MountChange, coalesce,
+    fs_type_from_mountinfo, fs_type_of, is_local_fs_type, mount_changes, restarts_monitor,
 };
 use rustyfin_core::scanner::ScanScope;
 use rustyfin_model::library::{Library, LibraryContentType, LibraryOptions};
@@ -246,6 +246,96 @@ fn fs_type_of_reads_the_mounts_of_this_machine() {
         assert!(is_local_fs_type(&fs), "the temp dir is on {fs}");
     } else {
         assert_eq!(fs_type_of(&temp), None);
+    }
+}
+
+// ── Mount changes ──
+
+fn changes(list: &[(&str, MountChange)]) -> Vec<(PathBuf, MountChange)> {
+    list.iter()
+        .map(|(point, change)| (PathBuf::from(point), *change))
+        .collect()
+}
+
+#[test]
+fn mount_changes_lists_the_mounts_that_came_and_went() {
+    use MountChange::{Mounted, Unmounted};
+    // The tmpfs on Film went away, /srv was remounted read-only, rclone was mounted again, and a
+    // share with a space in its name and two stacked disks came.
+    let after = MOUNTINFO
+        .replace("41 40 0:31 / /mnt/media/Film rw - tmpfs tmpfs rw\n", "")
+        .replace(
+            "60 22 8:33 / /srv rw - xfs /dev/sdc1 rw",
+            "60 22 8:33 / /srv ro,relatime - xfs /dev/sdc1 ro",
+        )
+        .replace("72 22 0:52 / /mnt/rclone", "74 22 0:54 / /mnt/rclone")
+        + r"80 50 0:60 / /mnt/nas/Movies/New\040Films rw - nfs4 nas:/export/new rw
+81 22 8:65 / /mnt/usb rw - vfat /dev/sdf1 rw
+82 81 8:81 / /mnt/usb rw - ext4 /dev/sdg1 rw
+";
+    assert!(
+        after.contains("/srv ro,relatime"),
+        "the remount is in the table"
+    );
+    assert_eq!(
+        mount_changes(MOUNTINFO, &after),
+        changes(&[
+            ("/mnt/media/Film", Unmounted),
+            ("/mnt/nas/Movies/New Films", Mounted),
+            ("/mnt/rclone", Mounted),
+            ("/mnt/rclone", Unmounted),
+            ("/mnt/usb", Mounted),
+        ]),
+        "sorted by mount point, Mounted first, stacked mounts once, a change of options is none"
+    );
+    assert_eq!(
+        mount_changes(&after, MOUNTINFO),
+        changes(&[
+            ("/mnt/media/Film", Mounted),
+            ("/mnt/nas/Movies/New Films", Unmounted),
+            ("/mnt/rclone", Mounted),
+            ("/mnt/rclone", Unmounted),
+            ("/mnt/usb", Unmounted),
+        ])
+    );
+    assert_eq!(mount_changes(MOUNTINFO, MOUNTINFO), Vec::new());
+    assert_eq!(
+        mount_changes(
+            "1 2 3:4\n",
+            "90 1 0:70 / /a rw - tmpfs tmpfs rw\n1 2 3:4 /\n"
+        ),
+        changes(&[("/a", Mounted)]),
+        "a line with fewer than five fields is skipped"
+    );
+}
+
+#[test]
+fn a_mount_at_above_or_under_a_path_restarts_its_monitor_and_an_unmount_only_under_it() {
+    let path = Path::new("/mnt/nas/Movies");
+    for (point, mounted, unmounted, what) in [
+        ("/mnt/nas/Movies", true, false, "at the path"),
+        ("/mnt/nas", true, false, "above the path"),
+        ("/", true, false, "at the root"),
+        ("/mnt/nas/Movies/Heat (1995)", true, true, "under the path"),
+        (
+            "/mnt/nas/Moviesque",
+            false,
+            false,
+            "beside the path, by whole components",
+        ),
+        ("/mnt/other", false, false, "elsewhere"),
+    ] {
+        let point = Path::new(point);
+        assert_eq!(
+            restarts_monitor(path, point, MountChange::Mounted),
+            mounted,
+            "a mount {what}"
+        );
+        assert_eq!(
+            restarts_monitor(path, point, MountChange::Unmounted),
+            unmounted,
+            "an unmount {what}"
+        );
     }
 }
 
