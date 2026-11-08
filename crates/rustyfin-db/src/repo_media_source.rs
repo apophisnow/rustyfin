@@ -2,9 +2,11 @@ use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-/// The version of the probe code whose results a source holds. A scan reads a file again, once,
-/// when its source has an older version. Bump it when the probe starts storing a field that it
-/// read wrong or not at all, so that the next scan reads every file again.
+/// The version of the probe code whose results a source holds. A scan reads the file of a movie,
+/// an episode or an audio track again, once, when its source has an older version. Bump it when
+/// the probe starts storing a field that it read wrong or not at all, so that the next scan reads
+/// those files again. Photos are never read again for it, so a field that photos need takes a
+/// change to the scans as well. A file whose probe failed is read again only once it changes.
 ///
 /// 1: the language and title of each stream, which ffprobe nests under the stream's tags.
 pub const PROBE_VERSION: i64 = 1;
