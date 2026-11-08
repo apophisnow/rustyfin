@@ -1280,6 +1280,15 @@ pub(super) const PROGRESS_FLOOR: u64 = 50_000;
 /// On top of the floor, each database page adds this many ticks to the budget, so a big but healthy
 /// source finishes while a crafted small one that spins is still cut off (spec Fix round 4, F4).
 pub(super) const PROGRESS_PER_PAGE: u64 = 100;
+/// The most ops a statement's compiled program may hold on a source's connection
+/// (`SQLITE_LIMIT_VDBE_OP`). The import's largest, a `quick_check` on the test fixtures, compiles to
+/// 226, while a crafted schema can make SQLite compile a program that doubles per level of a
+/// generated-column chain: one is compiled at the schema load itself, from the file's own
+/// `sqlite_stat1`, before any guard runs, and a compile can't be interrupted (B20 re-check 7, H4).
+/// SQLite doubles a program's op array and refuses a growth past the limit, so every program of up
+/// to 688,128 ops compiles and none over 1,000,000 does. It stops op arrays, not the parse trees a
+/// view's expansion builds; those are kept from compiling at all (re-check 6, H2).
+const MAX_PROGRAM_OPS: i32 = 1_000_000;
 
 /// Whether a copy of a database of `db_len` bytes and a `-wal` of `wal_len` bytes fits in `free`
 /// bytes with `COPY_SPARE` to spare. The sums saturate (spec Fix 3).
@@ -1515,7 +1524,8 @@ pub(super) fn page_count(header: &[u8], len: u64) -> u64 {
 /// dropped so a dropped request can't leave the worker spinning. The caller holds it from before
 /// its first statement, which loads the schema, and `SnapshotConn` holds it from then on (spec Fix
 /// round 5, R4). `budget` is in ticks (`progress_budget`); the handler fires every `PROGRESS_OPS`
-/// steps.
+/// steps. It also caps the programs `conn` compiles at `MAX_PROGRAM_OPS` ops, which the progress
+/// handler can't do, as it fires only while a program runs.
 pub(super) async fn guard_connection(
     file: &Path,
     conn: &mut SqliteConnection,
@@ -1535,10 +1545,17 @@ pub(super) async fn guard_connection(
         }
         guard.tick()
     };
-    conn.lock_handle()
-        .await
-        .map_err(|e| unreadable(file, &e))?
-        .set_progress_handler(PROGRESS_OPS, handler);
+    let mut handle = conn.lock_handle().await.map_err(|e| unreadable(file, &e))?;
+    // SAFETY: the handle is locked, so the pointer is a live connection that no other thread uses
+    // during the call. `sqlite3_limit` returns the old value, which isn't needed.
+    unsafe {
+        libsqlite3_sys::sqlite3_limit(
+            handle.as_raw_handle().as_ptr(),
+            libsqlite3_sys::SQLITE_LIMIT_VDBE_OP,
+            MAX_PROGRAM_OPS,
+        );
+    }
+    handle.set_progress_handler(PROGRESS_OPS, handler);
     Ok(Guarded {
         cancel: CancelOnDrop(cancel),
         ticks,
@@ -2598,14 +2615,20 @@ fn importable(type_name: &str) -> Option<(MediaType, String)> {
 
 /// A database that can't be read: a 400 naming the file, never row data.
 pub(super) fn unreadable(file: &Path, error: &sqlx::Error) -> ImportError {
+    let code = error.as_database_error().and_then(|db| db.code());
     // A query the progress handler interrupts (SQLITE_INTERRUPT = 9) means the schema made the read
     // spin past its budget: the source is damaged, not merely unreadable (spec Fix round 4, F4).
-    if error
-        .as_database_error()
-        .and_then(|db| db.code())
-        .is_some_and(|code| code.as_ref() == "9")
-    {
+    if code.as_deref() == Some("9") {
         return ImportError::BadSource(format!("{}: its schema is damaged", file.display()));
+    }
+    // A program past `MAX_PROGRAM_OPS` fails as out of memory (SQLITE_NOMEM = 7), and only a crafted
+    // schema compiles one, such as a statistics table built to blow up as the schema loads (B20
+    // re-check 7, H4). A real shortage of memory reads the same, hence "too big".
+    if code.as_deref() == Some("7") {
+        return ImportError::BadSource(format!(
+            "{}: its schema is damaged or too big to read",
+            file.display()
+        ));
     }
     // SQLite's text can quote the file, such as an object name in "malformed database schema
     // (…)", so it is clipped and escaped like a quick_check line (spec Fix round 5, R6).

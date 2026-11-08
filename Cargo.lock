@@ -2533,6 +2533,7 @@ dependencies = [
  "image",
  "libc",
  "libloading",
+ "libsqlite3-sys",
  "moka",
  "quick-xml",
  "reqwest",

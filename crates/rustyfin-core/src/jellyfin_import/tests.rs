@@ -3747,3 +3747,67 @@ async fn b20_snapshot_never_resolves_an_unnamed_view() {
         "the in-memory path (u64::MAX), then the copy path (0)"
     );
 }
+
+// Fix round 8 (re-check 7, H4): every schema load ends by compiling `SELECT tbl,idx,stat FROM
+// main.sqlite_stat1` against the file's own definition of that table, before any guard has run, and
+// no progress handler can stop a compile. Here `tbl` tops a chain of virtual generated columns, each
+// the sum of the one below, so the program doubles per level: 20 levels make 3,145,736 ops
+// (3 * 2^20 + 8, counted with Python's SQLite 3.46.1). The fix caps a program at 1,000,000 ops
+// (`SQLITE_LIMIT_VDBE_OP`) before the first statement loads the schema, so the load fails and both
+// paths refuse the file. Twenty levels are the fewest that clear the cap twice over: 19 make
+// 1,572,872 ops, and 18 make 786,440, which can fit under it. On 48f90f4 the compile finishes, the
+// empty table is read and both paths open the file: that is the red.
+//
+// The table is a plain one renamed in `sqlite_schema` with `writable_schema`, as its name is
+// reserved. A CREATE TABLE of the chain would itself compile a `SELECT *` over it, which SQLite runs
+// to look for generated-column loops, at about twice the cost of the load under test.
+#[tokio::test]
+async fn b20_snapshot_refuses_a_crafted_sqlite_stat1() {
+    use sqlx::{ConnectOptions, Connection};
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let db = tmp.0.join("jellyfin.db");
+    write_db(&db, &[USERS_DDL]).await;
+    const DEPTH: usize = 20;
+    let mut cols = String::from("c0");
+    for k in 1..DEPTH {
+        let prev = k - 1;
+        cols.push_str(&format!(", c{k} AS (c{prev} + c{prev})"));
+    }
+    let top = DEPTH - 1;
+    let stat1 = format!(
+        "CREATE TABLE stand_in (a); \
+         PRAGMA writable_schema = ON; \
+         UPDATE sqlite_schema SET name = 'sqlite_stat1', tbl_name = 'sqlite_stat1', \
+         sql = 'CREATE TABLE sqlite_stat1 ({cols}, tbl AS (c{top} + c{top}), idx, stat)' \
+         WHERE name = 'stand_in'; \
+         PRAGMA writable_schema = OFF"
+    );
+    {
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(stat1))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let expected = format!("{}: its schema is damaged or too big to read", db.display());
+    let mut texts = Vec::new();
+    for limit in [u64::MAX, 0] {
+        let open =
+            open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX)).await;
+        texts.push(match open.map(drop) {
+            Ok(()) => "read".to_string(),
+            Err(ImportError::BadSource(text)) => text,
+            Err(other) => format!("{other:?}"),
+        });
+    }
+    assert_eq!(
+        texts,
+        [expected.clone(), expected],
+        "the in-memory path (u64::MAX), then the copy path (0)"
+    );
+}
