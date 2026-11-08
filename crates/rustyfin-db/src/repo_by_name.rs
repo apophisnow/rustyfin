@@ -4,6 +4,7 @@ use std::str::FromStr;
 use rustyfin_model::media::MediaType;
 use sha1::{Digest, Sha1};
 use sqlx::SqlitePool;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 /// The four lists that are read by name.
@@ -34,9 +35,47 @@ impl ByNameKind {
 /// The namespace of the entry ids, `bba0cef5-b539-4903-ad04-cdc4497f4ca3`.
 pub const BY_NAME_NAMESPACE: Uuid = Uuid::from_u128(0xbba0cef5b5394903ad04cdc4497f4ca3);
 
-/// Folds a name for comparison and ids: trimmed, then lowercased.
+/// Folds a name for comparison and ids: trimmed, lowercased and stripped of accents, so "Ação",
+/// "ACAO" and a decomposed "Ação" are one name.
+///
+/// This is Jellyfin 10.11's clean value, `value.RemoveDiacritics().ToLowerInvariant()`
+/// (`Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:1438-1446`), for names in either
+/// Unicode form. Jellyfin swaps letters through the Diacritics.NET tables one at a time. Here the
+/// name is decomposed (NFD), the combining accents U+0300 to U+036F are dropped, the rest is composed
+/// again (NFC), and the letters that those tables fold but Unicode does not decompose are swapped by
+/// `unaccented`. That equals Jellyfin's fold on every letter of the tables; rarer accented letters
+/// that the tables leave alone, such as "ĉ", lose their accent here too.
+///
+/// The fold is frozen: every entry id is built from it (`by_name_id`) and clients store those ids, so
+/// a change would change ids that clients hold.
 pub fn fold_name(name: &str) -> String {
-    name.trim().to_lowercase()
+    let lower = name.trim().to_lowercase();
+    lower
+        .nfd()
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .nfc()
+        .map(unaccented)
+        .collect()
+}
+
+/// The lowercase letters that Jellyfin's Diacritics.NET tables fold and Unicode does not decompose.
+fn unaccented(c: char) -> char {
+    match c {
+        'ø' => 'o',
+        'đ' => 'd',
+        'ı' => 'i',
+        'ł' => 'l',
+        // Arabic alef with madda, hamza above or below, and wasla, to alef.
+        '\u{622}' | '\u{623}' | '\u{625}' | '\u{671}' => '\u{627}',
+        // Arabic waw with hamza to waw; yeh with hamza and alef maksura to yeh.
+        '\u{624}' => '\u{648}',
+        '\u{626}' | '\u{649}' => '\u{64a}',
+        // Arabic heh goal with hamza to heh goal.
+        '\u{6c2}' => '\u{6c1}',
+        // Tamil au to o.
+        '\u{b94}' => '\u{b92}',
+        other => other,
+    }
 }
 
 /// The id of the entry `name` of `kind`: a UUIDv5 of `<kind>:<folded name>` in `BY_NAME_NAMESPACE`.

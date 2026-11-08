@@ -1171,12 +1171,29 @@ fn j5_ids_are_uuid_v5_of_the_kind_and_the_folded_name() {
     );
     assert_eq!(id(Studio, "Pixar"), "01aa62ee-902a-5a32-9c32-aca3fdee5582");
     assert_eq!(id(Year, "1999"), "3b638efc-32dc-5eee-8ba2-c24d7c3bf319");
-    assert_eq!(id(Genre, "AÇÃO"), "a5215451-4864-524e-b61c-aa09421c2f8a");
+    // Accents fold away, so an accented name and its NFD form share the plain name's id.
+    assert_eq!(id(Genre, "AÇÃO"), "ee352a6b-1d4c-581e-bbbf-ebde19828365");
+    assert_eq!(id(Genre, "Acao"), "ee352a6b-1d4c-581e-bbbf-ebde19828365");
+    assert_eq!(
+        id(Genre, "Ac\u{327}a\u{303}o"),
+        "ee352a6b-1d4c-581e-bbbf-ebde19828365"
+    );
+    assert_eq!(id(Genre, "Comédia"), "9cbc059f-cf43-5355-9eae-90f8875b2c67");
+    assert_eq!(
+        id(Genre, "Come\u{301}dia"),
+        "9cbc059f-cf43-5355-9eae-90f8875b2c67"
+    );
     // Case and outer spaces don't change the id; other characters do.
     assert_eq!(id(Genre, "  aCTION "), id(Genre, "Action"));
     assert_ne!(id(Genre, "Sci Fi"), id(Genre, "Sci-Fi"));
+    // Accents fold as Jellyfin's tables fold them, also on letters with no decomposition such as
+    // ø and ł; the kana voicing mark, which the tables leave alone, stays.
+    assert_ne!(id(Genre, "ガ"), id(Genre, "カ"));
     assert_eq!(repo_by_name::by_name_id(Genre, "x").get_version_num(), 5);
-    assert_eq!(repo_by_name::fold_name("  AÇÃO "), "ação");
+    assert_eq!(repo_by_name::fold_name("  AÇÃO "), "acao");
+    assert_eq!(repo_by_name::fold_name("Come\u{301}dia"), "comedia");
+    assert_eq!(repo_by_name::fold_name("Bjørk ŁÓDŹ"), "bjork lodz");
+    assert_eq!(repo_by_name::fold_name("ガ"), "ガ");
     let kinds: Vec<_> = [Genre, MusicGenre, Studio, Year]
         .iter()
         .map(|k| k.as_str())
@@ -1680,6 +1697,42 @@ async fn j5_an_entry_keeps_its_name_under_every_scope_and_type_filter() {
         (found.kind, found.name.as_str()),
         (ByNameKind::MusicGenre, "Rock")
     );
+}
+
+#[tokio::test]
+async fn j5_accented_and_nfd_spellings_are_one_entry() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    for (name, genres) in [
+        ("A", "Acao|Comedia"),
+        ("B", "Acao|Comedia"),
+        ("C", "Ação|Comédia"),
+        ("D", "Ac\u{327}a\u{303}o|Come\u{301}dia"),
+    ] {
+        j5_item(pool, films, None, name, "Movie", genres, None).await;
+    }
+
+    let page = repo_by_name::list(pool, ByNameKind::Genre, &ByNameFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&page.items), ["Acao", "Comedia"]);
+    for (entry, accented) in page.items.iter().zip(["Ação", "Comédia"]) {
+        assert_eq!(entry.counts.items, 4, "{}", entry.name);
+        assert_eq!(
+            entry.id,
+            repo_by_name::by_name_id(ByNameKind::Genre, accented)
+        );
+    }
+    for name in ["AÇÃO", "ac\u{327}a\u{303}o", "comédia"] {
+        let found = j5_lookup(pool, ByNameKind::Genre, name).await;
+        assert_eq!(found.map(|f| f.2), Some(4), "{name}");
+    }
+    let search = ByNameFilter {
+        search_term: Some("ÇÃ".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, ByNameKind::Genre, &search).await, "1: Acao");
 }
 
 // ── Media Item Repository Tests ──

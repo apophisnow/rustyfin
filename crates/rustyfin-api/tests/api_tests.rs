@@ -2782,7 +2782,7 @@ const J5_SCI_FI: &str = "a3577062-d445-5df8-a91e-9f6fdcc7770f";
 const J5_MUSIC_ROCK: &str = "5682964f-dff2-51db-8651-c91285edb0a9";
 const J5_PIXAR: &str = "01aa62ee-902a-5a32-9c32-aca3fdee5582";
 const J5_YEAR_1999: &str = "3b638efc-32dc-5eee-8ba2-c24d7c3bf319";
-const J5_ACAO: &str = "a5215451-4864-524e-b61c-aa09421c2f8a";
+const J5_ACAO: &str = "ee352a6b-1d4c-581e-bbbf-ebde19828365";
 
 /// The keys of a genre, studio or year item without counts, sorted.
 const J5_DTO_KEYS: &[&str] = &[
@@ -3416,7 +3416,12 @@ async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
         (format!("/Genres?ParentId={nil}"), all.to_vec(), 8),
         ("/Genres?ParentId=".into(), all.to_vec(), 8),
         (format!("/Genres?ParentId={unknown}"), vec![], 0),
-        ("/Genres?SearchTerm=%C3%A7".into(), vec!["Ação"], 1),
+        (
+            "/Genres?SearchTerm=%C3%A7".into(),
+            vec!["Ação", "Comédia"],
+            2,
+        ),
+        ("/Genres?SearchTerm=ACAO".into(), vec!["Ação"], 1),
         ("/Genres?StartIndex=1000".into(), vec![], 8),
         ("/Genres?Limit=0".into(), vec![], 8),
         ("/Genres?Limit=1000000".into(), all.to_vec(), 8),
@@ -3435,6 +3440,7 @@ async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
 
     for (uri, name) in [
         ("/Genres/A%C3%A7%C3%A3o", "Ação"),
+        ("/Genres/Acao", "Ação"),
         ("/Genres/%20western%20", "Western"),
         ("/Genres/war", "War"),
     ] {
