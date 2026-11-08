@@ -1309,7 +1309,7 @@ mod tests {
         let vf = &args[position(&args, "-vf") + 1];
         assert!(
             vf.ends_with(
-                ",setpts=PTS+600.000/TB,subtitles='/input.mkv':si=1,setpts=PTS-600.000/TB"
+                ",setpts=PTS+600.000/TB,subtitles=f='/input.mkv':si=1,setpts=PTS-600.000/TB"
             ),
             "{vf}"
         );
@@ -1320,8 +1320,118 @@ mod tests {
         };
         let args = args_for(&profile);
         let vf = &args[position(&args, "-vf") + 1];
-        assert!(vf.ends_with(",subtitles='/input.mkv':si=1"), "{vf}");
+        assert!(vf.ends_with(",subtitles=f='/input.mkv':si=1"), "{vf}");
         assert!(!vf.contains("setpts"), "{vf}");
+    }
+
+    /// A port of libavutil's `av_get_token` (avstring.c), the parser ffmpeg reads a filter's
+    /// options with: the token up to an unquoted char of `term`, and the rest from that char.
+    /// Leading whitespace is skipped, `\x` is `x`, text in `'...'` is literal with the quotes
+    /// dropped, and whitespace outside quotes at the token's end is trimmed.
+    fn ff_token<'a>(s: &'a str, term: &str) -> (String, &'a str) {
+        let s = s.trim_start_matches([' ', '\n', '\t', '\r']);
+        let mut out = String::new();
+        let mut end = 0;
+        let mut rest = s;
+        while let Some(c) = rest.chars().next() {
+            if term.contains(c) {
+                break;
+            }
+            rest = &rest[c.len_utf8()..];
+            match (c, rest.chars().next()) {
+                ('\\', Some(next)) => {
+                    out.push(next);
+                    rest = &rest[next.len_utf8()..];
+                    end = out.len();
+                }
+                ('\'', _) => {
+                    let close = rest.find('\'').unwrap_or(rest.len());
+                    out.push_str(&rest[..close]);
+                    rest = &rest[close..];
+                    if let Some(after) = rest.strip_prefix('\'') {
+                        rest = after;
+                        end = out.len();
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        let kept = out.trim_end_matches([' ', '\n', '\t', '\r']).len().max(end);
+        out.truncate(kept);
+        (out, rest)
+    }
+
+    /// The options of a graph's `subtitles=` filter as ffmpeg reads them: the graph level, where
+    /// `[],;` end the filter and its quotes and escapes are undone, then `key=value` pairs split
+    /// by `:`, with the option level's quotes and escapes undone.
+    fn ff_subtitles_options(graph: &str) -> Vec<(String, String)> {
+        let (_, after) = graph
+            .split_once("subtitles=")
+            .expect("no subtitles= in the graph");
+        let (options, _) = ff_token(after, "[],;");
+        let mut pairs = Vec::new();
+        let mut rest = options.as_str();
+        while !rest.is_empty() {
+            let (key, value_text) = rest.split_once('=').expect("an option without =");
+            let (value, next) = ff_token(value_text, ":");
+            pairs.push((key.to_string(), value));
+            rest = next.strip_prefix(':').unwrap_or(next);
+        }
+        pairs
+    }
+
+    #[test]
+    fn test_subtitles_filter_escapes_like_jellyfin() {
+        assert_eq!(
+            subtitles_filter("/m/Ocean's Eleven: Redux.mkv", 2, 0),
+            r"subtitles=f='/m/Ocean'\\\''s Eleven\: Redux.mkv':si=2"
+        );
+        assert_eq!(
+            subtitles_filter("/m/Film.mkv", 2, 0),
+            "subtitles=f='/m/Film.mkv':si=2"
+        );
+    }
+
+    #[test]
+    fn test_subtitles_filter_paths_reach_ffmpeg_intact() {
+        let paths = [
+            "/m/Movies/Ocean's Eleven: Redux (2001).mkv",
+            r"/m/Movies/back\slash.mkv",
+            "/m/Movies/[Group] Show - 01 [1080p].mkv",
+            "/m/Movies/Hello, World; Again.mkv",
+            "/m/Movies/a=b.mkv",
+            r#"/m/Movies/"Quoted" Title.mkv"#,
+            r#"/m/Movies/It's: [all], of; them\ = "x".mkv"#,
+            "/m/Movies/''two''.mkv",
+            "/m/Movies/end'",
+        ];
+        for path in paths {
+            for ticks in [0, 125_000_000] {
+                let graph = subtitles_filter(path, 3, ticks);
+                let want = vec![
+                    ("f".to_string(), path.to_string()),
+                    ("si".to_string(), "3".to_string()),
+                ];
+                assert_eq!(ff_subtitles_options(&graph), want, "{graph}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_text_burn_in_escapes_the_input() {
+        let input = "/m/Ocean's Eleven: Redux.mkv";
+        for start_time_ticks in [0, 6_000_000_000] {
+            let profile = TranscodeProfile {
+                burn_subtitles: true,
+                subtitle_stream_index: Some(1),
+                start_time_ticks,
+                ..Default::default()
+            };
+            let args = build_ffmpeg_args(input, "/out/main.m3u8", "/out/seg_%04d.ts", &profile);
+            let vf = &args[position(&args, "-vf") + 1];
+            let burn = subtitles_filter(input, 1, start_time_ticks);
+            assert!(vf.contains(&burn), "{vf}");
+        }
     }
 
     #[tokio::test]
