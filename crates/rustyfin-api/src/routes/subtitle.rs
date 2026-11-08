@@ -5,10 +5,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
@@ -132,9 +136,15 @@ async fn get_subtitle_stream(
         .find(|s| s.index == index)
         .ok_or_else(|| ApiError::NotFound(format!("Subtitle index {index} not found")))?;
 
-    let content = tokio::fs::read(&sub.path)
+    let file = tokio::fs::File::open(&sub.path)
         .await
         .map_err(|e| ApiError::Internal(format!("Cannot read subtitle: {e}")))?;
+    let content = read_capped(file, MAX_SUBTITLE_BYTES)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Cannot read subtitle: {e}")))?
+        .ok_or_else(|| {
+            ApiError::PayloadTooLarge("The subtitle file is larger than 32 MiB".to_string())
+        })?;
 
     let ct = match sub.format.as_str() {
         "vtt" => "text/vtt; charset=utf-8",
@@ -273,6 +283,12 @@ async fn subtitle_vtt(
         tracing::warn!("Cannot read the subtitle source {}: {e}", input.display());
         ApiError::Internal("Cannot read the subtitle source".to_string())
     })?;
+    // An external file is read whole, so one over the cap is refused before any conversion
+    if stream.is_external && meta.len() > MAX_SUBTITLE_BYTES as u64 {
+        return Err(ApiError::PayloadTooLarge(
+            "The subtitle file is larger than 32 MiB".to_string(),
+        ));
+    }
     let mtime = meta
         .modified()
         .ok()
@@ -295,29 +311,41 @@ async fn subtitle_vtt(
     let input_hash = fnv1a(input.as_os_str().as_encoded_bytes());
     let stamp = format!("{input_hash:016x}-{}-{mtime}", meta.len());
 
-    // The whole WebVTT text, from the cache or from ffmpeg
+    // The WebVTT text: from the cache, or from one ffmpeg conversion per cache file at a time
     let text = match read_cached(&cache_file, &stamp).await {
         Some(text) => text,
         None => {
-            let cp1252 = stream.is_external && is_cp1252(&input).await;
-            let demuxer = if stream.is_external {
-                subtitle_demuxer(&input)
-            } else {
-                None
-            };
-            let text = ffmpeg_vtt(&input, &map, demuxer, cp1252).await?;
-            // ffmpeg keeps the ASS override and comment blocks as text; no ASS renderer shows them
-            let ass = stream.codec.as_deref().is_some_and(|codec| {
-                codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
-            });
-            let text = if ass { strip_ass_blocks(&text) } else { text };
-            match write_cache(&cache_dir, &cache_file, &stamp, &text).await {
-                Ok(()) => sweep_vtt_cache_daily(&cache_dir),
-                Err(e) => {
-                    tracing::warn!("Cannot cache the subtitle at {}: {e}", cache_file.display());
-                }
-            }
-            text
+            VTT_JOBS
+                .run(&cache_file, async {
+                    // A request that waited for this file finds the cache its predecessor wrote
+                    if let Some(text) = read_cached(&cache_file, &stamp).await {
+                        return Ok(text);
+                    }
+                    let cp1252 = stream.is_external && is_cp1252(&input).await;
+                    let demuxer = if stream.is_external {
+                        subtitle_demuxer(&input)
+                    } else {
+                        None
+                    };
+                    let text = ffmpeg_vtt(&input, &map, demuxer, cp1252).await?;
+                    // ffmpeg keeps the ASS override and comment blocks as text; no ASS renderer
+                    // shows them
+                    let ass = stream.codec.as_deref().is_some_and(|codec| {
+                        codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
+                    });
+                    let text = if ass { strip_ass_blocks(&text) } else { text };
+                    match write_cache(&cache_dir, &cache_file, &stamp, &text).await {
+                        Ok(()) => sweep_vtt_cache_daily(&cache_dir),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Cannot cache the subtitle at {}: {e}",
+                                cache_file.display()
+                            );
+                        }
+                    }
+                    Ok::<_, ApiError>(text)
+                })
+                .await?
         }
     };
 
@@ -382,15 +410,26 @@ async fn ffmpeg_vtt(
     cp1252: bool,
 ) -> Result<String, ApiError> {
     let mut command = tokio::process::Command::new("ffmpeg");
-    command
-        .args(vtt_args(input, map, demuxer, cp1252))
-        .kill_on_drop(true);
-    let stderr = match command.output().await {
-        Ok(out) if out.status.success() => match String::from_utf8(out.stdout) {
-            Ok(vtt) => return Ok(vtt),
-            Err(_) => "ffmpeg wrote text that is not UTF-8".to_string(),
-        },
-        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    command.args(vtt_args(input, map, demuxer, cp1252));
+    let stderr = match run_capped(&mut command, MAX_SUBTITLE_BYTES, VTT_TIME_LIMIT).await {
+        Ok(RunEnd::Exited { status, stdout, .. }) if status.success() => {
+            match String::from_utf8(stdout) {
+                Ok(vtt) => return Ok(vtt),
+                Err(_) => "ffmpeg wrote text that is not UTF-8".to_string(),
+            }
+        }
+        Ok(RunEnd::Exited { stderr, .. }) => stderr.trim().to_string(),
+        Ok(RunEnd::TooLarge) => {
+            return Err(ApiError::PayloadTooLarge(
+                "The subtitle is larger than 32 MiB as WebVTT".to_string(),
+            ));
+        }
+        Ok(RunEnd::TimedOut) => {
+            tracing::warn!("Converting {} as WebVTT took too long", input.display());
+            return Err(ApiError::Internal(
+                "Converting the subtitle took too long".to_string(),
+            ));
+        }
         Err(e) => e.to_string(),
     };
     tracing::warn!("Cannot write {} as WebVTT: {stderr}", input.display());
@@ -400,14 +439,179 @@ async fn ffmpeg_vtt(
 }
 
 /// Whether an external subtitle file is Windows-1252: its bytes are neither UTF-8 nor UTF-16,
-/// which a byte order mark starts. A file that cannot be read is not.
+/// which a byte order mark starts. A file that cannot be read, or is over the cap, is not.
 async fn is_cp1252(file: &std::path::Path) -> bool {
-    let Ok(bytes) = tokio::fs::read(file).await else {
+    let Ok(handle) = tokio::fs::File::open(file).await else {
+        return false;
+    };
+    let Ok(Some(bytes)) = read_capped(handle, MAX_SUBTITLE_BYTES).await else {
         return false;
     };
     let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
     !utf16 && std::str::from_utf8(&bytes).is_err()
 }
+
+/// The most bytes of an external subtitle file, and of the WebVTT that ffmpeg writes for one
+const MAX_SUBTITLE_BYTES: usize = 32 << 20;
+/// The conversions to WebVTT that run at once, across all subtitle files
+const MAX_VTT_JOBS: usize = 2;
+/// The time one conversion may take: an embedded stream reads all of its source file
+const VTT_TIME_LIMIT: Duration = Duration::from_secs(10 * 60);
+/// The start of a conversion's stderr that is kept for its log line
+const STDERR_KEEP: usize = 16 << 10;
+
+/// Reads `reader` to its end, unless it holds more than `cap` bytes: then None.
+async fn read_capped(
+    reader: impl AsyncRead + Unpin,
+    cap: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.take(cap as u64 + 1).read_to_end(&mut bytes).await?;
+    Ok((bytes.len() <= cap).then_some(bytes))
+}
+
+/// How a conversion's process ended
+enum RunEnd {
+    /// It exited on its own: with its whole stdout, and the start of its stderr
+    Exited {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: String,
+    },
+    /// Its stdout passed the cap, so it was killed
+    TooLarge,
+    /// It ran past the time limit, so it was killed
+    TimedOut,
+}
+
+/// Runs `command` with no stdin, and reads its stdout to at most `cap` bytes, all within `limit`.
+/// The process is killed when it passes either bound, or when this future is dropped.
+async fn run_capped(
+    command: &mut tokio::process::Command,
+    cap: usize,
+    limit: Duration,
+) -> std::io::Result<RunEnd> {
+    let started = Instant::now();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(std::io::Error::other("the process output is not piped"));
+    };
+    // Drained to its end, so that the process never blocks on a full stderr pipe
+    let errors = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break kept,
+                Ok(n) => {
+                    let room = STDERR_KEEP.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    });
+    let bytes = match tokio::time::timeout(limit, read_capped(&mut stdout, cap)).await {
+        Err(_elapsed) => {
+            let _ = child.kill().await;
+            return Ok(RunEnd::TimedOut);
+        }
+        Ok(read) => read?,
+    };
+    let Some(bytes) = bytes else {
+        let _ = child.kill().await;
+        return Ok(RunEnd::TooLarge);
+    };
+    // The output ended in time; the exit has what is left of the limit
+    match tokio::time::timeout(limit.saturating_sub(started.elapsed()), child.wait()).await {
+        Err(_elapsed) => {
+            let _ = child.kill().await;
+            Ok(RunEnd::TimedOut)
+        }
+        Ok(status) => {
+            let stderr = errors.await.unwrap_or_default();
+            Ok(RunEnd::Exited {
+                status: status?,
+                stdout: bytes,
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            })
+        }
+    }
+}
+
+/// The WebVTT conversions: one per cache file at a time, and `permits` in all. A later request
+/// for a file waits for the one before it, and then finds the cache that one wrote.
+struct VttJobs {
+    permits: tokio::sync::Semaphore,
+    files: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl VttJobs {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: tokio::sync::Semaphore::new(permits),
+            files: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Runs `job` once no other job holds `file` and a permit is free.
+    async fn run<T>(&self, file: &std::path::Path, job: impl std::future::Future<Output = T>) -> T {
+        let turn = Turn::new(self, file);
+        let _file_lock = turn.entry.lock().await;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        job.await
+    }
+}
+
+/// A request's turn for one cache file. Dropping it removes the file's entry from the map when no
+/// other request holds the entry, which also covers a request dropped while it waited.
+struct Turn<'a> {
+    jobs: &'a VttJobs,
+    file: PathBuf,
+    entry: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> Turn<'a> {
+    fn new(jobs: &'a VttJobs, file: &std::path::Path) -> Self {
+        let entry = jobs
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(file.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        Self {
+            jobs,
+            file: file.to_path_buf(),
+            entry,
+        }
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut files = self
+            .jobs
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only this turn and the map hold the entry: no other request waits for the file
+        if Arc::strong_count(&self.entry) == 2 {
+            files.remove(&self.file);
+        }
+    }
+}
+
+/// The WebVTT conversions of all the subtitle routes
+static VTT_JOBS: LazyLock<VttJobs> = LazyLock::new(|| VttJobs::new(MAX_VTT_JOBS));
 
 /// FNV-1a with 64 bits: the hash of an input's path in a cache stamp.
 fn fnv1a(bytes: &[u8]) -> u64 {
