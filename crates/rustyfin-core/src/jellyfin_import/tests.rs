@@ -2638,3 +2638,112 @@ fn b20_regular_source_is_opened_nonblocking() {
         "open_regular opens with O_NONBLOCK so a FIFO swapped in after the stat can't block the open"
     );
 }
+
+// F4 (round 4): a progress handler bounds the work a snapshot's schema load and checks may do.
+// `ProgressGuard::tick`, called every PROGRESS_OPS steps, returns false to interrupt once the budget
+// of ticks is spent or the cancel flag is set, so a crafted schema that spins and a request dropped
+// mid-read both stop the worker. `progress_budget` scales the budget with the page count, and
+// `page_count` reads the page size from the header (bytes 16-17, where 1 means 65536). On 8758ca9
+// none of this exists and a schema load that spins never returns.
+#[test]
+fn b20_progress_budget_and_cancel() {
+    use super::source::{
+        PROGRESS_FLOOR, PROGRESS_PER_PAGE, ProgressGuard, page_count, progress_budget,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // A budget of N ticks lets N calls continue, then interrupts, and stays interrupted.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let guard = ProgressGuard::new(2, Arc::clone(&cancel));
+    assert!(guard.tick(), "tick 1 of budget 2 continues");
+    assert!(guard.tick(), "tick 2 of budget 2 continues");
+    assert!(!guard.tick(), "tick 3 of budget 2 interrupts");
+    assert!(!guard.tick(), "and stays interrupted");
+
+    // The cancel flag interrupts at once, whatever the budget left.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let guard = ProgressGuard::new(1_000_000, Arc::clone(&cancel));
+    assert!(guard.tick(), "a fresh guard with budget to spare continues");
+    cancel.store(true, Ordering::Relaxed);
+    assert!(
+        !guard.tick(),
+        "a set cancel flag interrupts before the budget is spent"
+    );
+
+    // The budget is the floor for a small source and grows per page for a big one; it never wraps.
+    assert_eq!(
+        progress_budget(0),
+        PROGRESS_FLOOR,
+        "no pages gets the floor"
+    );
+    assert_eq!(
+        progress_budget(u64::MAX),
+        u64::MAX.saturating_mul(PROGRESS_PER_PAGE),
+        "a huge page count saturates, it does not wrap"
+    );
+    let big = PROGRESS_FLOOR * 10;
+    assert_eq!(
+        progress_budget(big),
+        big.saturating_mul(PROGRESS_PER_PAGE),
+        "beyond the floor the budget is per page"
+    );
+
+    // page_count divides the byte length by the header's page size; a field of 1 means 65536; a
+    // short or unreadable header takes the largest page, hence the fewest pages (tightest budget).
+    let mut header = [0u8; 100];
+    header[16] = 0x10; // page size 4096, big-endian
+    header[17] = 0x00;
+    assert_eq!(
+        page_count(&header, 4096 * 7),
+        7,
+        "byte length over page size"
+    );
+    header[16] = 0;
+    header[17] = 1; // the page-size field 1 means 65536
+    assert_eq!(
+        page_count(&header, 65536 * 3),
+        3,
+        "a field of 1 means 65536"
+    );
+    assert_eq!(
+        page_count(&[], 1_000_000),
+        1_000_000 / 65536,
+        "a short header takes the largest page"
+    );
+}
+
+// F4 (round 4): once the guard is installed, a query that runs past its budget is interrupted, and
+// an interrupted read is reported as a damaged schema, not a generic read error, because a schema
+// that makes the read spin is what trips the budget. A benign recursive query stands in for a
+// crafted spinning schema here; the live check exercises the real open_snapshot path. On 8758ca9
+// there is no guard and the query runs to completion.
+#[tokio::test]
+async fn b20_progress_interrupt_is_a_damaged_schema() {
+    use super::source::{guard_connection, unreadable};
+    use sqlx::ConnectOptions;
+
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .connect()
+        .await
+        .unwrap();
+    // Budget 0: the first time the handler fires (after PROGRESS_OPS steps) it interrupts.
+    let _cancel = guard_connection(Path::new("jellyfin.db"), &mut conn, 0)
+        .await
+        .unwrap();
+    // A recursive CTE counting toward 100000 does far more than PROGRESS_OPS steps before it ends.
+    let err = sqlx::query(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) \
+         SELECT count(*) FROM c",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect_err("the query is interrupted before it counts to 100000");
+    let ImportError::BadSource(message) = unreadable(Path::new("jellyfin.db"), &err) else {
+        panic!("an interrupted read is a BadSource");
+    };
+    assert!(
+        message.contains("its schema is damaged"),
+        "an interrupted read is a damaged schema, got: {message}"
+    );
+}

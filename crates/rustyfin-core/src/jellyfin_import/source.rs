@@ -8,6 +8,7 @@ use std::io::{ErrorKind, Read};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -1255,6 +1256,16 @@ const COPY_WAL: &str = "source.db-wal";
 static COPY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The space a copy leaves free on the data folder's disk, at least (spec Fix 3).
 const COPY_SPARE: u64 = 1 << 30;
+/// How many SQLite virtual-machine steps pass between calls to a snapshot's progress handler. Small
+/// enough that a spinning schema load is cut off promptly, large enough that the handler costs a
+/// healthy source almost nothing (spec Fix round 4, F4).
+const PROGRESS_OPS: i32 = 1000;
+/// The budget, in `PROGRESS_OPS`-step ticks, a snapshot gets even when it has very few pages, so a
+/// tiny but healthy source is never cut off.
+pub(super) const PROGRESS_FLOOR: u64 = 50_000;
+/// On top of the floor, each database page adds this many ticks to the budget, so a big but healthy
+/// source finishes while a crafted small one that spins is still cut off (spec Fix round 4, F4).
+pub(super) const PROGRESS_PER_PAGE: u64 = 100;
 
 /// Whether a copy of a database of `db_len` bytes and a `-wal` of `wal_len` bytes fits in `free`
 /// bytes with `COPY_SPARE` to spare. The sums saturate (spec Fix 3).
@@ -1324,8 +1335,14 @@ async fn snapshot_try(
         let Some(image) = on_blocking(file, move || read_once(&path, limit)).await? else {
             return Ok(None);
         };
-        let conn = connection_of_image(file, image).await?;
-        return Ok(Some(SnapshotConn { conn, _copy: None }));
+        let budget = progress_budget(page_count(&image, image.len() as u64));
+        let mut conn = connection_of_image(file, image).await?;
+        let cancel = guard_connection(file, &mut conn, budget).await?;
+        return Ok(Some(SnapshotConn {
+            _cancel: CancelOnDrop(cancel),
+            conn,
+            _copy: None,
+        }));
     }
     // The lock moves into the blocking task that copies, so a request dropped while the copy runs
     // can't let a second copy into the folder. The copy's drop releases it.
@@ -1339,13 +1356,18 @@ async fn snapshot_try(
     else {
         return Ok(None);
     };
-    let conn = SqliteConnectOptions::new()
-        .filename(copy.path.join(COPY_DB))
+    let copy_db = copy.path.join(COPY_DB);
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&copy_db)
         .read_only(true)
         .connect()
         .await
         .map_err(|e| unreadable(file, &e))?;
+    let header = on_blocking(file, move || read_header(&copy_db)).await?;
+    let budget = progress_budget(page_count(&header, db_len));
+    let cancel = guard_connection(file, &mut conn, budget).await?;
     Ok(Some(SnapshotConn {
+        _cancel: CancelOnDrop(cancel),
         conn,
         _copy: Some(copy),
     }))
@@ -1385,10 +1407,96 @@ async fn connection_of_image(
     Ok(conn)
 }
 
+/// The step budget behind a snapshot's progress handler. The handler calls `tick` every
+/// `PROGRESS_OPS` steps; `tick` returns false — interrupting the running query — once `budget` ticks
+/// have passed or `cancel` is set. So neither a crafted schema that makes a read spin nor a request
+/// dropped mid-read can hold the connection's worker thread (spec Fix round 4, F4).
+pub(super) struct ProgressGuard {
+    ticks: AtomicU64,
+    budget: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ProgressGuard {
+    pub(super) fn new(budget: u64, cancel: Arc<AtomicBool>) -> Self {
+        ProgressGuard {
+            ticks: AtomicU64::new(0),
+            budget,
+            cancel,
+        }
+    }
+
+    /// Whether the query may continue: false once the cancel flag is set or the budget is spent.
+    pub(super) fn tick(&self) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.ticks.fetch_add(1, Ordering::Relaxed) < self.budget
+    }
+}
+
+/// The tick budget for a source of `pages` pages: `PROGRESS_FLOOR` at least, and `PROGRESS_PER_PAGE`
+/// more for each page, so the budget tracks a healthy source's work and still bounds a spinning one.
+pub(super) fn progress_budget(pages: u64) -> u64 {
+    PROGRESS_FLOOR.max(pages.saturating_mul(PROGRESS_PER_PAGE))
+}
+
+/// The number of pages a SQLite database of `len` bytes holds, from its header's page size (bytes
+/// 16-17, big-endian, where 1 means 65536). A header too short to hold the field yields the largest
+/// page, hence the fewest pages and the tightest budget, which suits a crafted header.
+pub(super) fn page_count(header: &[u8], len: u64) -> u64 {
+    let page_size = match header.get(16..18) {
+        Some(bytes) => match u16::from_be_bytes([bytes[0], bytes[1]]) {
+            0 | 1 => 65536,
+            size => u64::from(size),
+        },
+        None => 65536,
+    };
+    len / page_size
+}
+
+/// Installs the progress guard on `conn` and returns its cancel flag, which `SnapshotConn` sets when
+/// it is dropped so a dropped request can't leave the worker spinning. `budget` is in ticks
+/// (`progress_budget`); the handler fires every `PROGRESS_OPS` steps.
+pub(super) async fn guard_connection(
+    file: &Path,
+    conn: &mut SqliteConnection,
+    budget: u64,
+) -> Result<Arc<AtomicBool>, ImportError> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let guard = ProgressGuard::new(budget, Arc::clone(&cancel));
+    conn.lock_handle()
+        .await
+        .map_err(|e| unreadable(file, &e))?
+        .set_progress_handler(PROGRESS_OPS, move || guard.tick());
+    Ok(cancel)
+}
+
+/// The first bytes of `path`'s SQLite header, enough for `page_count` to read the page size. A short
+/// read is not an error here: `page_count` treats a short header as the largest page.
+fn read_header(path: &Path) -> Result<Vec<u8>, ImportError> {
+    let mut file = File::open(path).map_err(|e| unreadable_path(path, &e))?;
+    let mut header = [0u8; 18];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(unreadable_path(path, &e)),
+        }
+    }
+    Ok(header[..read].to_vec())
+}
+
 /// A read-only connection to one snapshot of a source database, for as long as it lives. It
 /// derefs to its `SqliteConnection`. On the copy path it also holds the copy, and dropping it
 /// releases the connection, removes the copy's folder, then releases the copy lock.
 pub(crate) struct SnapshotConn {
+    /// Set when this snapshot is dropped so its progress handler interrupts any query still running
+    /// on the worker thread: a request dropped mid-read can't leave it spinning (spec Fix round 4,
+    /// F4). Declared before `conn` so it is set before the connection is torn down.
+    _cancel: CancelOnDrop,
     conn: SqliteConnection,
     /// The copy, None on the in-memory path. Only its drop matters.
     _copy: Option<CopyFolder>,
@@ -1405,6 +1513,16 @@ impl Deref for SnapshotConn {
 impl DerefMut for SnapshotConn {
     fn deref_mut(&mut self) -> &mut SqliteConnection {
         &mut self.conn
+    }
+}
+
+/// Sets its flag when dropped. `SnapshotConn` holds one before its connection so that dropping the
+/// snapshot signals the progress handler to interrupt a query the worker may still be running.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1913,7 +2031,16 @@ fn importable(type_name: &str) -> Option<(MediaType, String)> {
 }
 
 /// A database that can't be read: a 400 naming the file, never row data.
-fn unreadable(file: &Path, error: &sqlx::Error) -> ImportError {
+pub(super) fn unreadable(file: &Path, error: &sqlx::Error) -> ImportError {
+    // A query the progress handler interrupts (SQLITE_INTERRUPT = 9) means the schema made the read
+    // spin past its budget: the source is damaged, not merely unreadable (spec Fix round 4, F4).
+    if error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code.as_ref() == "9")
+    {
+        return ImportError::BadSource(format!("{}: its schema is damaged", file.display()));
+    }
     ImportError::BadSource(format!("cannot read {}: {error}", file.display()))
 }
 
