@@ -3037,6 +3037,10 @@ function jiSetChoice(el) {
 function jiSetConfirm(el) {
     if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
     else jiConfirm.delete(el.value);
+    const action = el.closest('div').querySelector('.ji-action');
+    action.textContent = el.checked
+        ? t('jellyfin_import.action_match')
+        : `${t('jellyfin_import.action_skip')}: ${t('jellyfin_import.reason_not_confirmed')}`;
 }
 
 async function jiPreview() {
@@ -3075,7 +3079,7 @@ function jiUsersHtml(users) {
                 <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
                 <span class="font-semibold">${escapeHtml(u.Name)}</span>
                 ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
-                <span class="text-xs text-white/50">${jiActionText(u)}</span>
+                <span class="ji-action text-xs text-white/50">${jiActionText(u)}</span>
             </label>${jiConfirmHtml(u)}
         </div>`;
     }).join('');
@@ -3087,11 +3091,21 @@ function jiConfirmHtml(u) {
     const s = u.SuggestedMatch;
     if (!s) return '';
     const checked = jiConfirm.get(u.JellyfinId) === s.UserId;
+    const date = iso => escapeHtml(new Date(iso).toLocaleDateString(uiLocale()));
+    const facts = [
+        s.IsAdministrator ? t('jellyfin_import.match_admin') : '',
+        t('jellyfin_import.match_created', { date: date(s.CreatedAt) }),
+        s.LastLoginDate ? t('jellyfin_import.match_last_login', { date: date(s.LastLoginDate) }) : t('jellyfin_import.match_never_signed_in'),
+        s.SetupCodePending ? t('jellyfin_import.match_setup_pending') : '',
+    ].filter(Boolean).join(' · ');
+    const others = s.OtherCaseNames || [];
     return `
             <label class="flex items-center gap-2 ml-7 mt-1 text-xs text-white/70">
                 <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''}>
                 <span>${t('jellyfin_import.confirm_match', { name: escapeHtml(s.Name) })}</span>
-            </label>`;
+            </label>
+            <p class="ml-7 text-xs text-white/40">${facts}</p>${others.length > 0 ? `
+            <p class="ml-7 text-xs text-amber-400">${t('jellyfin_import.match_other_case', { names: others.map(escapeHtml).join(', ') })}</p>` : ''}`;
 }
 
 // "Action", or "Action: reason" when there is a reason. The translations are static text.
