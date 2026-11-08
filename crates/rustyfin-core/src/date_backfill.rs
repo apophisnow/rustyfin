@@ -27,16 +27,22 @@ pub struct BackfillRun {
 /// Items per batch. Each batch is read, then written in one short transaction.
 pub const BATCH_SIZE: u32 = 500;
 
-/// The whole pending backfill: run_some(pool, BATCH_SIZE, u32::MAX).
-pub async fn run_pending(pool: &SqlitePool) -> Result<Option<BackfillRun>, sqlx::Error> {
-    run_some(pool, BATCH_SIZE, u32::MAX).await
+/// The whole pending backfill: run_some(pool, BATCH_SIZE, u32::MAX, after_batch).
+/// after_batch runs after each batch commits.
+pub async fn run_pending(
+    pool: &SqlitePool,
+    after_batch: impl FnMut(&BackfillRun),
+) -> Result<Option<BackfillRun>, sqlx::Error> {
+    run_some(pool, BATCH_SIZE, u32::MAX, after_batch).await
 }
 
 /// At most `max_batches` batches of `batch_size` items, from where the last run stopped.
+/// after_batch runs after each batch commits.
 pub async fn run_some(
     pool: &SqlitePool,
     batch_size: u32,
     max_batches: u32,
+    after_batch: impl FnMut(&BackfillRun),
 ) -> Result<Option<BackfillRun>, sqlx::Error> {
     let marker: Option<String> =
         sqlx::query_scalar("SELECT value FROM configuration WHERE key = 'date_added_backfill'")
@@ -52,7 +58,7 @@ pub async fn run_some(
         tracing::info!("date added backfill: resumed after item {last}");
     }
     let mut run = BackfillRun::default();
-    let result = run_batches(pool, &mut run, last, batch_size, max_batches).await;
+    let result = run_batches(pool, &mut run, last, batch_size, max_batches, after_batch).await;
     let elapsed = started.elapsed();
     let BackfillRun {
         checked,
@@ -85,12 +91,14 @@ pub async fn run_some(
 }
 
 /// The batches of run_some, from `last`. A batch's moves count in `run` once it has committed.
+/// after_batch runs after each batch commits.
 async fn run_batches(
     pool: &SqlitePool,
     run: &mut BackfillRun,
     mut last: String,
     batch_size: u32,
     max_batches: u32,
+    mut after_batch: impl FnMut(&BackfillRun),
 ) -> Result<(), sqlx::Error> {
     // A batch holds at least one item, so each batch moves the run on.
     let batch_size = batch_size.max(1);
@@ -146,6 +154,7 @@ async fn run_batches(
         tx.commit().await?;
         run.moved += batch_moved;
         run.finished = finished;
+        after_batch(run);
         if finished {
             break;
         }

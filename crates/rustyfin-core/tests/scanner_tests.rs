@@ -2883,7 +2883,7 @@ async fn b28_arm(pool: &SqlitePool) {
 /// Runs the whole backfill, which must be pending.
 #[cfg(target_os = "linux")]
 async fn b28_run(pool: &SqlitePool) -> rustyfin_core::date_backfill::BackfillRun {
-    rustyfin_core::date_backfill::run_pending(pool)
+    rustyfin_core::date_backfill::run_pending(pool, |_| {})
         .await
         .unwrap()
         .expect("a pending backfill")
@@ -3080,7 +3080,7 @@ async fn b28_a_second_run_changes_nothing_and_a_stopped_run_finishes_on_the_next
     b28_date_all(&fx.pool, &film, scanned).await;
 
     // A run stopped after its first batch, as by a shutdown, has dated that batch only.
-    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, 1)
+    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, 1, |_| {})
         .await
         .unwrap()
         .expect("a pending backfill");
@@ -3092,14 +3092,14 @@ async fn b28_a_second_run_changes_nothing_and_a_stopped_run_finishes_on_the_next
     assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
     // Done: later starts and scans don't run it.
     assert_eq!(
-        rustyfin_core::date_backfill::run_pending(&fx.pool)
+        rustyfin_core::date_backfill::run_pending(&fx.pool, |_| {})
             .await
             .unwrap(),
         None
     );
     scan(&fx.pool, &film).await;
     assert_eq!(
-        rustyfin_core::date_backfill::run_pending(&fx.pool)
+        rustyfin_core::date_backfill::run_pending(&fx.pool, |_| {})
             .await
             .unwrap(),
         None
@@ -3188,7 +3188,7 @@ async fn b28_a_run_stopped_by_an_error_logs_its_end() {
         .await
         .unwrap();
 
-    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, u32::MAX).await;
+    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, u32::MAX, |_| {}).await;
     assert!(stopped.is_err(), "{stopped:?}");
     assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 2);
     let logged = b28_logged();
@@ -3212,6 +3212,52 @@ async fn b28_a_run_stopped_by_an_error_logs_its_end() {
     let next = b28_run(&fx.pool).await;
     assert_eq!(b28_counts(next), (2, 2, 0, true));
     assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 4);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_each_batch_is_reported_once_it_has_committed() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films: Vec<String> = (0..5)
+        .map(|n| format!("Film {n} (200{n})/Film {n} (200{n}).mkv"))
+        .collect();
+    for rel in &films {
+        touch(&root_of(&film), rel);
+    }
+    for (n, rel) in films.iter().enumerate() {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000 + n as u64);
+    }
+    scan(&fx.pool, &film).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+
+    // At each report: the run so far, and how many films another connection sees moved. A report
+    // made before its batch commits would wait on the batch's lock, so that read gives up at 10 s.
+    let mut reports = Vec::new();
+    let run = rustyfin_core::date_backfill::run_some(&fx.pool, 2, u32::MAX, |run| {
+        let seen = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let read = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM media_items WHERE library_id = ?1 \
+                     AND media_type = 'Movie' AND date_created <> ?2",
+                )
+                .bind(film.id.to_string())
+                .bind(scanned.to_rfc3339())
+                .fetch_one(&fx.pool);
+                match tokio::time::timeout(Duration::from_secs(10), read).await {
+                    Ok(count) => count.unwrap(),
+                    Err(_) => -1,
+                }
+            })
+        });
+        reports.push((run.checked, run.moved, seen));
+    })
+    .await
+    .unwrap()
+    .expect("a pending backfill");
+    assert_eq!(b28_counts(run), (5, 5, 0, true));
+    assert_eq!(reports, [(2, 2, 2), (4, 4, 4), (5, 5, 5)]);
 }
 
 #[cfg(target_os = "linux")]
@@ -3531,7 +3577,7 @@ async fn b28_bench(count: u32) {
     let write = started.elapsed();
 
     let started = std::time::Instant::now();
-    let first = run_some(&fx.pool, BATCH_SIZE, 1)
+    let first = run_some(&fx.pool, BATCH_SIZE, 1, |_| {})
         .await
         .unwrap()
         .expect("a pending backfill");
