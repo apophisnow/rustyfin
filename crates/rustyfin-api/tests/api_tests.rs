@@ -482,6 +482,691 @@ async fn test_b8_socket_accepts_a_user_token_while_an_api_key_is_set() {
     std::fs::remove_dir_all(base.data_dir.as_path()).ok();
 }
 
+// ── J1: Jellyfin credentials ──
+// Jellyfin's apps send the token as `Authorization: MediaBrowser …, Token="…"` (older ones in
+// `X-Emby-Authorization`) and as `?ApiKey=` in URLs; master's styles keep working. The first
+// source that holds a token decides.
+
+/// jellyfin-web's credentials header for `token`, under `scheme`.
+fn j1_mb(scheme: &str, token: &str) -> String {
+    format!(
+        r#"{scheme} Client="Jellyfin Web", Device="Firefox", DeviceId="j1-device", Version="10.10.0", Token="{token}""#
+    )
+}
+
+/// A user who is not an administrator, and a token for them.
+async fn j1_user(state: &AppState) -> (String, uuid::Uuid) {
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: "j1-user".to_string(),
+        password_hash: String::new(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::Value::Null,
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &user)
+        .await
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, user.id)
+}
+
+/// A `GET path` request with `credentials`: (header, value) pairs, where the header `?` adds the
+/// value to the query string instead.
+fn j1_request(path: &str, credentials: &[(&str, &str)]) -> axum::http::request::Builder {
+    let query: Vec<&str> = credentials
+        .iter()
+        .filter(|(name, _)| *name == "?")
+        .map(|(_, value)| *value)
+        .collect();
+    let uri = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", query.join("&"))
+    };
+    let mut builder = Request::builder().uri(uri);
+    for (name, value) in credentials.iter().filter(|(name, _)| *name != "?") {
+        builder = builder.header(*name, *value);
+    }
+    builder
+}
+
+/// The status and body of the answer to `request`.
+async fn j1_send(state: &AppState, request: axum::http::request::Builder) -> (StatusCode, String) {
+    let resp = app(state.clone())
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The status and body of `GET path` with `credentials` (see `j1_request`).
+async fn j1_get(
+    state: &AppState,
+    path: &str,
+    credentials: &[(&str, &str)],
+) -> (StatusCode, String) {
+    j1_send(state, j1_request(path, credentials)).await
+}
+
+/// The id of the user `GET /Users/Me` returns for `credentials`, or the status when it isn't 200.
+async fn j1_me(state: &AppState, credentials: &[(&str, &str)]) -> Result<uuid::Uuid, StatusCode> {
+    let (status, body) = j1_get(state, "/Users/Me", credentials).await;
+    if status != StatusCode::OK {
+        return Err(status);
+    }
+    let user: serde_json::Value = serde_json::from_str(&body).unwrap();
+    Ok(uuid::Uuid::parse_str(user["Id"].as_str().unwrap()).unwrap())
+}
+
+/// Checks that the credential `(name, style)`, with `<t>` in place of the token, gives a user
+/// token that user's claims and the configured API key an administrator's.
+async fn j1_assert_style(state: &AppState, user: &(String, uuid::Uuid), name: &str, style: &str) {
+    let (token, user_id) = user;
+    let value = style.replace("<t>", token);
+    let me = j1_me(state, &[(name, value.as_str())]).await;
+    assert_eq!(me, Ok(*user_id), "user token, {name}: {style}");
+    let (status, _) = j1_get(state, "/System/Info/Storage", &[(name, value.as_str())]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "user token, {name}: {style}");
+    let value = style.replace("<t>", state.api_key.as_deref().unwrap());
+    let (status, _) = j1_get(state, "/System/Info/Storage", &[(name, value.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "API key, {name}: {style}");
+}
+
+#[tokio::test]
+async fn test_j1_jellyfin_styles_authenticate_a_user_token_and_the_api_key() {
+    let state = test_state().await;
+    let user = j1_user(&state).await;
+    let styles = [
+        ("Authorization", j1_mb("MediaBrowser", "<t>")),
+        ("Authorization", j1_mb("mediabrowser", "<t>")),
+        ("Authorization", j1_mb("Emby", "<t>")),
+        ("Authorization", j1_mb("EMBY", "<t>")),
+        // rustyfin-cli's header
+        ("Authorization", r#"MediaBrowser Token="<t>""#.to_string()),
+        ("X-Emby-Authorization", j1_mb("MediaBrowser", "<t>")),
+        ("X-Emby-Authorization", j1_mb("emby", "<t>")),
+        ("?", "ApiKey=<t>".to_string()),
+        ("?", "apikey=<t>".to_string()),
+        ("?", "static=true&APIKEY=<t>&DeviceId=j1-device".to_string()),
+    ];
+    for (name, style) in &styles {
+        j1_assert_style(&state, &user, name, style).await;
+    }
+}
+
+#[tokio::test]
+async fn test_j1_master_styles_keep_working() {
+    let state = test_state().await;
+    let user = j1_user(&state).await;
+    let styles = [
+        ("Authorization", "Bearer <t>"),
+        ("X-Emby-Token", "<t>"),
+        ("X-MediaBrowser-Token", "<t>"),
+        ("?", "api_key=<t>"),
+        ("?", "static=true&api_key=<t>"),
+    ];
+    for (name, style) in styles {
+        j1_assert_style(&state, &user, name, style).await;
+    }
+}
+
+#[tokio::test]
+async fn test_j1_percent_encoded_values_and_a_quoted_comma() {
+    let mut state = test_state().await;
+    // The configured key may hold any character but surrounding whitespace
+    let key = "j1 key+,100%";
+    state.api_key = Some(Arc::new(key.to_string()));
+    // Values in the MediaBrowser header and the query are decoded like Jellyfin's
+    // `WebUtility.UrlDecode`: `+` is a space, `%XX` a byte, and a `%` without two hex digits stays.
+    // Token headers are used as sent. The configured key also matches a MediaBrowser token and
+    // `api_key` as sent (J1 re-check R1, review F1).
+    let accepted = [
+        ("Authorization", r#"MediaBrowser Token="j1 key+,100%""#),
+        (
+            "Authorization",
+            r#"MediaBrowser Token="j1%20key%2B%2C100%25""#,
+        ),
+        ("Authorization", r#"MediaBrowser Token="j1+key%2b,100%""#),
+        (
+            "X-Emby-Authorization",
+            r#"Emby Token="j1%20key%2B%2C100%25""#,
+        ),
+        ("?", "ApiKey=j1%20key%2B%2C100%25"),
+        ("?", "apikey=j1+key%2b%2c100%25"),
+        ("?", "api_key=j1%20key%2B%2C100%25"),
+        ("?", "Api%4Bey=j1%20key%2B%2C100%25"),
+        ("Authorization", "Bearer j1 key+,100%"),
+        ("X-Emby-Token", key),
+        ("X-MediaBrowser-Token", key),
+    ];
+    for (name, value) in accepted {
+        let (status, _) = j1_get(&state, "/System/Info/Storage", &[(name, value)]).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {value}");
+    }
+    let refused = [
+        // A raw `+` is a space, and these spellings aren't the key as sent either
+        ("Authorization", r#"MediaBrowser Token="j1+key+,100%""#),
+        ("?", "ApiKey=j1+key+,100%25"),
+        // Token headers are not decoded
+        ("Authorization", "Bearer j1%20key%2B%2C100%25"),
+        ("X-Emby-Token", "j1%20key%2B%2C100%25"),
+    ];
+    for (name, value) in refused {
+        let (status, _) = j1_get(&state, "/System/Info/Storage", &[(name, value)]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{name}: {value}");
+    }
+
+    // A user token sent percent-encoded, and quoted commas in the other values
+    let (token, user_id) = j1_user(&state).await;
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let styles = [
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{encoded}""#),
+        ),
+        ("?", format!("ApiKey={encoded}")),
+        (
+            "Authorization",
+            format!(
+                r#"MediaBrowser Client="Jellyfin Android", Device="Phone, 2", DeviceId="j1", Version="2.6.0", Token="{token}""#
+            ),
+        ),
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{token}", Device="Phone, 2""#),
+        ),
+        // jellyfin-web encodes the device name
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Device="T%C3%A9l%C3%A9phone", Token="{token}""#),
+        ),
+        // Quoted text that looks like a key is part of the value
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Device="Phone, Token=j1-bad", Token="{token}""#),
+        ),
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{token}", Client="a, Token=j1-bad""#),
+        ),
+    ];
+    for (i, (name, value)) in styles.iter().enumerate() {
+        let me = j1_me(&state, &[(*name, value.as_str())]).await;
+        assert_eq!(me, Ok(user_id), "style {i}, {name}");
+    }
+}
+
+#[tokio::test]
+async fn test_j1_the_first_source_with_a_token_decides() {
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let key = state.api_key.clone().unwrap();
+    // A well-formed token that this server never issued
+    let bad = "0123456789abcdef0123456789abcdef";
+    let mb_good = r#"MediaBrowser Client="Jellyfin Web", Token="<good>""#;
+    let mb_bad = r#"MediaBrowser Client="Jellyfin Web", Token="<bad>""#;
+    let ok = StatusCode::OK;
+    let unauthorized = StatusCode::UNAUTHORIZED;
+    // (credentials, expected), with <good> a user token, <key> the configured key and <bad> a
+    // token nobody issued
+    let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
+        // An invalid first token is refused, whatever a later source holds
+        (
+            vec![("Authorization", mb_bad), ("?", "api_key=<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("?", "api_key=<key>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("?", "ApiKey=<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("X-Emby-Token", "<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("X-Emby-Authorization", mb_good)],
+            unauthorized,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer <bad>"),
+                ("X-Emby-Authorization", mb_good),
+            ],
+            unauthorized,
+        ),
+        (
+            vec![("X-Emby-Authorization", mb_bad), ("X-Emby-Token", "<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("X-Emby-Token", "<bad>"), ("X-MediaBrowser-Token", "<key>")],
+            unauthorized,
+        ),
+        (
+            vec![("X-MediaBrowser-Token", "<bad>"), ("?", "ApiKey=<good>")],
+            unauthorized,
+        ),
+        (vec![("?", "ApiKey=<bad>&api_key=<good>")], unauthorized),
+        (vec![("?", "api_key=<key>&ApiKey=<bad>")], unauthorized),
+        (vec![("?", "ApiKey=<bad>&ApiKey=<good>")], unauthorized),
+        // A valid first token is used, whatever a later source holds
+        (
+            vec![
+                ("Authorization", mb_good),
+                ("X-Emby-Token", "<bad>"),
+                ("?", "ApiKey=<bad>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer <good>"),
+                ("X-Emby-Authorization", mb_bad),
+            ],
+            ok,
+        ),
+        (
+            vec![("X-Emby-Authorization", mb_good), ("X-Emby-Token", "<bad>")],
+            ok,
+        ),
+        (vec![("X-Emby-Token", "<key>"), ("?", "ApiKey=<bad>")], ok),
+        (vec![("?", "api_key=<bad>&ApiKey=<good>")], ok),
+        // An empty, blank or missing token is no token: the next source decides
+        (
+            vec![
+                (
+                    "Authorization",
+                    r#"MediaBrowser Client="Jellyfin Web", Token="""#,
+                ),
+                ("X-Emby-Token", "<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", r#"MediaBrowser Token="  ""#),
+                ("?", "ApiKey=<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                (
+                    "Authorization",
+                    r#"MediaBrowser Client="Jellyfin Web", Device="Firefox""#,
+                ),
+                ("?", "ApiKey=<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer "),
+                ("X-Emby-Authorization", mb_good),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Basic ZHVtbXk6cHc="),
+                ("X-Emby-Token", "<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("X-Emby-Authorization", r#"Emby Token="""#),
+                ("X-MediaBrowser-Token", "<key>"),
+            ],
+            ok,
+        ),
+        (
+            vec![("X-Emby-Token", ""), ("X-MediaBrowser-Token", "<good>")],
+            ok,
+        ),
+        (
+            vec![("X-MediaBrowser-Token", "  "), ("?", "ApiKey=<good>")],
+            ok,
+        ),
+        (vec![("?", "ApiKey=&api_key=<good>")], ok),
+        (vec![("?", "ApiKey=%20&api_key=<key>")], ok),
+        // Blank tokens alone
+        (
+            vec![
+                ("Authorization", r#"MediaBrowser Token="""#),
+                ("X-Emby-Authorization", r#"MediaBrowser Token=" ""#),
+                ("X-Emby-Token", " "),
+                ("X-MediaBrowser-Token", ""),
+                ("?", "ApiKey=&api_key=+"),
+            ],
+            unauthorized,
+        ),
+    ];
+    for (credentials, expected) in &cases {
+        let values: Vec<String> = credentials
+            .iter()
+            .map(|(_, value)| {
+                value
+                    .replace("<good>", &good)
+                    .replace("<key>", &key)
+                    .replace("<bad>", bad)
+            })
+            .collect();
+        let sent: Vec<(&str, &str)> = credentials
+            .iter()
+            .zip(&values)
+            .map(|((name, _), value)| (*name, value.as_str()))
+            .collect();
+        let (status, body) = j1_get(&state, "/System/Info", &sent).await;
+        assert_eq!(status, *expected, "{credentials:?}");
+        for token in [good.as_str(), key.as_str(), bad] {
+            assert!(
+                !body.contains(token),
+                "the answer to {credentials:?} holds a token"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_j1_malformed_credentials_never_authenticate() {
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let key = state.api_key.clone().unwrap();
+    for t in [good.as_str(), key.as_str()] {
+        // The well-formed header is accepted
+        let well_formed = format!(r#"MediaBrowser Token="{t}""#);
+        let credentials = [("Authorization", well_formed.as_str())];
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, StatusCode::OK);
+        let cases = [
+            // Other schemes, or no space after the scheme
+            ("Authorization", format!("Basic {t}")),
+            ("Authorization", format!("bearer {t}")),
+            ("Authorization", format!(r#"Digest Token="{t}""#)),
+            ("Authorization", format!(r#"MediaBrowserToken="{t}""#)),
+            ("Authorization", format!(r#"Token="{t}""#)),
+            // No Token key; keys are case-sensitive, like Jellyfin's
+            (
+                "Authorization",
+                j1_mb("MediaBrowser", t).replace("Token=", "Tok="),
+            ),
+            ("Authorization", format!(r#"MediaBrowser token="{t}""#)),
+            ("Authorization", format!(r#"MediaBrowser TOKEN="{t}""#)),
+            // Unbalanced quotes
+            ("Authorization", format!(r#"MediaBrowser Token="{t}"#)),
+            ("Authorization", format!(r#"MediaBrowser Token={t}""#)),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Client="a, Token="{t}""#),
+            ),
+            (
+                "X-Emby-Authorization",
+                format!(r#"MediaBrowser Token="{t}"#),
+            ),
+            // Text around the value
+            ("Authorization", format!(r#"MediaBrowser Token="{t}"x"#)),
+            ("Authorization", format!(r#"MediaBrowser Token=" {t}""#)),
+            // Bad escapes and bytes that are not ASCII
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%""#)),
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%zz""#)),
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%FF""#)),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Token="{t}%C3%A9""#),
+            ),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Device="Téléphone", Token="{t}""#),
+            ),
+            ("X-Emby-Token", format!("{t}é")),
+            ("?", format!("ApiKey={t}%")),
+            ("?", format!("ApiKey=%zz{t}")),
+            ("?", format!("ApiKey={t}%FF")),
+            ("?", format!("ApiKey={t}%C3%A9")),
+            // Fragments
+            ("Authorization", "MediaBrowser".to_string()),
+            ("Authorization", "MediaBrowser ".to_string()),
+            ("Authorization", r#"MediaBrowser ,,=,"",=="""#.to_string()),
+            ("Authorization", "Emby".to_string()),
+            ("Authorization", String::new()),
+        ];
+        for (i, (name, value)) in cases.iter().enumerate() {
+            let (status, body) = j1_get(&state, "/System/Info", &[(*name, value.as_str())]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "case {i}, {name}");
+            assert!(!body.contains(t), "the answer to case {i} holds the token");
+        }
+    }
+    // A byte that is not UTF-8
+    let raw = [
+        b"MediaBrowser Device=\"Phone\xff\", Token=\"".as_slice(),
+        good.as_bytes(),
+        b"\"",
+    ]
+    .concat();
+    let request = j1_request("/System/Info", &[]).header(
+        "Authorization",
+        axum::http::HeaderValue::from_bytes(&raw).unwrap(),
+    );
+    let (status, _) = j1_send(&state, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_j1_a_repeated_token_takes_the_last_value_like_jellyfin() {
+    // Jellyfin's `GetParts` stores each pair with `result[key] = …`, so the last Token wins
+    // (Jellyfin.Server.Implementations/Security/AuthorizationContext.cs:296, 313 at v12.4), and
+    // it reads the first value of a repeated header (`auth[0]`, line 238).
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let mb_good = format!(r#"MediaBrowser Token="{good}""#);
+    let mb_bad = format!(r#"MediaBrowser Token="{bad}""#);
+    let cases = [
+        (
+            format!(r#"MediaBrowser Token="{bad}", Token="{good}""#),
+            StatusCode::OK,
+        ),
+        (
+            format!(r#"MediaBrowser Token="{good}", Token="{bad}""#),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!(r#"MediaBrowser Token="{good}", Client="a", Token="""#),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (i, (value, expected)) in cases.iter().enumerate() {
+        let credentials = [("Authorization", value.as_str())];
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, *expected, "case {i}");
+    }
+    let repeated = [
+        ([mb_good.as_str(), mb_bad.as_str()], StatusCode::OK),
+        (
+            [mb_bad.as_str(), mb_good.as_str()],
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (i, (values, expected)) in repeated.iter().enumerate() {
+        let credentials = values.map(|value| ("Authorization", value));
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, *expected, "repeated header, case {i}");
+    }
+}
+
+// J1 review F1: master compared `api_key` as sent, and URLs such as an *arr Webhook's carry the
+// configured key as typed. A key that holds `+` or `%XX` keeps working there, and works
+// percent-encoded too. `ApiKey` is decoded only, as in Jellyfin.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_raw_and_encoded_in_api_key() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    // (key, as typed, percent-encoded)
+    for (key, typed, encoded) in [
+        ("j1+key/A=", "j1+key/A=", "j1%2Bkey%2FA%3D"),
+        ("j1%41key", "j1%41key", "j1%2541key"),
+    ] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            format!("api_key={typed}"),
+            format!("api_key={encoded}"),
+            format!("static=true&API_KEY={typed}&DeviceId=j1-device"),
+            format!("ApiKey=&api_key={typed}"),
+            format!("ApiKey={encoded}"),
+        ];
+        for query in &accepted {
+            let (status, _) =
+                j1_get(&state, "/System/Info/Storage", &[("?", query.as_str())]).await;
+            assert_eq!(status, StatusCode::OK, "{key}: {query}");
+        }
+        let refused = [
+            // `ApiKey` is decoded only
+            vec![("?", format!("ApiKey={typed}"))],
+            // Either spelling must hold the whole key
+            vec![("?", format!("api_key={}", &typed[..typed.len() - 1]))],
+            // An invalid earlier token still decides
+            vec![
+                ("X-Emby-Token", bad.to_string()),
+                ("?", format!("api_key={typed}")),
+            ],
+            vec![("?", format!("ApiKey={bad}&api_key={typed}"))],
+        ];
+        for (i, credentials) in refused.iter().enumerate() {
+            let credentials: Vec<(&str, &str)> = credentials
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect();
+            let (status, body) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{key}: refused case {i}");
+            assert!(!body.contains(typed), "{key}: refused case {i}: {body}");
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let query = format!("api_key={encoded}");
+    assert_eq!(j1_me(&state, &[("?", query.as_str())]).await, Ok(user_id));
+}
+
+#[tokio::test]
+async fn test_j1_basic_authorization_next_to_api_key_is_not_refused() {
+    // An *arr Webhook URL with a user name and password: the app sends them as Basic, next to the
+    // URL's `api_key`. Basic gives no token, so `api_key` decides. The test guards that
+    // fall-through and doesn't reproduce a failure: Basic next to `api_key` was never refused, and
+    // before review F1's fix only the plus-sign key failed here, because `api_key` was decoded.
+    let mut state = test_state().await;
+    let headers = [
+        ("Authorization", "Basic YXJyOnNlY3JldA=="),
+        ("Content-Type", "application/json"),
+    ];
+    for key in ["test-api-key", "j1+key/A="] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let uri = format!("/Library/Media/Webhook?api_key={key}");
+        for method in ["POST", "PUT"] {
+            let body = Some(r#"{"eventType":"Test"}"#);
+            let (status, text) = b18_send(&app(state.clone()), method, &uri, &headers, body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{key}, {method}: {text}");
+        }
+    }
+}
+
+// J1 re-check R1: Sonarr's and Radarr's Emby / Jellyfin connection sends the configured key as typed
+// in `X-MediaBrowser-Token` and in `Authorization: MediaBrowser Token="…"` (`B18_ARR_AUTH`'s shape).
+// On master the raw `X-MediaBrowser-Token` decided; now the `MediaBrowser` token does, so its
+// `Token` matches the key as typed or decoded, like `api_key`. User tokens count decoded only.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_as_typed_in_media_browser_headers() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let body = serde_json::json!({ "updates": [
+        { "path": "/elsewhere/Other (2001)/Other (2001).mkv", "updateType": "Modified" },
+    ]})
+    .to_string();
+    // (key, percent-encoded)
+    for (key, encoded) in [("j1+key/A=", "j1%2Bkey%2FA%3D"), ("j1%41key", "j1%2541key")] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let arr = format!("MediaBrowser Token=\"{key}\"");
+        let headers = [
+            ("X-MediaBrowser-Token", key),
+            ("Authorization", arr.as_str()),
+            ("Content-Type", "application/json"),
+        ];
+        let uri = "/Library/Media/Updated";
+        let (status, text) =
+            b18_send(&app(state.clone()), "POST", uri, &headers, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{key}: {text}");
+
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            vec![
+                ("X-MediaBrowser-Token", key.to_string()),
+                ("Authorization", arr.clone()),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", key))],
+            vec![("X-Emby-Authorization", j1_mb("Emby", key))],
+            vec![
+                ("X-Emby-Token", key.to_string()),
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", key)),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", encoded))],
+        ];
+        let refused = [
+            // An invalid `MediaBrowser` token still decides over a valid token header.
+            vec![
+                ("Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-MediaBrowser-Token", key.to_string()),
+            ],
+            vec![
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-Emby-Token", key.to_string()),
+            ],
+            // Either spelling must hold the whole key.
+            vec![(
+                "Authorization",
+                j1_mb("MediaBrowser", &key[..key.len() - 1]),
+            )],
+        ];
+        for (expected, cases) in [
+            (StatusCode::OK, &accepted[..]),
+            (StatusCode::UNAUTHORIZED, &refused[..]),
+        ] {
+            for (i, credentials) in cases.iter().enumerate() {
+                let credentials: Vec<(&str, &str)> = credentials
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str()))
+                    .collect();
+                let (status, text) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+                assert_eq!(status, expected, "{key}: case {i}");
+                assert!(!text.contains(key), "{key}: case {i}: {text}");
+            }
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let credentials = j1_mb("MediaBrowser", &encoded);
+    assert_eq!(
+        j1_me(&state, &[("Authorization", credentials.as_str())]).await,
+        Ok(user_id)
+    );
+}
+
 // ── Error Response Format Tests ──
 
 #[tokio::test]
@@ -11471,6 +12156,323 @@ async fn g1c_next_up_accepts_both_casings() {
     }
 }
 
+// ── B29: item details per user ──
+// GET /Items/{id} caches only what every user sees and adds the requester's watch data to each
+// answer, so no user gets another's UserData or CompletionPercentage, a change shows on the next
+// request, and a cached answer equals a fresh one, Type included. Item details never reach the L2
+// table. Movies and episodes are built fresh each time.
+
+/// Stores one item of each kind that item details cover, a series with a season and an episode
+/// and an album with a track among them, and returns `(kind, id, runtime ticks)` for each.
+async fn b29_items(state: &AppState) -> Vec<(&'static str, uuid::Uuid, Option<i64>)> {
+    let folder = media_folder(state, "b29");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B29".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Mixed,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = |n: usize| uuid::Uuid::from_u128(0xb290_0000 + n as u128);
+    // (kind, name, parent, runtime, season number, index number)
+    let rows = [
+        ("Movie", "B29 Movie", None, Some(72_000_000_000), None, None),
+        ("Series", "B29 Series", None, None, None, None),
+        ("Season", "Season 1", Some(id(1)), None, None, Some(1)),
+        (
+            "Episode",
+            "B29 Episode",
+            Some(id(2)),
+            Some(27_000_000_000),
+            Some(1),
+            Some(2),
+        ),
+        ("MusicAlbum", "B29 Album", None, None, None, None),
+        (
+            "Audio",
+            "B29 Track",
+            Some(id(4)),
+            Some(2_400_000_000),
+            None,
+            Some(1),
+        ),
+        ("Genre", "B29 Genre", None, None, None, None),
+        ("Photo", "B29 Photo", None, None, None, None),
+    ];
+    let mut items = Vec::new();
+    for (n, (kind, name, parent, runtime, season, index)) in rows.into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path, \
+             parent_id, runtime_ticks, parent_index_number, index_number, date_created) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id(n).to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(kind)
+        .bind(format!("{folder}/{n}"))
+        .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+        .bind(runtime)
+        .bind(season)
+        .bind(index)
+        .bind("2024-01-01T00:00:00+00:00")
+        .execute(&state.db)
+        .await
+        .unwrap();
+        items.push((kind, id(n), runtime));
+    }
+    items
+}
+
+/// Sends a request as the token's user and asserts a 2xx answer.
+async fn b29_ok(
+    app: &axum::Router,
+    token: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) {
+    let (status, json) = send(app, request(method, uri, Some(token), body)).await;
+    assert!(status.is_success(), "{method} {uri}: {status} {json}");
+}
+
+/// The user saves a resume point at `ticks` on the item.
+async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: i64) {
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": ticks });
+    b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
+}
+
+/// The user saves a resume point at `ticks` on the item, then marks it played and favorite.
+async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
+    b29_progress(app, token, item, ticks).await;
+    for route in ["PlayedItems", "FavoriteItems"] {
+        let uri = format!("/Users/{user_id}/{route}/{item}");
+        b29_ok(app, token, "POST", &uri, None).await;
+    }
+}
+
+/// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.
+async fn b29_details(
+    app: &axum::Router,
+    token: &str,
+    user_id: &str,
+    item: uuid::Uuid,
+) -> serde_json::Value {
+    let uri = format!("/Items/{item}?userId={user_id}");
+    let (status, json) = send(app, request("GET", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    json
+}
+
+/// The user's watch data on the item as the database holds it, serialized as `UserData` is.
+async fn b29_stored(state: &AppState, user_id: &str, item: uuid::Uuid) -> serde_json::Value {
+    let user = user_id.parse().unwrap();
+    let data = rustyfin_db::repo_playback::get_user_item_data(&state.db, user, item)
+        .await
+        .unwrap();
+    serde_json::to_value(data).unwrap()
+}
+
+/// `value` as an answer brings it: written as text and read back, since serde_json can read a
+/// float back 1 ulp off.
+fn b29_as_sent(value: serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(&value.to_string()).unwrap()
+}
+
+/// Whether item details of this kind are cached.
+fn b29_cached_kind(kind: &str) -> bool {
+    kind != "Movie" && kind != "Episode"
+}
+
+#[tokio::test]
+async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
+    for (kind, item, runtime) in b29_items(&state).await {
+        // A watched it; B saved a resume point of its own.
+        b29_watch(&app, &a, &a_id, item, 1234).await;
+        b29_progress(&app, &b, item, 5000).await;
+        let first = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&first),
+            Some((true, true, 1234)),
+            "{kind}: A's first request"
+        );
+        // Within the cache's 300 s.
+        let details = b29_details(&app, &b, &b_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 5000)),
+            "{kind}: B gets A's watch data"
+        );
+        assert_eq!(
+            details["UserData"],
+            b29_stored(&state, &b_id, item).await,
+            "{kind}: B's UserData"
+        );
+        assert_eq!(
+            details["CompletionPercentage"],
+            b29_as_sent(serde_json::json!(
+                runtime.map(|r| 5000.0 / r as f64 * 100.0)
+            )),
+            "{kind}: B's CompletionPercentage"
+        );
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            details["UserData"],
+            b29_stored(&state, &a_id, item).await,
+            "{kind}: A's UserData"
+        );
+        assert_eq!(
+            details["CompletionPercentage"],
+            serde_json::json!(runtime.map(|_| 100.0)),
+            "{kind}: A's CompletionPercentage"
+        );
+        if b29_cached_kind(kind) {
+            // The entry A's request made holds nothing of A's.
+            let entry = state.cache.item_details.get(&item.to_string());
+            let entry = serde_json::to_value(entry.expect("cached")).unwrap();
+            assert!(
+                entry["UserData"].is_null() && entry["CompletionPercentage"].is_null(),
+                "{kind}: the cache holds watch data: {} {}",
+                entry["UserData"],
+                entry["CompletionPercentage"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b29_a_change_to_watch_data_shows_on_the_next_request() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, _, _) = g1_owner_and_viewer(&state, &app).await;
+    for (kind, item, _) in b29_items(&state).await {
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 0)),
+            "{kind}: before"
+        );
+        let played = format!("/Users/{a_id}/PlayedItems/{item}");
+        let favorite = format!("/Users/{a_id}/FavoriteItems/{item}");
+        // (change, method, uri, then (Played, IsFavorite, PlaybackPositionTicks))
+        let changes = [
+            ("marked played", "POST", &played, (true, false, 0)),
+            ("favorite", "POST", &favorite, (true, true, 0)),
+            ("marked unplayed", "DELETE", &played, (false, true, 0)),
+            ("not favorite", "DELETE", &favorite, (false, false, 0)),
+        ];
+        for (change, method, uri, expected) in changes {
+            b29_ok(&app, &a, method, uri, None).await;
+            let details = b29_details(&app, &a, &a_id, item).await;
+            assert_eq!(
+                g1c_user_data(&details),
+                Some(expected),
+                "{kind}: after {change}"
+            );
+        }
+        b29_progress(&app, &a, item, 4321).await;
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 4321)),
+            "{kind}: after a resume point"
+        );
+        // Written straight into the database, as an import does.
+        rustyfin_db::repo_playback::set_favorite(&state.db, a_id.parse().unwrap(), item, true)
+            .await
+            .unwrap();
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, true, 4321)),
+            "{kind}: after a write to the database"
+        );
+        if b29_cached_kind(kind) {
+            assert!(
+                state.cache.item_details.contains_key(&item.to_string()),
+                "{kind}: the details stay cached"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b29_cached_item_details_equal_fresh_ones() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
+    let mut cached = Vec::new();
+    for (kind, item, _) in b29_items(&state).await {
+        b29_watch(&app, &a, &a_id, item, 1234).await;
+        b29_progress(&app, &b, item, 5000).await;
+        let key = item.to_string();
+        state.cache.item_details.invalidate(&key);
+        let a_fresh = b29_details(&app, &a, &a_id, item).await;
+        cached.push((kind, state.cache.item_details.contains_key(&key)));
+        let b_cached = b29_details(&app, &b, &b_id, item).await;
+        let a_cached = b29_details(&app, &a, &a_id, item).await;
+        state.cache.item_details.invalidate(&key);
+        let b_fresh = b29_details(&app, &b, &b_id, item).await;
+        assert_eq!(a_fresh["Type"], kind, "{kind}: Type");
+        assert_eq!(b_fresh["Type"], kind, "{kind}: Type");
+        assert_eq!(a_cached, a_fresh, "{kind}: A's cached answer");
+        assert_eq!(b_cached, b_fresh, "{kind}: B's cached answer");
+    }
+    // Movies and episodes are built fresh each time; the other kinds come from the cache.
+    for (kind, cached) in cached {
+        assert_eq!(cached, b29_cached_kind(kind), "{kind}: cached");
+    }
+}
+
+#[tokio::test]
+async fn b29_item_details_never_reach_the_l2_table() {
+    // The L2 copy on.
+    let state = b27_restarted(&test_state().await).await;
+    let before_restart = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &before_restart).await;
+    let items = b29_items(&state).await;
+    let photo = items.iter().find(|(kind, ..)| *kind == "Photo").unwrap().1;
+    b29_watch(&before_restart, &a, &a_id, photo, 1234).await;
+    let details = b29_details(&before_restart, &a, &a_id, photo).await;
+    // The L2 copy is saved in the background.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_cache WHERE cache_key LIKE 'item:%'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "item details reached the L2 table");
+    // A row that an older build saved, with A's watch data, is not served after a restart.
+    sqlx::query("INSERT INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)")
+        .bind(format!("item:{photo}"))
+        .bind(details.to_string())
+        .bind((chrono::Utc::now() + chrono::TimeDelta::seconds(3600)).to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let restarted = b27_restarted(&state).await;
+    assert!(
+        !restarted
+            .cache
+            .item_details
+            .contains_key(&photo.to_string()),
+        "a restart loaded item details from the L2 table"
+    );
+    let after_restart = app(restarted);
+    let details = b29_details(&after_restart, &b, &b_id, photo).await;
+    assert_eq!(
+        g1c_user_data(&details),
+        Some((false, false, 0)),
+        "B after a restart"
+    );
+}
+
 // ── B17: library scan progress ──
 // Every signed-in socket gets `RefreshProgress` frames for a library's scan: "0" when it is
 // queued, each higher whole percent, and "100" once its probes have finished. A new socket
@@ -14947,4 +15949,135 @@ async fn b16_hls_transcodes_the_requested_version() {
         let (status, _, _) = g4_get(&app, &segment).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{transcode}");
     }
+}
+
+// ── B28: date added backfill ──
+// Once after the update, items already in a library get their file's date. Item details and search
+// cache answers that hold DateCreated, so the run drops both; lists and the Latest rows read the
+// database each time. Either way the new date shows at once, without a restart.
+
+/// The DateCreated of the item `id` in `uri`'s answer: the item itself, or one in a list.
+#[cfg(target_os = "linux")]
+async fn b28_date_created(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+    id: uuid::Uuid,
+) -> chrono::DateTime<chrono::Utc> {
+    let (status, json) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    let items = match &json {
+        serde_json::Value::Array(items) => items.clone(),
+        _ if json.get("Items").is_some() => json["Items"].as_array().cloned().unwrap_or_default(),
+        _ => vec![json.clone()],
+    };
+    let item = items
+        .iter()
+        .find(|item| item["Id"].as_str().and_then(|s| s.parse().ok()) == Some(id))
+        .unwrap_or_else(|| panic!("{uri}: no item {id} in {json}"));
+    let date = item["DateCreated"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{uri}: no DateCreated in {item}"));
+    chrono::DateTime::parse_from_rfc3339(date)
+        .unwrap_or_else(|e| panic!("{uri}: DateCreated {date}: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_backfilled_dates_show_at_once_in_details_lists_and_latest() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let folder = media_folder(&state, "b28");
+    let file = std::path::Path::new(&folder).join("B28 Film (2001)/B28 Film (2001).mkv");
+    let photo_file = std::path::Path::new(&folder).join("B28 Photo.jpg");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    for (path, secs) in [(&file, 1_000_000_000), (&photo_file, 1_000_000_100)] {
+        std::fs::write(path, b"").unwrap();
+        std::fs::File::open(path)
+            .and_then(|f| {
+                f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            })
+            .unwrap();
+    }
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B28".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    // A movie and a photo a scan before B23 dated by the time of the scan, in whole seconds.
+    let scanned = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
+    let id = uuid::Uuid::new_v4();
+    let photo = uuid::Uuid::new_v4();
+    for (item, name, kind, path) in [
+        (id, "B28 Film", "Movie", &file),
+        (photo, "B28 Photo", "Photo", &photo_file),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path, date_created) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(item.to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(kind)
+        .bind(path.to_str().unwrap())
+        .bind(scanned.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let (token, user_id) = admin_session(&state).await;
+    let sorted = "Recursive=true&IncludeItemTypes=Movie&SortBy=DateCreated&SortOrder=Descending";
+    let uris = [
+        // Cached for 300 s.
+        format!("/Items/{id}?userId={user_id}"),
+        // Read from the database each time.
+        format!("/Items?{sorted}"),
+        format!("/Users/{user_id}/Items?{sorted}"),
+        "/Items/Latest?Limit=20".to_string(),
+        format!("/Users/{user_id}/Items/Latest?Limit=20"),
+    ];
+    // The photo's details, which the cache serves again until the run drops them.
+    let photo_uri = format!("/Items/{photo}?userId={user_id}");
+    // Before the run every answer, cached ones included, has the scan's date.
+    for uri in &uris {
+        assert_eq!(
+            b28_date_created(&app, &token, uri, id).await,
+            scanned,
+            "{uri} before the run"
+        );
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            b28_date_created(&app, &token, &photo_uri, photo).await,
+            scanned,
+            "{photo_uri} before the run"
+        );
+    }
+    assert!(
+        state.cache.item_details.contains_key(&photo.to_string()),
+        "the photo's details are cached before the run"
+    );
+
+    rustyfin_api::date_backfill::run(&state).await;
+
+    let file_date = chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap();
+    for uri in &uris {
+        assert_eq!(
+            b28_date_created(&app, &token, uri, id).await,
+            file_date,
+            "{uri} after the run"
+        );
+    }
+    assert_eq!(
+        b28_date_created(&app, &token, &photo_uri, photo).await,
+        chrono::DateTime::from_timestamp(1_000_000_100, 0).unwrap(),
+        "{photo_uri} after the run"
+    );
 }
