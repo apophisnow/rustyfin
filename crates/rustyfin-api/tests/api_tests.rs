@@ -1065,7 +1065,9 @@ async fn test_j1_a_configured_key_with_plus_or_percent_works_raw_and_encoded_in_
 #[tokio::test]
 async fn test_j1_basic_authorization_next_to_api_key_is_not_refused() {
     // An *arr Webhook URL with a user name and password: the app sends them as Basic, next to the
-    // URL's `api_key`.
+    // URL's `api_key`. Basic gives no token, so `api_key` decides. The test guards that
+    // fall-through and doesn't reproduce a failure: Basic next to `api_key` was never refused, and
+    // before review F1's fix only the plus-sign key failed here, because `api_key` was decoded.
     let mut state = test_state().await;
     let headers = [
         ("Authorization", "Basic YXJyOnNlY3JldA=="),
