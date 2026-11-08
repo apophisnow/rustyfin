@@ -1759,6 +1759,286 @@ mod kernel {
         assert_rescans_since(&recorder, before, &[solaris]);
         watcher.stop();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_over_the_watch_limit_is_polled_and_the_limit_is_warned_about_once() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        // A second path of the library, with 6 folders.
+        let more = tree.outside("more");
+        write(&more.join("Alien (1979)/extras/Trailer.mkv"), 10);
+        write(&more.join("Brazil (1985)/extras/Trailer.mkv"), 10);
+        write(&more.join("Casablanca (1942)/Casablanca (1942).mkv"), 10);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel K Films", &[tree.root(), more.clone()]).await;
+        let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), tree.outside("data"));
+        watcher.set_watch_limit(Some(4));
+        watcher.set_poll_interval(Duration::from_millis(100));
+        watcher.start();
+
+        // The path with 4 folders fits; the one with 6 doesn't, and is polled from the start.
+        wait_watched(&watcher, &tree.root(), 4).await;
+        let monitored = wait_monitored(&watcher, "the path over the limit polled", |m| {
+            monitor_of(m, &more).is_some_and(|p| p.method == Method::Poll && p.ready)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &more).unwrap();
+        let fs_type = fs_type_of(&std::fs::canonicalize(&more).unwrap()).unwrap();
+        assert_eq!(
+            (
+                polled.fs_type.as_str(),
+                polled.reason.as_deref(),
+                polled.watches,
+                polled.folders
+            ),
+            (fs_type.as_str(), Some("watch limit reached"), 0, 6)
+        );
+        let warning = |path: &Path| {
+            format!(
+                "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead. Raise fs.inotify.max_user_watches to watch it.",
+                path.display()
+            )
+        };
+        let polling = |path: &Path, folders: usize| {
+            format!(
+                "library monitor: polling '{}' of 'Kernel K Films' ({fs_type}, watch limit reached): {folders} folders, every 100ms, baseline in ",
+                path.display()
+            )
+        };
+        wait_for_log(&[&warning(&more)]).await;
+        wait_for_log(&[&polling(&more, 6)]).await;
+        quiet_period().await;
+        assert!(
+            recorder.calls().is_empty(),
+            "falling back during setup reports nothing: {:?}",
+            recorder.calls()
+        );
+
+        // A new folder takes the watched path over the limit too. The folder is still rescanned, the
+        // path is polled from then on, and the limit is not warned about again.
+        write(&tree.at("Alien (1979)/Alien (1979).mkv"), 10);
+        let alien = folder_unit(&lib, tree.at("Alien (1979)"));
+        recorder.wait_for(&alien, 1).await;
+        let monitored = wait_monitored(&watcher, "the watched path polled", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.method == Method::Poll && p.ready)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &tree.root()).unwrap();
+        assert_eq!(
+            (polled.reason.as_deref(), polled.watches, polled.folders),
+            (Some("watch limit reached"), 0, 5)
+        );
+        wait_for_log(&[&polling(&tree.root(), 5)]).await;
+        assert_eq!(log_lines(&[&warning(&more)]).len(), 1);
+        assert!(
+            log_lines(&[&warning(&tree.root())]).is_empty(),
+            "the limit is warned about once per watcher"
+        );
+
+        // Both paths are polled now.
+        quiet_period().await;
+        tick();
+        write(&tree.at("Heat (1995)/Heat (1995).en.srt"), 10);
+        write(&more.join("Casablanca (1942)/Casablanca (1942).en.srt"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Heat (1995)")), 1)
+            .await;
+        recorder
+            .wait_for(&folder_unit(&lib, more.join("Casablanca (1942)")), 1)
+            .await;
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_library_path_is_polled_until_it_is_back_and_watched_again_at_the_next_reload()
+     {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel M Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        // What is deleted before the path itself is rescanned, but not the whole library.
+        std::fs::remove_dir_all(tree.root()).unwrap();
+        let heat = folder_unit(&lib, tree.at("Heat (1995)"));
+        let up = folder_unit(&lib, tree.at("Up (2009)"));
+        recorder.wait_for(&heat, 1).await;
+        recorder.wait_for(&up, 1).await;
+        let monitored = wait_monitored(&watcher, "the deleted path polled", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.method == Method::Poll)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &tree.root()).unwrap();
+        assert_eq!(
+            (polled.reason.as_deref(), polled.watches, polled.ready),
+            (Some("library path gone"), 0, false)
+        );
+        let missing = format!(
+            "library monitor: '{}' is missing or unreadable",
+            tree.root().display()
+        );
+        wait_for_log(&[&missing]).await;
+        quiet_period().await;
+        assert_rescans_since(&recorder, 0, &[heat.clone(), up]);
+
+        // Back, all at once: the poller takes its baseline, which reports nothing.
+        write(&tree.outside("staging/Heat (1995)/Heat (1995).mkv"), 10);
+        std::fs::rename(tree.outside("staging"), tree.root()).unwrap();
+        let monitored = wait_monitored(&watcher, "the path back and polled", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.ready)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &tree.root()).unwrap();
+        assert_eq!(
+            (polled.method, polled.reason.as_deref(), polled.folders),
+            (Method::Poll, Some("library path gone"), 2)
+        );
+        let before = recorder.calls().len();
+        several_polls().await;
+        assert_rescans_since(&recorder, before, &[]);
+
+        // The next reload watches it again.
+        watcher.libraries_changed();
+        let path = wait_watched(&watcher, &tree.root(), 2).await;
+        assert_eq!(path.reason, None);
+        let stopped = format!(
+            "library monitor: stopped '{}' of 'Kernel M Films'",
+            tree.root().display()
+        );
+        assert_eq!(
+            log_lines(&[&stopped]).len(),
+            1,
+            "its poll monitor is stopped"
+        );
+        assert_eq!(log_lines(&[&missing]).len(), 1, "and was warned about once");
+        write(&tree.at("Heat (1995)/Heat (1995).en.srt"), 10);
+        recorder.wait_for(&heat, 2).await;
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_symlinked_folder_on_a_filesystem_that_is_not_local_makes_its_path_polled() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        // /proc/sys/fs/inotify: a small folder on a filesystem that is not local.
+        symlink("/proc/sys/fs/inotify", tree.at("Inotify settings")).unwrap();
+        let later = tree.outside("later");
+        write(&later.join("Heat (1995)/Heat (1995).mkv"), 10);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel N Films", &[tree.root(), later.clone()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+
+        // A link there at the start: the path is polled from the start.
+        let monitored = wait_monitored(&watcher, "the path with the link polled", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.method == Method::Poll && p.ready)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &tree.root()).unwrap();
+        let fs_type = fs_type_of(&std::fs::canonicalize(tree.root()).unwrap()).unwrap();
+        assert_eq!(
+            (
+                polled.fs_type.as_str(),
+                polled.reason.as_deref(),
+                polled.watches,
+                polled.folders
+            ),
+            (fs_type.as_str(), Some("symlinked folder on proc"), 0, 5)
+        );
+        wait_watched(&watcher, &later, 2).await;
+
+        // A link made later: it is rescanned, and its path is polled from then on.
+        symlink("/proc/sys/fs/inotify", later.join("Inotify settings")).unwrap();
+        recorder
+            .wait_for(&folder_unit(&lib, later.join("Inotify settings")), 1)
+            .await;
+        let monitored = wait_monitored(&watcher, "the path with the later link polled", |m| {
+            monitor_of(m, &later).is_some_and(|p| p.method == Method::Poll && p.ready)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &later).unwrap();
+        assert_eq!(
+            (polled.reason.as_deref(), polled.watches, polled.folders),
+            (Some("symlinked folder on proc"), 0, 3)
+        );
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_symlinked_folder_moved_into_a_library_path_is_watched_like_one_made_there() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        write(
+            &tree.outside("elsewhere/Solaris (1972)/extras/Trailer.mkv"),
+            10,
+        );
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel P Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        // The link is made outside and moved in, which raises MOVED_TO without ISDIR.
+        symlink(
+            tree.outside("elsewhere/Solaris (1972)"),
+            tree.outside("link"),
+        )
+        .unwrap();
+        std::fs::rename(tree.outside("link"), tree.at("Solaris (1972)")).unwrap();
+        let solaris = folder_unit(&lib, tree.at("Solaris (1972)"));
+        recorder.wait_for(&solaris, 1).await;
+        wait_watched(&watcher, &tree.root(), 6).await;
+
+        // A change in the linked folder is rescanned under its path in the library.
+        write(
+            &tree.outside("elsewhere/Solaris (1972)/Solaris (1972).en.srt"),
+            10,
+        );
+        recorder.wait_for(&solaris, 2).await;
+        quiet_period().await;
+        assert_rescans_since(&recorder, 0, &[solaris]);
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_library_path_on_a_filesystem_that_is_not_local_is_polled() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let (pool, changes, _recorder) = kernel_fixture(&tree).await;
+        let settings = PathBuf::from("/proc/sys/fs/inotify");
+        add_library(&pool, "Kernel O Settings", std::slice::from_ref(&settings)).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+
+        let monitored = wait_monitored(&watcher, "the proc path polled", |m| {
+            monitor_of(m, &settings).is_some_and(|p| p.ready)
+        })
+        .await;
+        let polled = monitor_of(&monitored, &settings).unwrap();
+        assert_eq!(
+            (
+                polled.method,
+                polled.fs_type.as_str(),
+                polled.reason.as_deref(),
+                polled.watches,
+                polled.folders
+            ),
+            (
+                Method::Poll,
+                "proc",
+                Some("network or unknown filesystem"),
+                0,
+                1
+            )
+        );
+        wait_for_log(&[
+        "library monitor: polling '/proc/sys/fs/inotify' of 'Kernel O Settings' (proc, network or unknown filesystem): 1 folders, every 100ms, baseline in ",
+    ])
+    .await;
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:

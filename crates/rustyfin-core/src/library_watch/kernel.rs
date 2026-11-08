@@ -8,6 +8,8 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
@@ -15,7 +17,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::{Inner, MonitorKey};
+use super::{Inner, LIBRARY_PATH_GONE, MonitorKey, fs_type_from_mountinfo, is_local_fs_type};
 use crate::library_monitor::unit_for;
 use crate::naming::is_ignored_dir;
 use crate::scanner::ScanScope;
@@ -35,6 +37,10 @@ const BATCH_DELAY: Duration = Duration::from_millis(500);
 
 /// Bytes read from the kernel at a time. An event takes a few hundred bytes at most.
 const READ_BUFFER: usize = 16 * 1024;
+
+/// `EMFILE` on Linux: the limit on inotify instances, or on open files, is reached. libc is not a
+/// dependency of this crate on Linux, so the errno is written out.
+const EMFILE: i32 = 24;
 
 /// A folder's identity: device and inode. Two paths with one identity are one folder.
 type Id = (u64, u64);
@@ -57,6 +63,13 @@ struct Tree {
     /// The identities of the watched folders and of the data dir. A folder with one of them is
     /// not watched again.
     ids: HashSet<Id>,
+    /// The test limit of watches, if one is set: an add fails once the tree holds this many.
+    limit: Option<usize>,
+    /// The fallback that ends the kernel watching, once a walk or an event meets it. The walks stop
+    /// then, and the events after it only report their paths.
+    fallback: Option<Fallback>,
+    /// The mount table, read by the first check of the walk under way. None between walks.
+    mounts: Option<String>,
 }
 
 /// What a read of the kernel's queue gives: an event copied out of the read buffer, or the
@@ -68,6 +81,20 @@ enum Seen {
         mask: EventMask,
         name: Option<OsString>,
     },
+}
+
+/// Why the kernel watching of a path ends. The monitor then polls the path, for this reason.
+enum Fallback {
+    /// The kernel's watch limit is reached (`ENOSPC`, `StorageFull`), or the test limit is.
+    WatchLimit,
+    /// The kernel's limit on inotify instances is reached (`EMFILE` from `Inotify::init`).
+    InstanceLimit,
+    /// The library path's own watch reports it deleted, moved, unmounted or ignored.
+    LibraryPathGone,
+    /// A symlinked folder, or a mount inside the library, is not on a local filesystem. The reason.
+    NotLocal(String),
+    /// Any other failure of the kernel's watching, with its message.
+    Failed(String),
 }
 
 /// Watches the library path of the monitor `key` until the monitor has to poll it instead, and
@@ -84,10 +111,14 @@ pub(super) async fn watch(
     let root = key.1.clone();
     let setup_root = root.clone();
     let data_dir = inner.data_dir.clone();
-    let setup = tokio::task::spawn_blocking(move || setup(&setup_root, &data_dir)).await;
+    let limit = *inner
+        .watch_limit
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let setup = tokio::task::spawn_blocking(move || setup(&setup_root, &data_dir, limit)).await;
     let (inotify, mut tree, took) = match setup {
         Ok(Ok(setup)) => setup,
-        Ok(Err(err)) => return Some(format!("kernel watching failed: {err}")),
+        Ok(Err(fallback)) => return Some(fallback_reason(inner, &root, fallback)),
         Err(err) => {
             tracing::warn!(
                 "library monitor: could not set up '{}': {err}; restarting it at the next library change",
@@ -174,6 +205,11 @@ pub(super) async fn watch(
             }
             batch.entry(unit).or_insert(path);
         }
+        if let Some(fallback) = tree.fallback.take() {
+            // The batch goes out first, so the paths of this chunk are rescanned.
+            report(inner, &mut batch).await;
+            return Some(fallback_reason(inner, &root, fallback));
+        }
         let folders = tree.folders.len();
         inner.with_monitor(key, id, |monitor| {
             monitor.info.folders = folders;
@@ -183,11 +219,22 @@ pub(super) async fn watch(
 }
 
 /// Starts an inotify instance and watches the library path, with the folders under it. Runs on a
-/// blocking thread. Returns the instance, the tree and how long the setup took.
-fn setup(root: &Path, data_dir: &Path) -> io::Result<(Inotify, Tree, Duration)> {
+/// blocking thread. Returns the instance, the tree and how long the setup took, or the fallback
+/// that ends the kernel watching: the instance or a watch could not be had.
+fn setup(
+    root: &Path,
+    data_dir: &Path,
+    limit: Option<usize>,
+) -> Result<(Inotify, Tree, Duration), Fallback> {
     let started = std::time::Instant::now();
-    let inotify = Inotify::init()?;
-    let meta = fs::metadata(root)?;
+    let inotify = Inotify::init().map_err(|err| {
+        if err.raw_os_error() == Some(EMFILE) {
+            Fallback::InstanceLimit
+        } else {
+            Fallback::Failed(err.to_string())
+        }
+    })?;
+    let meta = fs::metadata(root).map_err(|err| Fallback::Failed(err.to_string()))?;
     let mut tree = Tree {
         root: root.to_path_buf(),
         watches: inotify.watches(),
@@ -199,9 +246,55 @@ fn setup(root: &Path, data_dir: &Path) -> io::Result<(Inotify, Tree, Duration)> 
             .map(|meta| (meta.dev(), meta.ino()))
             .into_iter()
             .collect(),
+        limit,
+        fallback: None,
+        mounts: None,
     };
-    tree.watch_folder(root, (meta.dev(), meta.ino()))?;
-    Ok((inotify, tree, started.elapsed()))
+    tree.watch_folder(root, (meta.dev(), meta.ino()))
+        .map_err(add_failure)?;
+    // The walk of the library path may have met a fallback. The instance goes with the tree.
+    match tree.fallback.take() {
+        Some(fallback) => Err(fallback),
+        None => Ok((inotify, tree, started.elapsed())),
+    }
+}
+
+/// The fallback for a failed add of a watch: the watch limit when the kernel has no more watches
+/// to give, and the failure otherwise.
+fn add_failure(err: io::Error) -> Fallback {
+    if err.kind() == io::ErrorKind::StorageFull {
+        Fallback::WatchLimit
+    } else {
+        Fallback::Failed(err.to_string())
+    }
+}
+
+/// The reason a monitor of `root` polls instead, once its kernel watching ends with `fallback`.
+/// Logs the warning of the watch limit or of the instance limit, once each in the watcher.
+fn fallback_reason(inner: &Inner, root: &Path, fallback: Fallback) -> String {
+    match fallback {
+        Fallback::WatchLimit => {
+            if !inner.watch_limit_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead. Raise fs.inotify.max_user_watches to watch it.",
+                    root.display()
+                );
+            }
+            "watch limit reached".to_string()
+        }
+        Fallback::InstanceLimit => {
+            if !inner.instance_limit_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "library monitor: the kernel's inotify instance limit is reached; polling '{}' instead. Raise fs.inotify.max_user_instances to watch it.",
+                    root.display()
+                );
+            }
+            "inotify instance limit reached".to_string()
+        }
+        Fallback::LibraryPathGone => LIBRARY_PATH_GONE.to_string(),
+        Fallback::NotLocal(reason) => reason,
+        Fallback::Failed(err) => format!("kernel watching failed: {err}"),
+    }
 }
 
 /// Waits until the kernel has events, then reads all of them. Copies them out of the buffer.
@@ -281,9 +374,18 @@ impl Tree {
             return;
         };
         let Some(name) = name else {
-            // Without a name, the event is about the folder itself. Only the kernel dropping its
-            // watch changes the tree. The library path's own watch is left alone.
-            if mask.contains(EventMask::IGNORED) && dir != self.root {
+            // Without a name, the event is about the folder itself. The library path's own watch
+            // going away ends the kernel watching. The kernel dropping a subfolder's watch forgets
+            // the folder.
+            if dir == self.root {
+                let gone = EventMask::DELETE_SELF
+                    | EventMask::MOVE_SELF
+                    | EventMask::UNMOUNT
+                    | EventMask::IGNORED;
+                if mask.intersects(gone) {
+                    self.fallback.get_or_insert(Fallback::LibraryPathGone);
+                }
+            } else if mask.contains(EventMask::IGNORED) {
                 self.forget(&dir, false);
             }
             return;
@@ -292,16 +394,25 @@ impl Tree {
             return;
         }
         let path = dir.join(&name);
-        // A symlink to a folder is created without ISDIR, so its target is checked.
+        if self.fallback.is_some() {
+            // The walks have stopped, so the tree is left as it is. The path still reports.
+            reported.push(path);
+            return;
+        }
+        // A symlink to a folder is created or moved in without ISDIR, so its target is checked.
         let creates_folder = if mask.contains(EventMask::ISDIR) {
             mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
         } else {
-            mask.contains(EventMask::CREATE) && folder_id(&path).is_some()
+            mask.intersects(EventMask::CREATE | EventMask::MOVED_TO) && folder_id(&path).is_some()
         };
         if creates_folder {
             // Reported only when it is watched now: not when it is gone, the data dir, or watched
-            // under another name already.
-            if self.watch_new(&path) {
+            // under another name already. A fallback that the folder causes reports it as well, so
+            // a folder whose walk failed is still rescanned.
+            self.mounts = None;
+            let parent_dev = self.dev_of(&dir);
+            let watched = self.watch_new(&path, parent_dev);
+            if watched || self.fallback.is_some() {
                 reported.push(path);
             }
             return;
@@ -318,10 +429,25 @@ impl Tree {
     /// before the listing, so a subfolder made meanwhile is listed or raises an event. Errors when
     /// the watch on `dir` itself fails.
     fn watch_folder(&mut self, dir: &Path, id: Id) -> io::Result<()> {
-        let wd = self.watches.add(dir, WATCH_MASK)?;
+        let wd = self.add_watch(dir)?;
         self.record(dir, wd, id);
-        self.walk_children(dir);
+        self.walk_children(dir, id.0);
         Ok(())
+    }
+
+    /// Adds the watch of `dir`. With the test limit set, the add fails with `StorageFull` once the
+    /// tree holds that many folders, before the kernel is asked.
+    fn add_watch(&mut self, dir: &Path) -> io::Result<WatchDescriptor> {
+        if self.limit.is_some_and(|limit| self.folders.len() >= limit) {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
+        self.watches.add(dir, WATCH_MASK)
+    }
+
+    /// The device of the watched folder at `dir`, which is the device its subfolders are checked
+    /// against. Zero when the tree does not hold `dir`, which an event's folder never is.
+    fn dev_of(&self, dir: &Path) -> u64 {
+        self.folders.get(dir).map_or(0, |folder| folder.id.0)
     }
 
     /// Records the watch `wd` of the folder at `dir`. An entry that `dir` had before (the folder
@@ -341,17 +467,25 @@ impl Tree {
         self.ids.insert(id);
     }
 
-    /// Watches the new folders under `dir`, in name order.
-    fn walk_children(&mut self, dir: &Path) {
+    /// Watches the new folders under `dir`, of device `dev`, in name order. The walk stops at a
+    /// fallback.
+    fn walk_children(&mut self, dir: &Path, dev: u64) {
         for name in subfolders(dir) {
-            self.watch_new(&dir.join(name));
+            if self.fallback.is_some() {
+                return;
+            }
+            self.watch_new(&dir.join(name), dev);
         }
     }
 
-    /// Watches `dir`, a folder that appeared, and the folders under it. Returns whether `dir` is
-    /// watched now. It is not when it is gone, when it is the data dir or watched under another
-    /// name, or when its watch fails.
-    fn watch_new(&mut self, dir: &Path) -> bool {
+    /// Watches `dir`, a folder that appeared in a folder of device `parent_dev`, and the folders
+    /// under it. Returns whether `dir` is watched now. It is not when it is gone, when it is the
+    /// data dir or watched under another name, or when its watch fails. A watch limit or a folder
+    /// that is not local sets the fallback instead, and then nothing more is watched.
+    fn watch_new(&mut self, dir: &Path, parent_dev: u64) -> bool {
+        if self.fallback.is_some() {
+            return false;
+        }
         let Some(id) = folder_id(dir) else {
             tracing::debug!(
                 "library monitor: '{}' is gone or not a folder; not watched",
@@ -362,13 +496,53 @@ impl Tree {
         if self.ids.contains(&id) {
             return false;
         }
+        self.check_folder(dir, id, parent_dev);
+        if self.fallback.is_some() {
+            return false;
+        }
         match self.watch_folder(dir, id) {
             Ok(()) => true,
+            Err(err) if err.kind() == io::ErrorKind::StorageFull => {
+                self.fallback.get_or_insert(Fallback::WatchLimit);
+                false
+            }
             Err(err) => {
                 tracing::debug!("library monitor: not watching '{}': {err}", dir.display());
                 false
             }
         }
+    }
+
+    /// Checks the folder at `dir`, of identity `id`, whose parent is on device `parent_dev`. A
+    /// symlinked folder, or a mount inside the library, must be on a local filesystem, judged by
+    /// the fs type of its canonical path. Sets the fallback when it is not.
+    fn check_folder(&mut self, dir: &Path, id: Id, parent_dev: u64) {
+        let is_link = fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
+        if !is_link && id.0 == parent_dev {
+            return;
+        }
+        let fs_type = self.fs_type_at(dir);
+        if is_local_fs_type(&fs_type) {
+            return;
+        }
+        let reason = if is_link {
+            format!("symlinked folder on {fs_type}")
+        } else {
+            format!("mount of {fs_type} inside")
+        };
+        self.fallback.get_or_insert(Fallback::NotLocal(reason));
+    }
+
+    /// The fs type of the canonical path of `dir`. The mount table is read at the first check of a
+    /// walk. "unknown" when there is no answer.
+    fn fs_type_at(&mut self, dir: &Path) -> String {
+        let Ok(canonical) = fs::canonicalize(dir) else {
+            return "unknown".to_string();
+        };
+        let mounts = self
+            .mounts
+            .get_or_insert_with(|| fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
+        fs_type_from_mountinfo(mounts.as_str(), &canonical).unwrap_or_else(|| "unknown".to_string())
     }
 
     /// Forgets the folder at `dir`, and removes its watch when `unwatch` is set. The kernel has
@@ -401,6 +575,10 @@ impl Tree {
     /// first, since their events may have been lost. The walk then goes down through the watched
     /// folders under the library path and watches the new ones, adding no second watch.
     fn overflow_walk(&mut self) {
+        if self.fallback.is_some() {
+            return;
+        }
+        self.mounts = None;
         let known: Vec<(PathBuf, Id)> = self
             .folders
             .iter()
@@ -416,12 +594,17 @@ impl Tree {
             }
         }
         let root = self.root.clone();
-        self.overflow_dir(&root);
+        let root_dev = self.dev_of(&root);
+        self.overflow_dir(&root, root_dev);
     }
 
-    /// Goes down through the watched folders under `dir`, and watches the new ones.
-    fn overflow_dir(&mut self, dir: &Path) {
+    /// Goes down through the watched folders under `dir`, of device `dev`, and watches the new
+    /// ones. The walk stops at a fallback.
+    fn overflow_dir(&mut self, dir: &Path, dev: u64) {
         for name in subfolders(dir) {
+            if self.fallback.is_some() {
+                return;
+            }
             let child = dir.join(name);
             let Some(id) = folder_id(&child) else {
                 continue;
@@ -431,10 +614,10 @@ impl Tree {
                 .get(&child)
                 .is_some_and(|folder| folder.id == id)
             {
-                self.overflow_dir(&child);
+                self.overflow_dir(&child, id.0);
             } else {
                 // New, or watched under another name, or the data dir: `watch_new` tells.
-                self.watch_new(&child);
+                self.watch_new(&child, dev);
             }
         }
     }

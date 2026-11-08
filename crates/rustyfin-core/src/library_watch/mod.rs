@@ -8,6 +8,7 @@ mod poll;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -29,6 +30,11 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// The reason of a path that is missing when its monitor starts. That monitor polls the path, and
 /// the next reload after the path has appeared replaces it.
 const PATH_NOT_FOUND: &str = "path not found";
+
+/// The reason of a path whose library path the kernel reports gone: deleted, moved, unmounted or
+/// its watch ignored. That monitor polls the path, and the next reload after the path is back
+/// replaces it, as with `PATH_NOT_FOUND`.
+const LIBRARY_PATH_GONE: &str = "library path gone";
 
 /// How a library path is monitored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +84,16 @@ struct Inner {
     /// The poll interval. Every poll monitor subscribes to it.
     interval: watch::Sender<Duration>,
     state: Mutex<State>,
+    /// The test limit of kernel watches for the monitors started from now on. See
+    /// `set_watch_limit`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    watch_limit: Mutex<Option<usize>>,
+    /// Whether the warning of the kernel's watch limit is logged. It is logged once per watcher.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    watch_limit_warned: AtomicBool,
+    /// Whether the warning of the kernel's instance limit is logged. It is logged once per watcher.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    instance_limit_warned: AtomicBool,
 }
 
 #[derive(Default)]
@@ -123,6 +139,9 @@ impl LibraryWatcher {
                 reload: Notify::new(),
                 interval,
                 state: Mutex::new(State::default()),
+                watch_limit: Mutex::new(None),
+                watch_limit_warned: AtomicBool::new(false),
+                instance_limit_warned: AtomicBool::new(false),
             }),
         }
     }
@@ -177,6 +196,17 @@ impl LibraryWatcher {
     /// Makes the monitors started from now on poll, whatever their filesystem.
     pub fn set_force_poll(&self, on: bool) {
         self.inner.lock().force_poll = on;
+    }
+
+    /// Makes the kernel monitors started from now on fail their watches once they hold `limit` of
+    /// them, as if the kernel's watch limit were reached. For the tests.
+    #[doc(hidden)]
+    pub fn set_watch_limit(&self, limit: Option<usize>) {
+        *self
+            .inner
+            .watch_limit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = limit;
     }
 
     /// Makes each watching monitor of `library_id` act as if the kernel's queue had overflowed: it
@@ -249,8 +279,8 @@ fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) 
 
 /// Brings the monitors in line with the libraries: stops the ones not wanted any more, starts
 /// the missing ones and updates the library names and paths of the others. A monitor whose task
-/// ended early, or whose path was missing at start and has appeared since, is replaced by a new
-/// one for its key. A database error keeps the monitors as they are.
+/// ended early, or whose path was missing at start or gone from its kernel watch, and has appeared
+/// since, is replaced by a new one for its key. A database error keeps the monitors as they are.
 async fn reconcile(inner: &Arc<Inner>, generation: u64) {
     let libraries = match monitored_libraries(&inner.pool).await {
         Ok(libraries) => libraries,
@@ -289,8 +319,10 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             let key = (library.id, PathBuf::from(path));
             if let Some(monitor) = state.monitors.get_mut(&key) {
                 let replaced = monitor.task.is_finished()
-                    || (monitor.info.reason.as_deref() == Some(PATH_NOT_FOUND)
-                        && monitor.info.ready);
+                    || (matches!(
+                        monitor.info.reason.as_deref(),
+                        Some(PATH_NOT_FOUND | LIBRARY_PATH_GONE)
+                    ) && monitor.info.ready);
                 if !replaced {
                     monitor.info.library_name.clone_from(&library.name);
                     monitor.library_paths.clone_from(&library.paths);
