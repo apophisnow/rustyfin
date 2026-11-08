@@ -18,8 +18,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::{
-    INSTANCE_LIMIT_REACHED, Inner, LIBRARY_PATH_GONE, MonitorKey, WATCH_LIMIT_REACHED,
-    fs_type_from_mountinfo, is_local_fs_type,
+    FILE_LIMIT_REACHED, INSTANCE_LIMIT_REACHED, Inner, LIBRARY_PATH_GONE, MonitorKey,
+    WATCH_LIMIT_REACHED, fs_type_from_mountinfo, is_local_fs_type,
 };
 use crate::library_monitor::unit_for;
 use crate::naming::is_ignored_dir;
@@ -92,6 +92,9 @@ enum Fallback {
     WatchLimit,
     /// The kernel's limit on inotify instances is reached (`EMFILE` from `Inotify::init`).
     InstanceLimit,
+    /// The process's own limit on open files is reached: `Inotify::init` gives `EMFILE`, and so
+    /// does a plain open of `/dev/null`.
+    FileLimit,
     /// The library path's own watch reports it deleted, moved, unmounted or ignored.
     LibraryPathGone,
     /// A symlinked folder, or a mount inside the library, is not on a local filesystem. The reason.
@@ -231,10 +234,18 @@ fn setup(
 ) -> Result<(Inotify, Tree, Duration), Fallback> {
     let started = std::time::Instant::now();
     let inotify = Inotify::init().map_err(|err| {
-        if err.raw_os_error() == Some(EMFILE) {
-            Fallback::InstanceLimit
-        } else {
-            Fallback::Failed(err.to_string())
+        if err.raw_os_error() != Some(EMFILE) {
+            return Fallback::Failed(err.to_string());
+        }
+        // Both the kernel's limit on instances and the process's limit on open files give
+        // EMFILE. A plain open fails only at the file limit, so it tells the two apart.
+        match fs::File::open("/dev/null") {
+            Err(open_err) if open_err.raw_os_error() == Some(EMFILE) => Fallback::FileLimit,
+            Ok(probe) => {
+                drop(probe);
+                Fallback::InstanceLimit
+            }
+            Err(_) => Fallback::InstanceLimit,
         }
     })?;
     let meta = fs::metadata(root).map_err(|err| Fallback::Failed(err.to_string()))?;
@@ -273,7 +284,8 @@ fn add_failure(err: io::Error) -> Fallback {
 }
 
 /// The reason a monitor of `root` polls instead, once its kernel watching ends with `fallback`.
-/// Logs the warning of the watch limit or of the instance limit, once each in the watcher.
+/// Logs the warning of the watch limit, the instance limit or the file limit, once each in the
+/// watcher.
 fn fallback_reason(inner: &Inner, root: &Path, fallback: Fallback) -> String {
     match fallback {
         Fallback::WatchLimit => {
@@ -293,6 +305,15 @@ fn fallback_reason(inner: &Inner, root: &Path, fallback: Fallback) -> String {
                 );
             }
             INSTANCE_LIMIT_REACHED.to_string()
+        }
+        Fallback::FileLimit => {
+            if !inner.file_limit_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "library monitor: the open file limit of the process is reached; polling '{}' instead. Raise it (ulimit -n, systemd LimitNOFILE=, docker run --ulimit nofile=) to watch it; the next SIGHUP or library change tries again.",
+                    root.display()
+                );
+            }
+            FILE_LIMIT_REACHED.to_string()
         }
         Fallback::LibraryPathGone => LIBRARY_PATH_GONE.to_string(),
         Fallback::NotLocal(reason) => reason,

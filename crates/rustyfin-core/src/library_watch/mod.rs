@@ -44,6 +44,10 @@ const WATCH_LIMIT_REACHED: &str = "watch limit reached";
 /// reload tries the kernel again, as with `WATCH_LIMIT_REACHED`.
 const INSTANCE_LIMIT_REACHED: &str = "inotify instance limit reached";
 
+/// The reason of a path polled because the process's open file limit is reached. The next reload
+/// tries the kernel again, as with `WATCH_LIMIT_REACHED`.
+const FILE_LIMIT_REACHED: &str = "open file limit reached";
+
 /// How a library path is monitored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -102,6 +106,9 @@ struct Inner {
     /// Whether the warning of the kernel's instance limit is logged. It is logged once per watcher.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     instance_limit_warned: AtomicBool,
+    /// Whether the warning of the open file limit is logged. It is logged once per watcher.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    file_limit_warned: AtomicBool,
 }
 
 #[derive(Default)]
@@ -150,6 +157,7 @@ impl LibraryWatcher {
                 watch_limit: Mutex::new(None),
                 watch_limit_warned: AtomicBool::new(false),
                 instance_limit_warned: AtomicBool::new(false),
+                file_limit_warned: AtomicBool::new(false),
             }),
         }
     }
@@ -289,8 +297,9 @@ fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) 
 /// the missing ones and updates the library names and paths of the others. A monitor whose task
 /// ended early, or whose path was missing at start or gone from its kernel watch, and has appeared
 /// since, is replaced by a new one for its key. A monitor polling because the kernel's watch or
-/// instance limit is reached is replaced too, ready or not: the new one tries the kernel again and
-/// falls back again while the limit holds. A database error keeps the monitors as they are.
+/// instance limit, or the process's open file limit, is reached is replaced too, ready or not: the
+/// new one tries the kernel again and falls back again while the limit holds. A database error
+/// keeps the monitors as they are.
 async fn reconcile(inner: &Arc<Inner>, generation: u64) {
     let libraries = match monitored_libraries(&inner.pool).await {
         Ok(libraries) => libraries,
@@ -331,7 +340,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
                 let replaced = monitor.task.is_finished()
                     || matches!(
                         monitor.info.reason.as_deref(),
-                        Some(WATCH_LIMIT_REACHED | INSTANCE_LIMIT_REACHED)
+                        Some(WATCH_LIMIT_REACHED | INSTANCE_LIMIT_REACHED | FILE_LIMIT_REACHED)
                     )
                     || (matches!(
                         monitor.info.reason.as_deref(),
