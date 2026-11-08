@@ -174,7 +174,10 @@ pub(super) async fn watch(
                     return Some(format!("kernel watching failed: {err}"));
                 }
             },
-            () = overflow.notified() => vec![Seen::Overflow],
+            () = overflow.notified() => match tree.folders.get(&root) {
+                Some(folder) => vec![seen_of(folder.wd.clone(), EventMask::Q_OVERFLOW, None)],
+                None => Vec::new(),
+            },
             () = flush => {
                 report(inner, &mut batch).await;
                 due = None;
@@ -329,15 +332,11 @@ async fn read_ready(fd: &mut AsyncFd<Inotify>, buf: &mut [u8]) -> io::Result<Vec
         match ready.get_inner_mut().read_events(buf) {
             Ok(events) => {
                 for event in events {
-                    seen.push(if event.mask.contains(EventMask::Q_OVERFLOW) {
-                        Seen::Overflow
-                    } else {
-                        Seen::Event {
-                            wd: event.wd,
-                            mask: event.mask,
-                            name: event.name.map(OsStr::to_os_string),
-                        }
-                    });
+                    seen.push(seen_of(
+                        event.wd,
+                        event.mask,
+                        event.name.map(OsStr::to_os_string),
+                    ));
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -346,6 +345,16 @@ async fn read_ready(fd: &mut AsyncFd<Inotify>, buf: &mut [u8]) -> io::Result<Vec
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// What an event read from the kernel's queue is: the overflow of the queue, or an event of a
+/// watched folder. A fake overflow goes through here too.
+fn seen_of(wd: WatchDescriptor, mask: EventMask, name: Option<OsString>) -> Seen {
+    if mask.contains(EventMask::Q_OVERFLOW) {
+        Seen::Overflow
+    } else {
+        Seen::Event { wd, mask, name }
     }
 }
 
