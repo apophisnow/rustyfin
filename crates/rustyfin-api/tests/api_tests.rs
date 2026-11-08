@@ -7693,6 +7693,36 @@ async fn b23_episode_numbers_sort_in_order() {
     );
 }
 
+#[tokio::test]
+async fn b23_a_sort_list_of_any_length_answers_as_its_distinct_keys() {
+    let state = test_state().await;
+    let movies = rustyfin_model::library::LibraryContentType::Movies;
+    let (token, user_id, _) = b23_library(&state, movies, &b23_movies()).await;
+    let app = app(state);
+    // SQLite allows 2,000 ORDER BY terms. Jellyfin's EF Core adds a repeated expression only once,
+    // and so does Rustyfin, so a list of any length sorts as its distinct keys do.
+    let names = ["Name"; 2000].join(",");
+    for list in ["/Items".to_string(), format!("/Users/{user_id}/Items")] {
+        let list = format!("{list}?Recursive=true&IncludeItemTypes=Movie&SortOrder=Descending");
+        let once = b23_names(&app, &token, &format!("{list}&SortBy=Name")).await;
+        assert_eq!(once.len(), 6, "{list}");
+        // Not through b23_names, whose message would print all 2,000 keys.
+        let uri = format!("{list}&SortBy={names}");
+        let (status, json) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}&SortBy=Name x2000: {json}");
+        let repeated: Vec<&str> = json["Items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["Name"].as_str().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(repeated, once, "{list}");
+    }
+}
+
 // ── G1c ──
 // One user's data stays theirs: GET /Items/Resume lists only the caller's items (or those of the
 // user a userId names, under path_user's rules), IsFavorite/IsPlayed/IsUnplayed match only the
