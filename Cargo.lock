@@ -2510,6 +2510,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
 ]
 
