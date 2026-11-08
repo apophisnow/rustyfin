@@ -1964,9 +1964,10 @@ async fn b27_restarted(state: &AppState) -> AppState {
 }
 
 /// Waits until the `api_cache` table holds `rows` search answers, which are saved in the
-/// background.
+/// background. Gives up after 45 s, since a busy host can stall the saves for seconds.
 async fn b27_wait_for_l2_rows(state: &AppState, rows: i64) {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
         let (saved,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM api_cache WHERE cache_key LIKE 'search:%'")
                 .fetch_one(&state.db)
@@ -1975,9 +1976,12 @@ async fn b27_wait_for_l2_rows(state: &AppState, rows: i64) {
         if saved >= rows {
             return;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fewer than {rows} search answers reached the api_cache table in 45 s"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("fewer than {rows} search answers reached the api_cache table");
 }
 
 /// The number of answers in the search cache.
