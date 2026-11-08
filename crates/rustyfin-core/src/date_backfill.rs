@@ -42,7 +42,7 @@ pub async fn run_some(
         sqlx::query_scalar("SELECT value FROM configuration WHERE key = 'date_added_backfill'")
             .fetch_optional(pool)
             .await?;
-    let Some(mut last) = marker else {
+    let Some(last) = marker else {
         return Ok(None);
     };
     let started = Instant::now();
@@ -51,9 +51,49 @@ pub async fn run_some(
     } else {
         tracing::info!("date added backfill: resumed after item {last}");
     }
+    let mut run = BackfillRun::default();
+    let result = run_batches(pool, &mut run, last, batch_size, max_batches).await;
+    let elapsed = started.elapsed();
+    let BackfillRun {
+        checked,
+        moved,
+        unreadable,
+        finished,
+    } = run;
+    match result {
+        Ok(()) => {
+            let outcome = if finished {
+                "finished"
+            } else {
+                "stopped part way"
+            };
+            tracing::info!(
+                "date added backfill: {outcome} in {elapsed:.2?}; {checked} items checked, \
+                 {moved} moved to their path's date, {unreadable} unreadable"
+            );
+            Ok(Some(run))
+        }
+        Err(error) => {
+            tracing::warn!(
+                "date added backfill: stopped by an error in {elapsed:.2?}; \
+                 {checked} items checked, {moved} moved to their path's date, \
+                 {unreadable} unreadable"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// The batches of run_some, from `last`. A batch's moves count in `run` once it has committed.
+async fn run_batches(
+    pool: &SqlitePool,
+    run: &mut BackfillRun,
+    mut last: String,
+    batch_size: u32,
+    max_batches: u32,
+) -> Result<(), sqlx::Error> {
     // A batch holds at least one item, so each batch moves the run on.
     let batch_size = batch_size.max(1);
-    let mut run = BackfillRun::default();
     for _ in 0..max_batches {
         let rows: Vec<(String, String, String)> = sqlx::query_as(BATCH_SQL)
             .bind(last.as_str())
@@ -79,8 +119,9 @@ pub async fn run_some(
         let finished = (rows.len() as u64) < u64::from(batch_size);
         let next = rows.last().map(|row| row.0.clone()).unwrap_or_default();
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut batch_moved: u64 = 0;
         for (id, path, stored, date) in &moves {
-            run.moved += sqlx::query(
+            batch_moved += sqlx::query(
                 "UPDATE media_items SET date_created = ?1 \
                  WHERE id = ?2 AND path = ?3 AND date_created = ?4",
             )
@@ -103,27 +144,12 @@ pub async fn run_some(
                 .await?;
         }
         tx.commit().await?;
+        run.moved += batch_moved;
         run.finished = finished;
         if finished {
             break;
         }
         last = next;
     }
-    let elapsed = started.elapsed();
-    let outcome = if run.finished {
-        "finished"
-    } else {
-        "stopped part way"
-    };
-    let BackfillRun {
-        checked,
-        moved,
-        unreadable,
-        ..
-    } = run;
-    tracing::info!(
-        "date added backfill: {outcome} in {elapsed:.2?}; {checked} items checked, \
-         {moved} moved to their path's date, {unreadable} unreadable"
-    );
-    Ok(Some(run))
+    Ok(())
 }

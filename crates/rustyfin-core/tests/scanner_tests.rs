@@ -3113,6 +3113,108 @@ async fn b28_a_second_run_changes_nothing_and_a_stopped_run_finishes_on_the_next
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+struct B28Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(target_os = "linux")]
+impl std::io::Write for B28Logs {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The backfill's log lines, from every test in this binary since the first call. A subscriber
+/// for one thread misses events from a place another thread logged from first.
+#[cfg(target_os = "linux")]
+fn b28_logged() -> Vec<String> {
+    static LOGS: std::sync::OnceLock<B28Logs> = std::sync::OnceLock::new();
+    let logs = LOGS.get_or_init(|| {
+        let logs = B28Logs::default();
+        let sink = logs.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .expect("no other global subscriber in this test binary");
+        logs
+    });
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    text.lines()
+        .filter(|line| line.contains("date added backfill: "))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_run_stopped_by_an_error_logs_its_end() {
+    b28_logged();
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films: Vec<String> = (0..4)
+        .map(|n| format!("Film {n} (200{n})/Film {n} (200{n}).mkv"))
+        .collect();
+    for rel in &films {
+        touch(&root_of(&film), rel);
+    }
+    for (n, rel) in films.iter().enumerate() {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000 + n as u64);
+    }
+    scan(&fx.pool, &film).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+    // The run goes in id order, two items a batch. The last item's move fails after the second
+    // batch has moved the item before it, so that whole batch is undone.
+    let last: String = sqlx::query_scalar(
+        "SELECT MAX(id) FROM media_items WHERE library_id = ?1 AND media_type = 'Movie'",
+    )
+    .bind(film.id.to_string())
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    let fail = format!(
+        "CREATE TRIGGER b28_fail BEFORE UPDATE OF date_created ON media_items \
+         WHEN OLD.id = '{last}' BEGIN SELECT RAISE(ABORT, 'b28: a failed write'); END"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(fail))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, u32::MAX).await;
+    assert!(stopped.is_err(), "{stopped:?}");
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 2);
+    let logged = b28_logged();
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.ends_with("date added backfill: started")),
+        "{logged:#?}"
+    );
+    let end = logged
+        .iter()
+        .find(|line| line.contains("date added backfill: stopped by an error in "))
+        .unwrap_or_else(|| panic!("no end line in {logged:#?}"));
+    assert!(
+        end.ends_with("; 4 items checked, 2 moved to their path's date, 0 unreadable"),
+        "{end}"
+    );
+
+    // The next start redoes the batch that failed.
+    exec(&fx.pool, "DROP TRIGGER b28_fail", &[]).await;
+    let next = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(next), (2, 2, 0, true));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 4);
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn b28_a_file_link_is_dated_by_its_target_and_a_folder_link_by_its_own_times() {
     let fx = Fixture::new().await;
