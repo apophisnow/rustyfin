@@ -15,6 +15,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::query::{
+    bool_param, count_param, enum_values, first_value, item_kinds, list_values, media_types,
+    parent_param, uuid_param,
+};
 use crate::routes::playback::query_user;
 use crate::state::AppState;
 
@@ -142,7 +146,12 @@ async fn single_of(
     kind: ByNameKind,
     name: &str,
 ) -> Result<Json<ByNameDto>, ApiError> {
-    query_user(state, claims, user_param(params)?).await?;
+    query_user(
+        state,
+        claims,
+        uuid_param(params, "UserId")?.filter(|id| !id.is_nil()),
+    )
+    .await?;
     let entry = repo_by_name::get_by_name(&state.db_ro, kind, name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("{} not found", kind.as_str())))?;
@@ -170,103 +179,31 @@ struct ListQuery {
 
 impl ListQuery {
     fn parse(params: &[(String, String)]) -> Result<Self, ApiError> {
-        let total_count = match first_value(params, "EnableTotalRecordCount") {
-            None => true,
-            Some(value) if value.eq_ignore_ascii_case("true") => true,
-            Some(value) if value.eq_ignore_ascii_case("false") => false,
-            Some(_) => {
-                return Err(ApiError::BadRequest(
-                    "EnableTotalRecordCount must be true or false".to_string(),
-                ));
-            }
-        };
+        let total_count = bool_param(params, "EnableTotalRecordCount")?.unwrap_or(true);
         let filter = ByNameFilter {
-            parent_id: parent_param(params)?,
-            include_item_types: list_values(params, "IncludeItemTypes"),
-            exclude_item_types: list_values(params, "ExcludeItemTypes"),
-            media_types: list_values(params, "MediaTypes"),
-            search_term: text_param(params, "SearchTerm"),
-            name_starts_with: text_param(params, "NameStartsWith"),
-            name_starts_with_or_greater: text_param(params, "NameStartsWithOrGreater"),
-            name_less_than: text_param(params, "NameLessThan"),
-            descending: list_values(params, "SortOrder")
-                .first()
-                .is_some_and(|order| order.eq_ignore_ascii_case("Descending")),
-            start_index: first_value(params, "StartIndex")
-                .map(|value| parse_count("StartIndex", value))
-                .transpose()?
-                .unwrap_or(0),
-            limit: first_value(params, "Limit")
-                .map(|value| parse_count("Limit", value))
-                .transpose()?,
+            parent_id: parent_param(params, "ParentId")?,
+            include_item_types: item_kinds(params, "IncludeItemTypes"),
+            exclude_item_types: item_kinds(params, "ExcludeItemTypes"),
+            media_types: media_types(params, "MediaTypes"),
+            search_term: first_value(params, "SearchTerm").map(str::to_string),
+            name_starts_with: first_value(params, "NameStartsWith").map(str::to_string),
+            name_starts_with_or_greater: first_value(params, "NameStartsWithOrGreater")
+                .map(str::to_string),
+            name_less_than: first_value(params, "NameLessThan").map(str::to_string),
+            descending: enum_values(params, "SortOrder", &["Ascending", "Descending"]).first()
+                == Some(&"Descending"),
+            start_index: count_param(params, "StartIndex")?.unwrap_or(0),
+            limit: count_param(params, "Limit")?,
         };
         Ok(Self {
             filter,
-            user_id: user_param(params)?,
+            user_id: uuid_param(params, "UserId")?.filter(|id| !id.is_nil()),
             total_count,
-            item_counts: list_values(params, "Fields")
+            item_counts: list_values(params, "Fields", ',')
                 .iter()
                 .any(|field| field.eq_ignore_ascii_case("ItemCounts")),
         })
     }
-}
-
-/// The first non-empty value of `key` (names match ignoring ASCII case), trimmed. `None` when
-/// absent. An empty value counts as absent, as Jellyfin binds it to null.
-fn first_value<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(key))
-        .map(|(_, value)| value.trim())
-        .find(|value| !value.is_empty())
-}
-
-/// Every value of `key`, each split on commas, trimmed, with the empty entries dropped.
-fn list_values(params: &[(String, String)], key: &str) -> Vec<String> {
-    params
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(key))
-        .flat_map(|(_, value)| value.split(','))
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// A name filter's value. The repo reads an empty one as no filter.
-fn text_param(params: &[(String, String)], key: &str) -> Option<String> {
-    first_value(params, key).map(str::to_string)
-}
-
-/// The `ParentId` of a request. Absent, empty and nil all mean none; any other value is a UUID.
-fn parent_param(params: &[(String, String)]) -> Result<Option<Uuid>, ApiError> {
-    match first_value(params, "ParentId") {
-        None => Ok(None),
-        Some(value) => {
-            let id = parse_uuid("ParentId", value)?;
-            Ok((!id.is_nil()).then_some(id))
-        }
-    }
-}
-
-/// The `UserId` of a request, if it has one. A value that is not a UUID is a 400.
-fn user_param(params: &[(String, String)]) -> Result<Option<Uuid>, ApiError> {
-    first_value(params, "UserId")
-        .map(|value| parse_uuid("UserId", value))
-        .transpose()
-}
-
-fn parse_uuid(name: &str, value: &str) -> Result<Uuid, ApiError> {
-    value
-        .parse::<Uuid>()
-        .map_err(|_| ApiError::BadRequest(format!("{name} must be a UUID")))
-}
-
-/// A non-negative integer parameter.
-fn parse_count(name: &str, value: &str) -> Result<usize, ApiError> {
-    value
-        .parse::<usize>()
-        .map_err(|_| ApiError::BadRequest(format!("{name} must be a non-negative integer")))
 }
 
 /// The year in a path: a positive integer, or a 400.

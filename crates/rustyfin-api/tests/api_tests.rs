@@ -6264,6 +6264,167 @@ async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
     }
 }
 
+/// A library with a film ("Drama"), a series ("Crime") and an episode ("Comedy"), and an
+/// administrator's token, for the tests of how the lists read their parameters.
+async fn j5_reader_app() -> (axum::Router, String) {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Reader", LibraryContentType::Movies).await;
+    j5_item(&state, films, None, "Film", "Movie", "Drama", None).await;
+    j5_item(&state, films, None, "Show", "Series", "Crime", None).await;
+    j5_item(&state, films, None, "Pilot", "Episode", "Comedy", None).await;
+    (app(state), token)
+}
+
+/// Checks each case's status, listed names and whether the entries carry counts, all in one
+/// comparison so that a failure shows every case.
+async fn j5_assert_reads(
+    app: &axum::Router,
+    token: &str,
+    cases: &[(&str, StatusCode, &[&str], bool)],
+) {
+    let mut actual = Vec::new();
+    for &(uri, _, _, _) in cases {
+        let (status, body) = send_authed(app, "GET", uri, token, None).await;
+        let (names, counts) = if status == StatusCode::OK {
+            let counts = j5_items(&body)
+                .iter()
+                .any(|item| item.get("ChildCount").is_some());
+            (j5_names(&body), counts)
+        } else {
+            (Vec::new(), false)
+        };
+        actual.push((uri, status, names, counts));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|&(uri, status, names, counts)| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            (uri, status, names, counts)
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn j5_lists_drop_unknown_kinds_media_types_and_sort_orders() {
+    let (app, token) = j5_reader_app().await;
+    let ok = StatusCode::OK;
+    let all: &[&str] = &["Comedy", "Crime", "Drama"];
+    // Jellyfin's binder drops the entries of a typed list that it can't read, so a list of
+    // unknown entries filters nothing and turns no counts on. Known names are read without case.
+    j5_assert_reads(
+        &app,
+        &token,
+        &[
+            ("/Genres?IncludeItemTypes=Foo", ok, all, false),
+            ("/Genres?IncludeItemTypes=Foo,series", ok, &["Crime"], true),
+            (
+                "/Genres?ExcludeItemTypes=Foo,EPISODE",
+                ok,
+                &["Crime", "Drama"],
+                false,
+            ),
+            ("/Genres?MediaTypes=Foo", ok, all, false),
+            (
+                "/Genres?MediaTypes=Foo,video",
+                ok,
+                &["Comedy", "Drama"],
+                false,
+            ),
+            (
+                "/Genres?SortOrder=Foo,Descending",
+                ok,
+                &["Drama", "Crime", "Comedy"],
+                false,
+            ),
+            ("/Genres?SortOrder=Foo", ok, all, false),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_lists_do_not_split_repeated_keys() {
+    let (app, token) = j5_reader_app().await;
+    let ok = StatusCode::OK;
+    let all: &[&str] = &["Comedy", "Crime", "Drama"];
+    // As in Jellyfin's binder, a lone value splits on commas, but a repeated key gives one entry
+    // per value, and an entry with a comma in it names nothing.
+    j5_assert_reads(
+        &app,
+        &token,
+        &[
+            (
+                "/Genres?IncludeItemTypes=Movie,Series",
+                ok,
+                &["Crime", "Drama"],
+                true,
+            ),
+            (
+                "/Genres?IncludeItemTypes=Movie,Series&IncludeItemTypes=Episode",
+                ok,
+                &["Comedy"],
+                true,
+            ),
+            (
+                "/Genres?includeItemTypes=Movie&IncludeItemTypes=Series",
+                ok,
+                &["Crime", "Drama"],
+                true,
+            ),
+            (
+                "/Genres?MediaTypes=Video,Unknown&MediaTypes=Audio",
+                ok,
+                &[],
+                false,
+            ),
+            (
+                "/Genres?Fields=Overview,ItemCounts&Fields=Genres",
+                ok,
+                all,
+                false,
+            ),
+            ("/Genres?Fields=Overview&Fields=itemcounts", ok, all, true),
+            (
+                "/Genres?SortOrder=Ascending,Descending&SortOrder=Descending",
+                ok,
+                &["Drama", "Crime", "Comedy"],
+                false,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_lists_answer_400_for_counts_above_i32_max() {
+    let (app, token) = j5_reader_app().await;
+    let ok = StatusCode::OK;
+    let bad = StatusCode::BAD_REQUEST;
+    // Jellyfin binds StartIndex and Limit to an `int`, so a larger value is a 400.
+    j5_assert_reads(
+        &app,
+        &token,
+        &[
+            (
+                "/Genres?Limit=2147483647",
+                ok,
+                &["Comedy", "Crime", "Drama"],
+                false,
+            ),
+            ("/Genres?StartIndex=2147483647", ok, &[], false),
+            ("/Genres?Limit=2147483648", bad, &[], false),
+            ("/Genres?StartIndex=2147483648", bad, &[], false),
+            ("/Studios?Limit=2147483648", bad, &[], false),
+            ("/Years?StartIndex=2147483648", bad, &[], false),
+            ("/MusicGenres?Limit=2147483648", bad, &[], false),
+        ],
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn j5_names_fold_a_final_sigma_as_jellyfin_does() {
     use rustyfin_model::library::LibraryContentType;

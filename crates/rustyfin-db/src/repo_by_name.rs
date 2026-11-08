@@ -179,12 +179,12 @@ pub struct ByNameEntry {
 pub struct ByNameFilter {
     /// Only items of this library, or below this item.
     pub parent_id: Option<Uuid>,
-    /// Keep only items of these types, such as `Movie` or `Series`.
-    pub include_item_types: Vec<String>,
-    /// Drop items of these types.
-    pub exclude_item_types: Vec<String>,
-    /// Keep only items of these media kinds, such as `Video` or `Audio`.
-    pub media_types: Vec<String>,
+    /// Keep only items of these types, by canonical `BaseItemKind` name, such as `Movie`.
+    pub include_item_types: Vec<&'static str>,
+    /// Drop items of these types, by canonical `BaseItemKind` name.
+    pub exclude_item_types: Vec<&'static str>,
+    /// Keep only items of these media types, by canonical media type name, such as `Video`.
+    pub media_types: Vec<&'static str>,
     /// Keep names that contain this text.
     pub search_term: Option<String>,
     /// Keep names that start with this text.
@@ -487,15 +487,13 @@ fn in_kind(kind: ByNameKind, media: MediaType) -> bool {
     }
 }
 
-/// Whether an item of type `media` passes the item type and media kind filters. Names compare
-/// case-insensitively, and an empty list filters nothing.
+/// Whether an item of type `media` passes the item type and media kind filters. The lists hold
+/// canonical names, and an empty list filters nothing.
 fn passes_type_filters(filter: &ByNameFilter, media: MediaType) -> bool {
-    let listed =
-        |names: &[String], value: &str| names.iter().any(|name| name.eq_ignore_ascii_case(value));
     let item_kind = media.item_kind();
-    (filter.include_item_types.is_empty() || listed(&filter.include_item_types, item_kind))
-        && !listed(&filter.exclude_item_types, item_kind)
-        && (filter.media_types.is_empty() || listed(&filter.media_types, media.media_kind()))
+    (filter.include_item_types.is_empty() || filter.include_item_types.contains(&item_kind))
+        && !filter.exclude_item_types.contains(&item_kind)
+        && (filter.media_types.is_empty() || filter.media_types.contains(&media.media_kind()))
 }
 
 /// Whether a folded name passes the name filters. A blank filter value filters nothing.

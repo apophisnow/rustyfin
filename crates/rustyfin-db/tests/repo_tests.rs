@@ -1306,10 +1306,11 @@ async fn j5_genre_lists_honour_parent_types_names_order_and_paging() {
     assert_eq!(j5_list(pool, Genre, &under(show)).await, "1: Thriller");
     assert_eq!(j5_list(pool, Genre, &under(Uuid::new_v4())).await, "0: ");
 
-    // Item types match case-insensitively; unknown ones match nothing.
-    let types = |include: &[&str], exclude: &[&str]| ByNameFilter {
-        include_item_types: include.iter().map(|s| s.to_string()).collect(),
-        exclude_item_types: exclude.iter().map(|s| s.to_string()).collect(),
+    // Item types are canonical kind names, which the API's reader gives; a kind that no item has
+    // matches nothing.
+    let types = |include: &[&'static str], exclude: &[&'static str]| ByNameFilter {
+        include_item_types: include.to_vec(),
+        exclude_item_types: exclude.to_vec(),
         ..Default::default()
     };
     assert_eq!(
@@ -1317,15 +1318,11 @@ async fn j5_genre_lists_honour_parent_types_names_order_and_paging() {
         "2: Action, Drama"
     );
     assert_eq!(
-        j5_list(pool, Genre, &types(&["series"], &[])).await,
-        "2: Action, Drama"
-    );
-    assert_eq!(
         j5_list(pool, Genre, &types(&["Movie", "Episode"], &[])).await,
         "4: Action, Comedy, Sci-Fi, Thriller"
     );
     assert_eq!(
-        j5_list(pool, Genre, &types(&[], &["MOVIE"])).await,
+        j5_list(pool, Genre, &types(&[], &["Movie"])).await,
         "3: Action, Drama, Thriller"
     );
     assert_eq!(j5_list(pool, Genre, &types(&["BoxSet"], &[])).await, "0: ");
@@ -1492,13 +1489,13 @@ async fn j5_years_are_positive_production_years_and_studios_come_from_item_studi
         "4: 2017, 2009, 1999, 800"
     );
     let series = ByNameFilter {
-        include_item_types: vec!["Series".into()],
+        include_item_types: vec!["Series"],
         ..Default::default()
     };
     assert_eq!(j5_list(pool, Year, &series).await, "1: 1999");
     // A series is no Video, so 1999 counts only the movie.
     let video = ByNameFilter {
-        media_types: vec!["video".into()],
+        media_types: vec!["Video"],
         ..Default::default()
     };
     let videos = repo_by_name::list(pool, Year, &video).await.unwrap();
@@ -1619,7 +1616,7 @@ async fn j5_old_json_rows_and_odd_separators_list_without_error() {
     let genres = j5_list(pool, ByNameKind::Genre, &ByNameFilter::default()).await;
     assert_eq!(genres, all);
     let movies = ByNameFilter {
-        include_item_types: vec!["Movie".into()],
+        include_item_types: vec!["Movie"],
         ..Default::default()
     };
     assert_eq!(j5_list(pool, ByNameKind::Genre, &movies).await, all);
@@ -1695,7 +1692,7 @@ async fn j5_an_entry_keeps_its_name_under_every_scope_and_type_filter() {
 
     // The same under a type filter. Only the song counts, so Jazz, which only the album has, is left out.
     let songs = ByNameFilter {
-        include_item_types: vec!["Audio".to_string()],
+        include_item_types: vec!["Audio"],
         ..Default::default()
     };
     let page = repo_by_name::list(pool, ByNameKind::MusicGenre, &songs)
