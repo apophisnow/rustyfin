@@ -70,6 +70,7 @@ impl ApiCache {
     /// Invalidate caches when a library scan completes.
     pub fn invalidate_on_scan(&self) {
         self.invalidate_library_lists();
+        self.item_details.invalidate_all();
     }
 
     /// Invalidate a specific item's cache when metadata is refreshed.
