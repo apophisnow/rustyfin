@@ -3026,6 +3026,45 @@ mod kernel {
             .await;
         watcher.stop();
     }
+
+    /// Fix round 2, item D. A burst of mount changes, as an automounter or a host of containers
+    /// makes, is read about once a second, not once for each change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_burst_of_mount_changes_is_read_about_once_a_second() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let (pool, changes, _recorder) = kernel_fixture(&tree).await;
+        add_library(&pool, "Mount K Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 1).await;
+        let point = tree.outside("burst");
+        std::fs::create_dir_all(&point).unwrap();
+
+        let before = watcher.mount_readings();
+        let started = Instant::now();
+        let burst = tokio::task::spawn_blocking(move || {
+            Command::new("sh")
+                .arg("-c")
+                .arg(r#"for i in $(seq 200); do mount -t tmpfs tmpfs "$1" && umount "$1" || exit 1; done"#)
+                .arg("burst")
+                .arg(&point)
+                .status()
+                .unwrap()
+        });
+        assert!(burst.await.unwrap().success(), "200 mounts and unmounts");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let readings = watcher.mount_readings() - before;
+        let elapsed = started.elapsed();
+        assert!(
+            readings <= elapsed.as_secs() + 3,
+            "{readings} readings of the mount table in {elapsed:?}"
+        );
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:
