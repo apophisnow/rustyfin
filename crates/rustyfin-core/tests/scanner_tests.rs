@@ -2802,6 +2802,346 @@ async fn b23_new_items_are_dated_by_their_files() {
     }
 }
 
+// B28: date added backfill. Once after the update, an item already in a library gets the earlier
+// of its stored date and its path's date by B23's rules, since a scan before B23 stored the time of
+// the scan. An earlier or equal stored date is kept, and so is the date of an item whose path can't
+// be read. Once done it doesn't run again, and a run that stops part way goes on at the next start.
+
+/// The date_created stored for the item at `rel`, as stored.
+#[cfg(target_os = "linux")]
+async fn b28_stored(pool: &SqlitePool, lib: &Library, rel: &str) -> String {
+    let id = item_at(pool, lib, rel).await;
+    sqlx::query_scalar("SELECT date_created FROM media_items WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The date_created stored for the item at `rel`.
+#[cfg(target_os = "linux")]
+async fn b28_date(pool: &SqlitePool, lib: &Library, rel: &str) -> chrono::DateTime<chrono::Utc> {
+    let stored = b28_stored(pool, lib, rel).await;
+    chrono::DateTime::parse_from_rfc3339(&stored)
+        .unwrap_or_else(|e| panic!("date_created of {rel} is {stored}: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+/// `secs` seconds after the epoch.
+#[cfg(target_os = "linux")]
+fn b28_at(secs: u64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(secs as i64, 0).unwrap()
+}
+
+/// Stores `date` for every item in the library, as a scan before B23 stored the time of the scan.
+#[cfg(target_os = "linux")]
+async fn b28_date_all(pool: &SqlitePool, lib: &Library, date: chrono::DateTime<chrono::Utc>) {
+    sqlx::query("UPDATE media_items SET date_created = ?1 WHERE library_id = ?2")
+        .bind(date.to_rfc3339())
+        .bind(lib.id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Stores `date`, as given, for the item at `rel`.
+#[cfg(target_os = "linux")]
+async fn b28_set_date(pool: &SqlitePool, lib: &Library, rel: &str, date: &str) {
+    let id = item_at(pool, lib, rel).await;
+    sqlx::query("UPDATE media_items SET date_created = ?1 WHERE id = ?2")
+        .bind(date)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// B23's date for a path that isn't a link to a file: the older of its own modification and
+/// status-change times.
+#[cfg(target_os = "linux")]
+fn b28_own_date(path: &Path) -> chrono::DateTime<chrono::Utc> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    let (secs, nanos) = std::cmp::min(
+        (meta.mtime(), meta.mtime_nsec()),
+        (meta.ctime(), meta.ctime_nsec()),
+    );
+    chrono::DateTime::from_timestamp(secs, nanos as u32).unwrap()
+}
+
+/// Makes the backfill pending again from the start, as the update's migration does.
+#[cfg(target_os = "linux")]
+async fn b28_arm(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT OR REPLACE INTO configuration (key, value) VALUES ('date_added_backfill', '')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Runs the whole backfill, which must be pending.
+#[cfg(target_os = "linux")]
+async fn b28_run(pool: &SqlitePool) -> rustyfin_core::date_backfill::BackfillRun {
+    rustyfin_core::date_backfill::run_pending(pool)
+        .await
+        .unwrap()
+        .expect("a pending backfill")
+}
+
+/// What a run did: (checked, moved, unreadable, finished).
+#[cfg(target_os = "linux")]
+fn b28_counts(run: rustyfin_core::date_backfill::BackfillRun) -> (u64, u64, u64, bool) {
+    (run.checked, run.moved, run.unreadable, run.finished)
+}
+
+/// How many of `films` have their file's date, film n's being 1_000_000_000 + n seconds after the
+/// epoch; the others must still have `scanned`.
+#[cfg(target_os = "linux")]
+async fn b28_dated(
+    pool: &SqlitePool,
+    lib: &Library,
+    films: &[String],
+    scanned: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let mut dated = 0;
+    for (n, rel) in films.iter().enumerate() {
+        let date = b28_date(pool, lib, rel).await;
+        if date == b28_at(1_000_000_000 + n as u64) {
+            dated += 1;
+        } else {
+            assert_eq!(date, scanned, "{rel}");
+        }
+    }
+    dated
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_items_dated_by_their_scan_move_to_their_paths_dates() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let music = fx.library("music", LibraryContentType::Music).await;
+    let photos = fx.library("photos", LibraryContentType::Photos).await;
+    let movie = "Old Film (1999)/Old Film (1999).mkv";
+    let episode = "Show/Season 1/Show S01E01.mkv";
+    let track = "Artist A/Album A/01 Song.mp3";
+    touch(&root_of(&film), movie);
+    touch(&root_of(&tv), episode);
+    touch(&root_of(&music), track);
+    touch(&root_of(&photos), "Beach.jpg");
+    // Old modification times, set once every file exists, since a new file changes its folder's.
+    let dated = [
+        (&film, movie, 1_000_000_000),
+        (&tv, episode, 1_000_000_100),
+        (&tv, "Show/Season 1", 1_000_000_200),
+        (&tv, "Show", 1_000_000_300),
+        (&music, track, 1_000_000_400),
+        (&music, "Artist A/Album A", 1_000_000_500),
+        (&music, "Artist A", 1_000_000_600),
+        (&photos, "Beach.jpg", 1_000_000_700),
+    ];
+    for (lib, rel, secs) in dated {
+        b23_set_mtime(&root_of(lib).join(rel), secs);
+    }
+    for lib in [&film, &tv, &music, &photos] {
+        scan(&fx.pool, lib).await;
+        b28_date_all(&fx.pool, lib, chrono::Utc::now()).await;
+    }
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (8, 8, 0, true));
+    for (lib, rel, secs) in dated {
+        assert_eq!(b28_date(&fx.pool, lib, rel).await, b28_at(secs), "{rel}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_an_earlier_or_equal_stored_date_is_kept() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let earlier = "Earlier (2000)/Earlier (2000).mkv";
+    let equal = "Equal (2001)/Equal (2001).mkv";
+    let later = "Later (2002)/Later (2002).mkv";
+    let unparsed = "Unparsed (2003)/Unparsed (2003).mkv";
+    let films = [earlier, equal, later, unparsed];
+    for rel in films {
+        touch(&root_of(&film), rel);
+    }
+    for rel in films {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000);
+    }
+    scan(&fx.pool, &film).await;
+    // Dates an import or an older server could have stored: before the file's, the file's own,
+    // after it (the time of a scan before B23), and one in the column's default format, which has
+    // no offset, so the server reads it as the epoch.
+    b28_set_date(&fx.pool, &film, earlier, "2000-01-01T00:00:00+00:00").await;
+    b28_set_date(&fx.pool, &film, equal, "2001-09-09T01:46:40+00:00").await;
+    b28_set_date(&fx.pool, &film, later, &chrono::Utc::now().to_rfc3339()).await;
+    b28_set_date(&fx.pool, &film, unparsed, "2024-01-01 00:00:00").await;
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (4, 1, 0, true));
+    assert_eq!(
+        b28_date(&fx.pool, &film, earlier).await,
+        b28_at(946_684_800)
+    );
+    assert_eq!(
+        b28_date(&fx.pool, &film, equal).await,
+        b28_at(1_000_000_000)
+    );
+    assert_eq!(
+        b28_date(&fx.pool, &film, later).await,
+        b28_at(1_000_000_000)
+    );
+    assert_eq!(
+        b28_stored(&fx.pool, &film, unparsed).await,
+        "2024-01-01 00:00:00"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_path_that_cant_be_read_keeps_its_date() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    let gone = "Gone (1999)/Gone (1999).mkv";
+    let kept = "Kept (2001)/Kept (2001).mkv";
+    // An episode outside a season folder: the scanner makes up "Flat Show/Season 1", which has no
+    // folder.
+    let episode = "Flat Show/Flat Show S01E01.mkv";
+    touch(&root_of(&film), gone);
+    touch(&root_of(&film), kept);
+    touch(&root_of(&tv), episode);
+    let dated = [
+        (&film, kept, 1_000_000_000),
+        (&tv, episode, 1_000_000_100),
+        (&tv, "Flat Show", 1_000_000_300),
+    ];
+    for (lib, rel, secs) in dated {
+        b23_set_mtime(&root_of(lib).join(rel), secs);
+    }
+    scan(&fx.pool, &film).await;
+    scan(&fx.pool, &tv).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+    b28_date_all(&fx.pool, &tv, scanned).await;
+    // A file gone since the scan, as on a share that's offline or a drive that's unplugged.
+    std::fs::remove_file(root_of(&film).join(gone)).unwrap();
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (5, 3, 2, true));
+    for (lib, rel) in [(&film, gone), (&tv, "Flat Show/Season 1")] {
+        assert_eq!(b28_date(&fx.pool, lib, rel).await, scanned, "{rel}");
+    }
+    for (lib, rel, secs) in dated {
+        assert_eq!(b28_date(&fx.pool, lib, rel).await, b28_at(secs), "{rel}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_second_run_changes_nothing_and_a_stopped_run_finishes_on_the_next_start() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films: Vec<String> = (0..5)
+        .map(|n| format!("Film {n} (200{n})/Film {n} (200{n}).mkv"))
+        .collect();
+    for rel in &films {
+        touch(&root_of(&film), rel);
+    }
+    for (n, rel) in films.iter().enumerate() {
+        b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000 + n as u64);
+    }
+    scan(&fx.pool, &film).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+
+    // A run stopped after its first batch, as by a shutdown, has dated that batch only.
+    let stopped = rustyfin_core::date_backfill::run_some(&fx.pool, 2, 1)
+        .await
+        .unwrap()
+        .expect("a pending backfill");
+    assert_eq!(b28_counts(stopped), (2, 2, 0, false));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 2);
+    // The next start goes on from there.
+    let next = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(next), (3, 3, 0, true));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
+    // Done: later starts and scans don't run it.
+    assert_eq!(
+        rustyfin_core::date_backfill::run_pending(&fx.pool)
+            .await
+            .unwrap(),
+        None
+    );
+    scan(&fx.pool, &film).await;
+    assert_eq!(
+        rustyfin_core::date_backfill::run_pending(&fx.pool)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
+    // Run again over items already done, it changes nothing.
+    b28_arm(&fx.pool).await;
+    let again = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(again), (5, 0, 0, true));
+    assert_eq!(b28_dated(&fx.pool, &film, &films, scanned).await, 5);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_file_link_is_dated_by_its_target_and_a_folder_link_by_its_own_times() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    // As in B23's test: a series folder outside the library, linked in, and a film whose video
+    // file is a link to a link to a file outside the library.
+    touch(
+        &fx.path("elsewhere"),
+        "Linked Show/Season 1/Linked Show S01E01.mkv",
+    );
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Show"),
+        root_of(&tv).join("Linked Show"),
+    )
+    .unwrap();
+    let linked_film = "Linked Film (2003)/Linked Film (2003).mkv";
+    touch(&fx.path("elsewhere"), "Linked Film.mkv");
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Film.mkv"),
+        fx.path("elsewhere/hop.mkv"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root_of(&film).join("Linked Film (2003)")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/hop.mkv"),
+        root_of(&film).join(linked_film),
+    )
+    .unwrap();
+    b23_set_mtime(&fx.path("elsewhere/Linked Show"), 1_000_000_800);
+    b23_set_mtime(&fx.path("elsewhere/Linked Film.mkv"), 1_000_000_900);
+    scan(&fx.pool, &film).await;
+    scan(&fx.pool, &tv).await;
+    let scanned = chrono::Utc::now();
+    b28_date_all(&fx.pool, &film, scanned).await;
+    b28_date_all(&fx.pool, &tv, scanned).await;
+
+    b28_run(&fx.pool).await;
+    assert_eq!(
+        b28_date(&fx.pool, &film, linked_film).await,
+        b28_at(1_000_000_900)
+    );
+    assert_eq!(
+        b28_date(&fx.pool, &tv, "Linked Show").await,
+        b28_own_date(&root_of(&tv).join("Linked Show"))
+    );
+}
+
 // B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
 // its updates go 0, then up to at most 99, then 100 once its probes have finished. B18 adds the
 // state to each update: Queued, Active from the start, and Idle with the 100.
