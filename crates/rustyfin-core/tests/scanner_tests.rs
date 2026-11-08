@@ -6337,3 +6337,76 @@ async fn b18_tv_rescans_keep_loose_episodes_of_two_shows_apart() {
         );
     }
 }
+
+#[tokio::test]
+async fn b32_scans_collect_jellyfins_video_extensions() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&film);
+    for rel in [
+        "Chinatown (1974)/Chinatown (1974) BR-DISK.m2ts",
+        "Camcorder (2009)/Camcorder (2009).MTS",
+        "Dvd (2007)/Dvd (2007).vob",
+        "Recorded (2008)/Recorded (2008).dvr-ms",
+        "Ogg (2010)/Ogg (2010).ogv",
+        "Imaged (2011)/Imaged (2011) BR-DISK.iso",
+        "Linked (2012)/Linked (2012).strm",
+        "Upstream Color (2013)/BDMV/STREAM/00000.m2ts",
+        "Upstream Color (2013)/BDMV/STREAM/00001.m2ts",
+        "Anchorman 2 (2013)/VIDEO_TS/VTS_01_1.VOB",
+        "Anchorman 2 (2013)/VIDEO_TS/VIDEO_TS.IFO",
+    ] {
+        touch(&root, rel);
+    }
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&tv), "Show/Season 1/Show S01E01.m2ts");
+
+    scan(&fx.pool, &film).await;
+    scan(&fx.pool, &tv).await;
+
+    assert_eq!(
+        paths(&fx.pool, &film, "Movie").await,
+        [
+            "Camcorder (2009)/Camcorder (2009).MTS",
+            "Chinatown (1974)/Chinatown (1974) BR-DISK.m2ts",
+            "Dvd (2007)/Dvd (2007).vob",
+            "Ogg (2010)/Ogg (2010).ogv",
+            "Recorded (2008)/Recorded (2008).dvr-ms",
+        ]
+    );
+    assert_eq!(
+        paths(&fx.pool, &tv, "Episode").await,
+        ["Show/Season 1/Show S01E01.m2ts"]
+    );
+}
+
+/// ffmpeg.
+#[tokio::test]
+async fn b32_an_m2ts_joins_its_movie_as_a_version() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    const MKV: &str = "Chinatown (1974)/Chinatown (1974) Bluray-1080p.mkv";
+    const M2TS: &str = "Chinatown (1974)/Chinatown (1974) BR-DISK.m2ts";
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    clip(&fx, &root, MKV, 2);
+    scan_idle(&fx.pool, &lib).await;
+    let movie = item_at(&fx.pool, &lib, MKV).await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, movie, &marks).await;
+
+    clip(&fx, &root, M2TS, 2);
+    scan_idle(&fx.pool, &lib).await;
+
+    assert_groups(&fx.pool, &lib, &[(MKV, &[MKV, M2TS])]).await;
+    assert_eq!(
+        item_at(&fx.pool, &lib, MKV).await,
+        movie,
+        "the movie keeps its id"
+    );
+    assert_eq!(marks_of(&fx.pool, &user, movie).await, Some(marks));
+}

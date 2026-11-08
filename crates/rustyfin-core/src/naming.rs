@@ -28,6 +28,11 @@ const IGNORED_DIR_NAMES: &[&str] = &[
     "minta",
 ];
 
+/// Blu-ray and DVD folders, in lower case. Jellyfin plays the folder that holds one as a single title
+/// (`BaseVideoResolver.cs:261-286`); Rustyfin can't, so it skips them, and their `.m2ts` and `.vob` streams
+/// don't become titles of their own.
+const DISC_DIR_NAMES: &[&str] = &["bdmv", "video_ts"];
+
 /// File names that are skipped whole, in lower case.
 const IGNORED_FILE_NAMES: &[&str] = &["small.jpg", "albumart.jpg", "thumbs.db"];
 
@@ -36,12 +41,13 @@ const IGNORED_FILE_SUFFIXES: &[&str] = &[".bts", ".sync", ".trickplay"];
 
 /// Whether the scanner must not enter the folder called `name`.
 ///
-/// Skipped: names that start with `.` or `@`, names in `IGNORED_DIR_NAMES`, and names that end
-/// with `.trickplay`.
+/// Skipped: names that start with `.` or `@`, names in `IGNORED_DIR_NAMES` and `DISC_DIR_NAMES`, and
+/// names that end with `.trickplay`.
 pub fn is_ignored_dir(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.starts_with(['.', '@'])
         || IGNORED_DIR_NAMES.contains(&lower.as_str())
+        || DISC_DIR_NAMES.contains(&lower.as_str())
         || lower.ends_with(".trickplay")
 }
 

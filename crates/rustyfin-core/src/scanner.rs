@@ -16,8 +16,13 @@ use crate::scan_progress::ScanTicket;
 use crate::scan_sync;
 use crate::tmdb_client::TmdbApi;
 
+/// Jellyfin's video extensions (`NamingOptions.cs:24-79`) without `001`, `asx`, `bin`, `ifo`, `img`, `iso`,
+/// `nrg` and `strm`: split parts, playlists, disc images and links, which ffmpeg can't play as one title.
 pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
-    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg",
+    "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "3g2", "3gp",
+    "amv", "asf", "bivx", "divx", "dv", "dvr-ms", "f4v", "fli", "m2t", "m2ts", "m2v", "mk3d",
+    "mpe", "mts", "mxf", "nsv", "nuv", "ogm", "ogv", "pva", "qt", "rec", "rm", "rmvb", "svq3",
+    "tp", "ty", "viv", "vob", "vp3", "wtv", "xvid",
 ];
 pub(crate) const AUDIO_EXTENSIONS: &[&str] =
     &["mp3", "flac", "ogg", "wav", "aac", "wma", "m4a", "opus"];
