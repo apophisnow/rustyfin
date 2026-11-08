@@ -3230,3 +3230,110 @@ async fn b20_copy_path_reads_sqlites_page_size() {
         "the in-memory path"
     );
 }
+
+/// Writes `file`, a database of 512-byte pages whose schema b-tree spins (re-check 3, F4): page 1
+/// and the next `levels - 1` pages are interior pages whose `fan_out` child pointers all point at
+/// the next of them, and the last one's at a leaf of `rows` schema rows holding only NULLs. Loading
+/// the schema reads that leaf `fan_out`^`levels` times, and SQLite refuses each row (it has no root
+/// page) without ending the load, so 6 levels of 20 (3.5 KB) load for minutes. No tree is deeper
+/// than `levels`, so no cursor or check can overflow a stack.
+fn spinning_schema(file: &Path, levels: u32, fan_out: u16, rows: u8) {
+    let ps = 512;
+    let pages = levels + 1;
+    let mut bytes = vec![0u8; ps * pages as usize];
+    // The database header (file format section 1.3): a rollback-journal database in UTF-8 whose
+    // size in pages holds (its change counter matches its version-valid-for number).
+    bytes[..16].copy_from_slice(b"SQLite format 3\0");
+    bytes[16..24].copy_from_slice(&[2, 0, 1, 1, 0, 64, 32, 32]);
+    bytes[24..28].copy_from_slice(&1u32.to_be_bytes());
+    bytes[28..32].copy_from_slice(&pages.to_be_bytes());
+    bytes[44..48].copy_from_slice(&4u32.to_be_bytes());
+    bytes[56..60].copy_from_slice(&1u32.to_be_bytes());
+    bytes[92..96].copy_from_slice(&1u32.to_be_bytes());
+    bytes[96..100].copy_from_slice(&3_046_000u32.to_be_bytes());
+    let cells = fan_out - 1;
+    for level in 0..levels {
+        let page = &mut bytes[level as usize * ps..][..ps];
+        let h = if level == 0 { 100 } else { 0 };
+        let child = (level + 2).to_be_bytes();
+        // An interior table page: `cells` cells of a child pointer and a one-byte key, and the
+        // right-most pointer, all at the next page.
+        page[h] = 0x05;
+        page[h + 3..h + 5].copy_from_slice(&cells.to_be_bytes());
+        page[h + 5..h + 7].copy_from_slice(&(512 - 5 * cells).to_be_bytes());
+        page[h + 8..h + 12].copy_from_slice(&child);
+        for cell in 0..usize::from(cells) {
+            let at = ps - 5 * (cell + 1);
+            page[h + 12 + 2 * cell..h + 14 + 2 * cell].copy_from_slice(&(at as u16).to_be_bytes());
+            page[at..at + 4].copy_from_slice(&child);
+            page[at + 4] = cell as u8 + 1;
+        }
+    }
+    // The leaf: `rows` cells of 8 bytes, the payload size, the rowid and a record of five NULLs.
+    let leaf = &mut bytes[levels as usize * ps..];
+    leaf[0] = 0x0D;
+    leaf[3..5].copy_from_slice(&u16::from(rows).to_be_bytes());
+    leaf[5..7].copy_from_slice(&(512 - 8 * u16::from(rows)).to_be_bytes());
+    for row in 0..rows {
+        let at = ps - 8 * (usize::from(row) + 1);
+        let pointer = 8 + 2 * usize::from(row);
+        leaf[pointer..pointer + 2].copy_from_slice(&(at as u16).to_be_bytes());
+        leaf[at..at + 8].copy_from_slice(&[6, row + 1, 6, 0, 0, 0, 0, 0]);
+    }
+    std::fs::write(file, bytes).unwrap();
+}
+
+// Fix round 5, R4 (re-check 4, point 4 (d)): a request dropped while a snapshot's first statement
+// loads a spinning schema stops the worker, on both paths. The probe lifts the budget, so only the
+// cancel can end the load, and counts the handler's ticks. Before, `guard_connection` returned a
+// bare flag that was wrapped in `CancelOnDrop` only after `read_roots`, so dropping the request
+// there dropped the flag unset and the worker spun on until the load ended.
+#[tokio::test]
+async fn b20_dropped_snapshot_stops_its_worker() {
+    use super::source::{PROGRESS_PROBE, ProgressProbe};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    let tmp = TempDir::new();
+    let data = TempDir::new();
+    let file = tmp.0.join("jellyfin.db");
+    spinning_schema(&file, 6, 20, 10);
+    let mut outcomes = Vec::new();
+    for (path, limit) in [("in memory", u64::MAX), ("copy", 0)] {
+        let probe = Arc::new(ProgressProbe {
+            budget: u64::MAX,
+            ticks: AtomicU64::new(0),
+        });
+        let open =
+            open_snapshot_with_free(&file, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX));
+        let opened = tokio::time::timeout(
+            Duration::from_millis(200),
+            PROGRESS_PROBE.scope(Arc::clone(&probe), open),
+        )
+        .await
+        .is_ok();
+        // The request is dropped. The ticks have stopped once 100 ms pass without one.
+        let dropped = Instant::now();
+        let mut last = probe.ticks.load(Ordering::Relaxed);
+        let ticked = last > 0;
+        let stopped = loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = probe.ticks.load(Ordering::Relaxed);
+            if now == last {
+                break true;
+            }
+            if dropped.elapsed() > Duration::from_secs(2) {
+                break false;
+            }
+            last = now;
+        };
+        let outcome = match (opened, ticked, stopped) {
+            (true, _, _) => "opened within 200 ms",
+            (false, false, _) => "no guarded statement ran",
+            (false, true, true) => "stopped",
+            (false, true, false) => "still spinning 2 s after the drop",
+        };
+        outcomes.push(format!("{path}: {outcome}"));
+    }
+    assert_eq!(outcomes, ["in memory: stopped", "copy: stopped"]);
+}

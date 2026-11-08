@@ -1352,7 +1352,7 @@ async fn snapshot_try(
         })
         .await?;
         return Ok(Some(SnapshotConn {
-            _cancel: CancelOnDrop(cancel),
+            _cancel: cancel,
             conn,
             _copy: None,
         }));
@@ -1391,7 +1391,7 @@ async fn snapshot_try(
     let owner = file.to_path_buf();
     on_blocking(file, move || check_tree_depth(&pages, &owner, &roots)).await?;
     Ok(Some(SnapshotConn {
-        _cancel: CancelOnDrop(cancel),
+        _cancel: cancel,
         conn,
         _copy: Some(copy),
     }))
@@ -1478,21 +1478,48 @@ pub(super) fn page_count(header: &[u8], len: u64) -> u64 {
     len / page_size
 }
 
-/// Installs the progress guard on `conn` and returns its cancel flag, which `SnapshotConn` sets when
-/// it is dropped so a dropped request can't leave the worker spinning. `budget` is in ticks
-/// (`progress_budget`); the handler fires every `PROGRESS_OPS` steps.
+/// Installs the progress guard on `conn` and returns its cancel, which sets the guard's flag when
+/// dropped so a dropped request can't leave the worker spinning. The caller holds it from before
+/// its first statement, which loads the schema, and `SnapshotConn` holds it from then on (spec Fix
+/// round 5, R4). `budget` is in ticks (`progress_budget`); the handler fires every `PROGRESS_OPS`
+/// steps.
 pub(super) async fn guard_connection(
     file: &Path,
     conn: &mut SqliteConnection,
     budget: u64,
-) -> Result<Arc<AtomicBool>, ImportError> {
+) -> Result<CancelOnDrop, ImportError> {
     let cancel = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let probe = PROGRESS_PROBE.try_with(Arc::clone).ok();
+    #[cfg(test)]
+    let budget = probe.as_ref().map_or(budget, |probe| probe.budget);
     let guard = ProgressGuard::new(budget, Arc::clone(&cancel));
+    let handler = move || {
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.ticks.fetch_add(1, Ordering::Relaxed);
+        }
+        guard.tick()
+    };
     conn.lock_handle()
         .await
         .map_err(|e| unreadable(file, &e))?
-        .set_progress_handler(PROGRESS_OPS, move || guard.tick());
-    Ok(cancel)
+        .set_progress_handler(PROGRESS_OPS, handler);
+    Ok(CancelOnDrop(cancel))
+}
+
+/// A test's hold on the guards `guard_connection` installs while a future runs inside
+/// `PROGRESS_PROBE.scope`: each takes `budget` in place of its own and counts its ticks in `ticks`
+/// (spec Fix round 5, R4).
+#[cfg(test)]
+pub(super) struct ProgressProbe {
+    pub(super) budget: u64,
+    pub(super) ticks: AtomicU64,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static PROGRESS_PROBE: Arc<ProgressProbe>;
 }
 
 /// The root pages `check_tables`' `quick_check` reads for `tables`, as `(table, rootpage)`: each
@@ -1740,9 +1767,10 @@ impl DerefMut for SnapshotConn {
     }
 }
 
-/// Sets its flag when dropped. `SnapshotConn` holds one before its connection so that dropping the
-/// snapshot signals the progress handler to interrupt a query the worker may still be running.
-struct CancelOnDrop(Arc<AtomicBool>);
+/// Sets its flag when dropped. `guard_connection` returns one, and `SnapshotConn` holds it before
+/// its connection, so that dropping the request or the snapshot signals the progress handler to
+/// interrupt a query the worker may still be running.
+pub(super) struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
