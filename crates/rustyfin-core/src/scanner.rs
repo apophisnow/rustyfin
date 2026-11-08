@@ -1406,13 +1406,28 @@ pub(crate) async fn dir_id(path: &Path) -> std::io::Result<DirId> {
     fs::canonicalize(path).await
 }
 
+/// The metadata `date_added` reads for `path`. A file link gives its final target's, every hop
+/// followed, as Jellyfin resolves one; anything else, a folder link, and a link whose target can't be
+/// read give the entry's own, from `lstat`. None if even that can't be read.
+async fn date_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    let own = fs::symlink_metadata(path).await.ok()?;
+    if own.file_type().is_symlink()
+        && let Ok(target) = fs::metadata(path).await
+        && target.is_file()
+    {
+        return Some(target);
+    }
+    Some(own)
+}
+
 /// When the item at `path` was added, as Jellyfin dates it. On Linux .NET has no birth time, so its
-/// creation time is the older of the modification and status-change times, from `lstat`: a symlink
-/// gives its own times. Now, if they can't be read.
+/// creation time is the older of the modification and status-change times, from `date_metadata`, so
+/// a file link is dated by its final target and a folder link by its own times. Now, if they
+/// can't be read.
 #[cfg(target_os = "linux")]
 async fn date_added(path: &Path) -> DateTime<Utc> {
     use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = fs::symlink_metadata(path).await else {
+    let Some(meta) = date_metadata(path).await else {
         return Utc::now();
     };
     let modified = (meta.mtime(), meta.mtime_nsec());
@@ -1422,16 +1437,17 @@ async fn date_added(path: &Path) -> DateTime<Utc> {
 }
 
 /// When the item at `path` was added, as Jellyfin dates it: its creation time, else its
-/// modification time, from `lstat`. Now, if they can't be read.
+/// modification time, from `date_metadata`, so a file link is dated by its final target and a
+/// folder link by its own times. Now, if they can't be read.
 #[cfg(not(target_os = "linux"))]
 async fn date_added(path: &Path) -> DateTime<Utc> {
-    match fs::symlink_metadata(path).await {
-        Ok(meta) => meta
+    match date_metadata(path).await {
+        Some(meta) => meta
             .created()
             .or_else(|_| meta.modified())
             .map(DateTime::<Utc>::from)
             .unwrap_or_else(|_| Utc::now()),
-        Err(_) => Utc::now(),
+        None => Utc::now(),
     }
 }
 

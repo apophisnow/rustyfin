@@ -2685,9 +2685,10 @@ async fn new_items_skip_known_failures() {
 }
 
 // B23: date added. A new item is dated the way Jellyfin dates it on Linux: by its path's creation
-// time, which .NET reads there as the older of the modification and status-change times, without
-// following a symlink. A movie by its video file; a series, season, artist or album by its folder;
-// an episode, track or photo by its file.
+// time, which .NET reads there as the older of the modification and status-change times. A file
+// that is a symlink is dated by its final target, as Jellyfin resolves one; a folder link keeps its
+// own times. A movie by its video file; a series, season, artist or album by its folder; an
+// episode, track or photo by its file.
 
 /// Sets the modification time of a file or folder to `secs` after the epoch (which sets its
 /// status-change time to now).
@@ -2741,6 +2742,21 @@ async fn b23_new_items_are_dated_by_their_files() {
         root_of(&tv).join("Linked Show"),
     )
     .unwrap();
+    // A film whose video file is a link to a link to a file outside the library: the final file's
+    // times count.
+    let linked_film = "Linked Film (2003)/Linked Film (2003).mkv";
+    touch(&fx.path("elsewhere"), "Linked Film.mkv");
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/Linked Film.mkv"),
+        fx.path("elsewhere/hop.mkv"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root_of(&film).join("Linked Film (2003)")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.path("elsewhere/hop.mkv"),
+        root_of(&film).join(linked_film),
+    )
+    .unwrap();
     // Old modification times, set once every file exists, since a new file changes its folder's.
     let old = [
         (root_of(&film).join(old_film), 1_000_000_000),
@@ -2752,6 +2768,7 @@ async fn b23_new_items_are_dated_by_their_files() {
         (root_of(&music).join("Artist A"), 1_000_000_600),
         (root_of(&photos).join("Beach.jpg"), 1_000_000_700),
         (fx.path("elsewhere/Linked Show"), 1_000_000_800),
+        (fx.path("elsewhere/Linked Film.mkv"), 1_000_000_900),
     ];
     for (path, secs) in &old {
         b23_set_mtime(path, *secs);
@@ -2772,6 +2789,7 @@ async fn b23_new_items_are_dated_by_their_files() {
         (&music, "Artist A/Album A", 1_000_000_500),
         (&music, "Artist A", 1_000_000_600),
         (&photos, "Beach.jpg", 1_000_000_700),
+        (&film, linked_film, 1_000_000_900),
     ] {
         assert_eq!(b23_date_created(&fx.pool, lib, rel).await, secs, "{rel}");
     }
