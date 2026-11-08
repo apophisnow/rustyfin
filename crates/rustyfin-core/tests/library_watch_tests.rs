@@ -1461,6 +1461,35 @@ async fn a_database_error_keeps_the_current_monitors() {
     watcher.stop();
 }
 
+/// Fix round 2, item E: a reconcile that fails is tried again a little later, so a library added
+/// while the database failed is monitored without another reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_reconcile_is_retried() {
+    let _logs = captured_logs();
+    let tree = Tree::new();
+    let (pool, changes) = manager_fixture(&tree).await;
+    add_library(&pool, "Watch I Films", &[tree.outside("films")]).await;
+    let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+    wait_monitored(&watcher, "the films path", |m| {
+        ready_paths(m) == [tree.outside("films")]
+    })
+    .await;
+
+    watcher.fail_reconciles(1);
+    add_library(&pool, "Watch I Shows", &[tree.outside("shows")]).await;
+    watcher.libraries_changed();
+    wait_for_log(&[
+        "library monitor: could not load the libraries (",
+        "injected for a test",
+    ])
+    .await;
+    wait_monitored(&watcher, "the shows library is added by a retry", |m| {
+        ready_paths(m) == [tree.outside("films"), tree.outside("shows")]
+    })
+    .await;
+    watcher.stop();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_poll_interval_applies_at_once() {
     let _logs = captured_logs();
@@ -3105,6 +3134,50 @@ mod kernel {
         recorder
             .wait_for(&folder_unit(&lib, tree.at("Alpha (2001)")), 1)
             .await;
+        watcher.stop();
+    }
+
+    /// Fix round 2, item E: a failed reading of the mount table doesn't end the follower. It tries
+    /// again a little later and compares the table with its last good reading, so a share mounted
+    /// on a watched path while the reading failed is still seen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_failed_reading_of_the_mount_table_is_retried() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount M Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 1).await;
+
+        watcher.fail_mount_reads(1);
+        let _share = Share::mount(&tree.root());
+        let watching = format!(
+            "library monitor: watching '{}' of 'Mount M Films' (",
+            tree.root().display()
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log_lines(&[&watching]).len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the path is not watched again on the share within 20 s: {:?}",
+                watcher.monitored()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        write(&tree.at("Film (2001)/Film (2001).mkv"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Film (2001)")), 1)
+            .await;
+        let failed = log_lines(&[
+            "library monitor: cannot read the mount table (injected for a test); trying again in 1 s",
+        ]);
+        assert_eq!(failed.len(), 1, "warned once");
+        let again = log_lines(&["library monitor: following the mount table again"]);
+        assert_eq!(again.len(), 1, "logged once");
         watcher.stop();
     }
 }
