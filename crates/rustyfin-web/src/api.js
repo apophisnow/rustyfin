@@ -17,6 +17,7 @@ const API = {
     _cacheGen: 0, // Bumped by clearUserCache(); answers from an older generation are not stored
     _adminCheck: null, // The running /Users/Me re-read, shared by concurrent callers
     onAdminLost: null, // Set by app.js; called when this account loses administrator rights
+    onSignedOut: null, // Set by app.js; called after every sign-out, the user's or a 401's
 
     /**
      * Get cached response or fetch from server with deduplication.
@@ -133,9 +134,11 @@ const API = {
     },
 
     async get(path) {
+        const sent = this.token;
         const res = await fetch(this.base + path, { headers: this.headers() });
         if (!res.ok) {
-            if (res.status === 401 && this.token) {
+            // A late 401 for an older token must not sign out the user who signed in since.
+            if (res.status === 401 && sent && this.token === sent) {
                 this.logout();
                 window.location.hash = 'login';
             }
@@ -304,6 +307,7 @@ const API = {
         this.userName = null;
         this.isAdmin = false;
         ['rustyfin_token', 'rustyfin_user_id', 'rustyfin_user_name', 'rustyfin_is_admin'].forEach(k => localStorage.removeItem(k));
+        if (this.onSignedOut) this.onSignedOut();
     },
 
     isLoggedIn() {

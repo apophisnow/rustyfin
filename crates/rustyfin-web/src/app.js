@@ -257,6 +257,7 @@ async function wizComplete() {
             try {
                 await API.login(wizCredentials.name, wizCredentials.password);
                 wizProgress.loggedIn = true;
+                wizCredentials = null; // the password isn't needed after the sign-in
                 // Replace a socket or retry left from an earlier session, so the new token is used now
                 stopScanProgressWebSocket();
                 initScanProgressWebSocket();
@@ -2584,9 +2585,7 @@ async function handleSetupPassword(e) {
 }
 
 function doLogout() {
-    stopScanProgressWebSocket();
     API.logout();
-    updateAuthUI();
     navigate('home');
     toast(t('login.signed_out'));
 }
@@ -4335,6 +4334,27 @@ function followAdminLoss() {
     if (currentPage === 'admin') navigate('home');
 }
 API.onAdminLost = followAdminLoss;
+
+// Runs after every sign-out, the user's or a 401's: drops what the signed-out user left in this tab, such as the
+// import page's setup codes and the server log, so the next user can't read them.
+function afterSignOut() {
+    stopScanProgressWebSocket();
+    LiveLog.disconnect();
+    LiveLog.messages = [];
+    jiShownCodes.clear();
+    jiPendingNames = new Map();
+    jiChoice.clear();
+    jiConfirm.clear();
+    $('page-admin').innerHTML = ''; // the import preview (#ji-users), its codes box and the live log
+    libraries = [];
+    updateAuthUI();
+}
+API.onSignedOut = afterSignOut;
+
+// Another tab signed in or out: reload, so this tab drops the old session's token, cache and pages.
+window.addEventListener('storage', e => {
+    if (e.key === 'rustyfin_token') location.reload();
+});
 
 // --- Live Log Functions ---
 let liveLogInitialized = false;
