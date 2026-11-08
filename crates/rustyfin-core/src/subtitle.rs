@@ -146,6 +146,18 @@ pub fn srt_to_vtt(srt: &str) -> String {
     out
 }
 
+/// Whether a subtitle codec is a picture subtitle, which is overlaid rather than drawn as text.
+/// Matched without case: any codec containing "pgs", or one of the DVD, DVB, VobSub, XSUB and SUP
+/// names.
+pub fn is_image_subtitle(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    codec.contains("pgs")
+        || matches!(
+            codec.as_str(),
+            "dvd_subtitle" | "dvdsub" | "vobsub" | "dvb_subtitle" | "dvbsub" | "xsub" | "sup"
+        )
+}
+
 /// Remote subtitle search result
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -393,5 +405,39 @@ mod tests {
         let vtt = srt_to_vtt(srt);
         // The blank line between cues should be preserved
         assert!(vtt.contains("\n\n"));
+    }
+
+    // ── is_image_subtitle ──
+
+    #[test]
+    fn test_picture_subtitle_codecs_are_images() {
+        // ffprobe's names and Jellyfin's, matched without case
+        for codec in [
+            "hdmv_pgs_subtitle",
+            "PGSSUB",
+            "dvd_subtitle",
+            "DVDSUB",
+            "vobsub",
+            "dvb_subtitle",
+            "DVBSUB",
+            "xsub",
+            "sup",
+        ] {
+            assert!(is_image_subtitle(codec), "{codec}");
+        }
+        for codec in [
+            "subrip",
+            "srt",
+            "ass",
+            "ssa",
+            "webvtt",
+            "vtt",
+            "mov_text",
+            "text",
+            "dvb_teletext",
+            "",
+        ] {
+            assert!(!is_image_subtitle(codec), "{codec}");
+        }
     }
 }
