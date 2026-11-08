@@ -1,5 +1,4 @@
 use rustyfin_model::media::{MediaItem, MediaType};
-use rustyfin_model::search::SearchHint;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -15,64 +14,109 @@ fn normalize_fts_query(query: &str) -> String {
     format!("{}*", escaped)
 }
 
-/// Fallback LIKE search using prefix matching for better index utilization
-/// Uses `query%` instead of `%query%` so B-tree indexes can be used
-fn like_search_hints_query() -> &'static str {
-    "SELECT id, name, media_type, production_year, runtime_ticks
-     FROM media_items
-     WHERE name LIKE ?1
-     LIMIT ?2"
+/// A library item that a hints search matched. The hint filters, the score and the paging run on
+/// these.
+pub struct HintCandidate {
+    pub id: Uuid,
+    pub name: String,
+    /// The `media_type` as stored. It may be a name that is not a `BaseItemKind`.
+    pub kind: String,
+    /// The `tags` column split on `|`, each entry trimmed, empty entries dropped.
+    pub tags: Vec<String>,
+    pub production_year: Option<i32>,
+    pub runtime_ticks: Option<i64>,
 }
 
-pub async fn search_hints(
+/// Hint candidates by FTS5. `?1` is the FTS query and `?2` the parent id, or NULL for every
+/// library. A parent holds the items of that library and the descendants of that item, not the
+/// item itself. `UNION` (not `UNION ALL`) ends a walk that runs into a cycle of parents.
+const HINT_FTS_SQL: &str =
+    "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags
+     FROM media_items m
+     JOIN media_items_fts f ON f.rowid = m.rowid
+     WHERE media_items_fts MATCH ?1
+       AND (?2 IS NULL OR m.library_id = ?2 OR (m.id <> ?2 AND m.id IN (
+            WITH RECURSIVE below(id) AS (
+                SELECT c.id FROM media_items c WHERE c.parent_id = ?2
+                UNION
+                SELECT c.id FROM media_items c JOIN below b ON c.parent_id = b.id
+            )
+            SELECT id FROM below)))";
+
+/// The LIKE fallback of `HINT_FTS_SQL`. `?1` is the `query%` prefix pattern.
+const HINT_LIKE_SQL: &str =
+    "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags
+     FROM media_items m
+     WHERE m.name LIKE ?1
+       AND (?2 IS NULL OR m.library_id = ?2 OR (m.id <> ?2 AND m.id IN (
+            WITH RECURSIVE below(id) AS (
+                SELECT c.id FROM media_items c WHERE c.parent_id = ?2
+                UNION
+                SELECT c.id FROM media_items c JOIN below b ON c.parent_id = b.id
+            )
+            SELECT id FROM below)))";
+
+type HintRow = (
+    String,
+    String,
+    String,
+    Option<i32>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// Every library item that a hints search for `term` (trimmed) matches inside `parent`. The match
+/// is FTS5 over the names, overviews and genres, with the name prefix as the fallback when FTS5
+/// rejects the query. The result is neither ordered nor limited.
+pub async fn hint_candidates(
     pool: &SqlitePool,
-    query: &str,
-    limit: i64,
-) -> Result<Vec<SearchHint>, sqlx::Error> {
-    // Try FTS5 first for full-text search across name, overview, and genres
-    let fts_query = normalize_fts_query(query);
-    let rows = sqlx::query_as::<_, (String, String, String, Option<i32>, Option<i64>)>(
-        "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks
-         FROM media_items m
-         JOIN media_items_fts f ON f.rowid = m.rowid
-         WHERE media_items_fts MATCH ?1
-         LIMIT ?2",
-    )
-    .bind(&fts_query)
-    .bind(limit)
-    .fetch_all(pool)
-    .await;
+    term: &str,
+    parent: Option<Uuid>,
+) -> Result<Vec<HintCandidate>, sqlx::Error> {
+    let scope = parent.map(|id| id.to_string());
+    let fts_query = normalize_fts_query(term);
+    let rows = sqlx::query_as::<_, HintRow>(HINT_FTS_SQL)
+        .bind(&fts_query)
+        .bind(scope.clone())
+        .fetch_all(pool)
+        .await;
 
     let rows = match rows {
-        Ok(r) => r,
+        Ok(rows) => rows,
         Err(_) => {
-            // Fallback to LIKE search with prefix matching for index utilization
             // Using `query%` instead of `%query%` enables B-tree index scan on idx_media_items_name
-            let like_prefix = format!("{}%", query);
-            sqlx::query_as::<_, (String, String, String, Option<i32>, Option<i64>)>(
-                like_search_hints_query(),
-            )
-            .bind(&like_prefix)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
+            let like_prefix = format!("{term}%");
+            sqlx::query_as::<_, HintRow>(HINT_LIKE_SQL)
+                .bind(&like_prefix)
+                .bind(scope)
+                .fetch_all(pool)
+                .await?
         }
     };
 
     Ok(rows
         .into_iter()
-        .filter_map(|r| {
-            let id = Uuid::parse_str(&r.0).ok()?;
-            Some(SearchHint {
-                id,
-                name: r.1,
-                item_type: r.2.clone(),
-                media_type: Some(r.2),
-                production_year: r.3,
-                run_time_ticks: r.4,
+        .filter_map(|(id, name, kind, production_year, runtime_ticks, tags)| {
+            Some(HintCandidate {
+                id: Uuid::parse_str(&id).ok()?,
+                name,
+                kind,
+                tags: split_tags(tags.as_deref()),
+                production_year,
+                runtime_ticks,
             })
         })
         .collect())
+}
+
+/// The entries of a `tags` value: split on `|`, trimmed, with the empty ones dropped.
+fn split_tags(tags: Option<&str>) -> Vec<String> {
+    tags.unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Full search returning MediaItem results

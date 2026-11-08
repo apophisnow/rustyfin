@@ -1799,11 +1799,8 @@ async fn test_search_hints_empty_term() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(result["SearchHints"].is_array());
-    assert_eq!(result["TotalRecordCount"], 0);
+    // Jellyfin's searchTerm is required, so a blank one is a 400 (J6).
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -2260,6 +2257,883 @@ async fn b27_a_repeated_search_gets_the_first_answer_again() {
     assert_eq!(b27_kinds(&again), [("Comet Hunters", "Series", true)]);
     assert_eq!(again, first_series);
     assert_eq!(b27_answer(&app_after, movie, &token).await, first_movie);
+}
+
+// ── J6: search parity ──
+
+/// The J6 library and the ids of its items, with an administrator's token and id.
+struct J6Library {
+    token: String,
+    admin: uuid::Uuid,
+    library: uuid::Uuid,
+    movie: uuid::Uuid,
+    series: uuid::Uuid,
+    season: uuid::Uuid,
+    episode: uuid::Uuid,
+    artist: uuid::Uuid,
+    album: uuid::Uuid,
+    track: uuid::Uuid,
+}
+
+/// The hints a search for "comet" finds in the J6 library, sorted.
+const J6_COMETS: [&str; 7] = [
+    "Comet Band (MusicAlbum)",
+    "Comet Hunters (Series)",
+    "Comet Hunters S01E01 (Episode)",
+    "Comet Hunters Season 1 (Season)",
+    "Comet Night (Movie)",
+    "Comet Song (Audio)",
+    "Comet Songs (MusicAlbum)",
+];
+
+/// Creates an empty library and returns its id.
+async fn j6_library(state: &AppState, name: &str) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![media_folder(
+            state,
+            &format!("j6-{}", uuid::Uuid::new_v4().simple()),
+        )],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Adds an item under `parent` as a scan stores it, without touching any cache, and returns its
+/// id.
+async fn j6_add_item(
+    state: &AppState,
+    library_id: uuid::Uuid,
+    parent: Option<uuid::Uuid>,
+    name: &str,
+    media_type: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let path = state
+        .data_dir
+        .join("media")
+        .join("j6")
+        .join(format!("{id}.mkv"));
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, parent_id, name, media_type, path)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(parent.map(|parent| parent.to_string()))
+    .bind(name)
+    .bind(media_type)
+    .bind(path.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Sets an item's `tags` (pipe-joined, as scans store them) or `overview`.
+async fn j6_set_text(state: &AppState, id: uuid::Uuid, column: &str, value: &str) {
+    let sql = match column {
+        "tags" => "UPDATE media_items SET tags = ? WHERE id = ?",
+        "overview" => "UPDATE media_items SET overview = ? WHERE id = ?",
+        _ => panic!("j6_set_text cannot set {column}"),
+    };
+    sqlx::query(sql)
+        .bind(value)
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Seeds the J6 library: the movie "Comet Night"; the series "Comet Hunters" with its season
+/// "Comet Hunters Season 1" and the season's episode "Comet Hunters S01E01"; the artist
+/// "Comet Band", a MusicAlbum without a parent as scans store artists, with its album
+/// "Comet Songs" and the album's track "Comet Song"; and the folder "Comet Folder". A search for
+/// "comet" finds `J6_COMETS`: all but the folder.
+async fn j6_seed(state: &AppState) -> J6Library {
+    let library = j6_library(state, "J6 Library").await;
+    let movie = j6_add_item(state, library, None, "Comet Night", "Movie").await;
+    let series = j6_add_item(state, library, None, "Comet Hunters", "Series").await;
+    let season = j6_add_item(
+        state,
+        library,
+        Some(series),
+        "Comet Hunters Season 1",
+        "Season",
+    )
+    .await;
+    let episode = j6_add_item(
+        state,
+        library,
+        Some(season),
+        "Comet Hunters S01E01",
+        "Episode",
+    )
+    .await;
+    let artist = j6_add_item(state, library, None, "Comet Band", "MusicAlbum").await;
+    let album = j6_add_item(state, library, Some(artist), "Comet Songs", "MusicAlbum").await;
+    let track = j6_add_item(state, library, Some(album), "Comet Song", "Audio").await;
+    j6_add_item(state, library, None, "Comet Folder", "Folder").await;
+    let (token, admin) = admin_session(state).await;
+    J6Library {
+        token,
+        admin,
+        library,
+        movie,
+        series,
+        season,
+        episode,
+        artist,
+        album,
+        track,
+    }
+}
+
+/// A token for a new user who is not an administrator, and the user's id.
+async fn j6_user_session(state: &AppState) -> (String, uuid::Uuid) {
+    let name = format!("user_{}", uuid::Uuid::new_v4().simple());
+    let id = add_user(state, &name, "j6-password", false).await;
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &name)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, id)
+}
+
+/// The hints a `/Search/Hints` request answers, as "Name (Type)" in answer order, and its
+/// `TotalRecordCount`. Panics unless the answer is 200.
+async fn j6_hints(app: &axum::Router, uri: &str, token: &str) -> (Vec<String>, i64) {
+    let body = b27_answer(app, uri, token).await;
+    let hints = body["SearchHints"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{uri}: no SearchHints in {body}"));
+    let found = hints
+        .iter()
+        .map(|hint| {
+            let name = hint["Name"].as_str().unwrap_or("?");
+            let item_type = hint["Type"].as_str().unwrap_or("?");
+            format!("{name} ({item_type})")
+        })
+        .collect();
+    (found, body["TotalRecordCount"].as_i64().unwrap_or(-1))
+}
+
+/// Owned copies of `names`.
+fn j6_names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+#[tokio::test]
+async fn j6_hints_read_names_and_values_in_any_case() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    for uri in [
+        "/Search/Hints?SearchTerm=comet",
+        "/Search/Hints?searchTerm=comet",
+        "/Search/Hints?SEARCHTERM=comet",
+        "/Search/Hints?searchterm=%20comet%20",
+    ] {
+        assert_eq!(b27_found(&app, uri, &lib.token).await, J6_COMETS, "{uri}");
+    }
+    for (query, expected) in [
+        ("INCLUDEITEMTYPES=movie", vec!["Comet Night (Movie)"]),
+        (
+            "ExcludeItemTypes=MOVIE,series,SEASON,episode,musicalbum",
+            vec!["Comet Song (Audio)"],
+        ),
+        ("mediatypes=AUDIO", vec!["Comet Song (Audio)"]),
+        (
+            "IncludeItemTypes=MusicAlbum&ISSERIES=FALSE&includemedia=True",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_filter_item_types() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    let series_and_episode = vec!["Comet Hunters (Series)", "Comet Hunters S01E01 (Episode)"];
+    for (query, expected) in [
+        ("includeItemTypes=Movie", vec!["Comet Night (Movie)"]),
+        (
+            "includeItemTypes=Series,Episode",
+            series_and_episode.clone(),
+        ),
+        // A repeated key is not split: each value is one kind, and "Series,Episode" is none.
+        (
+            "includeItemTypes=Series&includeItemTypes=Episode",
+            series_and_episode,
+        ),
+        (
+            "includeItemTypes=Series,Episode&includeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        (
+            "includeItemTypes=MusicAlbum,Audio&excludeItemTypes=Audio",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+        (
+            "excludeItemTypes=MusicAlbum,Audio,Season,Episode",
+            vec!["Comet Hunters (Series)", "Comet Night (Movie)"],
+        ),
+        // A kind Rustyfin never stores finds nothing; Folder, Year and CollectionFolder never
+        // come back.
+        ("includeItemTypes=Person", vec![]),
+        ("includeItemTypes=Folder", vec![]),
+        ("includeItemTypes=Year,CollectionFolder", vec![]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // A list that parses to nothing is Jellyfin's empty list, which filters nothing.
+    for query in [
+        "includeItemTypes=Bogus",
+        "includeItemTypes=",
+        "includeItemTypes=,",
+        "includeItemTypes=1",
+        "excludeItemTypes=Bogus",
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, J6_COMETS, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_filter_media_types() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    for (query, expected) in [
+        ("mediaTypes=Audio", vec!["Comet Song (Audio)"]),
+        (
+            "mediaTypes=Video",
+            vec!["Comet Hunters S01E01 (Episode)", "Comet Night (Movie)"],
+        ),
+        (
+            "mediaTypes=Video,Audio",
+            vec![
+                "Comet Hunters S01E01 (Episode)",
+                "Comet Night (Movie)",
+                "Comet Song (Audio)",
+            ],
+        ),
+        ("mediaTypes=Photo", vec![]),
+        ("mediaTypes=Video&includeItemTypes=Series", vec![]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // "Movie" is a kind, not a media type, so these lists parse to nothing.
+    for query in ["mediaTypes=Bogus", "mediaTypes=Movie", "mediaTypes="] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, J6_COMETS, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_scope_to_a_parent() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let other = j6_library(&state, "J6 Other").await;
+    j6_add_item(&state, other, None, "Comet Elsewhere", "Movie").await;
+    let app = app(state);
+    let scoped = |parent: String| format!("/Search/Hints?searchTerm=comet&parentId={parent}");
+
+    let below_series = vec![
+        "Comet Hunters S01E01 (Episode)",
+        "Comet Hunters Season 1 (Season)",
+    ];
+    for (parent, expected) in [
+        // An item holds its descendants, not itself, whichever way its id is written.
+        (lib.series.to_string(), below_series.clone()),
+        (lib.series.simple().to_string(), below_series),
+        (
+            lib.season.to_string(),
+            vec!["Comet Hunters S01E01 (Episode)"],
+        ),
+        (
+            lib.artist.to_string(),
+            vec!["Comet Song (Audio)", "Comet Songs (MusicAlbum)"],
+        ),
+        (lib.album.to_string(), vec!["Comet Song (Audio)"]),
+        (lib.episode.to_string(), vec![]),
+        // A library holds every item in it, and only those.
+        (lib.library.to_string(), J6_COMETS.to_vec()),
+        // An id that names nothing holds nothing.
+        (uuid::Uuid::new_v4().to_string(), vec![]),
+    ] {
+        let uri = scoped(parent);
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // No parent, or the nil id, searches every library.
+    let mut everywhere = J6_COMETS.to_vec();
+    everywhere.push("Comet Elsewhere (Movie)");
+    everywhere.sort();
+    for uri in [
+        "/Search/Hints?searchTerm=comet".to_string(),
+        scoped(uuid::Uuid::nil().to_string()),
+    ] {
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, everywhere, "{uri}");
+    }
+    let uri = scoped("bogus".to_string());
+    let (status, body) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+}
+
+#[tokio::test]
+async fn j6_hints_follow_the_include_flags() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    for (name, kind) in [
+        ("Comet Genre", "Genre"),
+        ("Comet Beat", "MusicGenre"),
+        ("Comet Person", "Person"),
+        ("Comet Studio", "Studio"),
+        ("Comet Artist", "MusicArtist"),
+    ] {
+        j6_add_item(&state, lib.library, None, name, kind).await;
+    }
+    let app = app(state);
+
+    let all = b27_found(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!(all.len(), 12, "{all:?}");
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|hint| !gone.contains(&hint.as_str()))
+            .cloned()
+            .collect()
+    };
+    for (query, gone) in [
+        (
+            "includeGenres=false",
+            vec!["Comet Beat (MusicGenre)", "Comet Genre (Genre)"],
+        ),
+        ("includePeople=false", vec!["Comet Person (Person)"]),
+        ("includeStudios=false", vec!["Comet Studio (Studio)"]),
+        ("includeArtists=false", vec!["Comet Artist (MusicArtist)"]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            without(&gone),
+            "{uri}"
+        );
+    }
+    // Without media, only the first group still on: genres, then people, studios, artists.
+    for (query, expected) in [
+        (
+            "includeMedia=false",
+            vec!["Comet Beat (MusicGenre)", "Comet Genre (Genre)"],
+        ),
+        (
+            "includeMedia=false&includeGenres=false",
+            vec!["Comet Person (Person)"],
+        ),
+        (
+            "includeMedia=false&includeGenres=false&includePeople=false",
+            vec!["Comet Studio (Studio)"],
+        ),
+        (
+            "includeMedia=false&includeGenres=false&includePeople=false&includeStudios=false",
+            vec!["Comet Artist (MusicArtist)"],
+        ),
+        (
+            "includeMedia=false&includeItemTypes=Studio",
+            vec!["Comet Studio (Studio)"],
+        ),
+        (
+            "includeMedia=false&includeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // With every group off nothing is added, so the media the excludes leave come back.
+    let uri = "/Search/Hints?searchTerm=comet&includeMedia=false&includeGenres=false\
+               &includePeople=false&includeStudios=false&includeArtists=false";
+    assert_eq!(b27_found(&app, uri, &lib.token).await, J6_COMETS);
+}
+
+#[tokio::test]
+async fn j6_hints_leave_out_folders_by_default() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Comet 1999", "Year").await;
+    j6_add_item(&state, lib.library, None, "Comet Shelf", "CollectionFolder").await;
+    // A stored kind that is not a BaseItemKind reads as a Folder.
+    j6_add_item(&state, lib.library, None, "Comet Stray", "Unknown").await;
+    let app = app(state);
+
+    assert_eq!(
+        b27_found(&app, "/Search/Hints?searchTerm=comet", &lib.token).await,
+        J6_COMETS
+    );
+    for query in [
+        "includeItemTypes=Folder",
+        "includeItemTypes=Folder,Year,CollectionFolder",
+        "includeMedia=false&includeItemTypes=Folder",
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        let found = b27_found(&app, &uri, &lib.token).await;
+        assert!(found.is_empty(), "{uri}: {found:?}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_page_after_counting() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    let (full, total) = j6_hints(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!((full.len(), total), (7, 7), "{full:?}");
+    for (query, range) in [
+        ("startIndex=2&limit=3", 2..5),
+        ("startIndex=6&limit=5", 6..7),
+        ("limit=0", 0..0),
+        ("startIndex=7", 7..7),
+        ("limit=2147483647", 0..7),
+        ("startIndex=2147483647&limit=2147483647", 7..7),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        let (page, total) = j6_hints(&app, &uri, &lib.token).await;
+        assert_eq!(page, full[range].to_vec(), "{uri}");
+        assert_eq!(total, 7, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_follow_jellyfins_order() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let hunters = j6_add_item(&state, lib.library, None, "Hunters", "Movie").await;
+    let of_comets = j6_add_item(&state, lib.library, None, "Hunters of Comets", "Movie").await;
+    let night_sky = j6_add_item(&state, lib.library, None, "Night Sky", "Movie").await;
+    j6_set_text(&state, night_sky, "overview", "Two hunters watch the sky.").await;
+    let app = app(state);
+
+    // SqlSearchProvider's scores: 100 when the clean name is the term, 80 when it starts with
+    // it, 75 when it holds the term and a space, 50 otherwise (here a last word and an
+    // overview); ties by id.
+    let mut expected = [
+        (100, hunters, "Hunters (Movie)"),
+        (80, of_comets, "Hunters of Comets (Movie)"),
+        (75, lib.season, "Comet Hunters Season 1 (Season)"),
+        (75, lib.episode, "Comet Hunters S01E01 (Episode)"),
+        (50, lib.series, "Comet Hunters (Series)"),
+        (50, night_sky, "Night Sky (Movie)"),
+    ];
+    expected.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let expected: Vec<&str> = expected.iter().map(|(_, _, hint)| *hint).collect();
+    let (found, total) = j6_hints(&app, "/Search/Hints?searchTerm=hunters", &lib.token).await;
+    assert_eq!(found, expected);
+    assert_eq!(total, 6);
+    // Pages keep that order.
+    let uri = "/Search/Hints?searchTerm=hunters&startIndex=3&limit=2";
+    let (page, total) = j6_hints(&app, uri, &lib.token).await;
+    assert_eq!(page, expected[3..5].to_vec());
+    assert_eq!(total, 6);
+}
+
+#[tokio::test]
+async fn j6_hints_is_movie_and_is_series_match_no_library_programs() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    // Library items are never Live TV programs. isMovie=true filters nothing when the include
+    // list is empty or names Movie or Trailer, and otherwise asks for program movies; false
+    // asks for items that are not program movies or series, which is all of them.
+    for (query, expected) in [
+        ("isMovie=true", J6_COMETS.to_vec()),
+        ("isMovie=false", J6_COMETS.to_vec()),
+        ("isSeries=false", J6_COMETS.to_vec()),
+        (
+            "isMovie=true&includeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        (
+            "isMovie=true&includeItemTypes=Trailer,Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        ("isMovie=true&includeItemTypes=Series", vec![]),
+        (
+            "isMovie=false&includeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        ("isSeries=true", vec![]),
+        ("isSeries=true&includeItemTypes=Series", vec![]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_is_kids_news_and_sports_match_tags() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let kids = j6_add_item(&state, lib.library, None, "Comet Kids", "Movie").await;
+    let sports = j6_add_item(&state, lib.library, None, "Comet Match", "Movie").await;
+    let news = j6_add_item(&state, lib.library, None, "Comet Report", "Movie").await;
+    j6_set_text(&state, kids, "tags", "Family|Kids").await;
+    j6_set_text(&state, sports, "tags", "SPORTS").await;
+    j6_set_text(&state, news, "tags", " News |Weekly").await;
+    let app = app(state);
+
+    let all = b27_found(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!(all.len(), 10, "{all:?}");
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|hint| !gone.contains(&hint.as_str()))
+            .cloned()
+            .collect()
+    };
+    // Each flag is a tag filter, matched by clean value: true needs one of the named tags,
+    // false needs none of them.
+    for (query, expected) in [
+        ("isKids=true", j6_names(&["Comet Kids (Movie)"])),
+        ("isSports=true", j6_names(&["Comet Match (Movie)"])),
+        ("isNews=true", j6_names(&["Comet Report (Movie)"])),
+        (
+            "isKids=true&isSports=true",
+            j6_names(&["Comet Kids (Movie)", "Comet Match (Movie)"]),
+        ),
+        (
+            "isKids=true&isSports=false",
+            j6_names(&["Comet Kids (Movie)"]),
+        ),
+        ("isKids=false", without(&["Comet Kids (Movie)"])),
+        (
+            "isSports=false&isNews=false",
+            without(&["Comet Match (Movie)", "Comet Report (Movie)"]),
+        ),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_answer_bad_input_with_400() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    for query in [
+        "",
+        "searchTerm=",
+        "searchTerm=%20%20",
+        "term=comet",
+        "searchTerm=comet&startIndex=-1",
+        "searchTerm=comet&StartIndex=ten",
+        "searchTerm=comet&limit=-1",
+        "searchTerm=comet&Limit=2147483648",
+        "searchTerm=comet&limit=99999999999999999999",
+        "searchTerm=comet&parentId=bogus",
+        "searchTerm=comet&userId=bogus",
+        "searchTerm=comet&isKids=yes",
+        "searchTerm=comet&includePeople=0",
+    ] {
+        let uri = format!("/Search/Hints?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_survive_odd_terms() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Amélie", "Movie").await;
+    j6_add_item(&state, lib.library, None, "東京物語", "Movie").await;
+    let app = app(state);
+
+    // A term that cleans to nothing finds nothing, as in SqlSearchProvider.
+    for term in ["%22", "*", "%22*", "(", "%25", "_", "'"] {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        let (found, total) = j6_hints(&app, &uri, &lib.token).await;
+        assert_eq!((found.len(), total), (0, 0), "{uri}: {found:?}");
+    }
+    // No other term is a 500 or a panic either.
+    for term in [
+        "A,,B",
+        "comet%22",
+        "comet*",
+        "comet%20OR",
+        "NOT",
+        "%E2%80%9Ccomet%E2%80%9D",
+        "%F0%9F%9A%80",
+    ] {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        let (status, body) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body["SearchHints"].is_array(), "{uri}: {body}");
+    }
+    // FTS folds case and diacritics, so each spelling finds "Amélie".
+    for term in ["amelie", "Am%C3%A9lie", "AM%C3%89LIE"] {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            ["Amélie (Movie)"],
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        b27_found(
+            &app,
+            "/Search/Hints?searchTerm=%E6%9D%B1%E4%BA%AC",
+            &lib.token
+        )
+        .await,
+        ["東京物語 (Movie)"]
+    );
+}
+
+#[tokio::test]
+async fn j6_hints_check_the_user() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (user_token, user) = j6_user_session(&state).await;
+    let app = app(state);
+
+    // RequestHelpers.GetUserId: a user may name themselves, and naming anyone else needs an
+    // administrator. A nil id names nobody, and an id nobody has is not looked up. The answer
+    // is cached by the first request, so the user check must come before the cache.
+    for (token, user_id, status) in [
+        (&user_token, user.to_string(), StatusCode::OK),
+        (&user_token, user.simple().to_string(), StatusCode::OK),
+        (&user_token, uuid::Uuid::nil().to_string(), StatusCode::OK),
+        (&user_token, lib.admin.to_string(), StatusCode::FORBIDDEN),
+        (
+            &user_token,
+            uuid::Uuid::new_v4().to_string(),
+            StatusCode::FORBIDDEN,
+        ),
+        (&lib.token, user.to_string(), StatusCode::OK),
+        (&lib.token, uuid::Uuid::new_v4().to_string(), StatusCode::OK),
+        (&user_token, "bogus".to_string(), StatusCode::BAD_REQUEST),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&userId={user_id}");
+        let (got, body) = send_authed(&app, "GET", &uri, token, None).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        if status == StatusCode::OK {
+            assert_eq!(body["TotalRecordCount"], 7, "{uri}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_share_one_entry_per_trimmed_term() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+
+    let first = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!(first["TotalRecordCount"], 7);
+    assert_eq!(b27_cached_answers(&state), 1);
+    // The term is trimmed before the key, names match in any case, and the user is not part
+    // of the key.
+    for uri in [
+        "/Search/Hints?searchTerm=%20comet%20".to_string(),
+        "/Search/Hints?SearchTerm=comet%09".to_string(),
+        format!("/Search/Hints?searchTerm=comet&userId={}", lib.admin),
+    ] {
+        assert_eq!(b27_answer(&app, &uri, &lib.token).await, first, "{uri}");
+    }
+    assert_eq!(b27_cached_answers(&state), 1);
+}
+
+#[tokio::test]
+async fn j6_hints_answers_differ_by_each_parameter_also_from_l2() {
+    let state = b27_restarted(&test_state().await).await;
+    let lib = j6_seed(&state).await;
+    for (name, kind) in [
+        ("Comet Genre", "Genre"),
+        ("Comet Person", "Person"),
+        ("Comet Studio", "Studio"),
+        ("Comet Artist", "MusicArtist"),
+    ] {
+        j6_add_item(&state, lib.library, None, name, kind).await;
+    }
+    let kids = j6_add_item(&state, lib.library, None, "Comet Kids", "Movie").await;
+    j6_set_text(&state, kids, "tags", "Kids").await;
+
+    let base = "/Search/Hints?searchTerm=comet";
+    let app_before = app(state.clone());
+    let (ordered, total) = j6_hints(&app_before, base, &lib.token).await;
+    assert_eq!(total, 12, "{ordered:?}");
+    let sorted = |mut hints: Vec<String>| {
+        hints.sort();
+        hints
+    };
+    let all = sorted(ordered.clone());
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|hint| !gone.contains(&hint.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    // Each request differs from the first, or from the one above it, in one parameter.
+    let requests = [
+        (base.to_string(), all.clone()),
+        (
+            "/Search/Hints?searchTerm=hunters".to_string(),
+            j6_names(&[
+                "Comet Hunters (Series)",
+                "Comet Hunters S01E01 (Episode)",
+                "Comet Hunters Season 1 (Season)",
+            ]),
+        ),
+        (
+            format!("{base}&includeItemTypes=Movie"),
+            j6_names(&["Comet Kids (Movie)", "Comet Night (Movie)"]),
+        ),
+        (
+            format!("{base}&excludeItemTypes=Movie"),
+            without(&["Comet Kids (Movie)", "Comet Night (Movie)"]),
+        ),
+        (
+            format!("{base}&mediaTypes=Audio"),
+            j6_names(&["Comet Song (Audio)"]),
+        ),
+        (
+            format!("{base}&parentId={}", lib.season),
+            j6_names(&["Comet Hunters S01E01 (Episode)"]),
+        ),
+        (
+            format!("{base}&startIndex=1"),
+            sorted(ordered[1..].to_vec()),
+        ),
+        (format!("{base}&limit=1"), ordered[..1].to_vec()),
+        (
+            format!("{base}&isKids=true"),
+            j6_names(&["Comet Kids (Movie)"]),
+        ),
+        (
+            format!("{base}&isKids=false"),
+            without(&["Comet Kids (Movie)"]),
+        ),
+        (format!("{base}&isNews=true"), vec![]),
+        (format!("{base}&isSports=true"), vec![]),
+        (format!("{base}&isSeries=true"), vec![]),
+        (
+            format!("{base}&includeItemTypes=Series"),
+            j6_names(&["Comet Hunters (Series)"]),
+        ),
+        (
+            format!("{base}&includeItemTypes=Series&isMovie=true"),
+            vec![],
+        ),
+        (
+            format!("{base}&includeMedia=false"),
+            j6_names(&["Comet Genre (Genre)"]),
+        ),
+        (
+            format!("{base}&includeGenres=false"),
+            without(&["Comet Genre (Genre)"]),
+        ),
+        (
+            format!("{base}&includePeople=false"),
+            without(&["Comet Person (Person)"]),
+        ),
+        (
+            format!("{base}&includeStudios=false"),
+            without(&["Comet Studio (Studio)"]),
+        ),
+        (
+            format!("{base}&includeArtists=false"),
+            without(&["Comet Artist (MusicArtist)"]),
+        ),
+    ];
+    for (uri, expected) in &requests {
+        assert_eq!(
+            &b27_found(&app_before, uri, &lib.token).await,
+            expected,
+            "{uri}"
+        );
+    }
+    // One answer each: no two requests shared a key.
+    let answers = requests.len();
+    assert_eq!(b27_cached_answers(&state), answers as u64);
+
+    // After a restart the L2 copy answers each request with its own items.
+    b27_wait_for_l2_rows(&state, answers as i64).await;
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), answers as u64);
+    let app_after = app(state.clone());
+    for (uri, expected) in &requests {
+        assert_eq!(
+            &b27_found(&app_after, uri, &lib.token).await,
+            expected,
+            "{uri}"
+        );
+    }
+    assert_eq!(b27_cached_answers(&state), answers as u64);
+}
+
+#[tokio::test]
+async fn j6_hints_carry_item_id_and_jellyfin_media_types() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    sqlx::query("UPDATE media_items SET production_year = ?, runtime_ticks = ? WHERE id = ?")
+        .bind(2024)
+        .bind(72_000_000_000i64)
+        .bind(lib.movie.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    let hints = body["SearchHints"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no SearchHints in {body}"));
+    assert_eq!(hints.len(), 7, "{body}");
+    for hint in hints {
+        // ItemId repeats Id, Artists is always a list, and MediaType is Jellyfin's media type
+        // of the kind, never the kind itself.
+        assert_eq!(hint["ItemId"], hint["Id"], "{hint}");
+        assert!(hint["Artists"].is_array(), "{hint}");
+        let media_type = match hint["Type"].as_str() {
+            Some("Movie" | "Episode") => "Video",
+            Some("Audio") => "Audio",
+            _ => "Unknown",
+        };
+        assert_eq!(hint["MediaType"], media_type, "{hint}");
+    }
+    let hint = |id: uuid::Uuid| {
+        hints
+            .iter()
+            .find(|hint| hint["Id"] == serde_json::json!(id))
+            .unwrap_or_else(|| panic!("no hint for {id} in {body}"))
+    };
+    let movie = hint(lib.movie);
+    assert_eq!(movie["Type"], "Movie");
+    assert_eq!(movie["MediaType"], "Video");
+    assert_eq!(movie["ProductionYear"], 2024);
+    assert_eq!(movie["RunTimeTicks"], 72_000_000_000i64);
+    let track = hint(lib.track);
+    assert_eq!(track["Type"], "Audio");
+    assert_eq!(track["MediaType"], "Audio");
 }
 
 // ── System Endpoint Tests ──
