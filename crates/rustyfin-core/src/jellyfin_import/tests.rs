@@ -3683,9 +3683,12 @@ async fn b20_read_roots_refuses_a_generated_column_chain_before_the_explain() {
 // and each level above it joins the one below to itself, so resolving the top view copies the list
 // 1,024 times. The fix reads the kind from `sqlite_schema`, which costs only the schema parse, so no
 // view is resolved: both paths open and read `Users` within 5 s. On 76680f2 both are still busy after
-// 5 s (seen under `timeout`+`prlimit`): that is the red. Ten levels cost the parent tens of seconds
-// and about 120 MiB a connection (measured with Python's SQLite 3.46.1), so even a red run stays
-// small without a prlimit; each level more would triple the time and double the memory.
+// 5 s (seen under `timeout`+`prlimit`): that is the red, and it needs a debug build, which builds
+// the bundled SQLite at `-O0`. Python's optimised SQLite 3.46.1 takes 5.8 s and about 120 MiB a
+// connection on these ten levels, only 0.8 s over the bound, so a `--release` run or a faster host
+// may pass on the parent. The first path's prepare goes on after its timeout while the second path
+// runs, so a red run holds about 240 MiB at once. From eight levels up, each level more about
+// doubles the time and the memory.
 #[tokio::test]
 async fn b20_snapshot_never_resolves_an_unnamed_view() {
     use sqlx::{ConnectOptions, Connection};
