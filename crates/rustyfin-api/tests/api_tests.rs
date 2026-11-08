@@ -2593,6 +2593,68 @@ async fn b30_p2_a_rescan_finds_a_poster_replaced_in_place() {
     );
 }
 
+#[tokio::test]
+async fn b30_p5_search_rejects_negative_and_oversized_paging() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+
+    // Negative values were cast to huge ones: Limit=-1 read as no limit, and StartIndex=-1
+    // overflowed where it met the limit.
+    for (query, parameter) in [
+        ("Term=comet&Limit=-1", "limit"),
+        ("Term=comet&Limit=2147483648", "limit"),
+        ("Term=comet&Limit=9223372036854775807", "limit"),
+        ("Term=comet&StartIndex=2147483648", "startIndex"),
+        ("Term=&Limit=-1", "limit"),
+        ("Term=&StartIndex=-1", "startIndex"),
+        ("Term=comet&StartIndex=-1", "startIndex"),
+    ] {
+        let uri = format!("/Search?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert!(body.to_string().contains(parameter), "{uri}: {body}");
+    }
+
+    let uri = "/Search?Term=comet&StartIndex=2147483647&Limit=2147483647";
+    let (status, body) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    assert_eq!(body["Items"], serde_json::json!([]), "{body}");
+    let page = b27_found(&app, "/Search?Term=comet&StartIndex=1&Limit=2", &token).await;
+    assert_eq!(page.len(), 2, "{page:?}");
+}
+
+#[tokio::test]
+async fn b30_p5_items_reads_negative_paging_as_jellyfin_does() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+    let uri = "/Items?searchTerm=comet&IncludeItemTypes=Movie,Series&Recursive=true";
+    let (status, all) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["Items"].as_array().map(Vec::len), Some(2), "{all}");
+
+    // Jellyfin skips only for a positive StartIndex, so a negative one is 0, and says so.
+    let (status, body) =
+        send_authed(&app, "GET", &format!("{uri}&StartIndex=-1"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["StartIndex"], 0, "{body}");
+    assert_eq!(body["Items"], all["Items"]);
+    // A negative Limit is no limit.
+    let (status, body) = send_authed(&app, "GET", &format!("{uri}&Limit=-1"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Items"], all["Items"]);
+    let page = format!("{uri}&StartIndex=1&Limit=1");
+    let (status, body) = send_authed(&app, "GET", &page, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["StartIndex"], 1, "{body}");
+    assert_eq!(
+        body["Items"],
+        serde_json::json!([all["Items"][1]]),
+        "{body}"
+    );
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]

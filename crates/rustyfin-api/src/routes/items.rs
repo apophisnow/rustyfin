@@ -1421,10 +1421,13 @@ impl ItemsQuery {
             .or(self.sort_order_lower.as_deref())
     }
     fn start_index(&self) -> i64 {
-        self.start_index.or(self.start_index_lower).unwrap_or(0)
+        self.start_index
+            .or(self.start_index_lower)
+            .unwrap_or(0)
+            .max(0)
     }
     fn limit(&self) -> i64 {
-        self.limit.unwrap_or(10_000)
+        self.limit.filter(|&limit| limit >= 0).unwrap_or(10_000)
     }
     fn name_starts_with(&self) -> Option<&str> {
         self.name_starts_with

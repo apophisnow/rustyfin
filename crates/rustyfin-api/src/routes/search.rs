@@ -188,21 +188,42 @@ fn parse_item_types(include_item_types: Option<&str>) -> Vec<MediaType> {
     }
 }
 
+/// Rejects a `/Search` paging value outside `0..=i32::MAX`. A negative one would
+/// wrap when cast to `usize`.
+fn check_search_paging(name: &str, value: i64) -> Result<(), ApiError> {
+    if value < 0 {
+        return Err(ApiError::BadRequest(format!(
+            "{name} must be a non-negative integer"
+        )));
+    }
+    if value > i64::from(i32::MAX) {
+        return Err(ApiError::BadRequest(format!(
+            "{name} must be at most {}",
+            i32::MAX
+        )));
+    }
+    Ok(())
+}
+
 async fn full_search(
     State(state): State<AppState>,
     Query(query): Query<FullSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let start_index = query.start_index.unwrap_or(0);
+    check_search_paging("startIndex", start_index)?;
+    check_search_paging("limit", query.limit)?;
+
     let term = query.term.unwrap_or_default();
     if term.is_empty() {
         let empty = QueryResult {
             items: vec![],
             total_record_count: 0,
-            start_index: query.start_index.unwrap_or(0),
+            start_index,
         };
         return Ok(Json(search_answer(&empty)?));
     }
 
-    let start_index = query.start_index.unwrap_or(0) as usize;
+    let start_index = start_index as usize;
     let limit = query.limit as usize;
 
     let item_types = parse_item_types(query.include_item_types.as_deref());
@@ -217,7 +238,7 @@ async fn full_search(
         &state.db_ro,
         &term,
         &item_types,
-        (start_index + limit) as i64,
+        start_index.saturating_add(limit) as i64,
     )
     .await?;
 
