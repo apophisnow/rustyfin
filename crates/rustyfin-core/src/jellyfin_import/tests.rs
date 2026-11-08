@@ -2224,3 +2224,143 @@ fn b20_mblinks_are_at_most_64_kib() {
         ]
     );
 }
+
+// Fix round 3, 5: a damaged table is a bad source before any row is read. A b-tree whose interior
+// pages point at one child page more than once makes every scan repeat that child's rows, so a
+// small file could be read without end.
+
+/// Damages `table` in the SQLite file `file`, which has no `-wal`: its root page and the root's
+/// first `levels - 1` children become interior pages whose three child pointers all point at the
+/// next of these pages, and the last one's at the root's `levels`th child, a leaf. A scan of the
+/// table then reads each row of that leaf 3^`levels` times. The root must be an interior page with
+/// at least `levels` children.
+async fn share_child_pages(file: &Path, table: &str, levels: usize) {
+    use sqlx::{ConnectOptions, Connection};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(file)
+        .connect()
+        .await
+        .unwrap();
+    let (root,): (i64,) = sqlx::query_as("SELECT rootpage FROM sqlite_schema WHERE name = ?1")
+        .bind(table)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    assert!(
+        !file.with_extension("db-wal").exists(),
+        "{}",
+        file.display()
+    );
+    let mut bytes = std::fs::read(file).unwrap();
+    let u16_at =
+        |bytes: &[u8], at: usize| usize::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]));
+    let u32_at =
+        |bytes: &[u8], at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+    // The header holds the page size at offset 16; 1 means 65536.
+    let size = match u16_at(&bytes, 16) {
+        1 => 65536,
+        size => size,
+    };
+    let start = |page: u32| (page as usize - 1) * size;
+    let root = u32::try_from(root).unwrap();
+    let at = start(root);
+    assert_eq!(bytes[at], 0x05, "{table}'s root is not an interior page");
+    let mut children: Vec<u32> = (0..u16_at(&bytes, at + 3))
+        .map(|cell| u32_at(&bytes, at + u16_at(&bytes, at + 12 + 2 * cell)))
+        .collect();
+    children.push(u32_at(&bytes, at + 8));
+    assert!(
+        children.len() >= levels,
+        "{table} has {} leaves",
+        children.len()
+    );
+    let chain: Vec<u32> = std::iter::once(root)
+        .chain(children[..levels - 1].iter().copied())
+        .collect();
+    for (level, &page) in chain.iter().enumerate() {
+        let child = chain
+            .get(level + 1)
+            .copied()
+            .unwrap_or(children[levels - 1])
+            .to_be_bytes();
+        // An interior table page: two cells at the page's end, with the keys 1 and 2, and the
+        // right-most pointer, all pointing at `child`.
+        let mut new = vec![0; size];
+        new[0] = 0x05;
+        new[3..5].copy_from_slice(&2u16.to_be_bytes());
+        new[5..7].copy_from_slice(&u16::try_from(size - 10).unwrap().to_be_bytes());
+        new[8..12].copy_from_slice(&child);
+        new[12..14].copy_from_slice(&u16::try_from(size - 10).unwrap().to_be_bytes());
+        new[14..16].copy_from_slice(&u16::try_from(size - 5).unwrap().to_be_bytes());
+        new[size - 10..size - 6].copy_from_slice(&child);
+        new[size - 6] = 1;
+        new[size - 5..size - 1].copy_from_slice(&child);
+        new[size - 1] = 2;
+        bytes[start(page)..start(page) + size].copy_from_slice(&new);
+    }
+    std::fs::write(file, bytes).unwrap();
+}
+
+#[tokio::test]
+async fn b20_snapshot_refuses_damaged_tables() {
+    // Permissions that make no one an administrator, so the reader's query keeps none of them,
+    // however often it reads them.
+    const PERMISSIONS: &str = "\
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) \
+        INSERT INTO Permissions (UserId, Kind, Value) \
+            SELECT printf('00000000-0000-0000-0000-%012d', x), 9, 0 FROM n;";
+    const PEOPLE: &str = "\
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000) \
+        INSERT INTO People (ItemId, Name, PersonType, SortOrder, ListOrder) \
+            SELECT '00000000-0000-0000-0000-0000000000F1', printf('Person %d', x), 'Actor', x, x \
+            FROM n;";
+    // A `Peoples` table whose CHECK fails every row, filled with checks off.
+    const CHECKED_PEOPLES: &str = "\
+        DROP TABLE Peoples; \
+        CREATE TABLE Peoples (Id TEXT, Name TEXT NOT NULL, PersonType TEXT, CHECK (0)); \
+        PRAGMA ignore_check_constraints = ON;";
+    let tmp = TempDir::new();
+    let (deep, old, checked) = (
+        tmp.0.join("permissions_18_levels"),
+        tmp.0.join("people_3_levels"),
+        tmp.0.join("check_fails"),
+    );
+    for dir in [&deep, &old, &checked] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let deep_db = deep.join("jellyfin.db");
+    write_db(&deep_db, &[USERS_DDL, NEW_LIBRARY_DDL, PERMISSIONS]).await;
+    share_child_pages(&deep_db, "Permissions", 18).await;
+    write_db(&old.join("jellyfin.db"), &[USERS_DDL]).await;
+    write_db(&old.join("library.db"), &[OLD_LIBRARY_DDL, PEOPLE]).await;
+    share_child_pages(&old.join("library.db"), "People", 3).await;
+    write_db(
+        &checked.join("jellyfin.db"),
+        &[USERS_DDL, NEW_LIBRARY_DDL, CHECKED_PEOPLES, ONE_CREDIT],
+    )
+    .await;
+    let outcome = |dir: &Path, file: &str, table: &str| match read_within_5s(dir) {
+        None => "still reading after 5 s".to_string(),
+        Some(Ok(())) => "read".to_string(),
+        Some(Err(ImportError::BadSource(text)))
+            if text.contains(&dir.join(file).display().to_string())
+                && text.contains(&format!("{table} is damaged")) =>
+        {
+            format!("{file}: {table} is damaged")
+        }
+        Some(Err(other)) => format!("{other:?}"),
+    };
+    assert_eq!(
+        [
+            outcome(&deep, "jellyfin.db", "Permissions"),
+            outcome(&old, "library.db", "People"),
+            outcome(&checked, "jellyfin.db", "Peoples"),
+        ],
+        [
+            "jellyfin.db: Permissions is damaged",
+            "library.db: People is damaged",
+            "read",
+        ]
+    );
+}

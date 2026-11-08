@@ -470,14 +470,21 @@ const JELLYFIN_TABLES: &[&str] = &[
 const LIBRARY_TABLES: &[&str] = &["TypedBaseItems", "UserDatas", "mediastreams", "People"];
 
 /// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
-/// with generated columns can make a query run without end or make values of any size. A name the
-/// file doesn't have is skipped; its query reports that, as before. `file` is the source's path,
-/// never a copy's.
+/// with generated columns can make a query run without end or make values of any size. It also
+/// refuses a damaged table, found with SQLite's `quick_check` before any row is read; the first row
+/// is enough and is all it reads. A name the file doesn't have is skipped; its query reports that,
+/// as before. `file` is the source's path, never a copy's.
 async fn check_tables(
     conn: &mut SqliteConnection,
     file: &Path,
     names: &[&str],
 ) -> Result<(), ImportError> {
+    // A CHECK expression runs for each row that `quick_check` reads, and a crafted one can make
+    // values of any size, so CHECK constraints are not run on this connection.
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
     for name in names {
         let kind: Option<(String,)> = sqlx::query_as(
             "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1 \
@@ -512,6 +519,23 @@ async fn check_tables(
         if generated > 0 {
             return Err(ImportError::BadSource(format!(
                 "{}: {name} has generated columns",
+                file.display()
+            )));
+        }
+        // Only the first row is read. SQLite reports the damaged pages there; the rows after it
+        // come from a walk over the table that follows the damaged tree.
+        let sql = format!("PRAGMA main.quick_check(\"{name}\")");
+        let first: Option<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| unreadable(file, &e))?;
+        if let Some((text,)) = first.filter(|(text,)| text.as_str() != "ok") {
+            let line = text
+                .lines()
+                .find(|line| !line.starts_with("***"))
+                .unwrap_or(text.as_str());
+            return Err(ImportError::BadSource(format!(
+                "{}: {name} is damaged: {line}",
                 file.display()
             )));
         }
