@@ -6574,3 +6574,297 @@ async fn b32_rescans_make_stored_specials_folders_season_0() {
     assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
     assert_eq!(marks_of(&fx.pool, &user, alpha).await, Some(favorite));
 }
+
+/// A `tvshow.nfo` with a value for each field that an NFO fills.
+const B32_TVSHOW_NFO: &str = "<tvshow><title>Hotel Series</title><year>2015</year>\
+    <plot>Synthetic test show.</plot><rating>7.5</rating><mpaa>TV-14</mpaa>\
+    <genre>Drama</genre><genre>Comedy</genre><runtime>45</runtime></tvshow>";
+
+/// The name, sort name, and the fields that an NFO fills, of a series or a season.
+#[derive(Debug, Default, PartialEq)]
+struct B32Shown {
+    name: String,
+    sort_name: Option<String>,
+    year: Option<i64>,
+    overview: Option<String>,
+    rating: Option<f64>,
+    official_rating: Option<String>,
+    genres: String,
+    runtime_ticks: Option<i64>,
+}
+
+impl B32Shown {
+    /// A name, a sort name and a year, and nothing that an NFO fills.
+    fn plain(name: &str, sort_name: &str, year: Option<i64>) -> Self {
+        Self {
+            name: name.to_string(),
+            sort_name: Some(sort_name.to_string()),
+            year,
+            ..Self::default()
+        }
+    }
+
+    /// What Hotel Series (2015) shows with its folder's name and year, and `B32_TVSHOW_NFO`.
+    fn hotel_series() -> Self {
+        Self {
+            overview: Some("Synthetic test show.".to_string()),
+            rating: Some(7.5),
+            official_rating: Some("TV-14".to_string()),
+            genres: "Drama|Comedy".to_string(),
+            runtime_ticks: Some(45 * 600_000_000),
+            ..Self::plain("Hotel Series", "hotel series", Some(2015))
+        }
+    }
+}
+
+/// The item at `rel`, relative to the library root, as `B32Shown`.
+async fn b32_shown(pool: &SqlitePool, lib: &Library, rel: &str) -> B32Shown {
+    type Row = (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        String,
+        Option<i64>,
+    );
+    let path = root_of(lib).join(rel);
+    let (name, sort_name, year, overview, rating, official_rating, genres, runtime_ticks): Row =
+        sqlx::query_as(
+            "SELECT name, sort_name, production_year, overview, community_rating, official_rating,
+                    genres, runtime_ticks
+             FROM media_items WHERE library_id = ?1 AND path = ?2",
+        )
+        .bind(lib.id.to_string())
+        .bind(path.to_str().unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{rel}: {e}"));
+    B32Shown {
+        name,
+        sort_name,
+        year,
+        overview,
+        rating,
+        official_rating,
+        genres,
+        runtime_ticks,
+    }
+}
+
+#[tokio::test]
+async fn b32_series_folders_give_a_name_a_year_and_their_tvshow_nfo() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [
+        "One Night (2023)/Season 01/One Night S01E01.mkv",
+        "1923 (2022)/Season 01/1923 S01E01.mkv",
+        "Plain Show/Season 01/Plain Show S01E01.mkv",
+        "Hotel Series (2015)/Season 01/Hotel Series S01E01.mkv",
+        "Hotel Series (2015)/Hotel Series S02E01.mkv",
+    ] {
+        touch(&root, rel);
+    }
+    std::fs::write(root.join("Hotel Series (2015)/tvshow.nfo"), B32_TVSHOW_NFO).unwrap();
+
+    scan(&fx.pool, &lib).await;
+
+    let shown = |rel| b32_shown(&fx.pool, &lib, rel);
+    assert_eq!(
+        shown("One Night (2023)").await,
+        B32Shown::plain("One Night", "one night", Some(2023))
+    );
+    assert_eq!(
+        shown("1923 (2022)").await,
+        B32Shown::plain("1923", "1923", Some(2022))
+    );
+    assert_eq!(
+        shown("Plain Show").await,
+        B32Shown::plain("Plain Show", "plain show", None)
+    );
+    assert_eq!(shown("Hotel Series (2015)").await, B32Shown::hotel_series());
+    // The seasons, the one with no folder too, don't read the series' tvshow.nfo.
+    assert_eq!(
+        shown("Hotel Series (2015)/Season 01").await,
+        B32Shown::plain("Season 01", "season 0001", None)
+    );
+    assert_eq!(
+        shown("Hotel Series (2015)/Season 2").await,
+        B32Shown::plain("Season 2", "season 0002", None)
+    );
+}
+
+#[tokio::test]
+async fn b32_metadata_refreshes_read_tvshow_nfo_for_the_series_only() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(
+        &root,
+        "Hotel Series (2015)/Season 01/Hotel Series S01E01.mkv",
+    );
+    scan(&fx.pool, &lib).await;
+    // The show gets its tvshow.nfo after the scan; the scheduled refresh reads it.
+    std::fs::write(root.join("Hotel Series (2015)/tvshow.nfo"), B32_TVSHOW_NFO).unwrap();
+    let client = reqwest::Client::new();
+    for rel in ["Hotel Series (2015)", "Hotel Series (2015)/Season 01"] {
+        let id = item_at(&fx.pool, &lib, rel).await;
+        let item = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        rustyfin_core::metadata::refresh_item_metadata(&fx.pool, &client, &item, None, None, None)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        b32_shown(&fx.pool, &lib, "Hotel Series (2015)").await,
+        B32Shown::hotel_series()
+    );
+    assert_eq!(
+        b32_shown(&fx.pool, &lib, "Hotel Series (2015)/Season 01").await,
+        B32Shown::plain("Season 01", "season 0001", None)
+    );
+}
+
+#[tokio::test]
+async fn b32_rescans_settle_series_folders_and_tvshow_nfo() {
+    const EPISODE: &str = "Hotel Series (2015)/Season 01/Hotel Series S01E01.mkv";
+    const SCENE: &str = "Hotel Series (2015)/Hotel.Series.S03.1080p";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [
+        EPISODE,
+        "Hotel Series (2015)/Hotel.Series.S03.1080p/Hotel Series S03E01.mkv",
+        "One Night (2023)/Season 01/One Night S01E01.mkv",
+        "1923 (2022)/Season 01/1923 S01E01.mkv",
+        "Kilo/Season 01/Kilo S01E01.mkv",
+    ] {
+        touch(&root, rel);
+    }
+    std::fs::write(root.join("Hotel Series (2015)/tvshow.nfo"), B32_TVSHOW_NFO).unwrap();
+    // Kilo's seasons read movie.nfo before tvshow.nfo under the older rule, so they keep its plot.
+    std::fs::write(
+        root.join("Kilo/tvshow.nfo"),
+        "<tvshow><plot>Kilo.</plot></tvshow>",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Kilo/movie.nfo"),
+        "<movie><plot>Kilo.</plot></movie>",
+    )
+    .unwrap();
+    scan(&fx.pool, &lib).await;
+    let hotel = item_at(&fx.pool, &lib, "Hotel Series (2015)").await;
+    let season = item_at(&fx.pool, &lib, "Hotel Series (2015)/Season 01").await;
+    let scene = item_at(&fx.pool, &lib, SCENE).await;
+    let one_night = item_at(&fx.pool, &lib, "One Night (2023)").await;
+    let nineteen = item_at(&fx.pool, &lib, "1923 (2022)").await;
+    let kilo_season = item_at(&fx.pool, &lib, "Kilo/Season 01").await;
+    let episode = item_at(&fx.pool, &lib, EPISODE).await;
+    // 3afba21 named a series after its folder, with no year, and gave the series' tvshow.nfo to its
+    // seasons instead. A season folder's name that looks like a file's took the show's title.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Hotel Series (2015)', sort_name = 'hotel series (2015)',
+             production_year = NULL, overview = NULL, community_rating = NULL,
+             official_rating = NULL, genres = '', runtime_ticks = NULL
+         WHERE id = ?1",
+        &[&hotel.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'One Night (2023)', sort_name = 'one night (2023)',
+             production_year = NULL
+         WHERE id = ?1",
+        &[&one_night.to_string()],
+    )
+    .await;
+    // A name that isn't the folder's stays.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Nineteen Twenty-Three',
+             sort_name = 'nineteen twenty-three', production_year = NULL
+         WHERE id = ?1",
+        &[&nineteen.to_string()],
+    )
+    .await;
+    // An overview that isn't the show's stays.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET overview = 'Its own overview.', production_year = 2015,
+             community_rating = 7.5, official_rating = 'TV-14', genres = 'Drama|Comedy',
+             runtime_ticks = 27000000000
+         WHERE id = ?1",
+        &[&season.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Hotel Series', sort_name = 'hotel series',
+             overview = 'Synthetic test show.', production_year = 2015, community_rating = 7.5,
+             official_rating = 'TV-14', genres = 'Drama|Comedy', runtime_ticks = 27000000000
+         WHERE id = ?1",
+        &[&scene.to_string()],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, episode, &marks).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, hotel, &favorite).await;
+    insert_marks(&fx.pool, &user, season, &favorite).await;
+
+    scan(&fx.pool, &lib).await;
+
+    let shown = |rel| b32_shown(&fx.pool, &lib, rel);
+    assert_eq!(shown("Hotel Series (2015)").await, B32Shown::hotel_series());
+    assert_eq!(
+        shown("One Night (2023)").await,
+        B32Shown::plain("One Night", "one night", Some(2023))
+    );
+    assert_eq!(
+        shown("1923 (2022)").await,
+        B32Shown::plain("Nineteen Twenty-Three", "nineteen twenty-three", Some(2022))
+    );
+    assert_eq!(
+        shown("Hotel Series (2015)/Season 01").await,
+        B32Shown {
+            overview: Some("Its own overview.".to_string()),
+            ..B32Shown::plain("Season 01", "season 0001", None)
+        }
+    );
+    assert_eq!(
+        shown(SCENE).await,
+        B32Shown::plain("Hotel.Series.S03.1080p", "season 0001", None)
+    );
+    assert_eq!(
+        shown("Kilo/Season 01").await.overview.as_deref(),
+        Some("Kilo.")
+    );
+    for (rel, id) in [
+        ("Hotel Series (2015)", hotel),
+        ("Hotel Series (2015)/Season 01", season),
+        (SCENE, scene),
+        ("One Night (2023)", one_night),
+        ("1923 (2022)", nineteen),
+        ("Kilo/Season 01", kilo_season),
+        (EPISODE, episode),
+    ] {
+        assert_eq!(item_at(&fx.pool, &lib, rel).await, id, "{rel}");
+    }
+    assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
+    assert_eq!(
+        marks_of(&fx.pool, &user, hotel).await,
+        Some(favorite.clone())
+    );
+    assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
+}

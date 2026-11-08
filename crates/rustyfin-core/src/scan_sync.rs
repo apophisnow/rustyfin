@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
+use rustyfin_model::metadata::ExternalMetadata;
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
@@ -799,6 +800,180 @@ pub async fn settle_season_numbers(
     }
     tx.commit().await?;
     Ok(changed)
+}
+
+/// A series folder that a scan walked, for `settle_series`.
+pub struct SeriesFolder {
+    /// The id of the series.
+    pub id: Uuid,
+    /// The name of its folder.
+    pub folder: String,
+    /// What its `tvshow.nfo` gives, if it has one.
+    pub nfo: Option<ExternalMetadata>,
+    /// With `nfo`, its seasons that read that file under the older rule, as they found no `.nfo` of their own
+    /// beside their folder: id, folder name and number.
+    pub nfo_seasons: Vec<(Uuid, String, Option<i32>)>,
+}
+
+/// The fields of a series or a season that `settle_series` settles.
+#[derive(Clone, PartialEq, sqlx::FromRow)]
+struct Shown {
+    id: String,
+    name: String,
+    sort_name: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i32>,
+    community_rating: Option<f64>,
+    official_rating: Option<String>,
+    genres: String,
+    runtime_ticks: Option<i64>,
+}
+
+/// Gives each series of `series`, and its seasons, what a new one gets now, where the stored values came from
+/// older rules:
+/// - A name and a sort name that are a folder's like `Title (Year)` become the title's, and a missing year
+///   becomes the folder's (`naming::series_title_and_year`). Any other name is kept.
+/// - Each field that the series' own `tvshow.nfo` fills, and that is still empty, gets the file's value, as a
+///   metadata refresh fills it (`metadata::apply_metadata_to_item`).
+/// - A season that read that file under the older rule loses each value that is still the file's. A name that
+///   took the show's title gets the season's folder name back.
+///
+/// Only the items that differ are written, in one transaction. Returns how many changed.
+pub async fn settle_series(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    series: &[SeriesFolder],
+) -> Result<u64, sqlx::Error> {
+    let stored: Vec<Shown> = sqlx::query_as(
+        "SELECT id, name, sort_name, overview, production_year, community_rating, official_rating,
+                genres, runtime_ticks
+         FROM media_items WHERE library_id = ?1 AND media_type IN ('Series', 'Season')",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let stored: HashMap<String, Shown> = stored.into_iter().map(|s| (s.id.clone(), s)).collect();
+
+    let mut changes: Vec<(Shown, &Shown)> = Vec::new();
+    for folder in series {
+        if let Some(old) = stored.get(&folder.id.to_string()) {
+            let mut new = old.clone();
+            if let Some((title, year)) = naming::series_title_and_year(&folder.folder) {
+                if new.name == folder.folder {
+                    new.name = title.to_string();
+                }
+                if new.sort_name.as_deref() == Some(&folder.folder.to_lowercase()) {
+                    new.sort_name = Some(title.to_lowercase());
+                }
+                new.production_year = new.production_year.or(Some(year));
+            }
+            if let Some(nfo) = &folder.nfo {
+                fill_from_nfo(&mut new, nfo);
+            }
+            if new != *old {
+                changes.push((new, old));
+            }
+        }
+        let Some(nfo) = &folder.nfo else {
+            continue;
+        };
+        for (id, season_folder, number) in &folder.nfo_seasons {
+            let Some(old) = stored.get(&id.to_string()) else {
+                continue;
+            };
+            let mut new = old.clone();
+            clear_show_nfo(&mut new, nfo, season_folder, *number);
+            if new != *old {
+                changes.push((new, old));
+            }
+        }
+    }
+    if changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed = 0;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (new, old) in changes {
+        // An item that another writer changed since it was read is left to the next scan.
+        changed += sqlx::query(
+            "UPDATE media_items SET name = ?1, sort_name = ?2, overview = ?3, production_year = ?4,
+                 community_rating = ?5, official_rating = ?6, genres = ?7, runtime_ticks = ?8
+             WHERE id = ?9 AND name IS ?10 AND sort_name IS ?11 AND overview IS ?12
+                 AND production_year IS ?13 AND community_rating IS ?14 AND official_rating IS ?15
+                 AND genres IS ?16 AND runtime_ticks IS ?17",
+        )
+        .bind(&new.name)
+        .bind(&new.sort_name)
+        .bind(&new.overview)
+        .bind(new.production_year)
+        .bind(new.community_rating)
+        .bind(&new.official_rating)
+        .bind(&new.genres)
+        .bind(new.runtime_ticks)
+        .bind(&old.id)
+        .bind(&old.name)
+        .bind(&old.sort_name)
+        .bind(&old.overview)
+        .bind(old.production_year)
+        .bind(old.community_rating)
+        .bind(&old.official_rating)
+        .bind(&old.genres)
+        .bind(old.runtime_ticks)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Fills each field of `shown` that is still empty with the value of `nfo`, as
+/// `metadata::apply_metadata_to_item` does with an NFO.
+fn fill_from_nfo(shown: &mut Shown, nfo: &ExternalMetadata) {
+    shown.overview = shown.overview.take().or_else(|| nfo.overview.clone());
+    shown.production_year = shown.production_year.or(nfo.production_year);
+    shown.community_rating = shown.community_rating.or(nfo.community_rating);
+    shown.official_rating = shown
+        .official_rating
+        .take()
+        .or_else(|| nfo.official_rating.clone());
+    // Genres are stored joined with `|`; an item reads none from blank ones.
+    if shown.genres.split('|').all(|g| g.trim().is_empty())
+        && let Some(genres) = nfo.genres.as_ref().filter(|g| !g.is_empty())
+    {
+        shown.genres = genres.join("|");
+    }
+    shown.runtime_ticks = shown.runtime_ticks.or(nfo.runtime_ticks);
+}
+
+/// Clears each field of a season's `shown` that still holds the value of its series' `tvshow.nfo`, `nfo`. A
+/// name that took the show's title, with its sort name, becomes the one that the season's folder, `folder`,
+/// and number give.
+fn clear_show_nfo(shown: &mut Shown, nfo: &ExternalMetadata, folder: &str, number: Option<i32>) {
+    fn clear<T: PartialEq>(field: &mut Option<T>, nfo: &Option<T>) {
+        if *field == *nfo {
+            *field = None;
+        }
+    }
+    if let Some(title) = &nfo.name
+        && shown.name == *title
+        && title != folder
+        && shown.sort_name.as_deref() == Some(&title.to_lowercase())
+    {
+        shown.name = folder.to_string();
+        shown.sort_name = Some(season_sort_name(number));
+    }
+    clear(&mut shown.overview, &nfo.overview);
+    clear(&mut shown.production_year, &nfo.production_year);
+    clear(&mut shown.community_rating, &nfo.community_rating);
+    clear(&mut shown.official_rating, &nfo.official_rating);
+    if let Some(genres) = nfo.genres.as_ref().filter(|g| !g.is_empty())
+        && shown.genres == genres.join("|")
+    {
+        shown.genres = String::new();
+    }
+    clear(&mut shown.runtime_ticks, &nfo.runtime_ticks);
 }
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.

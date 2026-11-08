@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::local_images;
 use crate::naming;
+use crate::nfo_parser;
 use crate::probe;
 use crate::scan_progress::ScanTicket;
 use crate::scan_sync;
@@ -574,6 +575,16 @@ async fn scan_flat_library(
     Ok((changes, new_item_ids))
 }
 
+/// A series folder that a TV scan walked.
+struct SeriesWalk {
+    /// The folder's path.
+    dir: String,
+    /// The folder's name.
+    folder: String,
+    /// Its seasons, by id: the name of each one's folder, or the one made for its loose files, and its number.
+    seasons: BTreeMap<Uuid, (String, Option<i32>)>,
+}
+
 /// Recursive scan for TV Shows: path/ShowName/Season XX/episode files
 async fn scan_tv_library(
     pool: &SqlitePool,
@@ -609,6 +620,9 @@ async fn scan_tv_library(
     // The episode files of each season, by season id: the id of its series, the season's number, then its
     // files in walk order. The episodes are reconciled once every path has been walked.
     let mut episode_files: BTreeMap<Uuid, (Uuid, Option<i32>, Vec<PathBuf>)> = BTreeMap::new();
+    // Each series that the walks met, by id: its folder's path and name, and its seasons with their
+    // folder's name and number. Series and seasons stored under older rules are settled from these.
+    let mut series_folders: BTreeMap<Uuid, SeriesWalk> = BTreeMap::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -706,16 +720,20 @@ async fn scan_tv_library(
                 id
             } else {
                 let id = Uuid::new_v4();
+                let (name, year) = match naming::series_title_and_year(&series_name) {
+                    Some((title, year)) => (title.to_string(), Some(year)),
+                    None => (series_name.clone(), None),
+                };
                 let series_item = MediaItem {
                     id,
-                    name: series_name.clone(),
-                    sort_name: Some(series_name.to_lowercase()),
+                    sort_name: Some(name.to_lowercase()),
+                    name,
                     overview: None,
                     media_type: MediaType::Series,
                     path: series_dir.clone(),
                     parent_id: None,
                     library_id: library.id,
-                    production_year: None,
+                    production_year: year,
                     community_rating: None,
                     official_rating: None,
                     genres: vec![],
@@ -770,6 +788,16 @@ async fn scan_tv_library(
                 id
             };
 
+            series_folders
+                .entry(series_id)
+                .or_insert_with(|| SeriesWalk {
+                    dir: series_dir.clone(),
+                    folder: series_name.clone(),
+                    seasons: BTreeMap::new(),
+                })
+                .seasons
+                .entry(season_id)
+                .or_insert_with(|| (season_name.clone(), season_number));
             episode_files
                 .entry(season_id)
                 .or_insert_with(|| (series_id, season_number, Vec::new()))
@@ -824,6 +852,42 @@ async fn scan_tv_library(
     if settled > 0 {
         tracing::info!(
             "TV library '{}': set the number of {} stored seasons",
+            library.name,
+            settled
+        );
+    }
+    // A series stored under an older rule gets the name and year that its folder gives now, and what its
+    // own tvshow.nfo gives; its seasons lose what they took from that file.
+    let mut folders = Vec::with_capacity(series_folders.len());
+    for (&id, walk) in &series_folders {
+        let nfo = match nfo_parser::find_series_nfo(Path::new(&walk.dir)) {
+            Some(nfo_path) => nfo_parser::parse_nfo(&nfo_path).await,
+            None => None,
+        };
+        // Under the older rule, a season read the series' tvshow.nfo when `find_nfo_for_media` found no
+        // other `.nfo` for its folder.
+        let nfo_seasons = match nfo {
+            Some(_) => walk
+                .seasons
+                .iter()
+                .filter(|(_, (name, _))| {
+                    nfo_parser::find_nfo_for_media(&Path::new(&walk.dir).join(name)).is_none()
+                })
+                .map(|(&season_id, (name, number))| (season_id, name.clone(), *number))
+                .collect(),
+            None => Vec::new(),
+        };
+        folders.push(scan_sync::SeriesFolder {
+            id,
+            folder: walk.folder.clone(),
+            nfo,
+            nfo_seasons,
+        });
+    }
+    let settled = scan_sync::settle_series(pool, library.id, &folders).await?;
+    if settled > 0 {
+        tracing::info!(
+            "TV library '{}': settled the names and metadata of {} stored series and seasons",
             library.name,
             settled
         );

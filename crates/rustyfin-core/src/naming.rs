@@ -417,6 +417,30 @@ pub fn is_specials_folder(name: &str, series_folder: &str) -> bool {
     rest == "specials" || rest == "extras"
 }
 
+/// The title and year of a series folder called `folder`, when it is named like "Title (Year)", as Jellyfin
+/// 12.4 reads them (`Emby.Naming/TV/SeriesResolver.cs:27-28`, `43-51`). The year is the first `(dddd)`, four
+/// ASCII digits, that follows at least one character; the title is the text before it, trimmed, and what
+/// follows is dropped. So `1923 (2022)` is `1923` from 2022, and `Show (US) (2010) [1080p]` is `Show (US)`
+/// from 2010. Jellyfin would give an empty title to ` (2010)`; that is `None` here, so the series keeps its
+/// folder's name.
+pub fn series_title_and_year(folder: &str) -> Option<(&str, i32)> {
+    // `(?<title>.+?)\s*\((?<year>[0-9]{4})\)`, unanchored: the first match starts the name.
+    let (at, year) = folder.char_indices().skip(1).find_map(|(at, _)| {
+        let rest = folder[at..].trim_start().as_bytes();
+        match rest.get(..6)? {
+            [b'(', digits @ .., b')'] if digits.iter().all(u8::is_ascii_digit) => {
+                let year = digits
+                    .iter()
+                    .fold(0, |year, d| year * 10 + i32::from(d - b'0'));
+                Some((at, year))
+            }
+            _ => None,
+        }
+    })?;
+    let title = folder[..at].trim();
+    (!title.is_empty()).then_some((title, year))
+}
+
 /// A title and year read from a movie file name, as Jellyfin's `CleanDateTime` and `CleanString` leave them
 /// (`NamingOptions.cs:146-160`).
 #[derive(Debug, Clone, PartialEq, Eq)]
