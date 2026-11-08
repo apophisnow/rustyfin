@@ -2862,9 +2862,11 @@ mod tests {
         assert_eq!(many(), many_sql);
     }
 
-    /// Each input the cache key holds tells two requests apart. For each pair that differs in one
-    /// input, whichever is stored first, both get the SQL they get from an empty cache. A key that
-    /// lost the input would serve one the other's SQL, with its binds in the wrong places.
+    /// Each input the cache key holds tells two requests apart. Each pair differs in one input, in
+    /// which of two lists holds a value, or in the order or directions of the sort terms. The two
+    /// get different keys, and whichever is stored first, both get the SQL they get from an empty
+    /// cache. A key that lost an input or merged two would serve one the other's SQL, with its
+    /// rows in the wrong order or its binds in the wrong places.
     #[test]
     fn test_filter_query_cache_tells_every_shape_input_apart() {
         /// The inputs `build_filtered_query` renders, for one request.
@@ -2908,6 +2910,28 @@ mod tests {
                 r.sort_order,
             )
         }
+        /// The length of a list, or 0 for no list.
+        fn len<T>(list: Option<&[T]>) -> usize {
+            list.map_or(0, <[T]>::len)
+        }
+        /// `r`'s cache key.
+        fn key(r: &FilterRequest) -> super::FilterShape {
+            super::filter_cache_key(
+                len(r.media_types.as_deref()),
+                len(r.exclude_media_types.as_deref()),
+                len(r.genres.as_deref()),
+                len(r.years.as_deref()),
+                len(r.official_ratings.as_deref()),
+                len(r.tags.as_deref()),
+                len(r.media_types_filter.as_deref()),
+                true,
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            )
+        }
 
         let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let base = FilterRequest {
@@ -2943,7 +2967,20 @@ mod tests {
                 let (mut x, mut y) = (base.clone(), base.clone());
                 set(&mut x, a);
                 set(&mut y, b);
-                pairs.push((format!("{field} {a} vs {b}"), x, y));
+                pairs.push((format!("{field} {a} vs {b}"), x, y, false));
+            }
+        }
+        // One value in one list vs one in another, for each two lists. A key that merged two
+        // lengths would give both the same key.
+        for (i, &(x_field, set_x)) in lists.iter().enumerate() {
+            for &(y_field, set_y) in &lists[i + 1..] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set_x(&mut x, 1);
+                set_y(&mut y, 1);
+                // IncludeItemTypes and MediaTypes both render `media_type IN (?)`, so only their
+                // keys tell these two apart.
+                let same_sql = (x_field, y_field) == ("media_types_len", "media_types_filter_len");
+                pairs.push((format!("{x_field} vs {y_field}"), x, y, same_sql));
             }
         }
         let flags: [(&str, fn(&mut FilterRequest, Option<bool>)); 3] = [
@@ -2960,7 +2997,7 @@ mod tests {
                 let (mut x, mut y) = (base.clone(), base.clone());
                 set(&mut x, a);
                 set(&mut y, b);
-                pairs.push((format!("{field} {a:?} vs {b:?}"), x, y));
+                pairs.push((format!("{field} {a:?} vs {b:?}"), x, y, false));
             }
         }
         for (a, b) in [
@@ -2969,6 +3006,15 @@ mod tests {
             (
                 ("SortName", "Ascending"),
                 ("SortName,DateCreated", "Ascending"),
+            ),
+            // The order of the terms, and a later term's own direction.
+            (
+                ("SortName,DateCreated", "Ascending"),
+                ("DateCreated,SortName", "Ascending"),
+            ),
+            (
+                ("SortName,DateCreated", "Ascending,Ascending"),
+                ("SortName,DateCreated", "Ascending,Descending"),
             ),
         ] {
             let x = FilterRequest {
@@ -2981,23 +3027,32 @@ mod tests {
                 sort_order: b.1,
                 ..base.clone()
             };
-            pairs.push((format!("sort {a:?} vs {b:?}"), x, y));
+            pairs.push((format!("sort {a:?} vs {b:?}"), x, y, false));
         }
         assert_eq!(
             pairs.len(),
-            26,
-            "7 lists at 2 pairs, 3 flags at 3 and 3 sorts"
+            49,
+            "7 lists at 2 pairs, 21 list swaps, 3 flags at 3 and 5 sorts"
         );
 
         let clear = || super::FILTER_QUERY_CACHE.lock().clear();
-        let mut shared = Vec::new();
-        for (case, x, y) in &pairs {
-            // What each gets from an empty cache. The pair must render different SQL.
+        let (mut same_key, mut shared) = (Vec::new(), Vec::new());
+        for (case, x, y, same_sql) in &pairs {
+            // The keys themselves: through the cache, equal keys that hash apart rarely meet.
+            if key(x) == key(y) {
+                same_key.push(case.as_str());
+            }
+            // What each gets from an empty cache. The pair must render different SQL, except the
+            // two lists that render the same clause.
             clear();
             let x_sql = cached_sql(x);
             clear();
             let y_sql = cached_sql(y);
-            assert_ne!(x_sql, y_sql, "{case}: both render the same SQL");
+            if *same_sql {
+                assert_eq!(x_sql, y_sql, "{case}: expected the same SQL");
+            } else {
+                assert_ne!(x_sql, y_sql, "{case}: both render the same SQL");
+            }
             // Each order, from an empty cache.
             clear();
             let x_first = (cached_sql(x), cached_sql(y));
@@ -3007,6 +3062,9 @@ mod tests {
                 shared.push(case.as_str());
             }
         }
-        assert!(shared.is_empty(), "these pairs shared SQL: {shared:?}");
+        assert!(
+            same_key.is_empty() && shared.is_empty(),
+            "these pairs got the same key: {same_key:?}; these shared SQL: {shared:?}"
+        );
     }
 }
