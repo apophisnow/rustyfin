@@ -694,6 +694,7 @@ async fn test_remote_browsing_burst_is_not_rate_limited() {
         width: None,
         height: None,
         blurhash: None,
+        stamp: None,
     };
     rustyfin_db::repo_image::upsert_image(&state.db, &img)
         .await
@@ -936,6 +937,7 @@ async fn test_item_image_missing_file_returns_404_not_500() {
         width: None,
         height: None,
         blurhash: None,
+        stamp: None,
     };
     rustyfin_db::repo_image::upsert_image(&state.db, &img)
         .await
@@ -2425,6 +2427,170 @@ async fn b30_p1_bounds_that_give_one_size_share_one_copy() {
     );
     let copies = b30_copies(&state);
     assert_eq!(copies.len(), 1, "{copies:?}");
+}
+
+/// The item's Primary image at `bounds` (a query string), which must be served.
+async fn b30_image(app: &axum::Router, token: &str, id: uuid::Uuid, bounds: &str) -> Vec<u8> {
+    let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+    let (status, _, bytes) = b30_get(app, &uri, token).await;
+    assert_eq!(status, StatusCode::OK, "{uri}");
+    bytes
+}
+
+/// The item's Primary image tag in its details, which the list of `item_type` items and the
+/// item's image list must give too.
+async fn b30_primary_tag(
+    app: &axum::Router,
+    token: &str,
+    id: uuid::Uuid,
+    item_type: &str,
+) -> String {
+    let (status, details) = send_authed(app, "GET", &format!("/Items/{id}"), token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    let tag = details["ImageTags"]["Primary"].clone();
+    let uri = format!("/Items?IncludeItemTypes={item_type}&Recursive=true");
+    let (status, list) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"))
+        .iter()
+        .find(|item| item["Id"] == id.to_string())
+        .unwrap_or_else(|| panic!("{id} is not in {list}"));
+    assert_eq!(
+        listed["ImageTags"]["Primary"], tag,
+        "the list and the details differ"
+    );
+    let uri = format!("/Items/{id}/Images");
+    let (status, images) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{images}");
+    let primary = images
+        .as_array()
+        .unwrap_or_else(|| panic!("no image list: {images}"))
+        .iter()
+        .find(|image| image["ImageType"] == "Primary")
+        .unwrap_or_else(|| panic!("no Primary in {images}"));
+    assert_eq!(
+        primary["ImageTag"], tag,
+        "the image list and the details differ"
+    );
+    tag.as_str()
+        .unwrap_or_else(|| panic!("no Primary tag in {details}"))
+        .to_string()
+}
+
+/// Whether `tag` is 32 lower-case hex digits.
+fn b30_is_tag(tag: &str) -> bool {
+    tag.len() == 32 && tag.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The id of the one `item_type` item in the item list.
+async fn b30_only(app: &axum::Router, token: &str, item_type: &str) -> uuid::Uuid {
+    let uri = format!("/Items?IncludeItemTypes={item_type}&Recursive=true");
+    let (status, list) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let items = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"));
+    assert_eq!(items.len(), 1, "{list}");
+    items[0]["Id"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn b30_p2_an_upload_changes_the_picture_and_every_tag() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    let red = b30_jpeg(64, 96, [255, 0, 0]);
+    let blue = b30_jpeg(48, 72, [0, 0, 255]);
+    // Their lengths differ too, so their stamps differ even within one tick of the clock.
+    assert_ne!(red.len(), blue.len());
+
+    b30_upload(&app, &token, id, &red).await;
+    let before = b30_primary_tag(&app, &token, id, "Photo").await;
+    let small = b30_image(&app, &token, id, "maxWidth=32").await;
+    assert_eq!(b30_picture(&small), ((32, 48), "red".to_string()));
+    assert!(
+        b30_image(&app, &token, id, "").await == red,
+        "not the upload"
+    );
+
+    b30_upload(&app, &token, id, &blue).await;
+    let small = b30_image(&app, &token, id, "maxWidth=32").await;
+    assert_eq!(
+        b30_picture(&small),
+        ((32, 48), "blue".to_string()),
+        "the old picture's copy came back"
+    );
+    assert!(
+        b30_image(&app, &token, id, "").await == blue,
+        "not the new upload"
+    );
+    let after = b30_primary_tag(&app, &token, id, "Photo").await;
+    assert!(
+        b30_is_tag(&before) && b30_is_tag(&after),
+        "{before}, {after}"
+    );
+    assert_ne!(after, before, "the tag did not change with the picture");
+}
+
+#[tokio::test]
+async fn b30_p2_a_rescan_finds_a_poster_replaced_in_place() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let lib = create_library_via_api(&app, &state, &token, "B30 Shows", "TvShows").await;
+    let show = std::path::Path::new(&media_folder(&state, "b30 shows")).join("B30 Show");
+    std::fs::create_dir_all(show.join("Season 1")).unwrap();
+    std::fs::write(show.join("Season 1").join("B30 Show - S01E01.mkv"), b"").unwrap();
+    let poster = show.join("poster.jpg");
+    std::fs::write(&poster, b30_jpeg(64, 96, [255, 0, 0])).unwrap();
+    let refresh = format!("/Library/VirtualFolders/{lib}/Refresh");
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    rustyfin_core::scanner::wait_for_idle().await;
+    let series = b30_only(&app, &token, "Series").await;
+    // This also leaves the series' details in the cache.
+    let before = b30_primary_tag(&app, &token, series, "Series").await;
+    let small = b30_image(&app, &token, series, "maxWidth=32").await;
+    assert_eq!(b30_picture(&small), ((32, 48), "red".to_string()));
+
+    // The poster is replaced in place by a smaller one, written later.
+    std::fs::write(&poster, b30_jpeg(48, 72, [0, 0, 255])).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&poster)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let (status, body) = send_authed(&app, "POST", &refresh, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    rustyfin_core::scanner::wait_for_idle().await;
+
+    let small = b30_image(&app, &token, series, "maxWidth=32").await;
+    assert_eq!(
+        b30_picture(&small),
+        ((32, 48), "blue".to_string()),
+        "the old poster's copy came back"
+    );
+    let after = b30_primary_tag(&app, &token, series, "Series").await;
+    assert!(
+        b30_is_tag(&before) && b30_is_tag(&after),
+        "{before}, {after}"
+    );
+    assert_ne!(after, before, "the tag did not change with the poster");
+    // The season list copies the series' tag. (No path gives an episode the series' tag, on
+    // 3afba21 either: a separate bug.)
+    let uri = "/Items?IncludeItemTypes=Season&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(
+        list["Items"][0]["SeriesPrimaryImageTag"],
+        after.as_str(),
+        "{list}"
+    );
 }
 
 // ── System Endpoint Tests ──

@@ -48,7 +48,7 @@ pub enum ScanScope {
     RootFiles(PathBuf),
 }
 
-/// How many items a scan added, removed and read again.
+/// How many items a scan added, removed and read again, and how many images changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanChanges {
     /// New items of every type, series, seasons, artists and albums included.
@@ -57,12 +57,14 @@ pub struct ScanChanges {
     pub removed: u32,
     /// Existing items that got probe steps again, because their files changed.
     pub reread: u32,
+    /// Images whose file changed since it was stored.
+    pub images: u32,
 }
 
 impl ScanChanges {
-    /// Whether the scan added, removed or read again at least one item.
+    /// Whether the scan added, removed or read again at least one item, or changed an image.
     pub fn changed(&self) -> bool {
-        self.added > 0 || self.removed > 0 || self.reread > 0
+        self.added > 0 || self.removed > 0 || self.reread > 0 || self.images > 0
     }
 }
 
@@ -127,7 +129,7 @@ pub async fn scan_with_metadata(
     }
     // The refresh shows as progress only when a provider is configured to make API calls.
     let counted = tmdb.is_some() || omdb_api_key.is_some() || fanart_api_key.is_some();
-    let (changes, new_item_ids) = match library.content_type {
+    let (mut changes, new_item_ids) = match library.content_type {
         LibraryContentType::TvShows => scan_tv_library(pool, library, scope, ticket).await?,
         LibraryContentType::Music => {
             scan_music_library(pool, library, scope, ticket, counted).await?
@@ -187,6 +189,9 @@ pub async fn scan_with_metadata(
         }
     }
 
+    // A local image replaced in place gets its new stamp, so its tag and copies change.
+    changes.images = restamp_local_images(pool, library, scope).await;
+
     // Rebuild materialized filter indexes after scan completes
     // This keeps the filter_genre_index, filter_year_index, filter_rating_index up-to-date.
     // A scoped rescan that changed nothing leaves them as they are.
@@ -197,6 +202,72 @@ pub async fn scan_with_metadata(
     }
 
     Ok(changes)
+}
+
+/// Restamps the local images of `scope` whose files changed since they were stored, and returns how
+/// many had a stored stamp that changed. An image with no stamp yet is stamped without being counted.
+/// A failed stat or read skips its image, and a database error skips it too, so it counts nothing.
+async fn restamp_local_images(pool: &SqlitePool, library: &Library, scope: &ScanScope) -> u32 {
+    let images = match rustyfin_db::repo_image::get_local_images_in_scope(
+        pool,
+        library.id,
+        &path_scope(scope),
+    )
+    .await
+    {
+        Ok(images) => images,
+        Err(e) => {
+            tracing::warn!(
+                "failed to read the images of library '{}': {}",
+                library.name,
+                e
+            );
+            return 0;
+        }
+    };
+    // One stat per image. Only a file whose stamp differs is read again, for its size.
+    let changed = match tokio::task::spawn_blocking(move || {
+        images
+            .into_iter()
+            .filter_map(|mut img| {
+                let meta = std::fs::metadata(&img.path).ok()?;
+                if img.stamp == Some(crate::image_proxy::file_stamp(&meta)) {
+                    return None;
+                }
+                let (stamp, width, height) =
+                    local_images::local_image_version(Path::new(&img.path));
+                let counted = img.stamp.is_some();
+                img.stamp = Some(stamp?);
+                img.width = width;
+                img.height = height;
+                Some((img, counted))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::warn!(
+                "failed to stat the images of library '{}': {}",
+                library.name,
+                e
+            );
+            return 0;
+        }
+    };
+
+    let mut count = 0;
+    for (mut img, counted) in changed {
+        if counted {
+            img.blurhash = crate::image_proxy::compute_blurhash(&img.path, None).await;
+        }
+        match rustyfin_db::repo_image::update_image_version(pool, &img).await {
+            Ok(()) => count += u32::from(counted),
+            Err(e) => tracing::warn!("failed to store the version of '{}': {}", img.path, e),
+        }
+    }
+    count
 }
 
 /// Serializes the scans that write items. Held until the probes they queued have finished.
@@ -565,6 +636,7 @@ async fn scan_flat_library(
         added: count,
         removed,
         reread,
+        images: 0,
     };
     Ok((changes, new_item_ids))
 }
@@ -914,6 +986,7 @@ async fn scan_tv_library(
         added: count,
         removed,
         reread,
+        images: 0,
     };
     Ok((changes, new_item_ids))
 }
@@ -1339,6 +1412,7 @@ async fn scan_music_library(
         added: count,
         removed,
         reread,
+        images: 0,
     };
     Ok((changes, new_item_ids))
 }

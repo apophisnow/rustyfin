@@ -166,7 +166,7 @@ async fn enrich_item(
             std::collections::HashMap::new();
         let mut backdrop_tags: Vec<String> = Vec::new();
         for img in &images {
-            let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+            let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
             if img.image_type == rustyfin_model::image::ImageType::Backdrop {
                 backdrop_tags.push(tag.clone());
             }
@@ -717,7 +717,7 @@ async fn enrich_items(
                 std::collections::HashMap::new();
             let mut backdrop_tags: Vec<String> = Vec::new();
             for img in images {
-                let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+                let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
                 if img.image_type == rustyfin_model::image::ImageType::Backdrop {
                     backdrop_tags.push(tag.clone());
                 }
@@ -788,7 +788,7 @@ async fn enrich_items(
                 std::collections::HashMap::new();
             let mut backdrop_tags: Vec<String> = Vec::new();
             for img in images {
-                let tag = format!("{}_{}", img.image_type.as_str(), img.image_index);
+                let tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
                 if img.image_type == rustyfin_model::image::ImageType::Backdrop {
                     backdrop_tags.push(tag.clone());
                 }

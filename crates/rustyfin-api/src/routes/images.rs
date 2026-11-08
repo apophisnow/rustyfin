@@ -40,7 +40,7 @@ async fn get_item_images(
         .map(|img| ImageInfo {
             image_type: img.image_type,
             image_index: img.image_index,
-            image_tag: format!("{}_{}", img.image_type.as_str(), img.image_index),
+            image_tag: rustyfin_core::image_proxy::image_tag(&img.path, img.stamp),
             path: img.path,
             width: img.width,
             height: img.height,
@@ -110,8 +110,17 @@ async fn serve_image(
         }
     };
 
-    // Build cache key for in-memory image cache
-    let cache_key = format!("{}:{}:{}:{}", id, image_type_str, index, rendition.key());
+    // Build cache key for in-memory image cache. The stamp changes with the file, so a replaced
+    // picture is not served from the old one.
+    let stamp = img.stamp.unwrap_or(0);
+    let cache_key = format!(
+        "{}:{}:{}:{}:{}",
+        id,
+        image_type_str,
+        index,
+        stamp,
+        rendition.key()
+    );
 
     // Check in-memory cache first
     let bytes = if let Some(cached) = state.image_cache.get(&cache_key) {
@@ -120,6 +129,7 @@ async fn serve_image(
         let cache_dir = state.data_dir.join("cache").join("images");
         let bytes = match rustyfin_core::image_proxy::render_image(
             &img.path,
+            img.stamp,
             rendition,
             &cache_dir,
             Some(&state.http_client),
@@ -209,18 +219,24 @@ async fn upload_item_image(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // The file's stamp and size, so that the new picture has its own tag and copies
+    let (stamp, width, height) = rustyfin_core::local_images::local_image_version(&file_path);
     let img = ItemImage {
         item_id: id,
         image_type,
         image_index: 0,
         path: file_path.to_string_lossy().to_string(),
         provider: "upload".to_string(),
-        width: None,
-        height: None,
+        width,
+        height,
         blurhash: None,
+        stamp,
     };
 
     rustyfin_db::repo_image::upsert_image(&state.db, &img).await?;
+    // Drop the answers and the pictures that name the old one
+    state.cache.invalidate_item(&id.to_string());
+    state.image_cache.invalidate_item(&id.to_string());
 
     Ok(Json(json!({ "status": "ok" })))
 }

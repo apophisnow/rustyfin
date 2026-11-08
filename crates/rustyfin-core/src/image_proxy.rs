@@ -124,10 +124,71 @@ fn read_dimensions(path: &str) -> Result<(u32, u32), String> {
         .map_err(|e| format!("failed to decode image: {}", e))
 }
 
+/// A local image's version and size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageStamp {
+    /// The file's version, from `file_stamp`.
+    pub stamp: i64,
+    /// The picture's size in pixels, read from its header; `None` when the header cannot be read.
+    pub size: Option<(u32, u32)>,
+}
+
+/// The version of a file: the first 8 bytes, big-endian, of SHA-256 over `{len}:{mtime_ns}`. The
+/// modification time is in nanoseconds since 1970, or 0 when it is earlier or unavailable, so two
+/// writes within one second still differ.
+pub fn file_stamp(meta: &std::fs::Metadata) -> i64 {
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    let digest = Sha256::digest(format!("{}:{mtime_ns}", meta.len()));
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(first)
+}
+
+/// Reads a local image's stamp, and its size from the header when that can be read. A link is read
+/// as the file it points to. Fails only when the file's metadata cannot be read.
+pub fn read_image_stamp(path: &Path) -> std::io::Result<ImageStamp> {
+    let meta = std::fs::metadata(path)?;
+    let size = image::ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    Ok(ImageStamp {
+        stamp: file_stamp(&meta),
+        size,
+    })
+}
+
+/// The tag of a local image, which changes with its picture: the first 32 hex digits of SHA-256 over
+/// the path and the stamp (0 when there is none).
+pub fn image_tag(path: &str, stamp: Option<i64>) -> String {
+    let digest = Sha256::digest(format!("{path}\n{}", stamp.unwrap_or(0)));
+    hex(&digest[..16])
+}
+
+/// The name of the disk copy of a source at a size. It holds the full SHA-256 of the path, as a
+/// short hash let different paths share a file, and the stamp, so a replaced file gets a new copy.
+pub fn cached_copy_name(source_path: &str, stamp: Option<i64>, width: u32, height: u32) -> String {
+    let hash = hex(&Sha256::digest(source_path.as_bytes()));
+    format!(
+        "{hash}_{:016x}_{width}x{height}.jpg",
+        stamp.unwrap_or(0) as u64
+    )
+}
+
+/// The lower-case hex digits of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Serves a rendition of an image. `Original` is the source's own bytes; a `Copy` is a JPEG
-/// cached on disk under its size.
+/// cached on disk under its stamp and size, so a replaced file is not served from an old copy.
 pub async fn render_image(
     source_path: &str,
+    stamp: Option<i64>,
     rendition: Rendition,
     cache_dir: &Path,
     http_client: Option<&reqwest::Client>,
@@ -136,13 +197,7 @@ pub async fn render_image(
         return read_image_bytes(source_path, http_client).await;
     };
 
-    // The name is a full SHA-256: a short hash let different paths share a file.
-    let hash: String = Sha256::digest(source_path.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let cache_name = format!("{}_{}x{}.jpg", hash, width, height);
-    let cache_path = cache_dir.join(&cache_name);
+    let cache_path = cache_dir.join(cached_copy_name(source_path, stamp, width, height));
 
     // Return cached version if exists
     if cache_path.exists()
@@ -196,7 +251,7 @@ pub async fn get_or_resize_image(
     http_client: Option<&reqwest::Client>,
 ) -> Result<Vec<u8>, String> {
     let rendition = plan_rendition(source_path, None, max_width, max_height).await?;
-    render_image(source_path, rendition, cache_dir, http_client).await
+    render_image(source_path, None, rendition, cache_dir, http_client).await
 }
 
 async fn read_image_bytes(
@@ -341,7 +396,8 @@ mod tests {
         let [r, _, b] = mean_rgb(&blue_small);
         assert!(b > 200 && r < 60, "bA's poster came back {:?}", [r, b]);
 
-        // Each has its own file, named by a full hash (64 hex digits) and the size it holds...
+        // Each has its own file, named by a full hash (64 hex digits), the source's stamp (none
+        // here) and the size it holds...
         let mut names: Vec<String> = std::fs::read_dir(&cache_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -354,7 +410,7 @@ mod tests {
                 hash.len() == 64 && hash.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
                 "{name}"
             );
-            assert_eq!(size, "8x12.jpg", "{name}");
+            assert_eq!(size, format!("{}_8x12.jpg", "0".repeat(16)), "{name}");
         }
         // ...from which each is served again.
         let again = get_or_resize_image(red, Some(8), None, &cache_dir, None).await;
@@ -480,5 +536,138 @@ mod tests {
                 "{width}x{height}"
             );
         }
+    }
+
+    /// A test's own directory, removed when the test ends.
+    fn b30_root() -> (std::path::PathBuf, RemoveOnDrop) {
+        let root = std::env::temp_dir().join(format!("rustyfin_b30_{}", uuid::Uuid::new_v4()));
+        (root.clone(), RemoveOnDrop(root))
+    }
+
+    /// The names in a folder, sorted.
+    fn b30_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn b30_p2_stamp_changes_with_the_length_and_the_modified_time() {
+        let (root, _remove) = b30_root();
+        let poster = root.join("poster.jpg");
+        write_poster(&poster, [255, 0, 0]);
+        let first = read_image_stamp(&poster).unwrap();
+        assert_eq!(first.size, Some((60, 90)));
+        assert_eq!(read_image_stamp(&poster).unwrap(), first);
+
+        // Another picture, of another length.
+        image::RgbImage::from_pixel(30, 45, image::Rgb([0, 0, 255]))
+            .save(&poster)
+            .unwrap();
+        let second = read_image_stamp(&poster).unwrap();
+        assert_eq!(second.size, Some((30, 45)));
+        assert_ne!(second.stamp, first.stamp);
+        // The same length, modified later.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&poster)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let third = read_image_stamp(&poster).unwrap();
+        assert_ne!(third.stamp, second.stamp);
+        // A link reads as the file it points to.
+        #[cfg(unix)]
+        {
+            let link = root.join("link.jpg");
+            std::os::unix::fs::symlink(&poster, &link).unwrap();
+            assert_eq!(read_image_stamp(&link).unwrap(), third);
+        }
+
+        // A file that is no picture has a stamp but no size; a missing one is an error.
+        std::fs::write(&poster, b"no picture").unwrap();
+        assert_eq!(read_image_stamp(&poster).unwrap().size, None);
+        assert!(read_image_stamp(&root.join("missing.jpg")).is_err());
+    }
+
+    #[test]
+    fn b30_p2_tag_and_copy_name_carry_the_stamp() {
+        let path = "/media/Film/Heat (1995)/poster.jpg";
+        let tag = image_tag(path, Some(42));
+        assert!(
+            tag.len() == 32 && tag.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{tag}"
+        );
+        assert_eq!(image_tag(path, Some(42)), tag);
+        assert_ne!(image_tag(path, Some(43)), tag);
+        assert_ne!(
+            image_tag("/media/Film/Heat (1995)/fanart.jpg", Some(42)),
+            tag
+        );
+        assert_eq!(image_tag(path, None), image_tag(path, Some(0)));
+
+        let name = cached_copy_name(path, Some(42), 300, 450);
+        let parts: Vec<&str> = name.split('_').collect();
+        assert_eq!(parts.len(), 3, "{name}");
+        assert!(
+            parts[0].len() == 64
+                && parts[0]
+                    .bytes()
+                    .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{name}"
+        );
+        assert_eq!(parts[1], "000000000000002a", "{name}");
+        assert_eq!(parts[2], "300x450.jpg", "{name}");
+        let negative = cached_copy_name(path, Some(-1), 300, 450);
+        assert_eq!(negative.split('_').nth(1), Some("ffffffffffffffff"));
+        assert_eq!(
+            cached_copy_name(path, None, 300, 450),
+            cached_copy_name(path, Some(0), 300, 450)
+        );
+        assert_ne!(
+            cached_copy_name("/media/other.jpg", Some(42), 300, 450),
+            name
+        );
+    }
+
+    #[tokio::test]
+    async fn b30_p2_render_image_names_its_copy_by_the_stamp() {
+        let (root, _remove) = b30_root();
+        let poster = root.join("media").join("poster.jpg");
+        let cache_dir = root.join("cache");
+        let path = poster.to_str().unwrap();
+        let copy = Rendition::Copy {
+            width: 8,
+            height: 12,
+        };
+        write_poster(&poster, [255, 0, 0]);
+        let red = render_image(path, Some(1), copy, &cache_dir, None)
+            .await
+            .unwrap();
+
+        // Replaced in place: its new stamp names a new copy...
+        write_poster(&poster, [0, 0, 255]);
+        let blue = render_image(path, Some(2), copy, &cache_dir, None)
+            .await
+            .unwrap();
+        let [r, _, b] = mean_rgb(&blue);
+        assert!(
+            b > 200 && r < 60,
+            "the new stamp got the old copy: {:?}",
+            [r, b]
+        );
+        // ...and the old stamp still names the old one.
+        let again = render_image(path, Some(1), copy, &cache_dir, None).await;
+        assert_eq!(again.unwrap(), red);
+        let mut expected = vec![
+            cached_copy_name(path, Some(1), 8, 12),
+            cached_copy_name(path, Some(2), 8, 12),
+        ];
+        expected.sort();
+        assert_eq!(b30_names(&cache_dir), expected);
     }
 }
