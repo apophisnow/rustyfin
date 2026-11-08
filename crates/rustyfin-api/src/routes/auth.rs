@@ -38,7 +38,14 @@ async fn login(
         Ok(user) => user,
         Err(rustyfin_auth::AuthError::InvalidCredentials) => {
             // The password may be a pending user's one-time code: the header says so (B20 3.2).
-            if !rustyfin_auth::setup_code_pending(&state.db, &req.username, &req.password).await? {
+            // It goes only to a user who may use a password, so a refused code gets no header (X1).
+            let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+            let pending =
+                rustyfin_auth::pending_setup_user(&state.db, &req.username, &req.password).await?;
+            let Some(user) = pending else {
+                return Err(ApiError::Unauthorized);
+            };
+            if !password_allowed(&state.db, &config, &user).await? {
                 return Err(ApiError::Unauthorized);
             }
             let mut response = ApiError::Unauthorized.into_response();
@@ -87,14 +94,14 @@ async fn login_with_setup_code(
         return Err(ApiError::BadRequest("NewPw is required.".to_string()));
     }
     let device = token_device(&headers);
-    let (user, token) = rustyfin_auth::authenticate_with_setup_code(
-        &state.db,
-        &req.username,
-        &req.code,
-        &req.new_pw,
-        &device,
-    )
-    .await?;
+    let verified = rustyfin_auth::accept_setup_code(&state.db, &req.username, &req.code).await?;
+    // The password switch applies as at login. A refused request leaves the code unused (X1).
+    let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
+    if !password_allowed(&state.db, &config, verified.user()).await? {
+        return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
+    }
+    let (user, token) =
+        rustyfin_auth::redeem_setup_code(&state.db, verified, &req.new_pw, &device).await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
 

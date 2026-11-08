@@ -379,18 +379,19 @@ pub async fn prepare_setup_code_checks() -> Result<(), AuthError> {
         .map(|_| ())
 }
 
-/// The check of a setup code (B20 fix 5), shared by `authenticate_with_setup_code` and
-/// `setup_code_pending`. Exactly one argon2 verification runs whoever is asked about: against the
-/// user's code hash when the user exists and has one, else against the dummy hash. A malformed code
-/// counts as wrong. So the answer time does not tell an unknown user, a user without a code or a
-/// disabled user from a wrong code. Returns the user and the code hash only when the user exists,
-/// is enabled, has a code and `code` is that code.
+/// The check of a setup code (B20 fix 5), shared by `accept_setup_code`, `pending_setup_user` and
+/// `authenticate_with_setup_code`. The user is found as a password sign-in finds one, so a name
+/// typed in another case still matches (B21 X2). Exactly one argon2 verification runs whoever is
+/// asked about: against the user's code hash when the user exists and has one, else against the
+/// dummy hash. A malformed code counts as wrong. So the answer time does not tell an unknown user,
+/// a user without a code or a disabled user from a wrong code. Returns the user and the code hash
+/// only when the user exists, is enabled, has a code and `code` is that code.
 async fn check_setup_code(
     pool: &SqlitePool,
     username: &str,
     code: &str,
 ) -> Result<Option<(User, String)>, AuthError> {
-    let user = repo_user::get_user_by_name(pool, username).await?;
+    let user = repo_user::find_user_for_sign_in(pool, username).await?;
     let (hash, enabled) = match &user {
         Some(user) => (
             repo_setup_code::code_hash(pool, user.id).await?,
@@ -415,22 +416,44 @@ async fn check_setup_code(
     })
 }
 
-/// Sets the password of a pending user and signs in (B20 3.3, 3.8). `code` must be the user's
-/// current setup code. `new_password` replaces the unusable password, and the code is used up, so
-/// it fails from then on. A wrong code, an unknown user, a user without a code, a disabled user, a
-/// malformed code or a code that another request used first gives `InvalidCredentials`, at the same
-/// cost (B20 fix 5).
-pub async fn authenticate_with_setup_code(
+/// A setup code that `accept_setup_code` has checked: the pending user it belongs to and the code's
+/// hash, which `redeem_setup_code` uses up. Holding one writes nothing.
+pub struct VerifiedSetupCode {
+    user: User,
+    hash: String,
+}
+
+impl VerifiedSetupCode {
+    /// The user whose setup code this is.
+    pub fn user(&self) -> &User {
+        &self.user
+    }
+}
+
+/// Checks a setup code (B20 3.3, B21 X1) and writes nothing. A wrong code, an unknown user, a user
+/// without a code, a disabled user or a malformed code gives `InvalidCredentials`, at the same cost
+/// (B20 fix 5). The caller may refuse the sign-in before `redeem_setup_code` uses the code up.
+pub async fn accept_setup_code(
     pool: &SqlitePool,
     username: &str,
     code: &str,
+) -> Result<VerifiedSetupCode, AuthError> {
+    match check_setup_code(pool, username, code).await? {
+        Some((user, hash)) => Ok(VerifiedSetupCode { user, hash }),
+        None => Err(AuthError::InvalidCredentials),
+    }
+}
+
+/// Sets the password of the user a verified setup code belongs to and signs in (B20 3.3, 3.8).
+/// `new_password` replaces the unusable password, and the code is used up, so it fails from then
+/// on. A code that another request used first gives `InvalidCredentials`.
+pub async fn redeem_setup_code(
+    pool: &SqlitePool,
+    verified: VerifiedSetupCode,
     new_password: &str,
     device: &TokenDevice,
 ) -> Result<(User, String), AuthError> {
-    let Some((user, hash)) = check_setup_code(pool, username, code).await? else {
-        return Err(AuthError::InvalidCredentials);
-    };
-
+    let VerifiedSetupCode { user, hash } = verified;
     let password_hash = hash_password(new_password).await?;
     if !repo_setup_code::redeem(pool, user.id, &hash, &password_hash).await? {
         return Err(AuthError::InvalidCredentials);
@@ -438,15 +461,40 @@ pub async fn authenticate_with_setup_code(
     issue_login_token(pool, user.id, device).await
 }
 
-/// Whether `code` is the current setup code of the enabled user `username` (B20 3.2, 3.8). Nothing
-/// is written; an unknown user, a disabled user, a user without a code or a malformed code gives
-/// `false`, at the same cost (B20 fix 5).
+/// Sets the password of a pending user and signs in (B20 3.3, 3.8): `accept_setup_code` then
+/// `redeem_setup_code`. `code` must be the user's current setup code.
+pub async fn authenticate_with_setup_code(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+    new_password: &str,
+    device: &TokenDevice,
+) -> Result<(User, String), AuthError> {
+    let verified = accept_setup_code(pool, username, code).await?;
+    redeem_setup_code(pool, verified, new_password, device).await
+}
+
+/// The user whose pending setup code `code` is (B20 3.2, B21 X2), or `None`. Nothing is written;
+/// an unknown user, a disabled user, a user without a code or a malformed code gives `None`, at the
+/// same cost (B20 fix 5).
+pub async fn pending_setup_user(
+    pool: &SqlitePool,
+    username: &str,
+    code: &str,
+) -> Result<Option<User>, AuthError> {
+    Ok(check_setup_code(pool, username, code)
+        .await?
+        .map(|(user, _)| user))
+}
+
+/// Whether `code` is the current setup code of the enabled user `username` (B20 3.2, 3.8). See
+/// `pending_setup_user`.
 pub async fn setup_code_pending(
     pool: &SqlitePool,
     username: &str,
     code: &str,
 ) -> Result<bool, AuthError> {
-    Ok(check_setup_code(pool, username, code).await?.is_some())
+    Ok(pending_setup_user(pool, username, code).await?.is_some())
 }
 
 /// Records a login and issues a token for `device`. The returned user is re-read after the login,

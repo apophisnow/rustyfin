@@ -25135,6 +25135,108 @@ async fn b20_setting_a_password_ends_the_code() {
     assert!(login(&w.app, "bob", "set by admin").await.is_some());
 }
 
+// B21 merge round 7: the password switch and name matching for setup codes (X1, X2).
+
+/// Turns password sign-in on or off as the B20 world's admin.
+async fn b21_x1_allow_passwords(w: &B20World, allow: bool) {
+    let body = serde_json::json!({ "AllowPasswordSignIn": allow });
+    let req = request("POST", "/Auth/Oidc/Settings", Some(&w.token), Some(body));
+    let (status, answer) = send(&w.app, req).await;
+    assert_eq!(status, StatusCode::OK, "saving: {answer}");
+    assert_eq!(answer["AllowPasswordSignIn"], allow, "{answer}");
+}
+
+#[tokio::test]
+async fn b21_x1_setup_code_obeys_the_password_switch() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    b21_x1_allow_passwords(&w, false).await;
+
+    // A wrong code is checked first and gets a wrong password's answer.
+    let other = rustyfin_auth::generate_setup_code();
+    let (status, header, _) = b20_redeem(&w.app, "bob", &other, "new pass").await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "wrong code"
+    );
+
+    // The right code is refused like a password, gives no token and stays unused.
+    let (status, header, answer) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(header, None);
+    assert_eq!(
+        answer["Detail"], "Password sign-in is turned off for this account.",
+        "{answer}"
+    );
+    assert!(answer.get("AccessToken").is_none(), "a token: {answer}");
+    assert_eq!(
+        b20_sessions(&w.state, bob).await,
+        (0, 0),
+        "bob got a session"
+    );
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "the code was used up"
+    );
+    let pending = b20_pending(&w).await;
+    let bob_pending = pending.iter().any(|e| b20_pending_entry(e).0 == bob);
+    assert!(bob_pending, "bob is no longer pending: {pending:?}");
+    assert!(login(&w.app, "bob", "new pass").await.is_none());
+
+    // A sign-in with the code doesn't send bob to the setup-code form.
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+
+    // Once password sign-in is back on, the same code works.
+    b21_x1_allow_passwords(&w, true).await;
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header.as_deref()),
+        (StatusCode::UNAUTHORIZED, Some("true")),
+        "sign-in after the switch"
+    );
+    let (status, _, answer) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["AccessToken"].is_string(), "{answer}");
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+}
+
+#[tokio::test]
+async fn b21_x2_setup_code_finds_names_in_any_case() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+
+    // The code typed as a password under another case of the name asks for a new password.
+    let (status, header, _) = b20_sign_in(&w.app, "Bob", &code).await;
+    assert_eq!(
+        (status, header.as_deref()),
+        (StatusCode::UNAUTHORIZED, Some("true")),
+        "sign-in as Bob"
+    );
+
+    // The code signs in as the stored "bob".
+    let (status, _, answer) = b20_redeem(&w.app, "BOB", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let id = answer["User"]["Id"].as_str().expect("no User.Id");
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap(), bob, "{answer}");
+    assert_eq!(answer["User"]["Name"], "bob", "{answer}");
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+}
+
 // B20 5: metadata for matched items.
 
 /// Replaces the world's Jellyfin item `name` with `edit` of it.
