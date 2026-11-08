@@ -357,10 +357,19 @@ const API = {
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
+        if (params.startTimeTicks > 0) q.set('StartTimeTicks', params.startTimeTicks);
+        if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
+        if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);
+        if (params.subtitleStreamIndex != null) q.set('SubtitleStreamIndex', params.subtitleStreamIndex);
         const data = await this.get(`/Videos/${itemId}/Universal?${q.toString()}`);
         // The player reads `url`; the server sends `Url`
         if (data && !data.url) data.url = data.Url;
         return data;
+    },
+
+    // Stops the transcode of one play session
+    stopActiveEncodings(playSessionId) {
+        return this.del(`/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playSessionId)}`);
     },
 
     // Search

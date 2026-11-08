@@ -1591,6 +1591,8 @@ let activePlayback = null;
 let pendingStop = Promise.resolve();
 // Incremented by each playItem call, so a call that finishes loading after a newer one gives up
 let playRequest = 0;
+// True while the seek bar is being dragged, so the timeline does not move the thumb
+let seekDragging = false;
 
 // Ticks to resume from. Items at or past 90 % of their runtime count as watched and start over.
 function resumePositionTicks(item) {
@@ -1651,6 +1653,192 @@ function stopPlayback() {
     return pendingStop;
 }
 
+// Loads the stream of a session from startTicks (item ticks) and attaches it to the video element
+async function openStream(session, startTicks) {
+    const video = $('video-player');
+    const { itemId, streamType } = session;
+    const load = ++session.loads;
+    // This load stays current until the session stops or a newer load starts
+    const current = () => activePlayback === session && session.loads === load;
+    const startSeconds = startTicks / 1e7;
+
+    let url;
+    let isHls = false;
+    let playSessionId = null;
+    let mediaSourceId = null;
+    if (streamType === 'Videos') {
+        // Use Universal endpoint to get the optimal playback URL
+        try {
+            const data = await API.getUniversalVideoUrl(itemId, { startTimeTicks: startTicks });
+            if (!current()) return;
+            if (data && data.url) {
+                // Add auth token to the stream URL so the video element can authenticate
+                const sep = data.url.includes('?') ? '&' : '?';
+                url = API.base + data.url + sep + 'api_key=' + encodeURIComponent(API.token);
+                isHls = data.url.includes('.m3u8');
+                // Determine playback method from the URL, not from SupportsDirectPlay flag
+                // which may be stale from the database
+                let method;
+                if (isHls) {
+                    method = t('player.hls_transcode');
+                } else if (data.url.includes('/stream')) {
+                    // Check if it's a static direct play or direct stream
+                    method = data.url.includes('Static=true') ? t('player.direct_play') : t('player.direct_stream');
+                } else {
+                    method = t('player.stream');
+                }
+                $('player-subtitle').textContent = method;
+                playSessionId = isHls ? data.PlaySessionId : null;
+                mediaSourceId = data.MediaSources?.[0]?.Id || null;
+            } else {
+                // Fallback: direct stream
+                url = API.streamUrl(itemId, streamType);
+                $('player-subtitle').textContent = t('player.video_stream_fallback');
+            }
+        } catch (e) {
+            if (!current()) return;
+            console.warn('Universal endpoint failed, using direct stream:', e);
+            url = API.streamUrl(itemId, streamType);
+            $('player-subtitle').textContent = t('player.video_stream_fallback');
+        }
+    } else if (streamType === 'Audio') {
+        url = API.streamUrl(itemId, streamType);
+        $('player-subtitle').textContent = t('player.audio_stream');
+    } else {
+        url = API.streamUrl(itemId, streamType);
+        $('player-subtitle').textContent = t('player.stream');
+    }
+
+    session.offset = isHls ? startSeconds : 0;
+    session.startAt = startSeconds;
+    session.isHls = isHls;
+    session.playSessionId = playSessionId;
+    session.mediaSourceId = mediaSourceId;
+
+    video.onerror = () => {
+        if (!current()) return;
+        console.error('Video playback error:', video.error);
+        const errMsg = video.error ? video.error.message : t('common.unknown_error');
+        $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
+    };
+
+    // Handle HLS streams with hls.js
+    if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
+        // The transcode already starts at startTicks, so its playlist starts at 0
+        hlsInstance = new Hls({
+            enableWorker: true,
+            lowLatencyMode: false,
+            startPosition: 0,
+        });
+        hlsInstance.loadSource(url);
+        hlsInstance.attachMedia(video);
+        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (!current()) return;
+            video.play().catch(e => console.warn('Autoplay block:', e));
+        });
+        hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+            if (!current()) return;
+            console.error('HLS error:', data);
+            if (data.fatal) {
+                $('player-subtitle').textContent = t('player.hls_error');
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    hlsInstance.startLoad();
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    hlsInstance.recoverMediaError();
+                } else {
+                    hlsInstance.destroy();
+                }
+            }
+        });
+    } else if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari native HLS support; its playlist also starts at startTicks, so it needs no seek
+        video.src = url;
+        video.addEventListener('loadedmetadata', () => {
+            if (!current()) return;
+            video.play().catch(e => console.warn('Autoplay block:', e));
+        }, { once: true });
+    } else {
+        // Direct play/stream
+        video.src = url;
+        if (startSeconds > 0) {
+            video.addEventListener('loadedmetadata', () => {
+                if (current()) video.currentTime = startSeconds;
+            }, { once: true });
+        }
+        video.play().catch(e => console.warn('Autoplay block:', e));
+    }
+    updatePlayerControls(session);
+}
+
+// Shows the item time and the bar; the bar stays still while the thumb is being dragged
+function updatePlayerControls(session) {
+    const pos = session.position();
+    const total = session.total();
+    $('player-duration').textContent = formatDurationSeconds(total);
+    // previewSeek owns the elapsed time and the bar during a drag
+    if (seekDragging) return;
+    $('player-cur-time').textContent = formatDurationSeconds(pos);
+    $('player-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
+}
+
+// Moves within the transcoded range in place; any other HLS point restarts the transcode after a pause
+function seekTo(session, seconds) {
+    const video = $('video-player');
+    const total = session.total();
+    if (total > 0) seconds = Math.min(seconds, total);
+    seconds = Math.max(0, seconds);
+    if (!session.isHls) {
+        video.currentTime = seconds;
+        return;
+    }
+    const rel = seconds - session.offset;
+    const seekable = video.seekable;
+    const end = seekable.length ? seekable.end(seekable.length - 1) : 0;
+    if (rel >= 0 && rel <= end) {
+        clearTimeout(session.seekTimer);
+        session.pendingSeek = null;
+        video.currentTime = rel;
+        return;
+    }
+    session.pendingSeek = seconds;
+    updatePlayerControls(session);
+    clearTimeout(session.seekTimer);
+    session.seekTimer = setTimeout(() => { session.seekTimer = null; restartStream(session, seconds); }, 400);
+}
+
+// Starts the transcode again at seconds of item time, stopping the old transcode first
+async function restartStream(session, seconds) {
+    session.pendingSeek = seconds;
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
+    if (session.isHls && session.playSessionId) API.stopActiveEncodings(session.playSessionId).catch(() => {});
+    await openStream(session, Math.round(seconds * 1e7));
+    // A newer seek keeps its own target
+    if (activePlayback === session && session.pendingSeek === seconds && !session.seekTimer) session.pendingSeek = null;
+}
+
+// Seeks to a point on the bar once the drag ends
+function seekVideo(percent) {
+    seekDragging = false;
+    if (!activePlayback) return;
+    seekTo(activePlayback, percent / 100 * activePlayback.total());
+}
+
+// Skips relative to the current item time
+function skipTime(deltaSeconds) {
+    if (!activePlayback) return;
+    seekTo(activePlayback, activePlayback.position() + deltaSeconds);
+}
+
+// Shows the elapsed time under the thumb while the bar is being dragged
+function previewSeek(percent) {
+    if (!activePlayback) return;
+    seekDragging = true;
+    $('player-cur-time').textContent = formatDurationSeconds(percent / 100 * activePlayback.total());
+}
+
 // --- Video Player (Cinema Mode) ---
 async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
     const video = $('video-player');
@@ -1669,6 +1857,11 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     $('player-title').textContent = title || t('player.playback');
     $('player-subtitle').textContent = t('player.loading');
+    // Clear the times and the bar so the previous item's values never show
+    $('player-cur-time').textContent = '0:00';
+    $('player-duration').textContent = '0:00';
+    $('player-seek').value = 0;
+    seekDragging = false;
 
     // Show modal immediately while loading
     if (!modal.open) {
@@ -1688,115 +1881,41 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (!title && item?.Name) $('player-title').textContent = item.Name;
 
     const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
-    const startSeconds = startTicks / 1e7;
-
-    let url;
-    let isHls = false;
-    if (streamType === 'Videos') {
-        // Use Universal endpoint to get the optimal playback URL
-        try {
-            const data = await API.getUniversalVideoUrl(itemId);
-            if (data && data.url) {
-                // Add auth token to the stream URL so the video element can authenticate
-                const sep = data.url.includes('?') ? '&' : '?';
-                url = API.base + data.url + sep + 'api_key=' + encodeURIComponent(API.token);
-                isHls = data.url.includes('.m3u8');
-                // Determine playback method from the URL, not from SupportsDirectPlay flag
-                // which may be stale from the database
-                let method;
-                if (isHls) {
-                    method = t('player.hls_transcode');
-                } else if (data.url.includes('/stream')) {
-                    // Check if it's a static direct play or direct stream
-                    method = data.url.includes('Static=true') ? t('player.direct_play') : t('player.direct_stream');
-                } else {
-                    method = t('player.stream');
-                }
-                $('player-subtitle').textContent = method;
-            } else {
-                // Fallback: direct stream
-                url = API.streamUrl(itemId, streamType);
-                $('player-subtitle').textContent = t('player.video_stream_fallback');
-            }
-        } catch (e) {
-            console.warn('Universal endpoint failed, using direct stream:', e);
-            url = API.streamUrl(itemId, streamType);
-            $('player-subtitle').textContent = t('player.video_stream_fallback');
-        }
-    } else if (streamType === 'Audio') {
-        url = API.streamUrl(itemId, streamType);
-        $('player-subtitle').textContent = t('player.audio_stream');
-    } else {
-        url = API.streamUrl(itemId, streamType);
-        $('player-subtitle').textContent = t('player.stream');
-    }
-
-    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
-
-    video.onerror = () => {
-        console.error('Video playback error:', video.error);
-        const errMsg = video.error ? video.error.message : t('common.unknown_error');
-        $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
-    };
-
-    // Handle HLS streams with hls.js
-    if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
-        hlsInstance = new Hls({
-            enableWorker: true,
-            lowLatencyMode: false,
-            startPosition: startTicks > 0 ? startSeconds : -1,
-        });
-        hlsInstance.loadSource(url);
-        hlsInstance.attachMedia(video);
-        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (activePlayback !== session) return;
-            video.play().catch(e => console.warn('Autoplay block:', e));
-        });
-        hlsInstance.on(Hls.Events.ERROR, (event, data) => {
-            if (activePlayback !== session) return;
-            console.error('HLS error:', data);
-            if (data.fatal) {
-                $('player-subtitle').textContent = t('player.hls_error');
-                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                    hlsInstance.startLoad();
-                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                    hlsInstance.recoverMediaError();
-                } else {
-                    hlsInstance.destroy();
-                }
-            }
-        });
-    } else if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Safari native HLS support
-        video.src = url;
-        video.addEventListener('loadedmetadata', () => {
-            if (activePlayback !== session) return;
-            if (startTicks > 0) video.currentTime = startSeconds;
-            video.play().catch(e => console.warn('Autoplay block:', e));
-        }, { once: true });
-    } else {
-        // Direct play/stream
-        video.src = url;
-        if (startTicks > 0) {
-            video.addEventListener('loadedmetadata', () => {
-                if (activePlayback === session) video.currentTime = startSeconds;
-            }, { once: true });
-        }
-        video.play().catch(e => console.warn('Autoplay block:', e));
-    }
-
-    API.reportPlaying(itemId, startTicks).catch(() => {});
+    const runtimeTicks = item?.RunTimeTicks || 0;
 
     // The session owns this playback: stop() reports the position once and tears the player down
     let stopped = false;
     const session = {
+        itemId,
+        streamType,
+        runtime: runtimeTicks > 0 ? runtimeTicks / 1e7 : null,
+        offset: 0,
+        startAt: startTicks / 1e7,
+        isHls: false,
+        playSessionId: null,
+        mediaSourceId: null,
+        loads: 0,
+        pendingSeek: null,
+        seekTimer: null,
+        // Item time in seconds: the pending seek target, else where the stream is
+        position() {
+            if (this.pendingSeek !== null) return this.pendingSeek;
+            const video = $('video-player');
+            // Before metadata has loaded currentTime reads 0 even when resuming, so use the start position
+            if (video.readyState < HTMLMediaElement.HAVE_METADATA) return this.startAt;
+            return this.offset + video.currentTime;
+        },
+        // The item's runtime when known, else the stream's length
+        total() {
+            if (this.runtime) return this.runtime;
+            const duration = $('video-player').duration;
+            return Number.isFinite(duration) && duration > 0 ? this.offset + duration : 0;
+        },
         stop() {
             if (stopped) return pendingStop;
             stopped = true;
-            // Before metadata has loaded currentTime reads 0 even when resuming, so report the start position then
-            const ticks = video.readyState >= HTMLMediaElement.HAVE_METADATA
-                ? Math.round(video.currentTime * 10000000)
-                : startTicks;
+            clearTimeout(session.seekTimer);
+            const ticks = Math.round(session.position() * 1e7);
             if (playerReportInterval) {
                 clearInterval(playerReportInterval);
                 playerReportInterval = null;
@@ -1827,20 +1946,14 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     if (playerReportInterval) clearInterval(playerReportInterval);
     playerReportInterval = setInterval(() => {
         if (!video.paused && !video.ended) {
-            const ticks = Math.round(video.currentTime * 10000000);
+            const ticks = Math.round(session.position() * 1e7);
             API.reportProgress(itemId, ticks, false).catch(() => {});
         }
     }, 8000);
 
     // Video events for custom UI
     video.ontimeupdate = () => {
-        const cur = video.currentTime;
-        const dur = video.duration || 0;
-        $('player-cur-time').textContent = formatDurationSeconds(cur);
-        $('player-duration').textContent = formatDurationSeconds(dur);
-        if (dur > 0) {
-            $('player-seek').value = (cur / dur) * 100;
-        }
+        if (activePlayback === session) updatePlayerControls(session);
     };
 
     video.onplay = () => updatePlayIcon(true);
@@ -1854,6 +1967,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     video.onended = () => {
         if (activePlayback === session) session.stop();
     };
+
+    await openStream(session, startTicks);
+    if (activePlayback === session) API.reportPlaying(itemId, startTicks).catch(() => {});
 }
 
 function closePlayer() {
@@ -1878,18 +1994,6 @@ function updatePlayIcon(isPlaying) {
             ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
             : '<path d="M8 5v14l11-7z"/>';
     }
-}
-
-function seekVideo(percent) {
-    const v = $('video-player');
-    if (!v || !v.duration) return;
-    v.currentTime = (percent / 100) * v.duration;
-}
-
-function skipTime(deltaSeconds) {
-    const v = $('video-player');
-    if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + deltaSeconds));
 }
 
 function setVolume(val) {
