@@ -1361,6 +1361,7 @@ mod kernel {
     use std::future::Future;
     use std::os::unix::fs::symlink;
     use std::pin::Pin;
+    use std::process::Command;
 
     use rustyfin_core::library_monitor::RescanRunner;
     use rustyfin_core::scanner::ScanChanges;
@@ -2184,6 +2185,260 @@ mod kernel {
         "library monitor: polling '/proc/sys/fs/inotify' of 'Kernel O Settings' (proc, network or unknown filesystem): 1 folders, every 100ms, baseline in ",
     ])
     .await;
+        watcher.stop();
+    }
+
+    // ── Mounts ──
+    // Mounting needs a mount namespace of its own. `mount_changes_in_a_namespace` runs the ignored
+    // `mount_ns_` tests again under `unshare -rm`, where they mount tmpfs; nothing is mounted
+    // outside it. Where unshare is not allowed (CI's container), it skips.
+
+    /// Set for the run of the `mount_ns_` tests under `unshare -rm`.
+    const MOUNT_NS: &str = "RUSTYFIN_TEST_MOUNT_NS";
+
+    #[test]
+    fn mount_changes_in_a_namespace() {
+        let allowed = Command::new("unshare")
+            .args(["-rm", "true"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !allowed {
+            eprintln!("skipped: `unshare -rm` is not allowed here, so nothing can be mounted");
+            return;
+        }
+        let out = Command::new("unshare")
+            .arg("-rm")
+            .arg(std::env::current_exe().unwrap())
+            .args(["mount_ns_", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(MOUNT_NS, "1")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success()
+                && text.contains("test result: ok.")
+                && !text.contains(" 0 passed"),
+            "the mount tests failed under `unshare -rm`:\n{text}"
+        );
+    }
+
+    /// Whether this is the run under `unshare -rm`; says so where it isn't.
+    fn in_mount_namespace() -> bool {
+        let inside = std::env::var_os(MOUNT_NS).is_some();
+        if !inside {
+            eprintln!("skipped: mount_changes_in_a_namespace runs it under `unshare -rm`");
+        }
+        inside
+    }
+
+    /// A tmpfs mounted on a folder, as a share would be; unmounted when dropped unless the test
+    /// unmounted it.
+    struct Share(Option<PathBuf>);
+
+    impl Share {
+        fn mount(at: &Path) -> Self {
+            std::fs::create_dir_all(at).unwrap();
+            let status = Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(at)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mounting tmpfs on {}", at.display());
+            Self(Some(at.to_path_buf()))
+        }
+
+        /// Unmounts it lazily, as a share that goes away does, also while a poll reads it.
+        fn unmount(&mut self) {
+            let at = self.0.take().unwrap();
+            let status = Command::new("umount").arg("-l").arg(&at).status().unwrap();
+            assert!(status.success(), "unmounting {}", at.display());
+        }
+    }
+
+    impl Drop for Share {
+        fn drop(&mut self) {
+            if let Some(at) = self.0.take() {
+                let _ = Command::new("umount").arg("-l").arg(&at).status();
+            }
+        }
+    }
+
+    /// The reviewer's case. inotify doesn't see into a filesystem mounted over a watched folder,
+    /// so a share mounted on a watched library path sets the path up again, on the share; what
+    /// then changes on the share is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_mounted_on_a_watched_path_is_watched_after() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount A Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 1).await;
+        let point = std::fs::canonicalize(tree.root()).unwrap();
+
+        let _share = Share::mount(&tree.root());
+        let watching = format!(
+            "library monitor: watching '{}' of 'Mount A Films' (",
+            tree.root().display()
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log_lines(&[&watching]).len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the path is not watched again on the share within 20 s: {:?}",
+                watcher.monitored()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        write(&tree.at("Film (2001)/Film (2001).mkv"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Film (2001)")), 1)
+            .await;
+        let mounted = format!(
+            "library monitor: '{}' was mounted; setting up '{}' of 'Mount A Films' again",
+            point.display(),
+            tree.root().display()
+        );
+        assert_eq!(log_lines(&[&mounted]).len(), 1, "logged once");
+        watcher.stop();
+    }
+
+    /// A share mounted inside a polled library path goes away. Its folders were not deleted, so
+    /// nothing is reported: the path is set up again and takes a new baseline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_unmounted_from_inside_a_polled_path_reports_nothing() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
+        let mut share = Share::mount(&tree.at("Shares"));
+        write(&tree.at("Shares/Film (2001)/Film (2001).mkv"), 10);
+        let point = std::fs::canonicalize(tree.at("Shares")).unwrap();
+        let (pool, changes) = manager_fixture(&tree).await;
+        add_library(&pool, "Mount B Films", &[tree.root()]).await;
+        let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+        wait_monitored(&watcher, "the baseline with the share", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.ready && p.folders == 4)
+        })
+        .await;
+
+        // No poll runs from just before the unmount until the path is set up again.
+        watcher.set_poll_interval(Duration::from_secs(3600));
+        several_polls().await;
+        share.unmount();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        watcher.set_poll_interval(Duration::from_millis(100));
+        several_polls().await;
+        assert!(
+            changes.pending().is_empty(),
+            "the share's folders were not deleted: {:?}",
+            changes.pending()
+        );
+        let unmounted = format!(
+            "library monitor: '{}' was unmounted; setting up '{}' of 'Mount B Films' again",
+            point.display(),
+            tree.root().display()
+        );
+        assert_eq!(log_lines(&[&unmounted]).len(), 1, "logged once");
+        let monitored = watcher.monitored();
+        assert_eq!(
+            monitor_of(&monitored, &tree.root()).map(|p| (p.ready, p.folders)),
+            Some((true, 3)),
+            "the new baseline"
+        );
+        watcher.stop();
+    }
+
+    /// A share mounted on a polled library path goes away and leaves the empty folder it was
+    /// mounted on. That is an unmounted share, not every folder deleted: the path is warned about
+    /// once and keeps its last state, its monitor is kept, and nothing is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_unmounted_from_a_polled_path_keeps_its_last_state() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let mut share = Share::mount(&tree.root());
+        write(&tree.at("Film (2001)/Film (2001).mkv"), 10);
+        let (pool, changes) = manager_fixture(&tree).await;
+        add_library(&pool, "Mount C Films", &[tree.root()]).await;
+        let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+        wait_monitored(&watcher, "the baseline", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.ready && p.folders == 2)
+        })
+        .await;
+
+        share.unmount();
+        let missing = format!(
+            "library monitor: '{}' is missing or unreadable; keeping its last state until it is back",
+            tree.root().display()
+        );
+        wait_for_log(&[&missing]).await;
+        several_polls().await;
+        assert_eq!(log_lines(&[&missing]).len(), 1, "warned about once");
+        assert!(
+            changes.pending().is_empty(),
+            "nothing was deleted: {:?}",
+            changes.pending()
+        );
+        let monitored = watcher.monitored();
+        assert_eq!(
+            monitor_of(&monitored, &tree.root()).map(|p| p.folders),
+            Some(2),
+            "the last state is kept"
+        );
+        let again = format!("setting up '{}' of", tree.root().display());
+        assert!(log_lines(&[&again]).is_empty(), "the monitor is kept");
+        watcher.stop();
+    }
+
+    /// The same for a watched library path: the kernel reports the path gone, so it is polled, and
+    /// nothing is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_unmounted_from_a_watched_path_reports_nothing() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let mut share = Share::mount(&tree.root());
+        write(&tree.at("Film (2001)/Film (2001).mkv"), 10);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        add_library(&pool, "Mount D Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 2).await;
+
+        share.unmount();
+        let monitored = wait_monitored(&watcher, "the unmounted path polled", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.method == Method::Poll && p.ready)
+        })
+        .await;
+        assert_eq!(
+            monitor_of(&monitored, &tree.root()).and_then(|p| p.reason.clone()),
+            Some("library path gone".to_string())
+        );
+        quiet_period().await;
+        assert!(
+            recorder.calls().is_empty(),
+            "nothing was deleted: {:?}",
+            recorder.calls()
+        );
+        let again = format!("setting up '{}' of", tree.root().display());
+        assert!(log_lines(&[&again]).is_empty(), "the monitor is kept");
         watcher.stop();
     }
 }
