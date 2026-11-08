@@ -324,6 +324,15 @@ pub async fn authenticate(
 /// parameters as code hashes, made once per process by `unusable_password_hash`.
 static DUMMY_CODE_HASH: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
+/// Makes the dummy hash now, at startup, so the first setup-code check does not pay for it (B20
+/// fix round 2, finding 4). Calling it again changes nothing.
+pub async fn prepare_setup_code_checks() -> Result<(), AuthError> {
+    DUMMY_CODE_HASH
+        .get_or_try_init(unusable_password_hash)
+        .await
+        .map(|_| ())
+}
+
 /// The check of a setup code (B20 fix 5), shared by `authenticate_with_setup_code` and
 /// `setup_code_pending`. Exactly one argon2 verification runs whoever is asked about: against the
 /// user's code hash when the user exists and has one, else against the dummy hash. A malformed code
@@ -581,5 +590,22 @@ mod tests {
         for guess in ["", "admin", "password"] {
             assert!(!verify_password(guess, &first).await.unwrap(), "{guess:?}");
         }
+    }
+
+    // Fix round 2, 4: the server makes the dummy hash at startup, so the first setup-code check that
+    // needs it runs one verification, like every later one.
+    #[tokio::test]
+    async fn b20_setup_code_checks_are_prepared_before_the_first_sign_in() {
+        prepare_setup_code_checks().await.unwrap();
+        let hash = DUMMY_CODE_HASH
+            .get()
+            .expect("no dummy hash after preparing");
+        assert!(hash.starts_with("$argon2"), "{hash}");
+        prepare_setup_code_checks().await.unwrap();
+        assert_eq!(
+            DUMMY_CODE_HASH.get(),
+            Some(hash),
+            "preparing again made a new hash"
+        );
     }
 }

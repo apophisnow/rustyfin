@@ -152,6 +152,12 @@ async fn main() {
         Err(e) => tracing::warn!("could not check for default admin passwords: {}", e),
     }
 
+    // Makes the setup-code dummy hash now, so the first setup-code check after a start
+    // is not slower.
+    if let Err(e) = rustyfin_auth::prepare_setup_code_checks().await {
+        tracing::warn!("could not prepare setup-code checks: {e}");
+    }
+
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
