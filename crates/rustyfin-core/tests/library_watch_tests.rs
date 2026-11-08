@@ -1297,6 +1297,62 @@ async fn a_new_poll_interval_applies_at_once() {
     watcher.stop();
 }
 
+/// A poll that hangs, as one of a hard-mounted NFS share that doesn't answer does, doesn't hold up
+/// shutdown: dropping the runtime, as the end of the server's `main` does, returns while the poll
+/// still waits.
+#[test]
+fn shutdown_does_not_wait_for_a_poll_that_hangs() {
+    let tree = Tree::new();
+    let films = tree.at("Films");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (parked_tx, parked) = std::sync::mpsc::channel::<PathBuf>();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let (parked_tx, release_rx) = (Mutex::new(parked_tx), Mutex::new(release_rx));
+    let (watcher, pool) = runtime.block_on(async {
+        let (pool, changes) = manager_fixture(&tree).await;
+        add_library(&pool, "Hanging Films", std::slice::from_ref(&films)).await;
+        let watcher = LibraryWatcher::new(pool.clone(), changes, tree.outside("data"));
+        watcher.set_force_poll(true);
+        watcher.set_poll_interval(Duration::from_millis(100));
+        watcher.set_poll_hook(Some(Arc::new(move |path: &Path| {
+            let _ = parked_tx.lock().unwrap().send(path.to_path_buf());
+            // Until the test lets go, or is gone.
+            let _ = release_rx.lock().unwrap().recv();
+        })));
+        watcher.start();
+        (watcher, pool)
+    });
+    let path = parked.recv_timeout(Duration::from_secs(20));
+    assert_eq!(
+        path.as_ref().ok(),
+        Some(&films),
+        "the poll reaches the hook"
+    );
+
+    runtime.block_on(async {
+        watcher.stop();
+        drop(watcher);
+        pool.close().await;
+    });
+    let (dropped_tx, dropped) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(runtime);
+        let _ = dropped_tx.send(());
+    });
+    let shut_down = dropped.recv_timeout(Duration::from_secs(5));
+    // The poll goes on, so that a runtime that waits for it can finish.
+    drop(release);
+    dropper.join().unwrap();
+    assert!(
+        shut_down.is_ok(),
+        "dropping the runtime waited for the poll that hangs"
+    );
+}
+
 // ── Kernel watching ──
 
 /// Kernel watching exists only on Linux; elsewhere every path is polled.
