@@ -284,15 +284,17 @@ pub async fn get_latest_items(
 }
 
 /// Query plan cache for `get_items_filtered`.
-/// Maps a query signature (hash of the SQL structure) to a cached SQL string,
-/// so repeated calls with the same filter shape reuse the same query plan.
+/// Maps a request's shape to its SQL, so repeated calls with the same filter shape reuse the same
+/// query plan.
 ///
-/// The signature is built from the number of array elements in each filter, the flags and the
-/// parsed sort terms, not the actual values, so different values with the same shape share a plan.
+/// The shape holds the number of array elements in each filter, the flags and the parsed sort
+/// terms, not the actual values, so different values with the same shape share a plan. The map is
+/// keyed by the shape itself, so a lookup finds only an entry whose shape equals the request's: two
+/// shapes whose hashes collide never share SQL, whose binds would not fit.
 /// It holds at most `FILTER_QUERY_CACHE_CAP` shapes, and a query longer than
 /// `FILTER_QUERY_MAX_CACHED_SQL` bytes is never stored.
 /// Uses parking_lot::Mutex instead of std::sync::Mutex to avoid blocking Tokio threads.
-type QueryCache = parking_lot::Mutex<HashMap<u64, (String, String)>>;
+type QueryCache = parking_lot::Mutex<HashMap<FilterShape, (String, String)>>;
 
 static FILTER_QUERY_CACHE: LazyLock<QueryCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
@@ -304,25 +306,26 @@ const FILTER_QUERY_CACHE_CAP: usize = 256;
 /// tag adds a clause, so the size follows the request.
 const FILTER_QUERY_MAX_CACHED_SQL: usize = 16 * 1024;
 
-/// Simple hash combiner for building a cache key from multiple u64 values.
-pub(crate) fn hash_combine(mut hash: u64, key: u64) -> u64 {
-    hash ^= key
-        .wrapping_add(0x9e3779b97f4a7c15)
-        .wrapping_add(hash << 6)
-        .wrapping_add(hash >> 2);
-    hash
+/// What a `get_items_filtered` request's SQL is built from: the length of each array filter, the
+/// flags and the parsed sort terms. Equal shapes build the same SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FilterShape {
+    media_types_len: usize,
+    exclude_media_types_len: usize,
+    genres_len: usize,
+    years_len: usize,
+    official_ratings_len: usize,
+    tags_len: usize,
+    media_types_filter_len: usize,
+    recursive: bool,
+    is_favorite: Option<bool>,
+    is_unplayed: Option<bool>,
+    is_played: Option<bool>,
+    sort: Vec<SortTerm>,
 }
 
-fn opt_bool_to_u64(v: Option<bool>) -> u64 {
-    match v {
-        None => 0,
-        Some(true) => 1,
-        Some(false) => 2,
-    }
-}
-
-/// Build a cache key from the filter array sizes, the flags and the parsed sort terms. Lists that
-/// parse to the same terms share a key, so the same cached query plan serves them.
+/// Build the cache key: the request's shape. Lists that parse to the same sort terms have equal
+/// shapes, so the same cached query plan serves them.
 pub(crate) fn filter_cache_key(
     media_types_len: usize,
     exclude_media_types_len: usize,
@@ -337,27 +340,25 @@ pub(crate) fn filter_cache_key(
     is_played: Option<bool>,
     sort_by: &str,
     sort_order: &str,
-) -> u64 {
-    let mut h = 0u64;
-    h = hash_combine(h, media_types_len as u64);
-    h = hash_combine(h, exclude_media_types_len as u64);
-    h = hash_combine(h, genres_len as u64);
-    h = hash_combine(h, years_len as u64);
-    h = hash_combine(h, official_ratings_len as u64);
-    h = hash_combine(h, tags_len as u64);
-    h = hash_combine(h, media_types_filter_len as u64);
-    h = hash_combine(h, recursive as u64);
-    h = hash_combine(h, opt_bool_to_u64(is_favorite));
-    h = hash_combine(h, opt_bool_to_u64(is_unplayed));
-    h = hash_combine(h, opt_bool_to_u64(is_played));
-    for term in parse_sort(sort_by, sort_order) {
-        h = hash_combine(h, ((term.key as u64) << 1) | term.descending as u64);
+) -> FilterShape {
+    FilterShape {
+        media_types_len,
+        exclude_media_types_len,
+        genres_len,
+        years_len,
+        official_ratings_len,
+        tags_len,
+        media_types_filter_len,
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort: parse_sort(sort_by, sort_order),
     }
-    h
 }
 
 /// A SortBy key as Jellyfin names it. Keys match without case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SortKey {
     SortName,
     Name,
@@ -415,7 +416,7 @@ impl SortKey {
 }
 
 /// One sort key with its direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SortTerm {
     key: SortKey,
     descending: bool,
@@ -519,11 +520,11 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
 }
 
 /// Build the SQL query with a static base for single-value params and dynamic
-/// parts only for array filters. Uses the cache to reuse query plans when the
-/// filter array sizes match a previous call.
+/// parts only for array filters. Reuses the SQL cached for an earlier call whose shape equals
+/// `cache_key`.
 #[allow(clippy::too_many_arguments)]
 fn build_filtered_query(
-    cache_key: u64,
+    cache_key: FilterShape,
     _recursive: bool,
     media_types: Option<&[String]>,
     exclude_media_types: Option<&[String]>,
@@ -538,7 +539,7 @@ fn build_filtered_query(
     sort_by: &str,
     sort_order: &str,
 ) -> (String, String) {
-    // Check cache first
+    // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
         let cache = FILTER_QUERY_CACHE.lock();
         if let Some((count_sql, data_sql)) = cache.get(&cache_key) {
