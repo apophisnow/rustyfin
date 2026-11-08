@@ -36,6 +36,14 @@ const PATH_NOT_FOUND: &str = "path not found";
 /// replaces it, as with `PATH_NOT_FOUND`.
 const LIBRARY_PATH_GONE: &str = "library path gone";
 
+/// The reason of a path polled because the kernel's watch limit is reached. The next reload tries
+/// the kernel again, so the path is polled again while the limit holds.
+const WATCH_LIMIT_REACHED: &str = "watch limit reached";
+
+/// The reason of a path polled because the kernel's inotify instance limit is reached. The next
+/// reload tries the kernel again, as with `WATCH_LIMIT_REACHED`.
+const INSTANCE_LIMIT_REACHED: &str = "inotify instance limit reached";
+
 /// How a library path is monitored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -280,7 +288,9 @@ fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) 
 /// Brings the monitors in line with the libraries: stops the ones not wanted any more, starts
 /// the missing ones and updates the library names and paths of the others. A monitor whose task
 /// ended early, or whose path was missing at start or gone from its kernel watch, and has appeared
-/// since, is replaced by a new one for its key. A database error keeps the monitors as they are.
+/// since, is replaced by a new one for its key. A monitor polling because the kernel's watch or
+/// instance limit is reached is replaced too, ready or not: the new one tries the kernel again and
+/// falls back again while the limit holds. A database error keeps the monitors as they are.
 async fn reconcile(inner: &Arc<Inner>, generation: u64) {
     let libraries = match monitored_libraries(&inner.pool).await {
         Ok(libraries) => libraries,
@@ -319,6 +329,10 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             let key = (library.id, PathBuf::from(path));
             if let Some(monitor) = state.monitors.get_mut(&key) {
                 let replaced = monitor.task.is_finished()
+                    || matches!(
+                        monitor.info.reason.as_deref(),
+                        Some(WATCH_LIMIT_REACHED | INSTANCE_LIMIT_REACHED)
+                    )
                     || (matches!(
                         monitor.info.reason.as_deref(),
                         Some(PATH_NOT_FOUND | LIBRARY_PATH_GONE)

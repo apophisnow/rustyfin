@@ -17,7 +17,10 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use super::{Inner, LIBRARY_PATH_GONE, MonitorKey, fs_type_from_mountinfo, is_local_fs_type};
+use super::{
+    INSTANCE_LIMIT_REACHED, Inner, LIBRARY_PATH_GONE, MonitorKey, WATCH_LIMIT_REACHED,
+    fs_type_from_mountinfo, is_local_fs_type,
+};
 use crate::library_monitor::unit_for;
 use crate::naming::is_ignored_dir;
 use crate::scanner::ScanScope;
@@ -276,20 +279,20 @@ fn fallback_reason(inner: &Inner, root: &Path, fallback: Fallback) -> String {
         Fallback::WatchLimit => {
             if !inner.watch_limit_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead. Raise fs.inotify.max_user_watches to watch it.",
+                    "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead. Raise fs.inotify.max_user_watches to watch it; the next SIGHUP or library change tries again.",
                     root.display()
                 );
             }
-            "watch limit reached".to_string()
+            WATCH_LIMIT_REACHED.to_string()
         }
         Fallback::InstanceLimit => {
             if !inner.instance_limit_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "library monitor: the kernel's inotify instance limit is reached; polling '{}' instead. Raise fs.inotify.max_user_instances to watch it.",
+                    "library monitor: the kernel's inotify instance limit is reached; polling '{}' instead. Raise fs.inotify.max_user_instances to watch it; the next SIGHUP or library change tries again.",
                     root.display()
                 );
             }
-            "inotify instance limit reached".to_string()
+            INSTANCE_LIMIT_REACHED.to_string()
         }
         Fallback::LibraryPathGone => LIBRARY_PATH_GONE.to_string(),
         Fallback::NotLocal(reason) => reason,
