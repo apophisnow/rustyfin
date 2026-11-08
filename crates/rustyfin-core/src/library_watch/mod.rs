@@ -760,3 +760,28 @@ pub fn coalesce(library_paths: &[String], paths: &[PathBuf]) -> Vec<PathBuf> {
         .cloned()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::open_file_limit;
+
+    #[test]
+    fn the_open_file_limit_is_the_soft_limit_on_its_line() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max cpu time              unlimited            unlimited            seconds   \n\
+                      Max open files            1024                 524288               files     \n\
+                      Max locked memory         8388608              8388608              bytes     \n";
+        assert_eq!(open_file_limit(limits), Some(1024));
+        let unlimited = limits.replace("1024     ", "unlimited");
+        assert_eq!(open_file_limit(&unlimited), Some(u64::MAX));
+        assert_eq!(
+            open_file_limit("Max cpu time  unlimited  unlimited  seconds\n"),
+            None
+        );
+        assert_eq!(
+            open_file_limit("Max open files  many  524288  files\n"),
+            None
+        );
+        assert_eq!(open_file_limit(""), None);
+    }
+}
