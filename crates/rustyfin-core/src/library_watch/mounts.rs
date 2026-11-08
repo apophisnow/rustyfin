@@ -111,6 +111,49 @@ pub fn restarts_monitor(path: &Path, point: &Path, change: MountChange) -> bool 
     }
 }
 
+/// The mount points of the autofs mounts in mountinfo text. An automount is mounted and expired as
+/// its path is accessed, so a change at it says nothing about the share behind it. A line whose
+/// filesystem type cannot be read is skipped.
+pub fn automount_points(mountinfo: &str) -> HashSet<PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            // The type follows the lone "-" after field 6, as in `fs_type_from_mountinfo`.
+            let dash = fields
+                .iter()
+                .skip(6)
+                .position(|field| *field == "-")
+                .map(|index| index + 6)?;
+            let (mount, fs_type) = (fields.get(4)?, fields.get(dash + 1)?);
+            (*fs_type == "autofs").then(|| PathBuf::from(unescape(mount)))
+        })
+        .collect()
+}
+
+/// Whether a change at `point` restarts the monitor of `path` that keeps its last state, see
+/// `restarts_monitor`. A change at an automount point, or at a folder directly in one, restarts
+/// nothing. A mount that appears restarts only when `watchable`; a mount that goes away restarts
+/// as `restarts_monitor` says.
+pub fn restarts_polled_monitor(
+    path: &Path,
+    point: &Path,
+    change: MountChange,
+    watchable: bool,
+    automounts: &HashSet<PathBuf>,
+) -> bool {
+    let under_automount = point
+        .parent()
+        .is_some_and(|parent| automounts.contains(parent));
+    if automounts.contains(point) || under_automount {
+        return false;
+    }
+    match change {
+        MountChange::Mounted => watchable && restarts_monitor(path, point, change),
+        MountChange::Unmounted => restarts_monitor(path, point, change),
+    }
+}
+
 /// Filesystem type of the mount that holds `path`, from `/proc/self/mountinfo`.
 #[cfg(target_os = "linux")]
 pub fn fs_type_of(path: &Path) -> Option<String> {

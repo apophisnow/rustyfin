@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::library_monitor::{ChangeQueue, unit_for};
 
 pub use mounts::{
-    MountChange, fs_type_from_mountinfo, fs_type_of, is_local_fs_type, mount_changes,
-    restarts_monitor,
+    MountChange, automount_points, fs_type_from_mountinfo, fs_type_of, is_local_fs_type,
+    mount_changes, restarts_monitor, restarts_polled_monitor,
 };
 pub use poll::FolderPoller;
 
@@ -40,6 +40,11 @@ const PATH_NOT_FOUND: &str = "path not found";
 /// its watch ignored. That monitor polls the path, and the next reload after the path is back
 /// replaces it, as with `PATH_NOT_FOUND`.
 const LIBRARY_PATH_GONE: &str = "library path gone";
+
+/// The reason of a path on a network or unknown filesystem, whose changes the kernel does not
+/// report, so it is polled. A mount that appears restarts that monitor only once a local
+/// filesystem holds the path.
+const NOT_LOCAL: &str = "network or unknown filesystem";
 
 /// The reason of a path polled because the kernel's watch limit is reached. The next reload tries
 /// the kernel again, so the path is polled again while the limit holds.
@@ -667,7 +672,7 @@ fn choose(path: &Path, force_poll: bool) -> Choice {
     } else if canonical.is_none() {
         Some(PATH_NOT_FOUND)
     } else if !fs_type.as_deref().is_some_and(is_local_fs_type) {
-        Some("network or unknown filesystem")
+        Some(NOT_LOCAL)
     } else {
         None
     };

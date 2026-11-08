@@ -1,6 +1,7 @@
 //! Follows the mount table, so a library path whose mounts change is set up again. inotify doesn't
 //! see into a filesystem mounted over a watched folder, and a path's method is picked only once,
-//! when its monitor starts.
+//! when its monitor starts. A polled path that keeps its last state is set up again only when it
+//! can be watched now, or when a mount under it went away.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -11,8 +12,11 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 
-use super::Inner;
-use super::mounts::{MountChange, mount_changes, restarts_monitor};
+use super::mounts::{
+    MountChange, automount_points, fs_type_from_mountinfo, is_local_fs_type, mount_changes,
+    restarts_monitor, restarts_polled_monitor,
+};
+use super::{Inner, LIBRARY_PATH_GONE, Method, MonitoredPath, NOT_LOCAL, PATH_NOT_FOUND};
 
 /// The mount table of this process. The kernel wakes a poll of it once per change.
 const MOUNT_TABLE: &str = "/proc/self/mountinfo";
@@ -66,26 +70,41 @@ async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
         let changes = mount_changes(&table, &new);
         table = new;
         if !changes.is_empty() {
-            mark_restarts(&inner, &changes);
+            mark_restarts(&inner, &table, &changes);
         }
     }
 }
 
 /// Marks each monitor that a change restarts, by the first such change in `changes`, then wakes
-/// the manager once when any monitor was marked. Each marked monitor is logged once.
-fn mark_restarts(inner: &Inner, changes: &[(PathBuf, MountChange)]) {
+/// the manager once when any monitor was marked. Each marked monitor is logged once. A polled path
+/// that keeps its last state is marked only when it can be watched in `table`, the mount table
+/// after the changes, or when a mount under it went away.
+fn mark_restarts(inner: &Inner, table: &str, changes: &[(PathBuf, MountChange)]) {
+    let automounts = automount_points(table);
     let any = {
         let mut state = inner.lock();
+        let force_poll = state.force_poll;
         let mut any = false;
         for monitor in state.monitors.values_mut() {
             let path = monitor
                 .canonical
                 .as_deref()
                 .unwrap_or(monitor.info.path.as_path());
-            let Some((point, change)) = changes
-                .iter()
-                .find(|(point, change)| restarts_monitor(path, point, *change))
-            else {
+            let found = if keeps_baseline(&monitor.info) {
+                // A polled path can be watched only if polling is not forced and a local
+                // filesystem now holds it.
+                let watchable = !force_poll
+                    && monitor.info.reason.as_deref() == Some(NOT_LOCAL)
+                    && fs_type_from_mountinfo(table, path).is_some_and(|fs| is_local_fs_type(&fs));
+                changes.iter().find(|(point, change)| {
+                    restarts_polled_monitor(path, point, *change, watchable, &automounts)
+                })
+            } else {
+                changes
+                    .iter()
+                    .find(|(point, change)| restarts_monitor(path, point, *change))
+            };
+            let Some((point, change)) = found else {
                 continue;
             };
             monitor.restart = true;
@@ -106,6 +125,17 @@ fn mark_restarts(inner: &Inner, changes: &[(PathBuf, MountChange)]) {
     if any {
         inner.reload.notify_one();
     }
+}
+
+/// Whether a monitor keeps its baseline, its last state, through a mount change: a polled path
+/// whose reason is not `PATH_NOT_FOUND` or `LIBRARY_PATH_GONE`. Every other monitor keeps the rule
+/// of `restarts_monitor`.
+fn keeps_baseline(info: &MonitoredPath) -> bool {
+    info.method == Method::Poll
+        && info
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason != PATH_NOT_FOUND && reason != LIBRARY_PATH_GONE)
 }
 
 /// Reads the whole mount table through `file`, from its start, so each read is a new reading.
