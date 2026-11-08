@@ -716,8 +716,10 @@ async fn read_new_layout(conn: &mut SqliteConnection) -> Result<ItemRows, sqlx::
 
 /// The old layout's items, user-data rows, streams and metadata rows, all from one snapshot of
 /// `library.db` (else `library.db.old`). A row reaches every importable item that has its `key`
-/// (`UserDataKey`). `data_dir` is where a copy goes when the file is too big for memory. Its
-/// tables are checked to be plain tables before any query runs.
+/// (`UserDataKey`). Only the first row of a key and user counts, as Jellyfin keeps that pair
+/// unique. A file that gives more watch data than its items and rows is a bad source.
+/// `data_dir` is where a copy goes when the file is too big for memory. Its tables are checked
+/// to be plain tables before any query runs.
 async fn read_old_layout(
     data_path: &Path,
     users: &[JfUser],
@@ -778,6 +780,10 @@ async fn read_old_layout(
         .iter()
         .map(|user| (user.internal_id, user.id))
         .collect();
+    // The watch data may be at most the importable items plus all the rows.
+    let bound = items.len() + data_rows.len();
+    // Jellyfin keeps (key, userId) unique, so a row whose pair was seen is skipped.
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
     let mut user_data = Vec::new();
     for (key, internal_id, played, plays, position, last, favorite, rating, audio, subtitle) in
         data_rows
@@ -785,7 +791,17 @@ async fn read_old_layout(
         let Some(&user) = internal_ids.get(&internal_id) else {
             continue;
         };
-        for &item in keyed.get(&key).into_iter().flatten() {
+        let on_key = keyed.get(&key).map_or(&[][..], Vec::as_slice);
+        if !seen.insert((key, internal_id)) {
+            continue;
+        }
+        if user_data.len() + on_key.len() > bound {
+            return Err(ImportError::BadSource(format!(
+                "{}: UserDatas gives more watch data than its items and rows",
+                file.display()
+            )));
+        }
+        for &item in on_key {
             user_data.push(JfUserData {
                 item,
                 user,
@@ -814,7 +830,7 @@ async fn read_library_db(conn: &mut SqliteConnection) -> Result<LibraryRows, sql
     .await?;
     let data: Vec<LibraryDataDbRow> = sqlx::query_as(
         "SELECT key, userId, played, playCount, playbackPositionTicks, lastPlayedDate, isFavorite, \
-         rating, AudioStreamIndex, SubtitleStreamIndex FROM UserDatas",
+         rating, AudioStreamIndex, SubtitleStreamIndex FROM UserDatas ORDER BY rowid",
     )
     .fetch_all(&mut *conn)
     .await?;

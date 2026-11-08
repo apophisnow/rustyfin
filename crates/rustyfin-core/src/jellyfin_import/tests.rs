@@ -2108,3 +2108,65 @@ async fn b20_person_names_and_types_have_caps() {
         assert_eq!(credits, want, "{}", dir.display());
     }
 }
+
+// Fix round 3, 2: an old-layout `UserDatas` row reaches every item with its key, so the watch data
+// is held to the items plus the rows: only the first row of a key and user counts, and a file that
+// still gives more is a bad source.
+
+#[tokio::test]
+async fn b20_old_watch_data_is_at_most_items_and_rows() {
+    // 30 users. One source has 200 movies on one key with 200 rows of the first user, play counts
+    // 1 to 200 in rowid order; the other has 30 movies on one key with a row of each user.
+    const USERS: &str = "\
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 30) \
+        INSERT INTO Users (Id, InternalId, Username) \
+            SELECT printf('00000000-0000-0000-0000-%012d', x), x, printf('user%d', x) FROM n;";
+    const ONE_USER: &str = "\
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200) \
+        INSERT INTO TypedBaseItems (guid, type, Name, Path, UserDataKey) \
+            SELECT printf('00000000-0000-0000-0001-%012d', x), \
+            'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', \
+            printf('/media/film%d.mkv', x), 'k1' FROM n; \
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200) \
+        INSERT INTO UserDatas (key, userId, played, playCount, isFavorite, playbackPositionTicks) \
+            SELECT 'k1', 1, 1, x, 0, 0 FROM n;";
+    const MANY_USERS: &str = "\
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 30) \
+        INSERT INTO TypedBaseItems (guid, type, Name, Path, UserDataKey) \
+            SELECT printf('00000000-0000-0000-0002-%012d', x), \
+            'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', \
+            printf('/media/film%d.mkv', x), 'k2' FROM n; \
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 30) \
+        INSERT INTO UserDatas (key, userId, played, playCount, isFavorite, playbackPositionTicks) \
+            SELECT 'k2', x, 1, 1, 0, 0 FROM n;";
+    let tmp = TempDir::new();
+    let (one, many) = (tmp.0.join("one_user"), tmp.0.join("many_users"));
+    for (dir, rows) in [(&one, ONE_USER), (&many, MANY_USERS)] {
+        std::fs::create_dir_all(dir).unwrap();
+        write_db(&dir.join("jellyfin.db"), &[USERS_DDL, USERS]).await;
+        write_db(&dir.join("library.db"), &[OLD_LIBRARY_DDL, rows]).await;
+    }
+    let data = TempDir::new();
+    let one_user = read_snapshot(&locate(&one).unwrap(), LayoutChoice::Auto, &data.0)
+        .await
+        .unwrap();
+    let many_users = read_snapshot(&locate(&many).unwrap(), LayoutChoice::Auto, &data.0)
+        .await
+        .map(|snapshot| snapshot.user_data.len());
+    let first_rows = one_user
+        .user_data
+        .iter()
+        .filter(|row| row.user == Uuid::from_u128(1) && row.play_count == 1)
+        .count();
+    let items: std::collections::HashSet<_> =
+        one_user.user_data.iter().map(|row| row.item).collect();
+    let refused = matches!(&many_users, Err(ImportError::BadSource(text))
+        if text.contains("library.db") && text.contains("UserDatas"));
+    // One assert for both sources, so a failing run shows both.
+    assert_eq!(
+        (one_user.user_data.len(), first_rows, items.len(), refused),
+        (200, 200, 200, true),
+        "200 rows of one user on 200 items, each from its first row; 30 users on 30 items \
+         refused, not {many_users:?}"
+    );
+}
