@@ -10665,19 +10665,20 @@ async fn b22_get(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Str
     )
 }
 
-/// Stores a source for `file` with `streams` (MediaStream JSON) and returns the id it is stored
-/// under.
+/// Stores a source for `file` in `container` with `streams` (MediaStream JSON) and returns the id
+/// it is stored under.
 async fn b22_insert_source(
     state: &AppState,
     item: uuid::Uuid,
     file: &std::path::Path,
+    container: &str,
     streams: serde_json::Value,
 ) -> String {
     let source: rustyfin_model::media_source::MediaSourceResponse =
         serde_json::from_value(serde_json::json!({
             "Id": uuid::Uuid::new_v4().to_string(),
             "Uid": uuid::Uuid::new_v4().to_string(),
-            "Container": "mkv",
+            "Container": container,
             "Protocol": "File",
             "Path": file.to_str().unwrap(),
             "MediaStreams": streams,
@@ -10886,7 +10887,7 @@ async fn b22_subtitle_vtt_refuses_bad_requests() {
         { "Index": 2, "CodecType": "subtitle", "Codec": "hdmv_pgs_subtitle" },
         { "Index": 3, "CodecType": "subtitle", "Codec": "subrip" },
     ]);
-    let msid = b22_insert_source(&state, id, &file, streams).await;
+    let msid = b22_insert_source(&state, id, &file, "mkv", streams).await;
     let app = app(state);
 
     let other = uuid::Uuid::new_v4();
@@ -10995,6 +10996,157 @@ async fn b22_report_bodies_carry_track_indexes() {
         });
         let (status, json) = send(&app, request("POST", uri, Some(&token), Some(body))).await;
         assert!(status.is_success(), "{uri}: {status} {json}");
+    }
+}
+
+/// Asks Universal to play `item` with `query`; returns the URL and the chosen source.
+async fn b22_universal(
+    app: &axum::Router,
+    token: &str,
+    item: uuid::Uuid,
+    query: &str,
+) -> (String, serde_json::Value) {
+    let uri = format!("/Videos/{item}/Universal?VideoCodecs=h264&AudioCodecs=aac{query}");
+    let (status, body) = send(app, request("GET", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let url = body["Url"].as_str().unwrap_or_default().to_string();
+    (url, body["MediaSources"][0].clone())
+}
+
+#[tokio::test]
+async fn b22_universal_sends_other_tracks_to_a_transcode() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "b22-universal"));
+    let file = folder.join("B22 Tracks.mp4");
+    std::fs::write(&file, b"b22").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "CodecType": "video", "Codec": "h264" },
+        { "Index": 1, "CodecType": "audio", "Codec": "aac", "Language": "eng" },
+        { "Index": 2, "CodecType": "audio", "Codec": "aac", "Language": "ger", "IsDefault": true },
+        { "Index": 3, "CodecType": "subtitle", "Codec": "hdmv_pgs_subtitle" },
+        { "Index": 4, "CodecType": "subtitle", "Codec": "subrip" },
+    ]);
+    b22_insert_source(&state, id, &file, "mp4", streams).await;
+    // Two audio streams without a default flag
+    let plain_file = folder.join("B22 Plain.mp4");
+    std::fs::write(&plain_file, b"b22").unwrap();
+    let plain = g4_insert_item(&state, "Movie", &plain_file).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "CodecType": "video", "Codec": "h264" },
+        { "Index": 1, "CodecType": "audio", "Codec": "aac" },
+        { "Index": 2, "CodecType": "audio", "Codec": "aac" },
+    ]);
+    b22_insert_source(&state, plain, &plain_file, "mp4", streams).await;
+    let app = app(state);
+    let m3u8 = format!("/Videos/{id}/main.m3u8?");
+
+    // The default audio, an index that names no audio, a text subtitle or none: the browser plays
+    // the file and shows a text subtitle itself
+    for query in [
+        "",
+        "&AudioStreamIndex=2",
+        "&AudioStreamIndex=9",
+        "&SubtitleStreamIndex=4",
+        "&SubtitleStreamIndex=-1",
+    ] {
+        let (url, source) = b22_universal(&app, &token, id, query).await;
+        assert!(url.contains("Static=true"), "{query}: {url}");
+        assert_eq!(source["SupportsDirectPlay"], true, "{query}");
+    }
+
+    // A browser plays only a file's default audio: another one needs a transcode that maps it
+    let (url, source) = b22_universal(&app, &token, id, "&AudioStreamIndex=1").await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(url.contains("&AudioStreamIndex=1"), "{url}");
+    assert!(!url.contains("SubtitleStreamIndex"), "{url}");
+    assert_eq!(source["SupportsDirectPlay"], false);
+    assert_eq!(source["SupportsDirectStream"], false);
+
+    // A picture subtitle is burned in
+    let (url, source) = b22_universal(&app, &token, id, "&SubtitleStreamIndex=3").await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(url.contains("&SubtitleStreamIndex=3"), "{url}");
+    assert!(url.contains("&SubtitleMethod=Encode"), "{url}");
+    assert_eq!(source["SupportsDirectPlay"], false);
+    assert_eq!(source["SupportsDirectStream"], false);
+
+    // A transcode for other reasons keeps the chosen tracks and burns in no text subtitle
+    let no_direct = "&EnableDirectPlay=false&EnableDirectStream=false";
+    let query =
+        format!("{no_direct}&AudioStreamIndex=2&SubtitleStreamIndex=4&StartTimeTicks=600000000");
+    let (url, _) = b22_universal(&app, &token, id, &query).await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    for part in [
+        "&AudioStreamIndex=2",
+        "&SubtitleStreamIndex=4",
+        "&StartTimeTicks=600000000",
+    ] {
+        assert!(url.contains(part), "{part}: {url}");
+    }
+    assert!(!url.contains("SubtitleMethod"), "{url}");
+    let query = format!("{no_direct}&SubtitleStreamIndex=-1");
+    let (url, _) = b22_universal(&app, &token, id, &query).await;
+    assert!(url.starts_with(&m3u8), "{url}");
+    assert!(!url.contains("StreamIndex"), "{url}");
+
+    // Without a flag the first audio stream is the default
+    let (url, _) = b22_universal(&app, &token, plain, "&AudioStreamIndex=1").await;
+    assert!(url.contains("Static=true"), "{url}");
+    let (url, _) = b22_universal(&app, &token, plain, "&AudioStreamIndex=2").await;
+    assert!(
+        url.starts_with(&format!("/Videos/{plain}/main.m3u8?")),
+        "{url}"
+    );
+    assert!(url.contains("&AudioStreamIndex=2"), "{url}");
+}
+
+#[tokio::test]
+async fn b22_playback_info_lists_external_subtitles() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = std::path::PathBuf::from(media_folder(&state, "b22-external"));
+    let file = folder.join("B22 Show.mkv");
+    std::fs::write(&file, b"b22").unwrap();
+    let srt = folder.join("B22 Show.eng.srt");
+    let ass = folder.join("B22 Show.ass");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:02,000\nHello\n").unwrap();
+    std::fs::write(&ass, "[Script Info]\n").unwrap();
+    // Another video's subtitle
+    std::fs::write(folder.join("B22 Other.srt"), "").unwrap();
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "CodecType": "video", "Codec": "h264" },
+        { "Index": 1, "CodecType": "audio", "Codec": "aac" },
+        { "Index": 2, "CodecType": "subtitle", "Codec": "subrip", "Language": "ger" },
+    ]);
+    b22_insert_source(&state, id, &file, "mkv", streams).await;
+    let app = app(state);
+
+    // The files beside the video follow its streams, in name order
+    let uri = format!("/Videos/{id}/PlaybackInfo");
+    let (status, body) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let streams = body["MediaSources"][0]["MediaStreams"].as_array().unwrap();
+    let indexes: Vec<i64> = streams
+        .iter()
+        .map(|s| s["Index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indexes, [0, 1, 2, 3, 4], "{body}");
+    assert_eq!(streams[2]["IsExternal"], false);
+    for (stream, codec, language, path) in [
+        (&streams[3], "ass", None, &ass),
+        (&streams[4], "srt", Some("eng"), &srt),
+    ] {
+        assert_eq!(stream["CodecType"], "subtitle", "{stream}");
+        assert_eq!(stream["Type"], "External", "{stream}");
+        assert_eq!(stream["IsExternal"], true, "{stream}");
+        assert_eq!(stream["Codec"], codec, "{stream}");
+        assert_eq!(stream["Language"].as_str(), language, "{stream}");
+        assert_eq!(stream["Path"], path.to_str().unwrap(), "{stream}");
     }
 }
 
