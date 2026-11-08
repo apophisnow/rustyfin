@@ -3550,7 +3550,11 @@ async fn b20_snapshot_refuses_a_spinning_schema() {
 // does not flatten it: the fix refuses any generated column before the first `EXPLAIN` (as
 // `check_tables` already does once the snapshot is open), returning "<file>: Users has generated
 // columns" on both paths. On 480c971 the `EXPLAIN` instead compiles the chain and the open fails with
-// "out of memory" (seen in ~2 s under `timeout`+`prlimit`): that is the red.
+// "out of memory" (seen in ~2 s under `timeout`+`prlimit`): that is the red. A red run needs a
+// prlimit, such as `--as=1GiB`: without one the `EXPLAIN` grows its op array to about 2 GiB a path
+// before SQLite refuses (re-check 6, L2). The depth can't shrink to fit: below about 25 levels the
+// parent's `EXPLAIN` finishes and `check_tables` refuses with the same text, so the test would pass
+// on its parent. Green runs cost nothing, as the generated columns are refused first.
 //
 // The schema is written straight into `sqlite_schema` with `writable_schema`, leaving the real root
 // page intact, as a hand-built source would store it — so building the fixture never compiles the
