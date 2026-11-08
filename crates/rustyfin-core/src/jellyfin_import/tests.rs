@@ -16,8 +16,8 @@ use super::plan::{UserMatch, match_user_name};
 use super::source::{
     FreeSpace, IN_MEMORY_LIMIT, JfCredit, JfImage, JfStream, JfUserData, ProviderIds, StreamKind,
     copy_at_most, copy_fits, free_space, guid_from_blob, guid_from_text, locate, open_snapshot,
-    open_snapshot_with, open_snapshot_with_free, parse_jellyfin_date, parse_old_images,
-    parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
+    open_snapshot_with_free, parse_jellyfin_date, parse_old_images, parse_provider_ids,
+    read_library_folders, read_snapshot, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -1356,7 +1356,7 @@ async fn wal_writer(dir: &Path) -> sqlx::SqliteConnection {
 /// (0 always copies). The data folder it gets is empty again once the snapshot is dropped.
 async fn snapshot_rows_with(file: &Path, limit: u64) -> Vec<i64> {
     let data = TempDir::new();
-    let mut conn = open_snapshot_with(file, &data.0, limit)
+    let mut conn = open_snapshot_with_free(file, &data.0, limit, |_| Ok(u64::MAX))
         .await
         .unwrap_or_else(|e| panic!("{}: {e:?}", file.display()));
     let rows: Vec<i64> = sqlx::query_scalar("SELECT n FROM t ORDER BY n")
@@ -1662,7 +1662,7 @@ async fn b20_snapshot_copies_a_big_source_to_the_data_folder() {
     let total = std::fs::metadata(&file).unwrap().len() + wal.len() as u64;
     for (limit, copied) in [(total, false), (total - 1, true)] {
         let data = TempDir::new();
-        let mut conn = open_snapshot_with(&file, &data.0, limit)
+        let mut conn = open_snapshot_with_free(&file, &data.0, limit, |_| Ok(u64::MAX))
             .await
             .unwrap_or_else(|e| panic!("limit {limit}: {e:?}"));
         let main: String =
