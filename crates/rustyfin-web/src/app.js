@@ -1745,6 +1745,9 @@ async function openStream(session, startTicks) {
             if (!current()) return;
             video.play().catch(e => console.warn('Autoplay block:', e));
         });
+        // A transcode that starts after the last keyframe of copied video lists no time: nothing is left
+        // to play, so end the playback as the stream's end does
+        hlsInstance.on(Hls.Events.LEVEL_LOADED, (event, data) => { if (current() && session.offset > 0 && data.details.totalduration === 0) session.stop(); });
         hlsInstance.on(Hls.Events.ERROR, (event, data) => {
             if (!current()) return;
             console.error('HLS error:', data);
@@ -1826,6 +1829,14 @@ function scheduleRestart(session, seconds) {
 
 // Starts the transcode again at seconds of item time, stopping the old transcode first
 async function restartStream(session, seconds) {
+    const total = session.total();
+    // The last second holds nothing to transcode, so end the playback as the stream's end does
+    // (pendingSeek makes the Stopped report say the end)
+    if (total > 0 && seconds > total - 1) {
+        session.pendingSeek = total;
+        session.stop();
+        return;
+    }
     session.tracksChanged = false;
     session.pendingSeek = seconds;
     if (hlsInstance) {
