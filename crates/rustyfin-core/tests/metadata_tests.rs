@@ -1,5 +1,5 @@
 //! Metadata refresh (B31): a refresh saves the item in place, so the rows that reference it
-//! survive and it keeps its id and date added.
+//! survive, it keeps its id and date added, and search and the filter counts follow it.
 
 use std::path::PathBuf;
 
@@ -221,6 +221,33 @@ async fn item_rows(pool: &SqlitePool, item: Uuid) -> Vec<(&'static str, i64)> {
     rows
 }
 
+/// The names search finds for `query`.
+async fn search(pool: &SqlitePool, query: &str) -> Vec<String> {
+    rustyfin_db::repo_search::search_items(pool, query, &[], 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.name)
+        .collect()
+}
+
+/// How many entries in the search index match `query`, whether or not an item still has them.
+async fn index_entries(pool: &SqlitePool, query: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM media_items_fts WHERE media_items_fts MATCH ?1")
+        .bind(query)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn rowid(pool: &SqlitePool, item: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT rowid FROM media_items WHERE id = ?1")
+        .bind(item.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn refresh(pool: &SqlitePool, item: &MediaItem) {
     rustyfin_core::metadata::refresh_item_metadata(
         pool,
@@ -259,4 +286,39 @@ async fn refresh_keeps_rows_that_reference_the_item() {
     assert_eq!(after.name, "New Title", "the refresh applied the NFO");
     assert_eq!(after.date_created, stored.date_created);
     assert_eq!(item_rows(pool, stored.id).await, before);
+}
+
+/// A refresh that renames an item keeps its rowid, which the search index is keyed on, so search
+/// finds the new name once and the old one not at all, and the year and rating counts stay right.
+/// `INSERT OR REPLACE` gave the item a new rowid and left its old entry in the index.
+#[tokio::test]
+async fn refresh_renames_the_item_in_search() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+    let stored = fx.movie("Old.Title", Some(NFO)).await;
+    fx.movie("Other", None).await;
+    let before = rowid(pool, stored.id).await;
+
+    refresh(pool, &stored).await;
+
+    assert_eq!(search(pool, "New").await, ["New Title"]);
+    assert_eq!(search(pool, "Old").await, Vec::<String>::new());
+    assert_eq!(index_entries(pool, "new*").await, 1);
+    assert_eq!(
+        index_entries(pool, "old*").await,
+        0,
+        "the old name has no entry left"
+    );
+    assert_eq!(rowid(pool, stored.id).await, before, "the item keeps its rowid");
+    let years: Vec<(i64, i64)> = sqlx::query_as("SELECT year, item_count FROM filter_year_index")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(years, [(2001, 2)]);
+    let ratings: Vec<(String, i64)> =
+        sqlx::query_as("SELECT rating, item_count FROM filter_rating_index")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(ratings, [("R".to_string(), 2)]);
 }
