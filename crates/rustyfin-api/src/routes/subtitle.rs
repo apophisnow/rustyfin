@@ -545,8 +545,8 @@ mod tests {
         "Other.srt",
     ];
 
-    #[test]
-    fn test_external_streams_follow_the_highest_index() {
+    #[tokio::test]
+    async fn test_external_streams_follow_the_highest_index() {
         let folder = Folder::with(&FILES);
         let source = source(
             &folder,
@@ -556,7 +556,7 @@ mod tests {
                 { "Index": 1, "CodecType": "audio", "Codec": "aac" },
             ]),
         );
-        let streams = external_streams(&source);
+        let streams = external_streams(&source).await;
         let (eng, ger, plain) = (
             folder.path("Film.eng.srt"),
             folder.path("Film.ger.ass"),
@@ -579,8 +579,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_external_streams_skip_files_the_source_lists() {
+    #[tokio::test]
+    async fn test_external_streams_skip_files_the_source_lists() {
         let folder = Folder::with(&FILES);
         let source = source(
             &folder,
@@ -597,7 +597,7 @@ mod tests {
         );
         let (ger, plain) = (folder.path("Film.ger.ass"), folder.path("Film.srt"));
         assert_eq!(
-            summary(&external_streams(&source)),
+            summary(&external_streams(&source).await),
             vec![
                 (8, Some("ass"), Some("ger"), Some(ger.as_str())),
                 (9, Some("srt"), None, Some(plain.as_str())),
@@ -605,10 +605,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_external_streams_of_a_source_without_streams_start_at_zero() {
+    #[tokio::test]
+    async fn test_external_streams_of_a_source_without_streams_start_at_zero() {
         let folder = Folder::with(&FILES);
         let indexes: Vec<i32> = external_streams(&source(&folder, json!([])))
+            .await
             .iter()
             .map(|s| s.index)
             .collect();
@@ -616,7 +617,7 @@ mod tests {
 
         // No subtitle files: nothing
         let bare = Folder::with(&["Film.mkv"]);
-        assert!(external_streams(&source(&bare, json!([]))).is_empty());
+        assert!(external_streams(&source(&bare, json!([]))).await.is_empty());
     }
 
     #[test]
