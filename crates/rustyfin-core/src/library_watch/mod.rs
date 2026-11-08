@@ -10,7 +10,7 @@ mod poll;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -100,7 +100,8 @@ pub struct LibraryWatcher {
 /// A monitor is keyed by its library id and its path.
 type MonitorKey = (Uuid, PathBuf);
 
-/// The hook that `set_poll_hook` installs. A poll calls it on the polling thread.
+/// The hook that `set_poll_hook` and `set_walk_hook` install. A poll calls it on the polling
+/// thread, and a walk on the thread that walks the folders.
 type PollHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 struct Inner {
@@ -127,6 +128,17 @@ struct Inner {
     file_limit_warned: AtomicBool,
     /// The hook of `set_poll_hook`, read before each poll. The lock is not held while it runs.
     poll_hook: Mutex<Option<PollHook>>,
+    /// The hook of `set_walk_hook`, read when a kernel watch starts. The lock is not held while it
+    /// runs.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    walk_hook: Mutex<Option<PollHook>>,
+    /// The readings of the mount table so far, injected failures too. See `mount_readings`.
+    mount_reads: AtomicU64,
+    /// The next readings of the mount table that fail. See `fail_mount_reads`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fail_mount_reads: AtomicUsize,
+    /// The next reconciles that fail. See `fail_reconciles`.
+    fail_reconciles: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -242,6 +254,10 @@ impl LibraryWatcher {
                 instance_limit_warned: AtomicBool::new(false),
                 file_limit_warned: AtomicBool::new(false),
                 poll_hook: Mutex::new(None),
+                walk_hook: Mutex::new(None),
+                mount_reads: AtomicU64::new(0),
+                fail_mount_reads: AtomicUsize::new(0),
+                fail_reconciles: AtomicUsize::new(0),
             }),
         }
     }
@@ -340,6 +356,39 @@ impl LibraryWatcher {
             .unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
+    /// The follower's readings of the mount table so far. An injected failure counts as a reading.
+    /// For the tests.
+    #[doc(hidden)]
+    pub fn mount_readings(&self) -> u64 {
+        self.inner.mount_reads.load(Ordering::Relaxed)
+    }
+
+    /// Makes the next `n` readings of the mount table fail, as a failed read does; `n` replaces the
+    /// count. The reading that `start` makes first is never failed. For the tests.
+    #[doc(hidden)]
+    pub fn fail_mount_reads(&self, n: usize) {
+        self.inner.fail_mount_reads.store(n, Ordering::Relaxed);
+    }
+
+    /// Makes the next `n` reconciles fail as a database error does, so each keeps the monitors as
+    /// they are; `n` replaces the count. For the tests.
+    #[doc(hidden)]
+    pub fn fail_reconciles(&self, n: usize) {
+        self.inner.fail_reconciles.store(n, Ordering::Relaxed);
+    }
+
+    /// Calls `hook` with each folder before its kernel watch is added: in the setup walk, in the
+    /// walks of new folders and after an overflow. It applies to the kernel watches started from
+    /// now on; `None` removes it. The lock is not held while the hook runs. For the tests.
+    #[doc(hidden)]
+    pub fn set_walk_hook(&self, hook: Option<PollHook>) {
+        *self
+            .inner
+            .walk_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
     /// The monitored library paths, sorted by library name, then path.
     pub fn monitored(&self) -> Vec<MonitoredPath> {
         let mut paths: Vec<MonitoredPath> = self
@@ -376,6 +425,14 @@ impl Inner {
     }
 }
 
+/// Takes one of the injected failures counted in `count`: counts one down and returns true, while
+/// `count` is above zero.
+pub(super) fn take_injected(count: &AtomicUsize) -> bool {
+    count
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+
 /// Reconciles the monitors with the libraries, then waits for `libraries_changed`, for ever.
 async fn run_manager(inner: Arc<Inner>, generation: u64) {
     loop {
@@ -403,7 +460,14 @@ fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) 
 /// reached is replaced too, ready or not, once a limit has changed since it fell back. While none
 /// has changed, it is kept with its baseline. A database error keeps the monitors as they are.
 async fn reconcile(inner: &Arc<Inner>, generation: u64) {
-    let libraries = match monitored_libraries(&inner.pool).await {
+    let loaded = if take_injected(&inner.fail_reconciles) {
+        Err(sqlx::Error::Io(std::io::Error::other(
+            "injected for a test",
+        )))
+    } else {
+        monitored_libraries(&inner.pool).await
+    };
+    let libraries = match loaded {
         Ok(libraries) => libraries,
         Err(err) => {
             tracing::warn!(

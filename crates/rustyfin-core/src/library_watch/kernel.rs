@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::{
-    FILE_LIMIT_REACHED, INSTANCE_LIMIT_REACHED, Inner, LIBRARY_PATH_GONE, MonitorKey,
+    FILE_LIMIT_REACHED, INSTANCE_LIMIT_REACHED, Inner, LIBRARY_PATH_GONE, MonitorKey, PollHook,
     WATCH_LIMIT_REACHED, fs_type_from_mountinfo, is_local_fs_type, off_runtime,
 };
 use crate::library_monitor::unit_for;
@@ -68,6 +68,8 @@ struct Tree {
     ids: HashSet<Id>,
     /// The test limit of watches, if one is set: an add fails once the tree holds this many.
     limit: Option<usize>,
+    /// The hook of `set_walk_hook`, called with each folder before its watch is added.
+    walk_hook: Option<PollHook>,
     /// The fallback that ends the kernel watching, once a walk or an event meets it. The walks stop
     /// then, and the events after it only report their paths.
     fallback: Option<Fallback>,
@@ -125,7 +127,12 @@ pub(super) async fn watch(
         .watch_limit
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let setup = off_runtime(move || setup(&setup_root, &data_dir, limit)).await;
+    let walk_hook = inner
+        .walk_hook
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let setup = off_runtime(move || setup(&setup_root, &data_dir, limit, walk_hook)).await;
     let (inotify, mut tree, took) = match setup {
         Ok(Ok(setup)) => setup,
         Ok(Err(fallback)) => return Some(fallback_reason(inner, &root, fallback)),
@@ -247,6 +254,7 @@ fn setup(
     root: &Path,
     data_dir: &Path,
     limit: Option<usize>,
+    walk_hook: Option<PollHook>,
 ) -> Result<(Inotify, Tree, Duration), Fallback> {
     let started = std::time::Instant::now();
     let inotify = Inotify::init().map_err(|err| {
@@ -277,6 +285,7 @@ fn setup(
             .into_iter()
             .collect(),
         limit,
+        walk_hook,
         fallback: None,
         mounts: None,
         link_targets: BTreeSet::new(),
@@ -473,6 +482,9 @@ impl Tree {
     /// before the listing, so a subfolder made meanwhile is listed or raises an event. Errors when
     /// the watch on `dir` itself fails.
     fn watch_folder(&mut self, dir: &Path, id: Id) -> io::Result<()> {
+        if let Some(hook) = &self.walk_hook {
+            hook(dir);
+        }
         let wd = self.add_watch(dir)?;
         self.record(dir, wd, id);
         self.walk_children(dir, id.0);

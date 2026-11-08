@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -16,7 +17,9 @@ use super::mounts::{
     MountChange, automount_points, fs_type_from_mountinfo, is_local_fs_type, mount_changes,
     restarts_monitor, restarts_polled_monitor,
 };
-use super::{Inner, LIBRARY_PATH_GONE, Method, MonitoredPath, NOT_LOCAL, PATH_NOT_FOUND};
+use super::{
+    Inner, LIBRARY_PATH_GONE, Method, MonitoredPath, NOT_LOCAL, PATH_NOT_FOUND, take_injected,
+};
 
 /// The mount table of this process. The kernel wakes a poll of it once per change.
 const MOUNT_TABLE: &str = "/proc/self/mountinfo";
@@ -38,6 +41,7 @@ pub(super) fn follow(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
             return None;
         }
     };
+    inner.mount_reads.fetch_add(1, Ordering::Relaxed);
     let table = match read_table(fd.get_ref()) {
         Ok(table) => table,
         Err(err) => {
@@ -60,7 +64,13 @@ async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
             }
         };
         ready.clear_ready();
-        let new = match read_table(ready.get_inner()) {
+        inner.mount_reads.fetch_add(1, Ordering::Relaxed);
+        let read = if take_injected(&inner.fail_mount_reads) {
+            Err(io::Error::other("injected for a test"))
+        } else {
+            read_table(ready.get_inner())
+        };
+        let new = match read {
             Ok(new) => new,
             Err(err) => {
                 warn_cannot_follow(&err);
