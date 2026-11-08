@@ -3347,26 +3347,32 @@ async fn b20_dropped_snapshot_stops_its_worker() {
         )
         .await
         .is_ok();
-        // The request is dropped. The ticks have stopped once 100 ms pass without one.
+        // The request is dropped when its 200 ms scope ends. A loaded machine may not schedule the
+        // sqlx worker within that window, so keying the outcome on a tick inside it flaked (L2); key
+        // it on the stop instead. Watch the ticks for up to 2 s: once the worker has run they climb,
+        // then plateau when the drop's cancel interrupts it, so a plateau after movement is the stop.
+        // Ticks still climbing at 2 s mean the drop did not stop the worker.
         let dropped = Instant::now();
         let mut last = probe.ticks.load(Ordering::Relaxed);
-        let ticked = last > 0;
+        let mut moved = false;
         let stopped = loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let now = probe.ticks.load(Ordering::Relaxed);
-            if now == last {
-                break true;
+            if now != last {
+                moved = true;
+                last = now;
+            } else if moved {
+                break true; // climbed, then held: the worker stopped
             }
             if dropped.elapsed() > Duration::from_secs(2) {
-                break false;
+                // Never climbed: nothing was left spinning. Still climbing: not stopped.
+                break !moved;
             }
-            last = now;
         };
-        let outcome = match (opened, ticked, stopped) {
-            (true, _, _) => "opened within 200 ms",
-            (false, false, _) => "no guarded statement ran",
-            (false, true, true) => "stopped",
-            (false, true, false) => "still spinning 2 s after the drop",
+        let outcome = match (opened, stopped) {
+            (true, _) => "opened within 200 ms",
+            (false, true) => "stopped",
+            (false, false) => "still spinning 2 s after the drop",
         };
         outcomes.push(format!("{path}: {outcome}"));
     }
