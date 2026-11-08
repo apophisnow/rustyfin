@@ -520,12 +520,12 @@ fn order_by_clause(terms: &[SortTerm]) -> String {
 }
 
 /// Build the SQL query with a static base for single-value params and dynamic
-/// parts only for array filters. Reuses the SQL cached for an earlier call whose shape equals
-/// `cache_key`.
+/// parts only for array filters. Reuses the SQL cached for an earlier call of the same shape.
+/// The key is built here, from the filter this call renders, so no caller can pair a key with a
+/// different filter.
 #[allow(clippy::too_many_arguments)]
 fn build_filtered_query(
-    cache_key: FilterShape,
-    _recursive: bool,
+    recursive: bool,
     media_types: Option<&[String]>,
     exclude_media_types: Option<&[String]>,
     genres: Option<&[String]>,
@@ -539,6 +539,22 @@ fn build_filtered_query(
     sort_by: &str,
     sort_order: &str,
 ) -> (String, String) {
+    let cache_key = filter_cache_key(
+        media_types.map(|t| t.len()).unwrap_or(0),
+        exclude_media_types.map(|t| t.len()).unwrap_or(0),
+        genres.map(|g| g.len()).unwrap_or(0),
+        years.map(|y| y.len()).unwrap_or(0),
+        official_ratings.map(|r| r.len()).unwrap_or(0),
+        tags.map(|t| t.len()).unwrap_or(0),
+        media_types_filter.map(|t| t.len()).unwrap_or(0),
+        recursive,
+        is_favorite,
+        is_unplayed,
+        is_played,
+        sort_by,
+        sort_order,
+    );
+
     // Check cache first: a hit needs a stored shape equal to this one, not just an equal hash.
     {
         let cache = FILTER_QUERY_CACHE.lock();
@@ -765,26 +781,8 @@ pub async fn get_items_filtered(
     let sort_by_str = sort_by.unwrap_or("SortName");
     let sort_order_str = sort_order.unwrap_or("Ascending");
 
-    // Build cache key from array filter sizes and options
-    let cache_key = filter_cache_key(
-        media_types.map(|t| t.len()).unwrap_or(0),
-        exclude_media_types.map(|t| t.len()).unwrap_or(0),
-        genres.map(|g| g.len()).unwrap_or(0),
-        years.map(|y| y.len()).unwrap_or(0),
-        official_ratings.map(|r| r.len()).unwrap_or(0),
-        tags.map(|t| t.len()).unwrap_or(0),
-        media_types_filter.map(|t| t.len()).unwrap_or(0),
-        recursive,
-        is_favorite,
-        is_unplayed,
-        is_played,
-        sort_by_str,
-        sort_order_str,
-    );
-
     // Get cached query strings — same array sizes → same plan
     let (count_sql, data_sql) = build_filtered_query(
-        cache_key,
         recursive,
         media_types,
         exclude_media_types,
@@ -2754,9 +2752,9 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, true, None, None, None, sort_by, sort_order,
             )
         };
-        let build = |key, genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
+        let build = |genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
             super::build_filtered_query(
-                key, true, None, None, genres, None, None, None, None, None, None, None, sort_by,
+                true, None, None, genres, None, None, None, None, None, None, None, sort_by,
                 sort_order,
             )
         };
@@ -2769,7 +2767,7 @@ mod tests {
         assert_ne!(key("SortName", "Ascending"), key("SortNameA", "scending"));
         // A shape is stored while there is room.
         let sort_by = "DateCreated,SortName,ProductionYear";
-        let built = build(key(sort_by, "Descending"), None, sort_by, "Descending");
+        let built = build(None, sort_by, "Descending");
         assert_eq!(
             super::FILTER_QUERY_CACHE
                 .lock()
@@ -2795,7 +2793,7 @@ mod tests {
                 "Ascending",
             )
         };
-        let (count_sql, data_sql) = build(big(), Some(genres.as_slice()), "SortName", "Ascending");
+        let (count_sql, data_sql) = build(Some(genres.as_slice()), "SortName", "Ascending");
         assert!(count_sql.len() + data_sql.len() > 16 * 1024);
         assert!(!super::FILTER_QUERY_CACHE.lock().contains_key(&big()));
         // However many distinct lists come, at most 256 entries are kept.
@@ -2819,7 +2817,7 @@ mod tests {
                     }
                     for order in ["Ascending", "Descending"] {
                         let sort_by = format!("{a},{b},{c}");
-                        build(key(&sort_by, order), None, &sort_by, order);
+                        build(None, &sort_by, order);
                         lists += 1;
                     }
                 }
@@ -2838,24 +2836,9 @@ mod tests {
         let excluded: Vec<String> = (0..63).map(|i| format!("Type{i}")).collect();
         let (fav, sort_by, sort_order) = (Some(true), "SortName", "Ascending");
         let build = |include: Option<&[String]>, exclude: Option<&[String]>| {
-            let key = super::filter_cache_key(
-                include.map_or(0, <[String]>::len),
-                exclude.map_or(0, <[String]>::len),
-                0,
-                0,
-                0,
-                0,
-                0,
-                true,
-                fav,
-                None,
-                None,
-                sort_by,
-                sort_order,
-            );
             super::build_filtered_query(
-                key, true, include, exclude, None, None, None, None, None, fav, None, None,
-                sort_by, sort_order,
+                true, include, exclude, None, None, None, None, None, fav, None, None, sort_by,
+                sort_order,
             )
         };
         let one = || build(Some(included.as_slice()), None);
@@ -2907,26 +2890,9 @@ mod tests {
         fn years(n: usize) -> Option<Vec<i32>> {
             (n > 0).then(|| (0..n).map(|i| 2000 + i as i32).collect())
         }
-        /// `r`'s SQL through the cache, keyed as `get_items_filtered` keys it.
+        /// `r`'s SQL through the cache.
         fn cached_sql(r: &FilterRequest) -> (String, String) {
-            let len = |list: &Option<Vec<String>>| list.as_ref().map_or(0, Vec::len);
-            let key = super::filter_cache_key(
-                len(&r.media_types),
-                len(&r.exclude_media_types),
-                len(&r.genres),
-                r.years.as_ref().map_or(0, Vec::len),
-                len(&r.official_ratings),
-                len(&r.tags),
-                len(&r.media_types_filter),
-                true,
-                r.is_favorite,
-                r.is_unplayed,
-                r.is_played,
-                r.sort_by,
-                r.sort_order,
-            );
             super::build_filtered_query(
-                key,
                 true,
                 r.media_types.as_deref(),
                 r.exclude_media_types.as_deref(),
