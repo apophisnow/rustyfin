@@ -167,6 +167,16 @@ async fn main() {
     let data_dir_arc = Arc::new(data_dir);
     let task_scheduler =
         rustyfin_core::scheduler::TaskScheduler::new(pool.clone(), data_dir_arc.clone());
+    task_scheduler
+        .changes()
+        .set_delay(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_delay,
+        )));
+    task_scheduler
+        .watcher()
+        .set_poll_interval(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_poll_interval.max(1),
+        )));
 
     let plugin_manager = rustyfin_core::plugin_manager::PluginManager::new(&data_dir_arc);
     plugin_manager.load_all().await;
@@ -233,7 +243,17 @@ async fn main() {
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
     {
         let shutdown_rx = state.shutdown_tx.subscribe();
+        // Test switch: poll every library path, even on a local disk.
+        if std::env::var("RUSTYFIN_MONITOR_FORCE_POLL").is_ok_and(|v| v == "1") {
+            task_scheduler.watcher().set_force_poll(true);
+        }
         task_scheduler.start(shutdown_rx);
+    }
+
+    // Background task: once after an update, dates the items older versions stored by their files
+    {
+        let state = state.clone();
+        tokio::spawn(async move { rustyfin_api::date_backfill::run(&state).await });
     }
 
     // Extract HTTP port for discovery services
@@ -294,6 +314,8 @@ async fn main() {
     let cleanup_db = state.db.clone();
     let sighup_config = state.config.clone();
     let sighup_data_dir = state.data_dir.clone();
+    let sighup_changes = state.task_scheduler.changes().clone();
+    let sighup_watcher = state.task_scheduler.watcher().clone();
     let cache = state.cache.clone();
     let app = build_router(state)
         .layer(CompressionLayer::new())
@@ -339,6 +361,8 @@ async fn main() {
     {
         let config = sighup_config;
         let data_dir = sighup_data_dir;
+        let changes = sighup_changes;
+        let watcher = sighup_watcher;
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -351,6 +375,13 @@ async fn main() {
                         let new_config = load_config(&data_dir);
                         let mut cfg = config.write().await;
                         *cfg = new_config;
+                        changes.set_delay(std::time::Duration::from_secs(u64::from(
+                            cfg.library_monitor_delay,
+                        )));
+                        watcher.set_poll_interval(std::time::Duration::from_secs(u64::from(
+                            cfg.library_monitor_poll_interval.max(1),
+                        )));
+                        watcher.libraries_changed();
                         tracing::info!("configuration reloaded");
                     }
                 }

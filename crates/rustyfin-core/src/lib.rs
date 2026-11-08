@@ -1,6 +1,9 @@
+pub mod date_backfill;
 pub mod dlna;
 pub mod image_proxy;
 pub mod jellyfin_import;
+pub mod library_monitor;
+pub mod library_watch;
 pub mod local_images;
 pub mod mdns;
 pub mod media_segments;
