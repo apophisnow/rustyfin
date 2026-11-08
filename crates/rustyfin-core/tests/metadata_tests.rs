@@ -30,8 +30,14 @@ const ITEM_ROWS: [(&str, &str); 8] = [
         "item_images",
         "SELECT COUNT(*) FROM item_images WHERE item_id = ?1",
     ),
-    ("chapters", "SELECT COUNT(*) FROM chapters WHERE item_id = ?1"),
-    ("trickplay", "SELECT COUNT(*) FROM trickplay WHERE item_id = ?1"),
+    (
+        "chapters",
+        "SELECT COUNT(*) FROM chapters WHERE item_id = ?1",
+    ),
+    (
+        "trickplay",
+        "SELECT COUNT(*) FROM trickplay WHERE item_id = ?1",
+    ),
     (
         "playlist_items",
         "SELECT COUNT(*) FROM playlist_items WHERE item_id = ?1",
@@ -91,7 +97,10 @@ impl Fixture {
             name: name.to_string(),
             sort_name: Some(name.to_lowercase()),
             media_type: MediaType::Movie,
-            path: film.join(format!("{name}.mkv")).to_string_lossy().into_owned(),
+            path: film
+                .join(format!("{name}.mkv"))
+                .to_string_lossy()
+                .into_owned(),
             library_id: self.library_id,
             production_year: Some(2001),
             official_rating: Some("R".to_string()),
@@ -309,7 +318,11 @@ async fn refresh_renames_the_item_in_search() {
         0,
         "the old name has no entry left"
     );
-    assert_eq!(rowid(pool, stored.id).await, before, "the item keeps its rowid");
+    assert_eq!(
+        rowid(pool, stored.id).await,
+        before,
+        "the item keeps its rowid"
+    );
     let years: Vec<(i64, i64)> = sqlx::query_as("SELECT year, item_count FROM filter_year_index")
         .fetch_all(pool)
         .await
