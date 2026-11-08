@@ -3180,6 +3180,49 @@ mod kernel {
         assert_eq!(again.len(), 1, "logged once");
         watcher.stop();
     }
+
+    /// Fix round 2, item G: a setup walk whose monitor stops, here because monitoring is turned
+    /// off, stops too, instead of adding a watch for each folder of a path no longer monitored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_setup_walk_stops_when_its_monitor_stops() {
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        for year in 2001..=2020 {
+            write(&tree.at(&format!("Film ({year})/Film ({year}).mkv")), 10);
+        }
+        let (pool, changes, _recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel S Films", &[tree.root()]).await;
+        let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), tree.outside("data"));
+        let gate = PollGate::default();
+        let hold = gate.hook();
+        let visits = Arc::new(AtomicUsize::new(0));
+        let counted = visits.clone();
+        watcher.set_walk_hook(Some(Arc::new(move |dir: &Path| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            hold(dir);
+        })));
+        gate.closed.store(true, Ordering::SeqCst);
+        watcher.start();
+        gate.close().await;
+        let held_at = visits.load(Ordering::SeqCst);
+
+        set_monitoring(&pool, &watcher, &lib, false).await;
+        let stopped = format!(
+            "library monitor: stopped '{}' of 'Kernel S Films'",
+            tree.root().display()
+        );
+        wait_for_log(&[&stopped]).await;
+        // The abort drops the monitor's task a moment after the line is logged.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        gate.open();
+        quiet_period().await;
+        let visited = visits.load(Ordering::SeqCst);
+        assert!(
+            visited <= held_at + 1,
+            "the walk went on after its monitor stopped: {visited} folders visited, {held_at} before"
+        );
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:
