@@ -624,8 +624,10 @@ async fn test_j1_percent_encoded_values_and_a_quoted_comma() {
     state.api_key = Some(Arc::new(key.to_string()));
     // Values in the MediaBrowser header and the query are decoded like Jellyfin's
     // `WebUtility.UrlDecode`: `+` is a space, `%XX` a byte, and a `%` without two hex digits stays.
-    // Token headers are used as sent.
+    // Token headers are used as sent. The configured key also matches a MediaBrowser token and
+    // `api_key` as sent (J1 re-check R1, review F1).
     let accepted = [
+        ("Authorization", r#"MediaBrowser Token="j1 key+,100%""#),
         (
             "Authorization",
             r#"MediaBrowser Token="j1%20key%2B%2C100%25""#,
@@ -648,8 +650,8 @@ async fn test_j1_percent_encoded_values_and_a_quoted_comma() {
         assert_eq!(status, StatusCode::OK, "{name}: {value}");
     }
     let refused = [
-        // A raw `+` is a space
-        ("Authorization", r#"MediaBrowser Token="j1 key+,100%""#),
+        // A raw `+` is a space, and these spellings aren't the key as sent either
+        ("Authorization", r#"MediaBrowser Token="j1+key+,100%""#),
         ("?", "ApiKey=j1+key+,100%25"),
         // Token headers are not decoded
         ("Authorization", "Bearer j1%20key%2B%2C100%25"),
@@ -1078,6 +1080,89 @@ async fn test_j1_basic_authorization_next_to_api_key_is_not_refused() {
             assert_eq!(status, StatusCode::NO_CONTENT, "{key}, {method}: {text}");
         }
     }
+}
+
+// J1 re-check R1: Sonarr's and Radarr's Emby / Jellyfin connection sends the configured key as typed
+// in `X-MediaBrowser-Token` and in `Authorization: MediaBrowser Token="…"` (`B18_ARR_AUTH`'s shape).
+// On master the raw `X-MediaBrowser-Token` decided; now the `MediaBrowser` token does, so its
+// `Token` matches the key as typed or decoded, like `api_key`. User tokens count decoded only.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_as_typed_in_media_browser_headers() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let body = serde_json::json!({ "updates": [
+        { "path": "/elsewhere/Other (2001)/Other (2001).mkv", "updateType": "Modified" },
+    ]})
+    .to_string();
+    // (key, percent-encoded)
+    for (key, encoded) in [("j1+key/A=", "j1%2Bkey%2FA%3D"), ("j1%41key", "j1%2541key")] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let arr = format!("MediaBrowser Token=\"{key}\"");
+        let headers = [
+            ("X-MediaBrowser-Token", key),
+            ("Authorization", arr.as_str()),
+            ("Content-Type", "application/json"),
+        ];
+        let uri = "/Library/Media/Updated";
+        let (status, text) =
+            b18_send(&app(state.clone()), "POST", uri, &headers, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{key}: {text}");
+
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            vec![
+                ("X-MediaBrowser-Token", key.to_string()),
+                ("Authorization", arr.clone()),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", key))],
+            vec![("X-Emby-Authorization", j1_mb("Emby", key))],
+            vec![
+                ("X-Emby-Token", key.to_string()),
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", key)),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", encoded))],
+        ];
+        let refused = [
+            // An invalid `MediaBrowser` token still decides over a valid token header.
+            vec![
+                ("Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-MediaBrowser-Token", key.to_string()),
+            ],
+            vec![
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-Emby-Token", key.to_string()),
+            ],
+            // Either spelling must hold the whole key.
+            vec![(
+                "Authorization",
+                j1_mb("MediaBrowser", &key[..key.len() - 1]),
+            )],
+        ];
+        for (expected, cases) in [
+            (StatusCode::OK, &accepted[..]),
+            (StatusCode::UNAUTHORIZED, &refused[..]),
+        ] {
+            for (i, credentials) in cases.iter().enumerate() {
+                let credentials: Vec<(&str, &str)> = credentials
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str()))
+                    .collect();
+                let (status, text) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+                assert_eq!(status, expected, "{key}: case {i}");
+                assert!(!text.contains(key), "{key}: case {i}: {text}");
+            }
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let credentials = j1_mb("MediaBrowser", &encoded);
+    assert_eq!(
+        j1_me(&state, &[("Authorization", credentials.as_str())]).await,
+        Ok(user_id)
+    );
 }
 
 // ── Error Response Format Tests ──

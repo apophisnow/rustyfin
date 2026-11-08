@@ -2,7 +2,8 @@ use axum::http::{HeaderMap, Uri};
 
 /// The fields of a `MediaBrowser` or `Emby` authorization header, as Jellyfin clients send them.
 ///
-/// `Debug` prints every field except the token, which it shows only as present or absent.
+/// `Debug` prints every field except the token, which it shows only as present or absent. The
+/// token as sent is kept only to compare with the configured API key, and `Debug` never prints it.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct MediaBrowserAuth {
     pub client: Option<String>,
@@ -10,6 +11,8 @@ pub struct MediaBrowserAuth {
     pub device_id: Option<String>,
     pub version: Option<String>,
     pub token: Option<String>,
+    /// The `Token` value as sent: quotes trimmed, not URL-decoded. Set with `token`.
+    token_as_sent: Option<String>,
 }
 
 impl std::fmt::Debug for MediaBrowserAuth {
@@ -26,15 +29,19 @@ impl std::fmt::Debug for MediaBrowserAuth {
 
 impl MediaBrowserAuth {
     /// Stores one decoded value under its key. Only the five exact Jellyfin keys count, and a
-    /// later pair overwrites an earlier one.
+    /// later pair overwrites an earlier one. A `Token` also keeps its value as sent.
     fn store(&mut self, key: &str, value: &str) {
-        let value = Some(url_decode(value.trim_matches('"')));
+        let raw = value.trim_matches('"');
+        let value = Some(url_decode(raw));
         match key {
             "Client" => self.client = value,
             "Device" => self.device = value,
             "DeviceId" => self.device_id = value,
             "Version" => self.version = value,
-            "Token" => self.token = value,
+            "Token" => {
+                self.token = value;
+                self.token_as_sent = Some(raw.to_string());
+            }
             _ => {}
         }
     }
@@ -137,15 +144,21 @@ fn query_value(uri: &Uri, name: &str) -> Option<(String, String)> {
     })
 }
 
-fn media_browser_token(value: &str) -> Option<String> {
-    parse_media_browser(value)?.token
+/// The `MediaBrowser` token of a header value, decoded, with its value as sent.
+fn media_browser_token(value: &str) -> Option<PresentedToken> {
+    let auth = parse_media_browser(value)?;
+    Some(PresentedToken {
+        token: auth.token?,
+        as_sent: auth.token_as_sent,
+    })
 }
 
-/// A token from a source other than the `api_key` parameter, which keeps no raw value.
-fn without_raw(token: Option<String>) -> Option<PresentedToken> {
+/// A token from a source that keeps no value as sent: `Bearer`, `X-Emby-Token`,
+/// `X-MediaBrowser-Token` or `ApiKey`.
+fn without_as_sent(token: Option<String>) -> Option<PresentedToken> {
     token.map(|token| PresentedToken {
         token,
-        raw_api_key: None,
+        as_sent: None,
     })
 }
 
@@ -154,34 +167,36 @@ pub(crate) struct PresentedToken {
     /// The token. It is URL-decoded when it comes from a `MediaBrowser` header or a query
     /// parameter, and taken as sent otherwise.
     pub token: String,
-    /// The `api_key` query value as sent, before decoding, when that parameter gives the token.
-    pub raw_api_key: Option<String>,
+    /// The token as sent, before decoding, when it comes from the `api_key` query parameter or
+    /// from a `MediaBrowser` header's `Token` (in `Authorization` or `X-Emby-Authorization`).
+    /// `None` for `Bearer`, `X-Emby-Token`, `X-MediaBrowser-Token` and `ApiKey`.
+    pub as_sent: Option<String>,
 }
 
 /// The token a request presents, or `None`. A blank token counts as absent, and the first other
 /// token wins. The sources, in order: the `Authorization` header (a `Bearer` token as sent,
 /// otherwise its `MediaBrowser` token), the `MediaBrowser` token of `X-Emby-Authorization`, the
 /// `X-Emby-Token` header, the `X-MediaBrowser-Token` header, then the `ApiKey` and `api_key` query
-/// parameters. A header that is absent or not visible ASCII gives nothing. When the `api_key`
-/// parameter gives the token, `raw_api_key` is its value as sent; otherwise it is `None`.
+/// parameters. A header that is absent or not visible ASCII gives nothing. A `MediaBrowser`
+/// token and the `api_key` parameter also give their value as sent, in `as_sent`. The other
+/// sources give `None` there.
 pub(crate) fn request_token(headers: &HeaderMap, uri: &Uri) -> Option<PresentedToken> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
-    let authorization = header("authorization").and_then(|value| {
-        value
-            .strip_prefix("Bearer ")
-            .map(str::to_string)
-            .or_else(|| media_browser_token(value))
-    });
+    let authorization =
+        header("authorization").and_then(|value| match value.strip_prefix("Bearer ") {
+            Some(token) => without_as_sent(Some(token.to_string())),
+            None => media_browser_token(value),
+        });
     let api_key = query_value(uri, "api_key").map(|(token, raw)| PresentedToken {
         token,
-        raw_api_key: Some(raw),
+        as_sent: Some(raw),
     });
     [
-        without_raw(authorization),
-        without_raw(header("x-emby-authorization").and_then(media_browser_token)),
-        without_raw(header("x-emby-token").map(str::to_string)),
-        without_raw(header("x-mediabrowser-token").map(str::to_string)),
-        without_raw(query_value(uri, "ApiKey").map(|(token, _)| token)),
+        authorization,
+        header("x-emby-authorization").and_then(media_browser_token),
+        without_as_sent(header("x-emby-token").map(str::to_string)),
+        without_as_sent(header("x-mediabrowser-token").map(str::to_string)),
+        without_as_sent(query_value(uri, "ApiKey").map(|(token, _)| token)),
         api_key,
     ]
     .into_iter()
@@ -214,9 +229,10 @@ mod tests {
         presented(headers, uri).map(|presented| presented.token)
     }
 
-    /// The `api_key` value as sent, when `request_token` picks that parameter.
-    fn raw_api_key(headers: &[(&'static str, &str)], uri: &str) -> Option<String> {
-        presented(headers, uri).and_then(|presented| presented.raw_api_key)
+    /// The token as sent, before decoding, when `request_token` picks the `api_key` parameter or a
+    /// `MediaBrowser` token.
+    fn as_sent(headers: &[(&'static str, &str)], uri: &str) -> Option<String> {
+        presented(headers, uri).and_then(|presented| presented.as_sent)
     }
 
     fn mb(token: &str) -> String {
@@ -233,6 +249,7 @@ mod tests {
                 device_id: Some("TW96aWxsYS81LjA".to_string()),
                 version: Some("10.10.0".to_string()),
                 token: Some("0123456789abcdef0123456789abcdef".to_string()),
+                token_as_sent: Some("0123456789abcdef0123456789abcdef".to_string()),
             })
         );
     }
@@ -565,33 +582,98 @@ mod tests {
         ] {
             let uri = format!("/x?{query}");
             assert_eq!(token(&[], &uri).as_deref(), Some(decoded), "{query}");
-            assert_eq!(raw_api_key(&[], &uri).as_deref(), Some(raw), "{query}");
+            assert_eq!(as_sent(&[], &uri).as_deref(), Some(raw), "{query}");
         }
         // *arr sends Basic next to `api_key`, and Basic gives no token.
         let basic = [("authorization", "Basic YXJyOnNlY3JldA==")];
         assert_eq!(token(&basic, "/x?api_key=a+b").as_deref(), Some("a b"));
-        assert_eq!(
-            raw_api_key(&basic, "/x?api_key=a+b").as_deref(),
-            Some("a+b")
-        );
-        // Other sources give no raw value, even next to an `api_key`.
+        assert_eq!(as_sent(&basic, "/x?api_key=a+b").as_deref(), Some("a+b"));
+        // An earlier source decides, with its own value as sent or none.
         assert_eq!(token(&[], "/x?ApiKey=a+b").as_deref(), Some("a b"));
-        assert_eq!(raw_api_key(&[], "/x?ApiKey=a+b"), None);
-        assert_eq!(raw_api_key(&[], "/x?ApiKey=t1&api_key=a+b"), None);
+        assert_eq!(as_sent(&[], "/x?ApiKey=a+b"), None);
+        assert_eq!(as_sent(&[], "/x?ApiKey=t1&api_key=a+b"), None);
+        assert_eq!(as_sent(&[("x-emby-token", "t3")], "/x?api_key=a+b"), None);
         assert_eq!(
-            raw_api_key(&[("x-emby-token", "t3")], "/x?api_key=a+b"),
-            None
+            as_sent(&[("authorization", &mb("t%31"))], "/x?api_key=a+b").as_deref(),
+            Some("t%31")
         );
         assert_eq!(
-            raw_api_key(&[("authorization", &mb("t1"))], "/x?api_key=a+b"),
-            None
-        );
-        assert_eq!(
-            raw_api_key(&[("authorization", "Bearer t1")], "/x?api_key=a+b"),
+            as_sent(&[("authorization", "Bearer t1")], "/x?api_key=a+b"),
             None
         );
         // A value that is blank once decoded counts as absent, as in every source.
         assert!(presented(&[], "/x?api_key=+").is_none());
         assert!(presented(&[], "/x?api_key=%20").is_none());
+    }
+
+    // J1 re-check R1: Sonarr and Radarr send the configured key as typed in `X-MediaBrowser-Token`
+    // and in `Authorization: MediaBrowser Token="…"`, and the decoded `MediaBrowser` token decides.
+    // So that token also gives its value as sent: inside the quotes, before decoding.
+    #[test]
+    fn j1_a_media_browser_token_also_gives_its_value_as_sent() {
+        for name in ["authorization", "x-emby-authorization"] {
+            for (value, decoded, sent) in [
+                (r#"MediaBrowser Token="a+b%2Bc""#, "a b+c", "a+b%2Bc"),
+                (
+                    r#"Emby Client="c+d", Token="j1%41key""#,
+                    "j1Akey",
+                    "j1%41key",
+                ),
+                ("mediabrowser Token=a+b", "a b", "a+b"),
+                // A repeated key keeps its last value, in both spellings.
+                (r#"MediaBrowser Token="t+1", Token="c%41""#, "cA", "c%41"),
+            ] {
+                let headers = [(name, value)];
+                assert_eq!(
+                    token(&headers, "/x").as_deref(),
+                    Some(decoded),
+                    "{name}: {value}"
+                );
+                assert_eq!(
+                    as_sent(&headers, "/x").as_deref(),
+                    Some(sent),
+                    "{name}: {value}"
+                );
+            }
+        }
+        // *arr's two headers: the `MediaBrowser` token decides, and keeps its spelling as sent.
+        let arr = [
+            ("x-mediabrowser-token", "k+y%41"),
+            ("authorization", r#"MediaBrowser Token="k+y%41""#),
+        ];
+        assert_eq!(token(&arr, "/x").as_deref(), Some("k yA"));
+        assert_eq!(as_sent(&arr, "/x").as_deref(), Some("k+y%41"));
+        let emby = [
+            ("x-emby-token", "k+y"),
+            ("x-emby-authorization", r#"Emby Token="k+y""#),
+        ];
+        assert_eq!(token(&emby, "/x").as_deref(), Some("k y"));
+        assert_eq!(as_sent(&emby, "/x").as_deref(), Some("k+y"));
+        // `Bearer` and the token headers are taken as sent already; `ApiKey` is decoded only.
+        for (headers, uri, taken) in [
+            (vec![("authorization", "Bearer a+b")], "/x", "a+b"),
+            (vec![("x-emby-token", "a+b")], "/x", "a+b"),
+            (vec![("x-mediabrowser-token", "a+b")], "/x", "a+b"),
+            (vec![], "/x?ApiKey=a+b", "a b"),
+        ] {
+            assert_eq!(
+                token(&headers, uri).as_deref(),
+                Some(taken),
+                "{headers:?} {uri}"
+            );
+            assert_eq!(as_sent(&headers, uri), None, "{headers:?} {uri}");
+        }
+        // A `MediaBrowser` token that is blank once decoded still counts as absent.
+        let blank = [
+            ("authorization", r#"MediaBrowser Token="+""#),
+            ("x-mediabrowser-token", "k1"),
+        ];
+        assert_eq!(token(&blank, "/x").as_deref(), Some("k1"));
+        assert_eq!(as_sent(&blank, "/x"), None);
+        // `Debug` shows neither spelling.
+        let auth = parse_media_browser(r#"MediaBrowser Client="c", Token="j1%41key""#).unwrap();
+        let shown = format!("{auth:?}");
+        assert!(!shown.contains("j1%41key"), "{shown}");
+        assert!(!shown.contains("j1Akey"), "{shown}");
     }
 }

@@ -23,10 +23,11 @@ pub use credentials::{MediaBrowserAuth, parse_media_browser};
 /// (`Bearer <token>`, otherwise a `MediaBrowser` token), the `MediaBrowser` token of the
 /// `X-Emby-Authorization` header, the `X-Emby-Token` header, the `X-MediaBrowser-Token` header,
 /// then the `ApiKey` and `api_key` query parameters (see `credentials::request_token`). The
-/// configured API key gives administrator claims. The `api_key` value also counts as sent when it
-/// is compared with that key, because URLs such as an *arr Webhook's carry the key as typed. Any
-/// other token must be a live user token. Takes the request's headers and URI rather than the
-/// request: axum's `Body` is not `Sync`, so a `&Request` cannot be held across the await.
+/// configured API key gives administrator claims. The `api_key` value and a `MediaBrowser` token
+/// also count as sent when they are compared with that key, because *arr's Webhook URLs and its
+/// Emby / Jellyfin connection carry the key as typed. Any other token must be a live user token.
+/// Takes the request's headers and URI rather than the request: axum's `Body` is not `Sync`, so a
+/// `&Request` cannot be held across the await.
 async fn request_claims(
     state: &AppState,
     headers: &HeaderMap,
@@ -39,10 +40,10 @@ async fn request_claims(
         return Err(ApiError::Unauthorized);
     }
 
-    // Check if the token, or the `api_key` value as sent, matches a configured API key
+    // Check if the token, or the value as sent (`api_key` or a `MediaBrowser` token), matches a
+    // configured API key
     if let Some(ref api_key) = state.api_key
-        && (presented.token == **api_key
-            || presented.raw_api_key.as_deref() == Some(api_key.as_str()))
+        && (presented.token == **api_key || presented.as_sent.as_deref() == Some(api_key.as_str()))
     {
         // API key auth: create admin claims
         return Ok((
