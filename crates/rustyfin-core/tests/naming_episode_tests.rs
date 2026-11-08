@@ -58,3 +58,37 @@ fn parse_episode_table() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn b32_parse_episode_e_dot() {
+    // Jellyfin's third rule, `foo.E01.` (NamingOptions.cs:330-331): `e`, digits and a dot, which may be the
+    // extension's, so the digits may end the stem. It comes after `S01E02` and `ep05`, before `1x02`.
+    let table: &[(&str, Option<i32>)] = &[
+        (
+            "Dekalog.E02.1989.720p.BluRay.AAC.1.0.x264-ZQ-xpost",
+            Some(2),
+        ),
+        ("Dekalog.E08.1080p.BluRay.x264-DEPTH", Some(8)),
+        ("Show.e05", Some(5)),
+        ("Show E05", Some(5)),
+        ("ShowE05", Some(5)),
+        ("Show.E05.1x02", Some(5)),
+        ("Episode 7.E05", Some(5)),
+        ("Show.ep03.E05", Some(3)),
+        ("Show.E05 720p", None),
+        ("Show.E1080p", None),
+    ];
+    for &(stem, episode) in table {
+        let want = episode.map(|episode| EpisodeNumbers {
+            season: None,
+            episode,
+            ending: None,
+        });
+        assert_eq!(parse_episode(stem), want, "{stem:?}");
+    }
+    assert_eq!(
+        parse_episode("Show.S01E02.E05").map(|n| (n.season, n.episode)),
+        Some((Some(1), 2)),
+        "S01E02 comes first"
+    );
+}

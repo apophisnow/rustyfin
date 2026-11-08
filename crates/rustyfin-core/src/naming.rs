@@ -133,16 +133,24 @@ type EpisodeRule = fn(&[u8]) -> Option<EpisodeNumbers>;
 ///
 /// 1. `S01E02`: `s`, digits, any run of `[ ] space . _ -`, `e`, digits. Season and episode.
 /// 2. `ep05`: one of `. _ space -`, `ep`, an optional `_`, digits. Episode only.
-/// 3. `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3 digits.
+/// 3. `foo.E01.`: `e`, digits, then `.` or the end of the stem. Episode only. Jellyfin 12.4 has it
+///    third (`NamingOptions.cs:330-331`).
+/// 4. `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3 digits.
 ///    Season and episode.
-/// 4. `Episode 7`: `episode`, optional spaces, digits, and optionally `-M` as the ending. Episode
+/// 5. `Episode 7`: `episode`, optional spaces, digits, and optionally `-M` as the ending. Episode
 ///    only.
 ///
-/// A rule whose season is invalid gives nothing (see `is_valid_season`). Rules 1 and 3 also read
-/// a multi-episode ending (see `repeated_ending`), and rule 4 reads `-M`.
+/// A rule whose season is invalid gives nothing (see `is_valid_season`). Rules 1 and 4 also read
+/// a multi-episode ending (see `repeated_ending`), and rule 5 reads `-M`.
 pub fn parse_episode(stem: &str) -> Option<EpisodeNumbers> {
     let bytes = stem.as_bytes();
-    let rules: [EpisodeRule; 4] = [rule_season_episode, rule_ep, rule_nxnn, rule_episode_word];
+    let rules: [EpisodeRule; 5] = [
+        rule_season_episode,
+        rule_ep,
+        rule_e_dot,
+        rule_nxnn,
+        rule_episode_word,
+    ];
     rules
         .into_iter()
         .find_map(|rule| rule(bytes).filter(|found| found.season.is_none_or(is_valid_season)))
@@ -194,7 +202,28 @@ fn rule_ep(bytes: &[u8]) -> Option<EpisodeNumbers> {
     })
 }
 
-/// Rule 3, `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3
+/// Rule 3, `foo.E01.`: `e`, 1+ digits, then `.` or the end of the stem. Jellyfin's expression
+/// `[^\\/]*?()\.?[Ee]([0-9]+)\.([^\\/]*)$` runs on the file name with its extension, whose dot can be
+/// the one after the digits. Nothing need come before the `e`.
+fn rule_e_dot(bytes: &[u8]) -> Option<EpisodeNumbers> {
+    (0..bytes.len()).find_map(|at| {
+        if !is_ci_at(bytes, at, b'e') {
+            return None;
+        }
+        let end = digits_end(bytes, at + 1);
+        if !matches!(bytes.get(end), None | Some(b'.')) {
+            return None;
+        }
+        let episode = parse_digits(&bytes[at + 1..end])?;
+        Some(EpisodeNumbers {
+            season: None,
+            episode,
+            ending: None,
+        })
+    })
+}
+
+/// Rule 4, `1x02`: at the start or after one of `. _ space [ ( -`, 1 to 4 digits, `x`, 1 to 3
 /// digits. The digit runs are whole: `1x1080` is no match, since 1080 has four digits.
 fn rule_nxnn(bytes: &[u8]) -> Option<EpisodeNumbers> {
     (0..bytes.len()).find_map(|at| {
@@ -221,7 +250,7 @@ fn rule_nxnn(bytes: &[u8]) -> Option<EpisodeNumbers> {
     })
 }
 
-/// Rule 4, `Episode 7`: `episode`, optional spaces, 1+ digits, and optionally `-M` as the ending.
+/// Rule 5, `Episode 7`: `episode`, optional spaces, 1+ digits, and optionally `-M` as the ending.
 fn rule_episode_word(bytes: &[u8]) -> Option<EpisodeNumbers> {
     (0..bytes.len()).find_map(|at| {
         if !bytes.get(at..at + 7)?.eq_ignore_ascii_case(b"episode") {

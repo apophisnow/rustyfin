@@ -6410,3 +6410,32 @@ async fn b32_an_m2ts_joins_its_movie_as_a_version() {
     );
     assert_eq!(marks_of(&fx.pool, &user, movie).await, Some(marks));
 }
+
+#[tokio::test]
+async fn b32_rescans_read_e_dot_episode_numbers() {
+    const E02: &str = "Dekalog/Season 1/Dekalog.E02.1989.720p.BluRay.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&lib), E02);
+    scan(&fx.pool, &lib).await;
+    let episode = item_at(&fx.pool, &lib, E02).await;
+    // 3afba21's rules left the number empty.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number = NULL WHERE id = ?1",
+        &[&episode.to_string()],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, episode, &marks).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        episodes(&fx.pool, &lib).await,
+        [(E02.to_string(), Some(2), Some(1), "Season 1".to_string())]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, E02).await, episode);
+    assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
+}
