@@ -601,6 +601,7 @@ async fn test_get_items_filtered_no_overflow() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -919,6 +920,7 @@ async fn test_filtered_query_with_genres_and_tags() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -993,6 +995,7 @@ async fn test_filtered_query_with_name_starts_with() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1029,6 +1032,7 @@ async fn test_filtered_query_with_name_starts_with() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1053,6 +1057,7 @@ async fn test_filtered_query_with_name_starts_with() {
         0,
         100,
         false,
+        None,
         None,
         None,
         None,

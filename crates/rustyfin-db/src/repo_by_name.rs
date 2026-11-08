@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use rustyfin_model::media::MediaType;
@@ -80,10 +80,15 @@ fn unaccented(c: char) -> char {
 
 /// The id of the entry `name` of `kind`: a UUIDv5 of `<kind>:<folded name>` in `BY_NAME_NAMESPACE`.
 pub fn by_name_id(kind: ByNameKind, name: &str) -> Uuid {
+    folded_id(kind, &fold_name(name))
+}
+
+/// `by_name_id` of a name that `fold_name` has already folded.
+fn folded_id(kind: ByNameKind, folded: &str) -> Uuid {
     // The uuid crate's v5 feature is off (its dependencies are not cached), so the SHA-1 is taken here.
     let mut hasher = Sha1::new();
     hasher.update(BY_NAME_NAMESPACE.as_bytes());
-    hasher.update(format!("{}:{}", kind.as_str(), fold_name(name)).as_bytes());
+    hasher.update(format!("{}:{}", kind.as_str(), folded).as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -281,6 +286,52 @@ pub async fn get_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<ByNameEntry
         }
     }
     Ok(None)
+}
+
+/// The ids of the items that `/Items` keeps for `GenreIds` and `StudioIds`, or `None` when both
+/// lists are empty. As in Jellyfin (`JellyfinQueryHelperExtensions.cs:92-111`), an item is kept when
+/// one of its genres, or studios, folds like the name of an entry whose id is listed: the ids of one
+/// list match any of them, both lists must match, and an id that names no entry matches nothing.
+/// A genre id may be a genre's or a music genre's, since both name the same genre values.
+pub async fn item_ids_with(
+    pool: &SqlitePool,
+    genre_ids: &[Uuid],
+    studio_ids: &[Uuid],
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    let mut kept: Option<HashSet<String>> = None;
+    for (kind, ids) in [
+        (ByNameKind::Genre, genre_ids),
+        (ByNameKind::Studio, studio_ids),
+    ] {
+        if ids.is_empty() {
+            continue;
+        }
+        let kinds: &[ByNameKind] = match kind {
+            ByNameKind::Genre => &[ByNameKind::Genre, ByNameKind::MusicGenre],
+            _ => &[kind],
+        };
+        let ids: HashSet<Uuid> = ids.iter().copied().collect();
+        // Whether each folded name is listed, so that each name is hashed once.
+        let mut listed: HashMap<String, bool> = HashMap::new();
+        let mut items = HashSet::new();
+        for row in name_rows(pool, kind, None).await? {
+            let hit = *listed
+                .entry(fold_name(&row.name))
+                .or_insert_with_key(|folded| {
+                    kinds
+                        .iter()
+                        .any(|&kind| ids.contains(&folded_id(kind, folded)))
+                });
+            if hit {
+                items.insert(row.item);
+            }
+        }
+        kept = Some(match kept {
+            Some(kept) => kept.intersection(&items).cloned().collect(),
+            None => items,
+        });
+    }
+    Ok(kept.map(|items| items.into_iter().collect()))
 }
 
 /// The rows behind one entry: the number of rows with each spelling, among all its rows, and each

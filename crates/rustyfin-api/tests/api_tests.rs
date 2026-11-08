@@ -3600,6 +3600,117 @@ async fn j5_item_genre_and_studio_ids_are_the_ids_of_the_lists() {
     }
 }
 
+/// The names in an `/Items` answer, sorted, after checking that it is a 200 whose total counts them.
+async fn j5_item_names(server: &J5Server, uri: &str) -> Vec<String> {
+    let (status, body) = server.get(uri).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let mut names = j5_names(&body);
+    assert_eq!(body["TotalRecordCount"], names.len(), "{uri}: {body}");
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn j5_items_filter_by_genre_ids() {
+    let server = J5Server::new().await;
+    let (_, genres) = server.get("/Genres").await;
+    let drama = j5_id(&genres, "Drama");
+    let admin = server.admin;
+    let cases = [
+        // Bravo's " action " is Alpha's "Action"; Delta's "Action & Adventure" is another genre.
+        (
+            format!("/Items?GenreIds={J5_ACTION}&IncludeItemTypes=Movie&Recursive=true"),
+            vec!["Alpha", "Bravo"],
+        ),
+        (
+            format!("/Items?genreIds={J5_ACTION}&includeItemTypes=Movie&recursive=true"),
+            vec!["Alpha", "Bravo"],
+        ),
+        (
+            format!("/Users/{admin}/Items?GenreIds={J5_SCI_FI}&Recursive=true"),
+            vec!["Alpha"],
+        ),
+        // Several ids match any of them.
+        (
+            format!("/Items?GenreIds={J5_ACTION},{drama}&Recursive=true"),
+            vec!["Alpha", "Bravo", "Echo", "Echo 1"],
+        ),
+        (
+            format!("/Items?GenreIds={J5_ACTION},{drama}&IncludeItemTypes=Episode&Recursive=true"),
+            vec!["Echo 1"],
+        ),
+        // A music genre's id finds the album and the song.
+        (
+            format!("/Items?GenreIds={J5_MUSIC_ROCK}&Recursive=true"),
+            vec!["Blue", "One"],
+        ),
+    ];
+    for (uri, expected) in cases {
+        assert_eq!(j5_item_names(&server, &uri).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j5_items_filter_by_studio_ids() {
+    let server = J5Server::new().await;
+    let (_, studios) = server.get("/Studios").await;
+    let hbo = j5_id(&studios, "HBO");
+    let cases = [
+        (
+            format!("/Items?StudioIds={J5_PIXAR}&IncludeItemTypes=Movie&Recursive=true"),
+            vec!["Alpha", "Bravo"],
+        ),
+        (
+            format!("/Items?studioIds={hbo}&Recursive=true"),
+            vec!["Echo"],
+        ),
+        (
+            format!("/Items?StudioIds={J5_PIXAR},{hbo}&Recursive=true"),
+            vec!["Alpha", "Bravo", "Echo"],
+        ),
+        // Genre and studio ids must both match.
+        (
+            format!("/Items?GenreIds={J5_SCI_FI}&StudioIds={J5_PIXAR}&Recursive=true"),
+            vec!["Alpha"],
+        ),
+        (
+            format!("/Items?GenreIds={J5_SCI_FI}&StudioIds={hbo}&Recursive=true"),
+            vec![],
+        ),
+    ];
+    for (uri, expected) in cases {
+        assert_eq!(j5_item_names(&server, &uri).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j5_items_with_unknown_or_bad_ids_answer_as_jellyfin_does() {
+    let server = J5Server::new().await;
+    let unknown = uuid::Uuid::new_v4();
+    let movies = "IncludeItemTypes=Movie&Recursive=true";
+    let all = vec!["Alpha", "Bravo", "Charlie", "Delta"];
+    let cases = [
+        // An id that names nothing matches no item.
+        (format!("/Items?GenreIds={unknown}&{movies}"), vec![]),
+        (format!("/Items?StudioIds={unknown}&{movies}"), vec![]),
+        (
+            format!("/Items?GenreIds={unknown},{J5_ACTION}&{movies}"),
+            vec!["Alpha", "Bravo"],
+        ),
+        // Values that aren't UUIDs are dropped; with none left, nothing is filtered.
+        (format!("/Items?GenreIds=bogus&{movies}"), all.clone()),
+        (format!("/Items?GenreIds=&StudioIds=&{movies}"), all.clone()),
+        (format!("/Items?StudioIds=studio-pixar&{movies}"), all),
+        (
+            format!("/Items?StudioIds=bogus,{J5_PIXAR}&{movies}"),
+            vec!["Alpha", "Bravo"],
+        ),
+    ];
+    for (uri, expected) in cases {
+        assert_eq!(j5_item_names(&server, &uri).await, expected, "{uri}");
+    }
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]

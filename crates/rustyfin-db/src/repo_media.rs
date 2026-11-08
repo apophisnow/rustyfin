@@ -682,6 +682,7 @@ fn build_filtered_query(
         AND (? IS NULL OR ? = '' OR date_created >= ?)
         AND (? IS NULL OR runtime_ticks >= ?)
         AND (? IS NULL OR runtime_ticks <= ?)
+        AND (? IS NULL OR id IN (SELECT value FROM json_each(?)))
     ";
 
     // Combine base WHERE with array filter WHERE parts
@@ -754,6 +755,7 @@ pub async fn get_items_filtered(
     date_created: Option<&str>,
     runtime: Option<(i32, i32)>,
     user_id: Option<Uuid>,
+    item_ids: Option<&[String]>,
 ) -> Result<(Vec<MediaItem>, i64), sqlx::Error> {
     // Convert options to strings for the (? IS NULL OR ? = '' OR col = ?) pattern
     let pid_str = parent_id.map(|u| u.to_string()).unwrap_or_default();
@@ -777,6 +779,8 @@ pub async fn get_items_filtered(
             )
         })
         .unwrap_or((None, None));
+    // The ids an item must be one of, as a JSON array for json_each, or NULL for any item.
+    let item_ids_json = item_ids.map(|ids| serde_json::Value::from(ids.to_vec()).to_string());
 
     let sort_by_str = sort_by.unwrap_or("SortName");
     let sort_order_str = sort_order.unwrap_or("Ascending");
@@ -845,7 +849,9 @@ pub async fn get_items_filtered(
         .bind(&min_ticks)
         .bind(&min_ticks)
         .bind(&max_ticks)
-        .bind(&max_ticks);
+        .bind(&max_ticks)
+        .bind(&item_ids_json)
+        .bind(&item_ids_json);
 
     // Array filter params
     if let Some(types) = media_types {
@@ -959,7 +965,9 @@ pub async fn get_items_filtered(
         .bind(&min_ticks)
         .bind(&min_ticks)
         .bind(&max_ticks)
-        .bind(&max_ticks);
+        .bind(&max_ticks)
+        .bind(&item_ids_json)
+        .bind(&item_ids_json);
 
     // Array filter params (same order as count query)
     if let Some(types) = media_types {
