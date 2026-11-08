@@ -2616,3 +2616,25 @@ fn b20_damaged_line_is_clipped_and_escaped() {
         out.len()
     );
 }
+
+// L7 (round 4): open_regular opens with O_NONBLOCK, so a FIFO (or device) swapped in for a regular
+// file between the stat and the open can't block the open forever; the handle's regular-file check
+// still rejects it. A static non-regular file is already caught at the stat, so the guarantee is
+// the open flag itself. On 8758ca9 the open has no O_NONBLOCK.
+#[cfg(unix)]
+#[test]
+fn b20_regular_source_is_opened_nonblocking() {
+    use std::os::unix::io::AsRawFd;
+    let tmp = TempDir::new();
+    let db = tmp.0.join("library.db");
+    std::fs::write(&db, b"hello").unwrap();
+    let handle = super::source::open_regular(&db)
+        .unwrap()
+        .expect("a regular file opens");
+    let flags = unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL failed");
+    assert!(
+        flags & libc::O_NONBLOCK != 0,
+        "open_regular opens with O_NONBLOCK so a FIFO swapped in after the stat can't block the open"
+    );
+}

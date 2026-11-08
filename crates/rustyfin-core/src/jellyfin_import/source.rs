@@ -1466,14 +1466,22 @@ fn read_once(file: &Path, limit: u64) -> Result<Option<Vec<u8>>, ImportError> {
 /// is a BadSource that names it, found before anything is read from it, so that nothing blocks on
 /// it or reads from it. `std::fs::metadata` follows links, so a link to a regular file is fine. The
 /// open handle is checked as well.
-fn open_regular(path: &Path) -> Result<Option<File>, ImportError> {
+pub(super) fn open_regular(path: &Path) -> Result<Option<File>, ImportError> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => {}
         Ok(_) => return Err(not_regular(path)),
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unreadable_path(path, &e)),
     }
-    let handle = match File::open(path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK so a FIFO or device swapped in for the file after the stat above returns from the
+    // open at once instead of waiting for a writer forever; the handle check below still rejects
+    // it. A regular file ignores the flag, on the open and on later reads.
+    let handle = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(handle) => handle,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unreadable_path(path, &e)),
