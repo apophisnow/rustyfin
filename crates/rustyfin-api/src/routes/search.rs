@@ -2,12 +2,14 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
+use std::collections::{BTreeSet, HashMap};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 use uuid::Uuid;
 
-use rustyfin_db::repo_search::HintCandidate;
+use rustyfin_db::repo_search::{HintAncestor, HintCandidate};
 use rustyfin_model::auth::Claims;
+use rustyfin_model::image::{ImageType, ItemImage};
 use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
 use rustyfin_model::search::{SearchHint, SearchHintResult};
 
@@ -340,6 +342,177 @@ fn hints_answer(result: &SearchHintResult) -> Result<serde_json::Value, ApiError
         .map_err(|e| ApiError::Internal(format!("could not serialize the hints answer: {e}")))
 }
 
+/// The Jellyfin `Folder` subclasses. `IsFolder` is true for these kinds and absent for the rest.
+const FOLDER_KINDS: [&str; 16] = [
+    "AggregateFolder",
+    "BasePluginFolder",
+    "BoxSet",
+    "Channel",
+    "ChannelFolderItem",
+    "CollectionFolder",
+    "Folder",
+    "ManualPlaylistsFolder",
+    "MusicAlbum",
+    "PhotoAlbum",
+    "Playlist",
+    "PlaylistsFolder",
+    "Season",
+    "Series",
+    "UserRootFolder",
+    "UserView",
+];
+
+/// The image of `image_type` with the lowest index that `item` has.
+fn lowest_image(
+    images: &HashMap<String, Vec<ItemImage>>,
+    item: Uuid,
+    image_type: ImageType,
+) -> Option<&ItemImage> {
+    images
+        .get(&item.to_string())?
+        .iter()
+        .filter(|image| image.image_type == image_type)
+        .min_by_key(|image| image.image_index)
+}
+
+/// The item that a hint takes an image of `image_type` from, with that image: `item` itself when
+/// it has one, else its ancestors nearest first. With `series_first`, the nearest Series ancestor
+/// with one comes before the other ancestors, as Jellyfin's thumb of an episode does.
+fn image_owner<'a>(
+    images: &'a HashMap<String, Vec<ItemImage>>,
+    item: Uuid,
+    ancestors: &[HintAncestor],
+    image_type: ImageType,
+    series_first: bool,
+) -> Option<(Uuid, &'a ItemImage)> {
+    let owner = |id: Uuid| lowest_image(images, id, image_type).map(|image| (id, image));
+    if let Some(found) = owner(item) {
+        return Some(found);
+    }
+    if series_first {
+        let series = ancestors
+            .iter()
+            .filter(|ancestor| stored_kind(&ancestor.kind) == "Series")
+            .find_map(|ancestor| owner(ancestor.id));
+        if series.is_some() {
+            return series;
+        }
+    }
+    ancestors.iter().find_map(|ancestor| owner(ancestor.id))
+}
+
+/// The ancestor `level` steps up (0 is the parent), if it is a MusicAlbum.
+fn music_album(ancestors: &[HintAncestor], level: usize) -> Option<&HintAncestor> {
+    ancestors
+        .get(level)
+        .filter(|ancestor| stored_kind(&ancestor.kind) == "MusicAlbum")
+}
+
+/// The tag of an image: its type and its index, as Jellyfin's image tags are formed.
+fn image_tag(image: &ItemImage) -> String {
+    format!("{}_{}", image.image_type.as_str(), image.image_index)
+}
+
+/// The width over the height of an image, when both are known and above zero.
+fn aspect_ratio(image: &ItemImage) -> Option<f64> {
+    match (image.width, image.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some(f64::from(width) / f64::from(height))
+        }
+        _ => None,
+    }
+}
+
+/// One hint of a page, from its candidate, its ancestors nearest first, and the images of the page
+/// and of those ancestors. A field the item has no data for is left out of the JSON.
+fn page_hint(
+    candidate: HintCandidate,
+    ancestors: &[HintAncestor],
+    images: &HashMap<String, Vec<ItemImage>>,
+) -> SearchHint {
+    let id = candidate.id;
+    let kind = stored_kind(&candidate.kind);
+    let primary = lowest_image(images, id, ImageType::Primary);
+    let thumb = image_owner(images, id, ancestors, ImageType::Thumb, kind == "Episode");
+    let backdrop = image_owner(images, id, ancestors, ImageType::Backdrop, false);
+    let series = match kind {
+        "Episode" | "Season" => ancestors
+            .iter()
+            .find(|ancestor| stored_kind(&ancestor.kind) == "Series")
+            .map(|ancestor| ancestor.name.clone()),
+        _ => None,
+    };
+    let status = match kind {
+        "Series" => candidate.status.filter(|text| !text.is_empty()),
+        _ => None,
+    };
+    // A track names its album (the parent) and the album's artist (the grandparent, which scans
+    // store as a MusicAlbum). A MusicAlbum under a MusicAlbum names its parent as its artist.
+    let (album, artist) = match kind {
+        "Audio" => (music_album(ancestors, 0), music_album(ancestors, 1)),
+        "MusicAlbum" => (None, music_album(ancestors, 0)),
+        _ => (None, None),
+    };
+    SearchHint {
+        item_id: id,
+        id,
+        name: candidate.name,
+        index_number: candidate.index_number,
+        production_year: candidate.production_year,
+        parent_index_number: candidate.parent_index_number,
+        primary_image_tag: primary.map(image_tag),
+        primary_image_aspect_ratio: primary.and_then(aspect_ratio),
+        thumb_image_tag: thumb.map(|(_, image)| image_tag(image)),
+        thumb_image_item_id: thumb.map(|(owner, _)| owner.simple().to_string()),
+        backdrop_image_tag: backdrop.map(|(_, image)| image_tag(image)),
+        backdrop_image_item_id: backdrop.map(|(owner, _)| owner.simple().to_string()),
+        item_type: kind.to_string(),
+        is_folder: FOLDER_KINDS.contains(&kind).then_some(true),
+        run_time_ticks: candidate.runtime_ticks,
+        media_type: query::media_type_of(kind).to_string(),
+        end_date: candidate.end_date,
+        series,
+        status,
+        album: album.map(|album| album.name.clone()),
+        album_id: album.map(|album| album.id),
+        album_artist: artist.map(|artist| artist.name.clone()),
+        artists: artist
+            .map(|artist| vec![artist.name.clone()])
+            .unwrap_or_default(),
+    }
+}
+
+/// The hints of one page. The page's ancestors are read in one query, then the images of its items
+/// and of their ancestors, in chunks of 500 ids. An empty page reads nothing.
+async fn page_hints(
+    state: &AppState,
+    page: Vec<HintCandidate>,
+) -> Result<Vec<SearchHint>, ApiError> {
+    if page.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = &state.db_ro;
+    let ids: Vec<Uuid> = page.iter().map(|candidate| candidate.id).collect();
+    let ancestors = rustyfin_db::repo_search::hint_ancestors(pool, &ids).await?;
+    let image_ids: BTreeSet<Uuid> = ids
+        .iter()
+        .copied()
+        .chain(ancestors.values().flatten().map(|ancestor| ancestor.id))
+        .collect();
+    let image_ids: Vec<Uuid> = image_ids.into_iter().collect();
+    let mut images: HashMap<String, Vec<ItemImage>> = HashMap::new();
+    for chunk in image_ids.chunks(500) {
+        images.extend(rustyfin_db::repo_image::get_images_batch(pool, chunk).await?);
+    }
+    Ok(page
+        .into_iter()
+        .map(|candidate| {
+            let item_ancestors = ancestors.get(&candidate.id).map_or(&[][..], Vec::as_slice);
+            page_hint(candidate, item_ancestors, &images)
+        })
+        .collect())
+}
+
 /// Answers `/Search/Hints`: the user check, the cache, then the search. The answer is serialized
 /// once, and the reply, the cache and L2 all hold that value.
 async fn search_hints(
@@ -396,24 +569,13 @@ async fn search_hints(
         score_b.cmp(score_a).then_with(|| a.id.cmp(&b.id))
     });
     let total_record_count = hits.len() as i64;
-    let search_hints: Vec<SearchHint> = hits
+    let page: Vec<HintCandidate> = hits
         .into_iter()
         .skip(request.start_index)
         .take(request.limit)
-        .map(|(_, candidate)| {
-            let kind = stored_kind(&candidate.kind);
-            SearchHint {
-                item_id: candidate.id,
-                id: candidate.id,
-                name: candidate.name,
-                production_year: candidate.production_year,
-                item_type: kind.to_string(),
-                media_type: query::media_type_of(kind).to_string(),
-                run_time_ticks: candidate.runtime_ticks,
-                ..Default::default()
-            }
-        })
+        .map(|(_, candidate)| candidate)
         .collect();
+    let search_hints = page_hints(&state, page).await?;
 
     let value = hints_answer(&SearchHintResult {
         search_hints,

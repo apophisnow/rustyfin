@@ -2334,11 +2334,14 @@ async fn j6_add_item(
     id
 }
 
-/// Sets an item's `tags` (pipe-joined, as scans store them) or `overview`.
+/// Sets an item's `tags` (pipe-joined, as scans store them), `overview`, `status` or `end_date`
+/// (RFC 3339, as scans store it).
 async fn j6_set_text(state: &AppState, id: uuid::Uuid, column: &str, value: &str) {
     let sql = match column {
         "tags" => "UPDATE media_items SET tags = ? WHERE id = ?",
         "overview" => "UPDATE media_items SET overview = ? WHERE id = ?",
+        "status" => "UPDATE media_items SET status = ? WHERE id = ?",
+        "end_date" => "UPDATE media_items SET end_date = ? WHERE id = ?",
         _ => panic!("j6_set_text cannot set {column}"),
     };
     sqlx::query(sql)
@@ -2428,6 +2431,204 @@ async fn j6_hints(app: &axum::Router, uri: &str, token: &str) -> (Vec<String>, i
 /// Owned copies of `names`.
 fn j6_names(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| name.to_string()).collect()
+}
+
+/// Sets an item's `index_number` or `parent_index_number`.
+async fn j6_set_int(state: &AppState, id: uuid::Uuid, column: &str, value: i64) {
+    let sql = match column {
+        "index_number" => "UPDATE media_items SET index_number = ? WHERE id = ?",
+        "parent_index_number" => "UPDATE media_items SET parent_index_number = ? WHERE id = ?",
+        _ => panic!("j6_set_int cannot set {column}"),
+    };
+    sqlx::query(sql)
+        .bind(value)
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Stores an image of `item_id` as a scan does, with its width and height when `size` is given.
+async fn j6_add_image(
+    state: &AppState,
+    item_id: uuid::Uuid,
+    image_type: rustyfin_model::image::ImageType,
+    image_index: i32,
+    size: Option<(i32, i32)>,
+) {
+    let path = state.data_dir.join("j6-images").join(format!(
+        "{item_id}-{}-{image_index}.jpg",
+        image_type.as_str()
+    ));
+    let image = rustyfin_model::image::ItemImage {
+        item_id,
+        image_type,
+        image_index,
+        path: path.to_string_lossy().to_string(),
+        provider: "local".to_string(),
+        width: size.map(|(width, _)| width),
+        height: size.map(|(_, height)| height),
+        blurhash: None,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &image)
+        .await
+        .unwrap();
+}
+
+/// The hint for `id` in a `/Search/Hints` answer. Panics if there is none.
+fn j6_hint(body: &serde_json::Value, id: uuid::Uuid) -> &serde_json::Value {
+    body["SearchHints"]
+        .as_array()
+        .and_then(|hints| {
+            hints
+                .iter()
+                .find(|hint| hint["Id"] == serde_json::json!(id))
+        })
+        .unwrap_or_else(|| panic!("no hint for {id} in {body}"))
+}
+
+/// Asserts that `hint` has none of `fields`.
+fn j6_assert_absent(hint: &serde_json::Value, fields: &[&str]) {
+    for field in fields {
+        assert!(hint.get(field).is_none(), "{field} in {hint}");
+    }
+}
+
+/// The `BaseItemKind` names of the Kotlin SDK. A hint's Type must be one of them.
+const J6_SDK_KINDS: [&str; 37] = [
+    "AggregateFolder",
+    "Audio",
+    "AudioBook",
+    "BasePluginFolder",
+    "Book",
+    "BoxSet",
+    "Channel",
+    "ChannelFolderItem",
+    "CollectionFolder",
+    "Episode",
+    "Folder",
+    "Genre",
+    "ManualPlaylistsFolder",
+    "Movie",
+    "LiveTvChannel",
+    "LiveTvProgram",
+    "MusicAlbum",
+    "MusicArtist",
+    "MusicGenre",
+    "MusicVideo",
+    "Person",
+    "Photo",
+    "PhotoAlbum",
+    "Playlist",
+    "PlaylistsFolder",
+    "Program",
+    "Recording",
+    "Season",
+    "Series",
+    "Studio",
+    "Trailer",
+    "TvChannel",
+    "TvProgram",
+    "UserRootFolder",
+    "UserView",
+    "Video",
+    "Year",
+];
+
+/// The fields of the Kotlin SDK's `SearchHint`, by their JSON names.
+const J6_SDK_HINT_FIELDS: [&str; 29] = [
+    "ItemId",
+    "Id",
+    "Name",
+    "MatchedTerm",
+    "IndexNumber",
+    "ProductionYear",
+    "ParentIndexNumber",
+    "PrimaryImageTag",
+    "ThumbImageTag",
+    "ThumbImageItemId",
+    "BackdropImageTag",
+    "BackdropImageItemId",
+    "Type",
+    "IsFolder",
+    "RunTimeTicks",
+    "MediaType",
+    "StartDate",
+    "EndDate",
+    "Series",
+    "Status",
+    "Album",
+    "AlbumId",
+    "AlbumArtist",
+    "Artists",
+    "SongCount",
+    "EpisodeCount",
+    "ChannelId",
+    "ChannelName",
+    "PrimaryImageAspectRatio",
+];
+
+/// Asserts that the Kotlin SDK reads `hint` as a `SearchHint`. The SDK's JSON is not lenient:
+/// ItemId, Id, Name, Type and Artists are required, the ids are UUIDs (hyphenated, or 32 lowercase
+/// hex digits), Type is a `BaseItemKind`, and every other field has its type when present. On top
+/// of that, the hint has no nulls and no field the SDK would drop, MediaType is one of Jellyfin's
+/// media types, and the image item ids have Jellyfin's 32-digit form.
+fn j6_assert_sdk_hint(hint: &serde_json::Value) {
+    let fields = hint
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {hint}"));
+    let is_simple = |text: &str| {
+        text.len() == 32
+            && text
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    };
+    let is_uuid = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|text| {
+            is_simple(text) || (text.len() == 36 && uuid::Uuid::parse_str(text).is_ok())
+        })
+    };
+    let is_i32 = |value: &serde_json::Value| {
+        value
+            .as_i64()
+            .is_some_and(|number| i32::try_from(number).is_ok())
+    };
+    for (field, value) in fields {
+        assert!(
+            J6_SDK_HINT_FIELDS.contains(&field.as_str()),
+            "{field} is no SearchHint field: {hint}"
+        );
+        assert!(!value.is_null(), "{field} is null: {hint}");
+        let fits = match field.as_str() {
+            "ItemId" | "Id" | "AlbumId" | "ChannelId" => is_uuid(value),
+            "Name" | "MatchedTerm" | "PrimaryImageTag" | "ThumbImageTag" | "BackdropImageTag"
+            | "Series" | "Status" | "Album" | "AlbumArtist" | "ChannelName" => value.is_string(),
+            "ThumbImageItemId" | "BackdropImageItemId" => value.as_str().is_some_and(is_simple),
+            "Type" => value
+                .as_str()
+                .is_some_and(|kind| J6_SDK_KINDS.contains(&kind)),
+            "MediaType" => value.as_str().is_some_and(|media_type| {
+                ["Unknown", "Video", "Audio", "Photo", "Book"].contains(&media_type)
+            }),
+            "IndexNumber" | "ProductionYear" | "ParentIndexNumber" | "SongCount"
+            | "EpisodeCount" => is_i32(value),
+            "RunTimeTicks" => value.is_i64(),
+            "IsFolder" => value.is_boolean(),
+            "StartDate" | "EndDate" => value
+                .as_str()
+                .is_some_and(|date| chrono::DateTime::parse_from_rfc3339(date).is_ok()),
+            "Artists" => value
+                .as_array()
+                .is_some_and(|artists| artists.iter().all(serde_json::Value::is_string)),
+            "PrimaryImageAspectRatio" => value.is_number(),
+            _ => false,
+        };
+        assert!(fits, "{field} has the wrong type: {hint}");
+    }
+    for required in ["ItemId", "Id", "Name", "Type", "Artists"] {
+        assert!(fields.contains_key(required), "no {required}: {hint}");
+    }
+    assert_eq!(hint["ItemId"], hint["Id"], "{hint}");
 }
 
 #[tokio::test]
@@ -3134,6 +3335,317 @@ async fn j6_hints_carry_item_id_and_jellyfin_media_types() {
     let track = hint(lib.track);
     assert_eq!(track["Type"], "Audio");
     assert_eq!(track["MediaType"], "Audio");
+}
+
+#[tokio::test]
+async fn j6_hint_fields_for_series() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_set_int(&state, lib.season, "index_number", 1).await;
+    j6_set_int(&state, lib.episode, "index_number", 3).await;
+    j6_set_int(&state, lib.episode, "parent_index_number", 1).await;
+    for id in [lib.series, lib.season, lib.episode] {
+        j6_set_text(&state, id, "status", "Ended").await;
+    }
+    j6_set_text(&state, lib.series, "end_date", "2024-05-01T00:00:00+00:00").await;
+    // An end date that does not parse is left out, not an error.
+    j6_set_text(&state, lib.season, "end_date", "someday").await;
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // Jellyfin fills Status for series only, and EndDate for any item that has one.
+    let series = j6_hint(&body, lib.series);
+    assert_eq!(series["IsFolder"], true, "{series}");
+    assert_eq!(series["Status"], "Ended", "{series}");
+    let end_date = series["EndDate"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no EndDate in {series}"));
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(end_date).unwrap(),
+        chrono::DateTime::parse_from_rfc3339("2024-05-01T00:00:00Z").unwrap(),
+        "{series}"
+    );
+    j6_assert_absent(series, &["Series", "IndexNumber", "ParentIndexNumber"]);
+    // Seasons and episodes name their series.
+    let season = j6_hint(&body, lib.season);
+    assert_eq!(season["IsFolder"], true, "{season}");
+    assert_eq!(season["IndexNumber"], 1, "{season}");
+    assert_eq!(season["Series"], "Comet Hunters", "{season}");
+    j6_assert_absent(season, &["Status", "EndDate", "ParentIndexNumber"]);
+    let episode = j6_hint(&body, lib.episode);
+    assert_eq!(episode["IndexNumber"], 3, "{episode}");
+    assert_eq!(episode["ParentIndexNumber"], 1, "{episode}");
+    assert_eq!(episode["Series"], "Comet Hunters", "{episode}");
+    j6_assert_absent(episode, &["IsFolder", "Status", "EndDate"]);
+    // A movie has none of them, and no artists.
+    let movie = j6_hint(&body, lib.movie);
+    j6_assert_absent(
+        movie,
+        &[
+            "IsFolder",
+            "IndexNumber",
+            "ParentIndexNumber",
+            "Series",
+            "Status",
+            "EndDate",
+            "Album",
+            "AlbumId",
+            "AlbumArtist",
+        ],
+    );
+    assert_eq!(movie["Artists"], serde_json::json!([]), "{movie}");
+}
+
+#[tokio::test]
+async fn j6_hint_fields_for_music() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    // An album without an artist: scans store it without a parent, like an artist.
+    let loose_album = j6_add_item(&state, lib.library, None, "Comet Loose", "MusicAlbum").await;
+    let loose_track = j6_add_item(
+        &state,
+        lib.library,
+        Some(loose_album),
+        "Comet Loose Track",
+        "Audio",
+    )
+    .await;
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // A track names its album and the album's artist.
+    let track = j6_hint(&body, lib.track);
+    assert_eq!(track["Album"], "Comet Songs", "{track}");
+    assert_eq!(track["AlbumId"], serde_json::json!(lib.album), "{track}");
+    assert_eq!(track["AlbumArtist"], "Comet Band", "{track}");
+    assert_eq!(
+        track["Artists"],
+        serde_json::json!(["Comet Band"]),
+        "{track}"
+    );
+    j6_assert_absent(track, &["IsFolder", "Series"]);
+    // An album names its artist.
+    let album = j6_hint(&body, lib.album);
+    assert_eq!(album["IsFolder"], true, "{album}");
+    assert_eq!(album["AlbumArtist"], "Comet Band", "{album}");
+    assert_eq!(
+        album["Artists"],
+        serde_json::json!(["Comet Band"]),
+        "{album}"
+    );
+    j6_assert_absent(album, &["Album", "AlbumId"]);
+    // An artist names nobody.
+    let artist = j6_hint(&body, lib.artist);
+    assert_eq!(artist["IsFolder"], true, "{artist}");
+    assert_eq!(artist["Artists"], serde_json::json!([]), "{artist}");
+    j6_assert_absent(artist, &["Album", "AlbumId", "AlbumArtist"]);
+    // A track of an album without an artist names the album only.
+    let loose = j6_hint(&body, loose_track);
+    assert_eq!(loose["Album"], "Comet Loose", "{loose}");
+    assert_eq!(loose["AlbumId"], serde_json::json!(loose_album), "{loose}");
+    assert_eq!(loose["Artists"], serde_json::json!([]), "{loose}");
+    j6_assert_absent(loose, &["AlbumArtist"]);
+}
+
+#[tokio::test]
+async fn j6_hint_images_follow_jellyfin() {
+    use rustyfin_model::image::ImageType::{Backdrop, Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let watch = j6_add_item(&state, lib.library, None, "Comet Watch", "Series").await;
+    let watch_season = j6_add_item(
+        &state,
+        lib.library,
+        Some(watch),
+        "Comet Watch Season 1",
+        "Season",
+    )
+    .await;
+    let watch_episode = j6_add_item(
+        &state,
+        lib.library,
+        Some(watch_season),
+        "Comet Watch S01E01",
+        "Episode",
+    )
+    .await;
+    j6_add_image(&state, lib.movie, Primary, 0, Some((1000, 1500))).await;
+    j6_add_image(&state, lib.movie, Thumb, 0, None).await;
+    j6_add_image(&state, lib.movie, Backdrop, 2, None).await;
+    j6_add_image(&state, lib.movie, Backdrop, 1, None).await;
+    j6_add_image(&state, lib.series, Thumb, 0, None).await;
+    j6_add_image(&state, lib.series, Backdrop, 0, None).await;
+    j6_add_image(&state, lib.season, Thumb, 0, None).await;
+    j6_add_image(&state, lib.episode, Primary, 0, None).await;
+    j6_add_image(&state, watch_season, Primary, 0, Some((0, 100))).await;
+    j6_add_image(&state, watch_season, Thumb, 0, None).await;
+    j6_add_image(&state, watch_season, Backdrop, 0, None).await;
+    j6_add_image(&state, lib.album, Primary, 0, None).await;
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // An item's own images, the lowest index of each type; the aspect ratio of the primary image
+    // when its size is known.
+    let movie = j6_hint(&body, lib.movie);
+    assert_eq!(movie["PrimaryImageTag"], "Primary_0", "{movie}");
+    let ratio = movie["PrimaryImageAspectRatio"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no PrimaryImageAspectRatio in {movie}"));
+    assert!((ratio - 1000.0 / 1500.0).abs() < 1e-9, "{movie}");
+    assert_eq!(movie["ThumbImageTag"], "Thumb_0", "{movie}");
+    assert_eq!(movie["ThumbImageItemId"], lib.movie.simple().to_string());
+    assert_eq!(movie["BackdropImageTag"], "Backdrop_1", "{movie}");
+    assert_eq!(movie["BackdropImageItemId"], lib.movie.simple().to_string());
+    // An episode without a thumb takes its series' thumb before its season's, and the backdrop of
+    // the nearest parent that has one.
+    let episode = j6_hint(&body, lib.episode);
+    assert_eq!(episode["PrimaryImageTag"], "Primary_0", "{episode}");
+    j6_assert_absent(episode, &["PrimaryImageAspectRatio"]);
+    assert_eq!(episode["ThumbImageTag"], "Thumb_0", "{episode}");
+    assert_eq!(episode["ThumbImageItemId"], lib.series.simple().to_string());
+    assert_eq!(episode["BackdropImageTag"], "Backdrop_0", "{episode}");
+    assert_eq!(
+        episode["BackdropImageItemId"],
+        lib.series.simple().to_string()
+    );
+    let season = j6_hint(&body, lib.season);
+    assert_eq!(season["ThumbImageItemId"], lib.season.simple().to_string());
+    assert_eq!(
+        season["BackdropImageItemId"],
+        lib.series.simple().to_string()
+    );
+    j6_assert_absent(season, &["PrimaryImageTag", "PrimaryImageAspectRatio"]);
+    let series = j6_hint(&body, lib.series);
+    assert_eq!(series["ThumbImageItemId"], lib.series.simple().to_string());
+    assert_eq!(
+        series["BackdropImageItemId"],
+        lib.series.simple().to_string()
+    );
+    j6_assert_absent(series, &["PrimaryImageTag", "PrimaryImageAspectRatio"]);
+    // A size of zero gives a tag but no aspect ratio. Without a series thumb, an episode takes
+    // the thumb of its nearest parent that has one.
+    let watch_season_hint = j6_hint(&body, watch_season);
+    assert_eq!(watch_season_hint["PrimaryImageTag"], "Primary_0");
+    j6_assert_absent(watch_season_hint, &["PrimaryImageAspectRatio"]);
+    let watch_episode_hint = j6_hint(&body, watch_episode);
+    assert_eq!(
+        watch_episode_hint["ThumbImageItemId"],
+        watch_season.simple().to_string()
+    );
+    assert_eq!(
+        watch_episode_hint["BackdropImageItemId"],
+        watch_season.simple().to_string()
+    );
+    j6_assert_absent(watch_episode_hint, &["PrimaryImageTag"]);
+    j6_assert_absent(
+        j6_hint(&body, watch),
+        &["PrimaryImageTag", "ThumbImageTag", "BackdropImageTag"],
+    );
+    // A track does not take its album's primary image.
+    let album = j6_hint(&body, lib.album);
+    assert_eq!(album["PrimaryImageTag"], "Primary_0", "{album}");
+    j6_assert_absent(
+        j6_hint(&body, lib.track),
+        &[
+            "PrimaryImageTag",
+            "ThumbImageTag",
+            "ThumbImageItemId",
+            "BackdropImageTag",
+            "BackdropImageItemId",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn j6_hint_fields_parse_as_the_kotlin_sdk_reads_them() {
+    use rustyfin_model::image::ImageType::{Backdrop, Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    sqlx::query("UPDATE media_items SET production_year = ?, runtime_ticks = ? WHERE id = ?")
+        .bind(2024)
+        .bind(72_000_000_000i64)
+        .bind(lib.movie.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    j6_set_int(&state, lib.season, "index_number", 1).await;
+    j6_set_int(&state, lib.episode, "index_number", 3).await;
+    j6_set_int(&state, lib.episode, "parent_index_number", 1).await;
+    j6_set_text(&state, lib.series, "status", "Continuing").await;
+    j6_set_text(&state, lib.series, "end_date", "2024-05-01T00:00:00+00:00").await;
+    j6_add_image(&state, lib.movie, Primary, 0, Some((1000, 1500))).await;
+    j6_add_image(&state, lib.series, Thumb, 0, None).await;
+    j6_add_image(&state, lib.series, Backdrop, 0, None).await;
+    // Two items whose parents point at each other, as a broken scan could leave them.
+    let loop_season = j6_add_item(&state, lib.library, None, "Comet Loop", "Season").await;
+    let loop_episode = j6_add_item(
+        &state,
+        lib.library,
+        Some(loop_season),
+        "Comet Loop Episode",
+        "Episode",
+    )
+    .await;
+    sqlx::query("UPDATE media_items SET parent_id = ? WHERE id = ?")
+        .bind(loop_episode.to_string())
+        .bind(loop_season.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+
+    // The search the web client sends, and the one the Kotlin SDK's getSearchHints sends.
+    let mut seen = std::collections::BTreeSet::new();
+    for uri in [
+        "/Search/Hints?searchTerm=comet",
+        "/Search/Hints?searchTerm=comet&includePeople=true&includeMedia=true\
+         &includeGenres=true&includeStudios=true&includeArtists=true",
+    ] {
+        let body = b27_answer(&app, uri, &lib.token).await;
+        let hints = body["SearchHints"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: no SearchHints in {body}"));
+        assert_eq!(hints.len(), 9, "{uri}: {body}");
+        let total = body["TotalRecordCount"].as_i64();
+        assert!(
+            total.is_some_and(|total| i32::try_from(total).is_ok()),
+            "{body}"
+        );
+        for hint in hints {
+            j6_assert_sdk_hint(hint);
+            seen.extend(hint.as_object().unwrap().keys().cloned());
+        }
+    }
+    // Every field Rustyfin has data for appeared, so its type was checked.
+    for field in [
+        "ItemId",
+        "Id",
+        "Name",
+        "IndexNumber",
+        "ProductionYear",
+        "ParentIndexNumber",
+        "PrimaryImageTag",
+        "ThumbImageTag",
+        "ThumbImageItemId",
+        "BackdropImageTag",
+        "BackdropImageItemId",
+        "Type",
+        "IsFolder",
+        "RunTimeTicks",
+        "MediaType",
+        "EndDate",
+        "Series",
+        "Status",
+        "Album",
+        "AlbumId",
+        "AlbumArtist",
+        "Artists",
+        "PrimaryImageAspectRatio",
+    ] {
+        assert!(seen.contains(field), "no hint had {field}");
+    }
 }
 
 // ── System Endpoint Tests ──

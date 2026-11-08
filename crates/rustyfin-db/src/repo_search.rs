@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use rustyfin_model::media::{MediaItem, MediaType};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Normalize a search query for FTS5: escape special characters and add prefix wildcard
@@ -25,13 +27,22 @@ pub struct HintCandidate {
     pub tags: Vec<String>,
     pub production_year: Option<i32>,
     pub runtime_ticks: Option<i64>,
+    /// The `index_number`: an episode's or a season's number.
+    pub index_number: Option<i32>,
+    /// The `parent_index_number`: an episode's season number.
+    pub parent_index_number: Option<i32>,
+    /// The `end_date` when it parses as RFC 3339. A value that does not parse is `None`.
+    pub end_date: Option<DateTime<Utc>>,
+    /// The `status` as stored.
+    pub status: Option<String>,
 }
 
 /// Hint candidates by FTS5. `?1` is the FTS query and `?2` the parent id, or NULL for every
 /// library. A parent holds the items of that library and the descendants of that item, not the
 /// item itself. `UNION` (not `UNION ALL`) ends a walk that runs into a cycle of parents.
 const HINT_FTS_SQL: &str =
-    "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags
+    "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags,
+            m.index_number, m.parent_index_number, m.end_date, m.status
      FROM media_items m
      JOIN media_items_fts f ON f.rowid = m.rowid
      WHERE media_items_fts MATCH ?1
@@ -45,7 +56,8 @@ const HINT_FTS_SQL: &str =
 
 /// The LIKE fallback of `HINT_FTS_SQL`. `?1` is the `query%` prefix pattern.
 const HINT_LIKE_SQL: &str =
-    "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags
+    "SELECT m.id, m.name, m.media_type, m.production_year, m.runtime_ticks, m.tags,
+            m.index_number, m.parent_index_number, m.end_date, m.status
      FROM media_items m
      WHERE m.name LIKE ?1
        AND (?2 IS NULL OR m.library_id = ?2 OR (m.id <> ?2 AND m.id IN (
@@ -62,6 +74,10 @@ type HintRow = (
     String,
     Option<i32>,
     Option<i64>,
+    Option<String>,
+    Option<i32>,
+    Option<i32>,
+    Option<String>,
     Option<String>,
 );
 
@@ -96,17 +112,89 @@ pub async fn hint_candidates(
 
     Ok(rows
         .into_iter()
-        .filter_map(|(id, name, kind, production_year, runtime_ticks, tags)| {
-            Some(HintCandidate {
-                id: Uuid::parse_str(&id).ok()?,
+        .filter_map(
+            |(
+                id,
                 name,
                 kind,
-                tags: split_tags(tags.as_deref()),
                 production_year,
                 runtime_ticks,
-            })
-        })
+                tags,
+                index_number,
+                parent_index_number,
+                end_date,
+                status,
+            )| {
+                Some(HintCandidate {
+                    id: Uuid::parse_str(&id).ok()?,
+                    name,
+                    kind,
+                    tags: split_tags(tags.as_deref()),
+                    production_year,
+                    runtime_ticks,
+                    index_number,
+                    parent_index_number,
+                    end_date: end_date.and_then(|text| text.parse::<DateTime<Utc>>().ok()),
+                    status,
+                })
+            },
+        )
         .collect())
+}
+
+/// One ancestor of a library item, with its `media_type` as stored.
+pub struct HintAncestor {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+}
+
+/// The ancestors of the items whose ids are the JSON array `?1`. Each row is an item, the depth of
+/// one of its ancestors (the parent is 1) and that ancestor. The walk stops at depth 32, which ends
+/// a cycle of parents.
+const HINT_ANCESTORS_SQL: &str = "WITH RECURSIVE up(item_id, depth, id) AS (
+        SELECT m.id, 1, m.parent_id
+        FROM json_each(?1) j JOIN media_items m ON m.id = j.value
+        WHERE m.parent_id IS NOT NULL
+        UNION ALL
+        SELECT up.item_id, up.depth + 1, p.parent_id
+        FROM up JOIN media_items p ON p.id = up.id
+        WHERE p.parent_id IS NOT NULL AND up.depth < 32
+    )
+    SELECT up.item_id, up.depth, a.id, a.name, a.media_type
+    FROM up JOIN media_items a ON a.id = up.id
+    ORDER BY up.item_id, up.depth";
+
+type HintAncestorRow = (String, i64, String, String, String);
+
+/// The ancestors of each of `item_ids`, nearest first. An item without a parent has no entry, and
+/// a repeated id is read once. The ids go to SQLite at most 500 per query.
+pub async fn hint_ancestors(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<HintAncestor>>, sqlx::Error> {
+    let mut ids = item_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut ancestors: HashMap<Uuid, Vec<HintAncestor>> = HashMap::new();
+    for chunk in ids.chunks(500) {
+        let texts: Vec<String> = chunk.iter().map(Uuid::to_string).collect();
+        let json = serde_json::to_string(&texts).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let rows = sqlx::query_as::<_, HintAncestorRow>(HINT_ANCESTORS_SQL)
+            .bind(json)
+            .fetch_all(pool)
+            .await?;
+        for (item_id, _depth, id, name, kind) in rows {
+            let (Ok(item_id), Ok(id)) = (Uuid::parse_str(&item_id), Uuid::parse_str(&id)) else {
+                continue;
+            };
+            ancestors
+                .entry(item_id)
+                .or_default()
+                .push(HintAncestor { id, name, kind });
+        }
+    }
+    Ok(ancestors)
 }
 
 /// The entries of a `tags` value: split on `|`, trimmed, with the empty ones dropped.
