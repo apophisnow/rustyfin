@@ -5357,3 +5357,760 @@ async fn b18_tv_rescans_keep_loose_episodes_of_two_shows_apart() {
         );
     }
 }
+
+// B26: re-read old streams. Each source records the version of the probe code that wrote it. A
+// scan reads again, once, every file whose source an older probe wrote, the way it reads a changed
+// file: videos through their version groups, music tracks and Mixed-library audio on their own.
+
+/// Copies a clip to `<root>/<rel>` whose audio and subtitle streams have a language and a title.
+/// ffmpeg writes it under `<temp dir>/clips` on first use.
+fn b26_clip(fx: &Fixture, root: &Path, rel: &str) -> PathBuf {
+    let template = fx.path("clips/b26-tagged.mkv");
+    if !template.exists() {
+        let srt = fx.path("clips/b26.srt");
+        std::fs::create_dir_all(srt.parent().unwrap()).unwrap();
+        std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,500\nHello\n").unwrap();
+        let status = Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=64x48:rate=5:duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=880:duration=2"])
+            .arg("-i")
+            .arg(&srt)
+            .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s"])
+            .args(["-c:v", "mpeg4", "-c:a", "aac", "-c:s", "srt"])
+            .args([
+                "-metadata:s:a:0",
+                "language=eng",
+                "-metadata:s:a:0",
+                "title=Main",
+            ])
+            .args(["-metadata:s:a:1", "language=spa"])
+            .args(["-metadata:s:a:1", "title=Commentary"])
+            .args([
+                "-metadata:s:s:0",
+                "language=ita",
+                "-metadata:s:s:0",
+                "title=Signs",
+            ])
+            .arg(&template)
+            .status()
+            .expect("run ffmpeg");
+        assert!(
+            status.success(),
+            "ffmpeg could not write {}",
+            template.display()
+        );
+    }
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::copy(&template, &path).unwrap();
+    path
+}
+
+/// Writes a one second Ogg FLAC tone to `<root>/<rel>`, with its parent folders. Its stream has
+/// the title "Song" and the language "ita".
+fn b26_track(root: &Path, rel: &str) -> PathBuf {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "flac"])
+        .args([
+            "-metadata:s:a:0",
+            "title=Song",
+            "-metadata:s:a:0",
+            "language=ita",
+        ])
+        .arg(&path)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg could not write {}",
+        path.display()
+    );
+    path
+}
+
+/// A stream as (index, codec type, language, title).
+type B26Stream = (i64, String, Option<String>, Option<String>);
+
+/// The audio and subtitle streams of the source at `<root>/<rel>`, by index.
+async fn b26_streams(pool: &SqlitePool, lib: &Library, rel: &str) -> Vec<B26Stream> {
+    let path = root_of(lib).join(rel);
+    sqlx::query_as(
+        "SELECT st.stream_index, st.codec_type, st.language, st.title
+         FROM media_streams AS st JOIN media_sources AS s ON s.id = st.source_id
+         WHERE s.path = ?1 AND st.codec_type IN ('audio', 'subtitle')
+         ORDER BY st.stream_index",
+    )
+    .bind(path.to_str().unwrap())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| panic!("the streams of {rel}: {e}"))
+}
+
+/// The streams of `labels`, as (index, codec type, language, title), with or without their labels.
+fn b26_labels(labels: &[(i64, &str, &str, &str)], labelled: bool) -> Vec<B26Stream> {
+    let label = |text: &str| labelled.then(|| text.to_string());
+    labels
+        .iter()
+        .map(|&(index, kind, language, title)| {
+            (index, kind.to_string(), label(language), label(title))
+        })
+        .collect()
+}
+
+/// The audio and subtitle streams of `b26_clip`, with or without their labels.
+fn b26_clip_streams(labelled: bool) -> Vec<B26Stream> {
+    b26_labels(
+        &[
+            (1, "audio", "eng", "Main"),
+            (2, "audio", "spa", "Commentary"),
+            (3, "subtitle", "ita", "Signs"),
+        ],
+        labelled,
+    )
+}
+
+/// The stream of `b26_track`, with or without its labels.
+fn b26_track_streams(labelled: bool) -> Vec<B26Stream> {
+    b26_labels(&[(0, "audio", "ita", "Song")], labelled)
+}
+
+/// Makes the sources of `rels`, relative to the library's root, look as the probe before 06fda0d
+/// left them: written by probe version 0, with no stream language or title.
+async fn b26_make_old(pool: &SqlitePool, lib: &Library, rels: &[&str]) {
+    let root = root_of(lib);
+    for rel in rels {
+        let path = root.join(rel);
+        let path = path.to_str().unwrap();
+        exec(
+            pool,
+            "UPDATE media_sources SET probe_version = 0 WHERE path = ?1",
+            &[path],
+        )
+        .await;
+        exec(
+            pool,
+            "UPDATE media_streams SET language = NULL, title = NULL
+             WHERE source_id IN (SELECT id FROM media_sources WHERE path = ?1)",
+            &[path],
+        )
+        .await;
+    }
+}
+
+/// The probe version of every source of the library, as (path relative to its root, version),
+/// sorted.
+async fn b26_versions(pool: &SqlitePool, lib: &Library) -> Vec<(String, i64)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT s.path, s.probe_version FROM media_sources AS s
+         JOIN media_items AS i ON i.id = s.item_id
+         WHERE i.library_id = ?1",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| panic!("the probe versions of the sources: {e}"));
+    let mut out: Vec<(String, i64)> = rows
+        .into_iter()
+        .map(|(path, version)| (rel(&root, &path), version))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `b26_versions` after the first scan of `files`: one source each, written by a current probe.
+async fn b26_fresh_versions(
+    pool: &SqlitePool,
+    lib: &Library,
+    files: &[&str],
+) -> Vec<(String, i64)> {
+    let fresh = b26_versions(pool, lib).await;
+    let mut paths: Vec<&str> = fresh.iter().map(|(path, _)| path.as_str()).collect();
+    let mut want = files.to_vec();
+    paths.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(paths, want, "the first scan did not probe each file once");
+    assert!(
+        fresh.iter().all(|(_, version)| *version > 0),
+        "a new probe stored version 0: {fresh:?}"
+    );
+    fresh
+}
+
+/// The ids of the item's sources, sorted.
+async fn b26_item_sources(pool: &SqlitePool, item: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?1 ORDER BY id")
+        .bind(item.to_string())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// B26 criteria 3 and 4, without ffprobe, as on CI's runner: a scan counts a movie whose source an
+/// older probe wrote as read again, before any probe runs, and leaves alone one whose source a
+/// probe at least as new as this one wrote. A version far above any real one stands for the
+/// current one, so the test holds when the version goes up.
+#[tokio::test]
+async fn b26_a_scan_counts_old_sources_as_rereads() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    for (rel, version) in [
+        ("Old (2001)/Old (2001).mkv", "0"),
+        ("New (2002)/New (2002).mkv", "1000000"),
+    ] {
+        let path = touch(&root, rel);
+        let item = insert_movie(pool, &lib, &path, Movie::default()).await;
+        let (size, modified) = stat(&path);
+        exec(
+            pool,
+            "INSERT INTO media_sources (id, item_id, uid, path, size, modified, probe_version)
+             VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6)",
+            &[
+                &Uuid::new_v4().to_string(),
+                &item.to_string(),
+                path.to_str().unwrap(),
+                &size.to_string(),
+                &modified.to_string(),
+                version,
+            ],
+        )
+        .await;
+    }
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the scan did not read the old source again, or not only it"
+    );
+}
+
+/// ffmpeg. B26 criteria 3, 4 and 10: a scan reads again, once, each movie whose sources an older
+/// probe wrote, every version of it, and its streams get their languages and titles back. The
+/// items keep their ids and user data. The next scan reads nothing again.
+#[tokio::test]
+async fn b26_old_sources_are_read_again_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let alpha = "Alpha (2001)/Alpha (2001).mkv";
+    let beta_uhd = "Beta (2002)/Beta (2002) Bluray-2160p.mkv";
+    let beta_hd = "Beta (2002)/Beta (2002) Bluray-1080p.mkv";
+    let files = [alpha, beta_uhd, beta_hd];
+    for file in files {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+    for file in files {
+        assert_eq!(
+            b26_streams(pool, &lib, file).await,
+            b26_clip_streams(true),
+            "{file}: a new probe stored no labels"
+        );
+    }
+
+    b26_make_old(pool, &lib, &files).await;
+    assert!(
+        b26_versions(pool, &lib).await.iter().all(|(_, v)| *v == 0),
+        "the sources are not old"
+    );
+    let user = insert_user(pool).await;
+    let alpha_id = item_at(pool, &lib, alpha).await;
+    let beta_id = item_at(pool, &lib, beta_uhd).await;
+    insert_marks(pool, &user, alpha_id, &b18_watched()).await;
+    insert_marks(pool, &user, beta_id, &at(1234, Some(LATE))).await;
+    let before = b18_source_ids(pool, &lib).await;
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 2),
+        "the scan did not read both movies again"
+    );
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [alpha, beta_hd, beta_uhd]);
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    for file in files {
+        assert_eq!(
+            b26_streams(pool, &lib, file).await,
+            b26_clip_streams(true),
+            "{file}: the re-read stored no labels"
+        );
+    }
+    assert_eq!(item_at(pool, &lib, alpha).await, alpha_id);
+    assert_eq!(item_at(pool, &lib, beta_uhd).await, beta_id);
+    assert_groups(
+        pool,
+        &lib,
+        &[(alpha, &[alpha]), (beta_uhd, &[beta_uhd, beta_hd])],
+    )
+    .await;
+    assert_eq!(marks_of(pool, &user, alpha_id).await, Some(b18_watched()));
+    assert_eq!(
+        marks_of(pool, &user, beta_id).await,
+        Some(at(1234, Some(LATE)))
+    );
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a second scan read a file again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, after);
+}
+
+/// ffmpeg. B26 criteria 3 and 4: a TV scan reads old episodes again, once.
+#[tokio::test]
+async fn b26_old_episodes_are_read_again_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let first = "Severance/Season 1/Severance S01E01.mkv";
+    let second = "Severance/Season 1/Severance S01E02.mkv";
+    let files = [first, second];
+    for file in files {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+    let ids = [
+        item_at(pool, &lib, first).await,
+        item_at(pool, &lib, second).await,
+    ];
+
+    b26_make_old(pool, &lib, &files).await;
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 2),
+        "the scan did not read both episodes again"
+    );
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    for file in files {
+        assert_eq!(
+            b26_streams(pool, &lib, file).await,
+            b26_clip_streams(true),
+            "{file}: the re-read stored no labels"
+        );
+    }
+    assert_eq!(
+        [
+            item_at(pool, &lib, first).await,
+            item_at(pool, &lib, second).await
+        ],
+        ids
+    );
+
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a second scan read an episode again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, after);
+}
+
+/// ffmpeg. B26 criteria 3 and 4: a rescan of one folder, as the library monitor runs, reads the old
+/// sources in it again and leaves the rest of the library to a later scan.
+#[tokio::test]
+async fn b26_a_folder_rescan_reads_its_old_sources_again() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let alpha = "Alpha (2001)/Alpha (2001).mkv";
+    let beta = "Beta (2002)/Beta (2002).mkv";
+    let files = [alpha, beta];
+    for file in files {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+    b26_make_old(pool, &lib, &files).await;
+
+    let folder = ScanScope::Folder(root.join("Alpha (2001)"));
+    assert_eq!(
+        b18_rescan(pool, &lib, &folder).await,
+        (0, 0, 1),
+        "the folder rescan did not read its movie again"
+    );
+    assert_eq!(b26_streams(pool, &lib, alpha).await, b26_clip_streams(true));
+    assert_eq!(
+        b26_streams(pool, &lib, beta).await,
+        b26_clip_streams(false),
+        "the folder rescan read a movie outside its folder"
+    );
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the full scan did not read the rest again, or read Alpha again"
+    );
+    assert_eq!(b26_streams(pool, &lib, beta).await, b26_clip_streams(true));
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read a movie again"
+    );
+}
+
+/// ffmpeg. B26 criterion 7: a scan that stopped part way had read one old movie again, had not
+/// reached another, and stopped during the probe of a third after its sources were gone, as the
+/// probe before B26 left them. The next scan reads the last two, and only them.
+#[tokio::test]
+async fn b26_a_stopped_reread_carries_on() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let done = "Done (2001)/Done (2001).mkv";
+    let left = "Left (2002)/Left (2002).mkv";
+    let cut = "Cut (2003)/Cut (2003).mkv";
+    let files = [done, left, cut];
+    for file in files {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+
+    b26_make_old(pool, &lib, &[left, cut]).await;
+    let cut_path = root.join(cut);
+    exec(
+        pool,
+        "DELETE FROM media_sources WHERE path = ?1",
+        &[cut_path.to_str().unwrap()],
+    )
+    .await;
+    let before = b18_source_ids(pool, &lib).await;
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 2),
+        "the scan did not carry on with the two movies left"
+    );
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [cut, left]);
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    for file in files {
+        assert_eq!(
+            b26_streams(pool, &lib, file).await,
+            b26_clip_streams(true),
+            "{file}"
+        );
+    }
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read a movie again"
+    );
+}
+
+/// ffmpeg. B26 criterion 5: an old file that also changed is read again once, and its stamp is
+/// stored. After that it is read again only when it changes, as any file is.
+#[tokio::test]
+async fn b26_changed_old_files_are_read_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let alpha = "Alpha (2001)/Alpha (2001).mkv";
+    let beta = "Beta (2002)/Beta (2002).mkv";
+    let files = [alpha, beta];
+    for file in files {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+    b26_make_old(pool, &lib, &files).await;
+
+    b18_set_modified(&root.join(alpha), 1_000_000_000);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 2),
+        "the changed old movie was not read once, or the other old movie not at all"
+    );
+    assert_eq!(b18_stamps(pool, &lib).await, b18_file_stamps(&lib, &files));
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    assert_eq!(b26_streams(pool, &lib, alpha).await, b26_clip_streams(true));
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read a movie again"
+    );
+
+    b18_set_modified(&root.join(beta), 1_000_000_000);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "a changed movie was not read again"
+    );
+}
+
+/// ffmpeg. B26 criterion 6: a re-read skips a file whose probe failed before, as every scan does.
+/// An old file that no longer probes gets a failure record, and later scans leave it alone.
+#[tokio::test]
+async fn b26_failed_probes_are_not_read_again() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let alpha = "Alpha (2001)/Alpha (2001).mkv";
+    let gamma = "Gamma (2003)/Gamma (2003).mkv";
+    let broken = touch(&root, "Broken (2010)/Broken (2010).mkv");
+    for file in [alpha, gamma] {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    assert!(
+        failure_of(pool, &broken).await.is_some(),
+        "the probe of the empty file did not fail"
+    );
+    b26_fresh_versions(pool, &lib, &[alpha, gamma]).await;
+    b26_make_old(pool, &lib, &[alpha, gamma]).await;
+    exec(
+        pool,
+        "UPDATE probe_failures SET failed_at = ?1",
+        &[LONG_AGO],
+    )
+    .await;
+
+    // Gamma no longer probes: zeros of its size, with its modification time, so only its version
+    // tells the scan to read it again.
+    let gamma_path = root.join(gamma);
+    let (size, modified) = stat(&gamma_path);
+    std::fs::write(&gamma_path, vec![0u8; usize::try_from(size).unwrap()]).unwrap();
+    b18_set_modified(&gamma_path, u64::try_from(modified).unwrap());
+    assert_eq!(stat(&gamma_path), (size, modified));
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 2),
+        "the scan did not read the two old movies again"
+    );
+    assert_eq!(
+        failure_of(pool, &broken).await,
+        failure(&broken, LONG_AGO),
+        "the scan probed a known failure again"
+    );
+    let (_, _, failed_at) = failure_of(pool, &gamma_path)
+        .await
+        .expect("the failed re-read is not recorded");
+    assert_eq!(
+        failure_of(pool, &gamma_path).await,
+        failure(&gamma_path, &failed_at)
+    );
+    assert_eq!(b26_streams(pool, &lib, alpha).await, b26_clip_streams(true));
+
+    exec(
+        pool,
+        "UPDATE probe_failures SET failed_at = ?1",
+        &[LONG_AGO],
+    )
+    .await;
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read a movie again"
+    );
+    for path in [&broken, &gamma_path] {
+        assert_eq!(
+            failure_of(pool, path).await,
+            failure(path, LONG_AGO),
+            "{}: a later scan probed it again",
+            path.display()
+        );
+    }
+}
+
+/// ffmpeg. B26 criterion 9: a music scan reads again, once, a track whose source an older probe
+/// wrote, on the same item, and leaves a current track alone.
+#[tokio::test]
+async fn b26_old_tracks_are_read_again_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let song = "Artist B/Album B/01 Song.ogg";
+    let other = "Artist B/Album B/02 Other.ogg";
+    let song_path = b26_track(&root, song);
+    let other_path = b26_track(&root, other);
+    scan(pool, &lib).await;
+    let first = b18_track_probed(pool, &song_path, &[]).await;
+    let other_id = b18_track_probed(pool, &other_path, &[]).await;
+    let fresh = b26_fresh_versions(pool, &lib, &[song, other]).await;
+    assert_eq!(b26_streams(pool, &lib, song).await, b26_track_streams(true));
+    let item = item_at(pool, &lib, song).await;
+
+    b26_make_old(pool, &lib, &[song]).await;
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the scan did not read the old track again, or not only it"
+    );
+    let second = b18_track_probed(pool, &song_path, &[first]).await;
+    assert_eq!(item_at(pool, &lib, song).await, item);
+    assert_eq!(b26_streams(pool, &lib, song).await, b26_track_streams(true));
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    assert_eq!(b18_track_probed(pool, &other_path, &[]).await, other_id);
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a second scan read a track again"
+    );
+    // A probe would replace the source row within this second.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(b18_track_probed(pool, &song_path, &[]).await, second);
+    assert_eq!(b18_track_probed(pool, &other_path, &[]).await, other_id);
+}
+
+/// ffmpeg. B26 criteria 3 and 9: in a Mixed library, an old video and an old audio file are each
+/// read again, once.
+#[tokio::test]
+async fn b26_old_files_of_a_mixed_library_are_read_again_once() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("mixed", LibraryContentType::Mixed).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let movie = "Alpha (2001)/Alpha (2001).mkv";
+    let song = "Songs/01 Song.ogg";
+    b26_clip(&fx, &root, movie);
+    b26_track(&root, song);
+    scan_idle(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &[movie, song]).await;
+
+    b26_make_old(pool, &lib, &[movie, song]).await;
+    let before = b18_source_ids(pool, &lib).await;
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 2),
+        "the scan did not read the old video and the old audio file again"
+    );
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [movie, song]);
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    assert_eq!(b26_streams(pool, &lib, movie).await, b26_clip_streams(true));
+    assert_eq!(b26_streams(pool, &lib, song).await, b26_track_streams(true));
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a second scan read a file again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, after);
+}
+
+/// ffmpeg. B26 criterion 8: `probe_and_save` replaces an item's sources only once its probe has
+/// ended, so a scan stopped during the probe of a track leaves the track's old source, which the
+/// next scan reads again. A FIFO holds the probe open until the test writes the track into it.
+#[cfg(unix)]
+#[tokio::test]
+async fn b26_a_probe_keeps_the_old_sources_until_it_ends() {
+    use std::io::Write as _;
+
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let song = "Artist B/Album B/01 Song.ogg";
+    let track = b26_track(&root, song);
+    scan(pool, &lib).await;
+    let old = b18_track_probed(pool, &track, &[]).await;
+    let item = item_at(pool, &lib, song).await;
+
+    let fifo = fx.path("fifo/01 Song.ogg");
+    let copy = fx.path("fifo/copy.ogg");
+    std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    std::fs::copy(&track, &copy).unwrap();
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo could not make {}", fifo.display());
+
+    // The writer's open of the FIFO ends once ffprobe has opened it to read the streams. The
+    // writer then puts the copy at the FIFO's path, which the probe's read of the chapters opens,
+    // and writes the track into the FIFO. It is not joined: a probe that never opens the FIFO
+    // fails the test at the timeout instead of hanging it.
+    let (opened, ffprobe_opened) = tokio::sync::oneshot::channel();
+    let (go, wait_for_go) = std::sync::mpsc::channel::<()>();
+    let bytes = std::fs::read(&track).unwrap();
+    let writer_end = fifo.clone();
+    std::thread::spawn(move || {
+        let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&writer_end) else {
+            return;
+        };
+        let _ = opened.send(());
+        if wait_for_go.recv().is_ok() {
+            let _ = std::fs::rename(&copy, &writer_end);
+            let _ = file.write_all(&bytes);
+        }
+    });
+    let probe = tokio::spawn({
+        let pool = pool.clone();
+        let fifo = fifo.to_str().unwrap().to_string();
+        async move { probe::probe_and_save(&pool, &item, &fifo).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), ffprobe_opened)
+        .await
+        .expect("ffprobe did not open the FIFO within 30 s")
+        .expect("the writer ended");
+    let during = b26_item_sources(pool, item).await;
+    go.send(()).unwrap();
+    let probed = tokio::time::timeout(Duration::from_secs(30), probe)
+        .await
+        .expect("the probe did not end within 30 s")
+        .expect("the probe task panicked");
+    assert_eq!(
+        during,
+        std::slice::from_ref(&old),
+        "the item lost its source while its probe ran"
+    );
+    probed.unwrap_or_else(|e| panic!("probe of the FIFO: {e}"));
+    let after = b26_item_sources(pool, item).await;
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_ne!(after, [old], "the probe did not replace the source");
+}

@@ -9,6 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::PathScope;
+use rustyfin_db::repo_media_source::PROBE_VERSION;
 use rustyfin_model::library::{Library, LibraryContentType};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -606,6 +607,30 @@ pub(crate) async fn store_stamp(
     Ok(())
 }
 
+/// The audio sources in `scope` that an older probe wrote, as source path -> item id. A scan
+/// reads each such file again, once: the probe stores the current [`PROBE_VERSION`].
+pub(crate) async fn outdated_audio_sources(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    scope: &PathScope,
+) -> Result<HashMap<String, Uuid>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT s.path, s.item_id FROM media_sources AS s
+         JOIN media_items AS m ON m.id = s.item_id
+         WHERE m.library_id = ?1 AND m.media_type = 'Audio' AND s.probe_version < ?2 AND {}",
+        scope.sql("s.path", 3)
+    )))
+    .bind(library_id.to_string())
+    .bind(PROBE_VERSION)
+    .bind(scope.param())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(path, id)| Uuid::parse_str(&id).ok().map(|id| (path, id)))
+        .collect())
+}
+
 /// An item of the library, as [`reconcile_groups`] reads it.
 #[derive(sqlx::FromRow)]
 struct ItemRow {
@@ -632,6 +657,8 @@ struct SourceRow {
     /// The size and modification time of the file when the source was stamped.
     size: Option<i64>,
     modified: Option<i64>,
+    /// The [`PROBE_VERSION`] of the probe that wrote the source.
+    probe_version: i64,
 }
 
 /// The fields that a group gives its item, by media type.
@@ -776,7 +803,7 @@ async fn reconcile_groups(
     .fetch_all(pool)
     .await?;
     let sources: Vec<SourceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified
+        "SELECT s.item_id, s.path, s.run_time_ticks, s.size, s.modified, s.probe_version
          FROM media_sources AS s
          JOIN media_items AS m ON m.id = s.item_id
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}
@@ -1135,9 +1162,10 @@ async fn settle_group(
         .await?;
     }
     // Steady state: nothing else owns the group, the survivor is at the primary, its sources are the
-    // probeable files, in order, with the right duration, and none of their files changed. Otherwise
-    // they are probed again. A changed file makes the whole group probe again, so that its versions
-    // stay in step. A primary with no duration cannot be fixed by probing, so it counts as right.
+    // probeable files, in order, with the right duration, none of their files changed, and
+    // no source comes from an older probe. Otherwise they are probed again. A changed file makes
+    // the whole group probe again, so that its versions stay in step. A primary with no duration
+    // cannot be fixed by probing, so it counts as right.
     let source_paths_match = sources
         .iter()
         .map(|source| source.path.as_str())
@@ -1148,10 +1176,15 @@ async fn settle_group(
     let changed = sources
         .iter()
         .any(|source| source_changed(&source.path, source.size, source.modified));
+    // A source that an older probe wrote is read again, once, for the fields that probe missed.
+    let outdated = sources
+        .iter()
+        .any(|source| source.probe_version < PROBE_VERSION);
     let steady = others.is_empty()
         && survivor.path == primary
         && source_paths_match
         && !changed
+        && !outdated
         && (probeable.is_empty() || runtime_match);
     let steps = if steady {
         Vec::new()

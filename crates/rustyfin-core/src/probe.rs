@@ -729,16 +729,32 @@ pub enum ProbeError {
 // ---------------------------------------------------------------------------
 
 /// Probe a file and save it as the primary (only) media source for an item.
-/// Deletes any existing sources first.
+/// The probe runs first: when it succeeds, the item's sources are replaced in one transaction;
+/// when it fails, they are deleted. So a probe cut short leaves the old sources.
+/// Each source records [`rustyfin_db::repo_media_source::PROBE_VERSION`], which tells a scan
+/// when to read the file again.
 pub async fn probe_and_save(
     pool: &sqlx::SqlitePool,
     item_id: &uuid::Uuid,
     path: &str,
 ) -> Result<(), ProbeError> {
-    // Delete any existing sources for this item
-    let _ = rustyfin_db::repo_media_source::delete_media_sources(pool, item_id).await;
+    let result = match probe_file(path).await {
+        Ok(result) => result,
+        Err(e) => {
+            // A file that cannot be probed keeps no sources
+            let _ = rustyfin_db::repo_media_source::delete_media_sources(pool, item_id).await;
+            return Err(e);
+        }
+    };
+    let _source_id = rustyfin_db::repo_media_source::replace_media_sources_with_streams(
+        pool,
+        item_id,
+        &result.source,
+    )
+    .await?;
+    save_runtime_and_chapters(pool, item_id, result.source.run_time_ticks, result.chapters).await;
 
-    probe_and_add_source_internal(pool, item_id, path).await
+    Ok(())
 }
 
 /// Probe a file and add it as an additional media source for an item.
@@ -904,8 +920,20 @@ async fn probe_and_add_source_internal(
         rustyfin_db::repo_media_source::insert_media_source_with_streams(pool, item_id, &source)
             .await?;
 
+    save_runtime_and_chapters(pool, item_id, source.run_time_ticks, result.chapters).await;
+
+    Ok(())
+}
+
+/// Internal: saves a probed file's runtime and chapters for an item.
+async fn save_runtime_and_chapters(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    run_time_ticks: Option<i64>,
+    mut chapters: Vec<Chapter>,
+) {
     // Update the media item's runtime_ticks if we got them from probing
-    if let Some(ticks) = source.run_time_ticks {
+    if let Some(ticks) = run_time_ticks {
         let _ = sqlx::query("UPDATE media_items SET runtime_ticks = ? WHERE id = ?")
             .bind(ticks)
             .bind(item_id.to_string())
@@ -914,9 +942,8 @@ async fn probe_and_add_source_internal(
     }
 
     // Save chapters if any were found
-    if !result.chapters.is_empty() {
+    if !chapters.is_empty() {
         let item_id_str = item_id.to_string();
-        let mut chapters = result.chapters;
         // Set the item_id on each chapter
         for ch in &mut chapters {
             ch.item_id = item_id_str.clone();
@@ -925,8 +952,6 @@ async fn probe_and_add_source_internal(
             warn!("failed to save chapters: {}", e);
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

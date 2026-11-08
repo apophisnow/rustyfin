@@ -2,6 +2,13 @@ use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+/// The version of the probe code whose results a source holds. A scan reads a file again, once,
+/// when its source has an older version. Bump it when the probe starts storing a field that it
+/// read wrong or not at all, so that the next scan reads every file again.
+///
+/// 1: the language and title of each stream, which ffprobe nests under the stream's tags.
+pub const PROBE_VERSION: i64 = 1;
+
 // ---------------------------------------------------------------------------
 // MediaSource DB row
 // ---------------------------------------------------------------------------
@@ -442,10 +449,9 @@ pub async fn delete_media_source(pool: &SqlitePool, source_id: &Uuid) -> Result<
     Ok(())
 }
 
-/// Insert a media source and all its streams in a single transaction.
-/// Returns the source ID.
-pub async fn insert_media_source_with_streams(
-    pool: &SqlitePool,
+/// Insert one media source and all its streams on an open connection. Returns the source ID.
+async fn insert_source_with_streams(
+    conn: &mut sqlx::SqliteConnection,
     item_id: &Uuid,
     source: &MediaSourceResponse,
 ) -> Result<Uuid, sqlx::Error> {
@@ -453,14 +459,12 @@ pub async fn insert_media_source_with_streams(
     let uid = source.uid.clone();
     let item_id_str = item_id.to_string();
 
-    let mut tx = pool.begin().await?;
-
     // Insert the source
     sqlx::query(
         "INSERT INTO media_sources \
          (id, item_id, uid, container, protocol, path, type, run_time_ticks, size, \
-          bitrate, video_bitrate, audio_bitrate, width, height, aspect_ratio, is_remote, media_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          bitrate, video_bitrate, audio_bitrate, width, height, aspect_ratio, is_remote, media_state, probe_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&item_id_str)
@@ -479,7 +483,8 @@ pub async fn insert_media_source_with_streams(
     .bind(&source.aspect_ratio)
     .bind(source.is_remote)
     .bind(&source.media_state)
-    .execute(&mut *tx)
+    .bind(PROBE_VERSION)
+    .execute(&mut *conn)
     .await?;
 
     // Insert all streams
@@ -528,12 +533,40 @@ pub async fn insert_media_source_with_streams(
         .bind(stream.is_interlaced)
         .bind(stream.embedded_bitmaps)
         .bind(stream.index)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
-    tx.commit().await?;
     Ok(Uuid::parse_str(&id).unwrap())
+}
+
+/// Insert a media source and all its streams in a single transaction.
+/// Returns the source ID.
+pub async fn insert_media_source_with_streams(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+    source: &MediaSourceResponse,
+) -> Result<Uuid, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = insert_source_with_streams(&mut tx, item_id, source).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Replace all media sources of an item with one source and its streams, in a single transaction, so the item never shows no source. Returns the new source's ID.
+pub async fn replace_media_sources_with_streams(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+    source: &MediaSourceResponse,
+) -> Result<Uuid, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM media_sources WHERE item_id = ?")
+        .bind(item_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let id = insert_source_with_streams(&mut tx, item_id, source).await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// Batch fetch all media sources and streams for multiple items in a single query.
