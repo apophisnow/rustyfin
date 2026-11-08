@@ -1452,6 +1452,7 @@ mod kernel {
     use std::os::unix::fs::symlink;
     use std::pin::Pin;
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use rustyfin_core::library_monitor::RescanRunner;
     use rustyfin_core::scanner::ScanChanges;
@@ -2331,13 +2332,37 @@ mod kernel {
 
     impl Share {
         fn mount(at: &Path) -> Self {
+            Self::mount_type("tmpfs", at)
+        }
+
+        /// Mounts a new filesystem of type `fs_type` on `at`.
+        fn mount_type(fs_type: &str, at: &Path) -> Self {
             std::fs::create_dir_all(at).unwrap();
             let status = Command::new("mount")
-                .args(["-t", "tmpfs", "tmpfs"])
+                .args(["-t", fs_type, fs_type])
                 .arg(at)
                 .status()
                 .unwrap();
-            assert!(status.success(), "mounting tmpfs on {}", at.display());
+            assert!(status.success(), "mounting {fs_type} on {}", at.display());
+            Self(Some(at.to_path_buf()))
+        }
+
+        /// Mounts the folder `src` on `at` too (a bind mount), as a share that keeps its files
+        /// while it is away from `at`.
+        fn bind(src: &Path, at: &Path) -> Self {
+            std::fs::create_dir_all(at).unwrap();
+            let status = Command::new("mount")
+                .arg("--bind")
+                .arg(src)
+                .arg(at)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "bind-mounting {} on {}",
+                src.display(),
+                at.display()
+            );
             Self(Some(at.to_path_buf()))
         }
 
@@ -2351,9 +2376,58 @@ mod kernel {
 
     impl Drop for Share {
         fn drop(&mut self) {
+            // A test may have mounted more on it; each unmount takes the top one.
             if let Some(at) = self.0.take() {
-                let _ = Command::new("umount").arg("-l").arg(&at).status();
+                for _ in 0..8 {
+                    let unmounted = Command::new("umount")
+                        .arg("-l")
+                        .arg(&at)
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success());
+                    if !unmounted {
+                        break;
+                    }
+                }
             }
+        }
+    }
+
+    /// Holds each poll before it reads, while it is closed.
+    #[derive(Clone, Default)]
+    struct PollGate {
+        closed: Arc<AtomicBool>,
+        held: Arc<AtomicUsize>,
+    }
+
+    impl PollGate {
+        /// The poll hook that waits at the gate.
+        fn hook(&self) -> Arc<dyn Fn(&Path) + Send + Sync> {
+            let gate = self.clone();
+            Arc::new(move |_: &Path| {
+                if !gate.closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                gate.held.fetch_add(1, Ordering::SeqCst);
+                while gate.closed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                gate.held.fetch_sub(1, Ordering::SeqCst);
+            })
+        }
+
+        /// Closes it, and waits up to 20 s until a poll is held there.
+        async fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while self.held.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline, "no poll is held within 20 s");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn open(&self) {
+            self.closed.store(false, Ordering::SeqCst);
         }
     }
 
@@ -2571,6 +2645,162 @@ mod kernel {
             tree.root().display()
         );
         assert_eq!(log_lines(&[&unmounted]).len(), 1, "logged once");
+        watcher.stop();
+    }
+
+    /// The reviewer's case (a), criterion 11. The share on a polled library path goes away, a film
+    /// is added on the NAS meanwhile, and the share comes back: the path is compared with its last
+    /// state, so the film is reported. Polls are held while the share comes back, so that none
+    /// falls between the mount and a restart of the monitor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_mounted_again_on_a_polled_path_is_compared_with_its_last_state() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        // The folder under the share must not have the share's modified time, or the first poll
+        // after the unmount sees the library path unchanged.
+        tick();
+        let nas = tree.outside("nas");
+        write(&nas.join("Alpha (2001)/Alpha (2001).mkv"), 10);
+        let mut share = Share::bind(&nas, &tree.root());
+        let (pool, changes) = manager_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount F Films", &[tree.root()]).await;
+        let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+        let gate = PollGate::default();
+        watcher.set_poll_hook(Some(gate.hook()));
+        wait_monitored(&watcher, "the baseline with the share", |m| {
+            monitor_of(m, &tree.root()).is_some_and(|p| p.ready && p.folders == 2)
+        })
+        .await;
+
+        share.unmount();
+        let missing = format!(
+            "library monitor: '{}' is missing or unreadable; keeping its last state until it is back",
+            tree.root().display()
+        );
+        wait_for_log(&[&missing]).await;
+        write(&nas.join("Bravo (2002)/Bravo (2002).mkv"), 10);
+        gate.close().await;
+        let _share = Share::bind(&nas, &tree.root());
+        // The follower sees the mount within milliseconds.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        gate.open();
+        let bravo = (lib.id, ScanScope::Folder(tree.at("Bravo (2002)")));
+        wait_pending(&changes, std::slice::from_ref(&bravo)).await;
+        several_polls().await;
+        assert_eq!(
+            changes.pending(),
+            vec![bravo],
+            "the film added while the share was away, alone"
+        );
+        let back = format!("library monitor: '{}' is back", tree.root().display());
+        assert_eq!(log_lines(&[&back]).len(), 1, "logged once");
+        let again = format!("setting up '{}' of", tree.root().display());
+        assert!(log_lines(&[&again]).is_empty(), "the monitor is kept");
+        watcher.stop();
+    }
+
+    /// The reviewer's case (b): an automount that expires between polls is mounted again by each
+    /// poll that reaches it. The poll hook does that here, before each poll. The path is still
+    /// compared with its last state, so a film added on the share is reported, and its monitor is
+    /// never set up again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_mounted_by_each_poll_is_still_compared() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let nas = tree.outside("nas");
+        write(&nas.join("Alpha (2001)/Alpha (2001).mkv"), 10);
+        let _share = Share::bind(&nas, &tree.root());
+        let (pool, changes) = manager_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount G Films", &[tree.root()]).await;
+        let watcher = polling_watcher(&pool, &changes, tree.outside("data"));
+        let remounts = Arc::new(AtomicUsize::new(0));
+        // The remounts end with the test, also when it fails, before its share and tree go.
+        let remounting = Arc::new(());
+        let alive = Arc::downgrade(&remounting);
+        let (root, src, counted) = (tree.root(), nas.clone(), Arc::clone(&remounts));
+        watcher.set_poll_hook(Some(Arc::new(move |_: &Path| {
+            if alive.strong_count() == 0 {
+                return;
+            }
+            let _ = Command::new("umount")
+                .arg("-l")
+                .arg(&root)
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = Command::new("mount")
+                .arg("--bind")
+                .arg(&src)
+                .arg(&root)
+                .stderr(std::process::Stdio::null())
+                .status();
+            counted.fetch_add(1, Ordering::SeqCst);
+        })));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while remounts.load(Ordering::SeqCst) < 3 {
+            assert!(Instant::now() < deadline, "fewer than 3 polls within 20 s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        write(&nas.join("Bravo (2002)/Bravo (2002).mkv"), 10);
+        let bravo = (lib.id, ScanScope::Folder(tree.at("Bravo (2002)")));
+        wait_pending(&changes, std::slice::from_ref(&bravo)).await;
+        several_polls().await;
+        assert_eq!(changes.pending(), vec![bravo], "the film added, alone");
+        let again = format!("setting up '{}' of", tree.root().display());
+        assert!(log_lines(&[&again]).is_empty(), "never set up again");
+        drop(remounting);
+        watcher.stop();
+    }
+
+    /// A library path on a filesystem that is not local is polled. Another such filesystem
+    /// mounted on it keeps its monitor, which compares with its last state; a local one sets it
+    /// up again, watched (a guard). devpts stands in for a network share: it is not local, and a
+    /// user namespace may mount it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts devpts and tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_path_on_a_filesystem_that_is_not_local_keeps_its_monitor_when_one_is_mounted_on_it()
+     {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let _ptys = Share::mount_type("devpts", &tree.root());
+        let (pool, changes, _recorder) = kernel_fixture(&tree).await;
+        add_library(&pool, "Mount H Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        let polling = format!(
+            "library monitor: polling '{}' of 'Mount H Films' (devpts, network or unknown filesystem): ",
+            tree.root().display()
+        );
+        wait_for_log(&[&polling]).await;
+
+        let _more = Share::mount_type("devpts", &tree.root());
+        quiet_period().await;
+        let again = format!(
+            "setting up '{}' of 'Mount H Films' again",
+            tree.root().display()
+        );
+        assert!(
+            log_lines(&[&again]).is_empty(),
+            "a filesystem that is not local either keeps the monitor"
+        );
+
+        let _local = Share::mount(&tree.root());
+        wait_for_log(&[&again]).await;
+        let watching = format!(
+            "library monitor: watching '{}' of 'Mount H Films' (tmpfs): ",
+            tree.root().display()
+        );
+        wait_for_log(&[&watching]).await;
         watcher.stop();
     }
 }
