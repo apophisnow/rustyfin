@@ -620,10 +620,27 @@ fn seconds_text(ticks: i64) -> String {
     )
 }
 
+/// Escapes a path for the single quotes of a `subtitles` option, as Jellyfin's
+/// `EscapeSubtitleFilterPath` does. Jellyfin turns `\` into `/` (Windows separators); here `\` is
+/// a file name character, so it is escaped like the others. The path sits in single quotes in a
+/// filter option, and ffmpeg unquotes it twice: for the graph (`'...'` is literal, `\x` is `x`,
+/// and an unquoted `[],;` ends the filter) and for the options (`\x` is `x`, and an unquoted `:`
+/// ends the value). Inside the quotes `[],;=` are plain. `:`, `\` and `"` get a backslash for the
+/// option level. `'` closes the quote, adds `\\\'` (the graph level leaves `\'`, the option level
+/// `'`) and opens the quote again.
+fn escape_filter_path(path: &str) -> String {
+    path.replace('\\', r"\\")
+        .replace(':', r"\:")
+        .replace('\'', r"'\\\''")
+        .replace('"', r#"\""#)
+}
+
 /// The text subtitle filter. After an input seek the frames start at 0, but the filter reads
 /// the file from its start, so the frames move to the file's time for it and back after.
 fn subtitles_filter(input: &str, sub_idx: u32, start_time_ticks: i64) -> String {
-    let subtitles = format!("subtitles='{input}':si={sub_idx}");
+    // The f= key keeps a path with `=` from being read as an option name
+    let escaped = escape_filter_path(input);
+    let subtitles = format!("subtitles=f='{escaped}':si={sub_idx}");
     if start_time_ticks > 0 {
         let secs = seconds_text(start_time_ticks);
         format!("setpts=PTS+{secs}/TB,{subtitles},setpts=PTS-{secs}/TB")
