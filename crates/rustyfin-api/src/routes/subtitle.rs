@@ -486,6 +486,7 @@ mod tests {
     use super::*;
     use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
     use std::path::Path;
+    use std::time::{Duration, SystemTime};
 
     /// A folder under the temp dir with empty files, removed when dropped.
     struct Folder(PathBuf);
@@ -675,5 +676,55 @@ mod tests {
                 .windows(2)
                 .any(|p| p[0] == "-sub_charenc" && p[1] == "CP1252")
         );
+    }
+
+    /// Writes `name` in `dir` as `len` bytes, last modified `age` before `now`.
+    fn aged_file(dir: &Path, name: &str, len: usize, now: SystemTime, age: Duration) {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; len]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(now - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_sweep_vtt_cache_removes_stale_files() {
+        let folder = Folder::with(&[]);
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let day = Duration::from_secs(86_400);
+        aged_file(&folder.0, "v1-a-3.vtt", 10, now, Duration::ZERO);
+        aged_file(&folder.0, "v1-d-3.5678.tmp", 10, now, Duration::ZERO);
+        aged_file(&folder.0, "notes.txt", 10, now, day * 60);
+        aged_file(&folder.0, "v1-b-3.vtt", 10, now, day * 31);
+        aged_file(&folder.0, "v1-c-3.1234.tmp", 10, now, hour * 2);
+        aged_file(&folder.0, "a-3-10-20.vtt", 10, now, Duration::ZERO);
+
+        assert_eq!(sweep_vtt_cache(&folder.0, now, u64::MAX), 3);
+        let mut names: Vec<String> = std::fs::read_dir(&folder.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["notes.txt", "v1-a-3.vtt", "v1-d-3.5678.tmp"]);
+    }
+
+    #[test]
+    fn test_sweep_vtt_cache_keeps_its_size() {
+        let folder = Folder::with(&[]);
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        aged_file(&folder.0, "v1-src-0.vtt", 10, now, hour * 3);
+        aged_file(&folder.0, "v1-src-1.vtt", 10, now, hour * 2);
+        aged_file(&folder.0, "v1-src-2.vtt", 10, now, hour);
+
+        // 30 bytes against 25: the one read longest ago goes, which leaves 20
+        assert_eq!(sweep_vtt_cache(&folder.0, now, 25), 1);
+        assert!(!Path::new(&folder.path("v1-src-0.vtt")).exists());
+        assert!(Path::new(&folder.path("v1-src-1.vtt")).exists());
+        assert!(Path::new(&folder.path("v1-src-2.vtt")).exists());
     }
 }

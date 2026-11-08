@@ -10974,6 +10974,51 @@ async fn b22_subtitle_vtt_strips_ass_blocks() {
 }
 
 #[tokio::test]
+async fn b22_subtitle_vtt_cache_keeps_one_file_per_stream() {
+    if !g4_have_ffmpeg("b22_subtitle_vtt_cache_keeps_one_file_per_stream") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (id, msid, _) = b22_film(&state, "b22-cache").await;
+    let cache = state.data_dir.join("cache").join("subtitle-vtt");
+    let eng = std::path::PathBuf::from(media_folder(&state, "b22-cache")).join("B22 Film.eng.srt");
+    let app = app(state);
+
+    // External English is stream 3
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    let (status, _, body) = b22_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("External English"), "{body}");
+
+    // The file changes: the next request converts it again and replaces the cache file
+    std::fs::write(&eng, "1\n00:00:01,000 --> 00:00:02,000\nChanged English\n").unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&eng)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let (status, _, body) = b22_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("Changed English") && !body.contains("External English"),
+        "{body}"
+    );
+
+    // One WebVTT file for the stream, named for the cache format
+    let names: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".vtt"))
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with("v1-"), "{names:?}");
+}
+
+#[tokio::test]
 async fn b22_report_bodies_carry_track_indexes() {
     use rustyfin_model::playback::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
 
