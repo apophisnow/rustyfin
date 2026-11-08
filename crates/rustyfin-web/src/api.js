@@ -14,6 +14,7 @@ const API = {
     _cache: new Map(),
     _cacheTTL: 30000, // 30 seconds default TTL
     _pendingRequests: new Map(), // Request deduplication: merge identical in-flight requests
+    _cacheGen: 0, // Bumped by clearUserCache(); answers from an older generation are not stored
 
     /**
      * Get cached response or fetch from server with deduplication.
@@ -32,17 +33,34 @@ const API = {
         }
 
         // Fetch and cache
+        const gen = this._cacheGen;
         const promise = this.get(path).then(data => {
-            this._cache.set(path, { data, time: Date.now() });
-            this._pendingRequests.delete(path);
+            if (gen === this._cacheGen) {
+                this._cache.set(path, { data, time: Date.now() });
+            }
+            if (this._pendingRequests.get(path) === promise) {
+                this._pendingRequests.delete(path);
+            }
             return data;
         }).catch(err => {
-            this._pendingRequests.delete(path);
+            if (this._pendingRequests.get(path) === promise) {
+                this._pendingRequests.delete(path);
+            }
             throw err;
         });
 
         this._pendingRequests.set(path, promise);
         return promise;
+    },
+
+    /**
+     * Forget every cached answer and in-flight request, so nothing one user loaded is served to the next.
+     * Every sign-in path and sign-out call this.
+     */
+    clearUserCache() {
+        this._cache.clear();
+        this._pendingRequests.clear();
+        this._cacheGen++;
     },
 
     /**
@@ -158,6 +176,7 @@ const API = {
 
     // Auth
     async login(username, password) {
+        this.clearUserCache();
         const res = await fetch(this.base + '/Users/AuthenticateByName', {
             method: 'POST',
             headers: {
@@ -200,6 +219,7 @@ const API = {
 
     // Signs in an imported user with the one-time code and the password chosen now.
     async loginWithSetupCode(username, code, newPw) {
+        this.clearUserCache();
         const res = await fetch(this.base + '/Users/AuthenticateWithSetupCode', {
             method: 'POST',
             headers: {
@@ -215,6 +235,7 @@ const API = {
     },
 
     logout() {
+        this.clearUserCache();
         if (this.token) {
             this.post('/Sessions/Logout').catch(() => {});
         }
