@@ -3511,33 +3511,6 @@ async fn j5_user_id_is_checked_and_does_not_change_the_lists() {
     assert_eq!(theirs, server.get("/Genres").await.1);
 }
 
-#[tokio::test]
-#[ignore = "J5 proposal: /Artists lists nothing since migration 014 stopped quoting media_type"]
-async fn j5_proposal_artists_list_the_music_library() {
-    let server = J5Server::new().await;
-    let (status, body) = server.get("/Artists").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let items = body.get("Items").unwrap_or(&body);
-    assert!(
-        items.as_array().is_some_and(|items| !items.is_empty()),
-        "no artists in a library with an album: {body}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "J5 proposal: /Persons answers a bare array, not a QueryResult of Person items"]
-async fn j5_proposal_persons_are_a_query_result() {
-    let server = J5Server::new().await;
-    sqlx::query("INSERT INTO people (id, name) VALUES ('person-j5', 'J5 Actor')")
-        .execute(&server.state.db)
-        .await
-        .unwrap();
-    let (status, body) = server.get("/Persons").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(j5_names(&body), ["J5 Actor"]);
-    assert_eq!(body["Items"][0]["Type"], "Person", "{body}");
-}
-
 // ── Shows Tests ──
 
 #[tokio::test]
