@@ -3,7 +3,8 @@
 //! when its monitor starts. A polled path that keeps its last state is set up again only when it
 //! can be watched now, or when a mount under it went away. The table is read at most twice in a
 //! row, then about once a second: a burst of changes is read about once a second, while a lone
-//! change, or two changes in a row, are read at once.
+//! change, or two changes in a row, are read at once. A failed wait or reading is tried again after
+//! waits of 1 s, doubled up to 60 s, and the reading that works is compared with the last good one.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -22,7 +23,8 @@ use super::mounts::{
     mount_keys, restarts_monitor, restarts_polled_monitor,
 };
 use super::{
-    Inner, LIBRARY_PATH_GONE, Method, MonitoredPath, NOT_LOCAL, PATH_NOT_FOUND, take_injected,
+    Inner, LIBRARY_PATH_GONE, Method, MonitoredPath, NOT_LOCAL, PATH_NOT_FOUND, RETRY_FIRST,
+    RETRY_MAX, take_injected,
 };
 
 /// The mount table of this process. The kernel wakes a poll of it once per change.
@@ -39,13 +41,7 @@ const READ_BURST: u32 = 2;
 /// table is read before this returns, so a monitor set up after it sees a table at least as new.
 /// None, after a warning, when the table cannot be opened, registered or read.
 pub(super) fn follow(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
-    let registered = File::open(MOUNT_TABLE).and_then(|file| {
-        // SAFETY: `file` moves into the `AsyncFd`, which owns it for its whole life. Nothing else
-        // closes or replaces its file descriptor.
-        unsafe { AsyncFd::register_with_interest(file, Interest::PRIORITY) }
-            .map_err(io::Error::from)
-    });
-    let fd = match registered {
+    let fd = match open_table() {
         Ok(fd) => fd,
         Err(err) => {
             warn_cannot_follow(&err);
@@ -63,44 +59,36 @@ pub(super) fn follow(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
     Some(tokio::spawn(follow_table(Arc::clone(inner), fd, table)))
 }
 
+/// Opens the mount table and registers it with the reactor for the priority events that the kernel
+/// sends at each change of the table. The file is closed when the returned `AsyncFd` is dropped.
+fn open_table() -> io::Result<AsyncFd<File>> {
+    File::open(MOUNT_TABLE).and_then(|file| {
+        // SAFETY: `file` moves into the `AsyncFd`, which owns it for its whole life. Nothing else
+        // closes or replaces its file descriptor.
+        unsafe { AsyncFd::register_with_interest(file, Interest::PRIORITY) }
+            .map_err(io::Error::from)
+    })
+}
+
 /// Waits for the kernel to wake the poll of the table, then reads the table and marks the monitors
 /// that its changes restart. Up to `READ_BURST` readings come back to back; after that the follower
 /// sleeps until one more reading is allowed, so a burst of changes is read about once a second,
 /// while a lone change, or two changes in a row, are read at once. The sleep comes after the wait
 /// and before the read. The readiness stays set during it, so a change made meanwhile is part of
-/// the reading after the sleep. A reading with the same text as the last one changes nothing. Ends,
-/// after a warning, when a wait or a read fails.
-async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
+/// the reading after the sleep. A reading with the same text as the last one changes nothing. A
+/// failed wait or reading is tried again by `retry_table`, which replaces `fd`; the reading that
+/// works is compared with the last good one, like any other.
+async fn follow_table(inner: Arc<Inner>, mut fd: AsyncFd<File>, mut table: String) {
     let mut keys = mount_keys(&table);
     let mut due = Instant::now();
     loop {
-        let mut ready = match fd.ready(Interest::PRIORITY).await {
-            Ok(ready) => ready,
-            Err(err) => {
-                warn_cannot_follow(&err);
-                return;
-            }
-        };
-        // Each reading moves `due` one `READ_INTERVAL` on. A reading may come up to `slack` before
-        // `due`, which lets `READ_BURST` readings come back to back.
-        let ahead = due.saturating_duration_since(Instant::now());
-        let slack = READ_INTERVAL * (READ_BURST - 1);
-        if ahead > slack {
-            tokio::time::sleep(ahead - slack).await;
-        }
-        due = due.max(Instant::now()) + READ_INTERVAL;
-        ready.clear_ready();
-        inner.mount_reads.fetch_add(1, Ordering::Relaxed);
-        let read = if take_injected(&inner.fail_mount_reads) {
-            Err(io::Error::other("injected for a test"))
-        } else {
-            read_table(ready.get_inner())
-        };
+        let read = wait_and_read(&inner, &fd, &mut due).await;
         let new = match read {
             Ok(new) => new,
             Err(err) => {
-                warn_cannot_follow(&err);
-                return;
+                let (registered, new) = retry_table(&inner, &err).await;
+                fd = registered;
+                new
             }
         };
         if new != table {
@@ -110,6 +98,61 @@ async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
             keys = new_keys;
             if !changes.is_empty() {
                 mark_restarts(&inner, &table, &changes);
+            }
+        }
+    }
+}
+
+/// Waits for the kernel to wake the poll of the table, then reads the table once `due` allows it,
+/// as `follow_table` describes. The reading moves `due` one `READ_INTERVAL` on. An injected
+/// failure fails it.
+async fn wait_and_read(inner: &Inner, fd: &AsyncFd<File>, due: &mut Instant) -> io::Result<String> {
+    let mut ready = fd.ready(Interest::PRIORITY).await?;
+    // Each reading moves `due` one `READ_INTERVAL` on. A reading may come up to `slack` before
+    // `due`, which lets `READ_BURST` readings come back to back.
+    let ahead = due.saturating_duration_since(Instant::now());
+    let slack = READ_INTERVAL * (READ_BURST - 1);
+    if ahead > slack {
+        tokio::time::sleep(ahead - slack).await;
+    }
+    *due = (*due).max(Instant::now()) + READ_INTERVAL;
+    ready.clear_ready();
+    inner.mount_reads.fetch_add(1, Ordering::Relaxed);
+    if take_injected(&inner.fail_mount_reads) {
+        return Err(io::Error::other("injected for a test"));
+    }
+    read_table(ready.get_inner())
+}
+
+/// Tries again to open, register and read the mount table, after `follow_table` failed a wait or a
+/// reading with `err`. Warns once. Then each try comes after a wait of `RETRY_FIRST`, doubled after
+/// each failed try up to `RETRY_MAX`, and the failed tries are not warned about again. Each try
+/// counts as one reading. The first try that works is logged, and its registered table and text
+/// are returned.
+async fn retry_table(inner: &Inner, err: &io::Error) -> (AsyncFd<File>, String) {
+    tracing::warn!(
+        "library monitor: cannot read the mount table ({err}); trying again in {} s",
+        RETRY_FIRST.as_secs()
+    );
+    let mut wait = RETRY_FIRST;
+    loop {
+        tokio::time::sleep(wait).await;
+        inner.mount_reads.fetch_add(1, Ordering::Relaxed);
+        let reading = if take_injected(&inner.fail_mount_reads) {
+            Err(io::Error::other("injected for a test"))
+        } else {
+            open_table().and_then(|fd| {
+                let table = read_table(fd.get_ref())?;
+                Ok((fd, table))
+            })
+        };
+        match reading {
+            Ok(found) => {
+                tracing::info!("library monitor: following the mount table again");
+                return found;
+            }
+            Err(_) => {
+                wait = (wait * 2).min(RETRY_MAX);
             }
         }
     }
@@ -194,7 +237,8 @@ fn read_table(mut file: &File) -> io::Result<String> {
     Ok(table)
 }
 
-/// Logs that the mount table cannot be followed.
+/// Logs that the mount table cannot be followed at `start`, when `follow` gives no follower. A
+/// failed wait or reading later on is tried again by `retry_table` instead.
 fn warn_cannot_follow(err: &io::Error) {
     tracing::warn!(
         "library monitor: cannot follow the mount table ({err}); a share mounted under a library path from now on is seen after a restart"

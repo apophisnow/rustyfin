@@ -32,6 +32,14 @@ pub use poll::FolderPoller;
 /// The poll interval until `set_poll_interval` changes it.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The first wait before a failed reconcile, or a failed reading of the mount table, is tried
+/// again. Each failure in a row doubles the wait, up to `RETRY_MAX`.
+pub(super) const RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait before a failed reconcile, or a failed reading of the mount table, is tried
+/// again. See `RETRY_FIRST`.
+pub(super) const RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// The reason of a path that is missing when its monitor starts. That monitor polls the path, and
 /// the next reload after the path has appeared replaces it.
 const PATH_NOT_FOUND: &str = "path not found";
@@ -433,11 +441,20 @@ pub(super) fn take_injected(count: &AtomicUsize) -> bool {
         .is_ok()
 }
 
-/// Reconciles the monitors with the libraries, then waits for `libraries_changed`, for ever.
+/// Reconciles the monitors with the libraries, then waits for `libraries_changed`, for ever. After
+/// a reconcile that fails, the next one is tried after a wait of `RETRY_FIRST`, doubled after each
+/// failure in a row up to `RETRY_MAX`; a `libraries_changed` that comes first ends the wait early.
+/// A reconcile that works resets the wait to `RETRY_FIRST`.
 async fn run_manager(inner: Arc<Inner>, generation: u64) {
+    let mut wait = RETRY_FIRST;
     loop {
-        reconcile(&inner, generation).await;
-        inner.reload.notified().await;
+        if reconcile(&inner, generation).await {
+            wait = RETRY_FIRST;
+            inner.reload.notified().await;
+        } else {
+            let _ = tokio::time::timeout(wait, inner.reload.notified()).await;
+            wait = (wait * 2).min(RETRY_MAX);
+        }
     }
 }
 
@@ -458,8 +475,9 @@ fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) 
 /// ended early, or whose path was missing at start or gone from its kernel watch, and has appeared
 /// since, is replaced by a new one for its key. A monitor polling because a kernel limit is
 /// reached is replaced too, ready or not, once a limit has changed since it fell back. While none
-/// has changed, it is kept with its baseline. A database error keeps the monitors as they are.
-async fn reconcile(inner: &Arc<Inner>, generation: u64) {
+/// has changed, it is kept with its baseline. A database error keeps the monitors as they are and
+/// returns false, so the manager tries again later; otherwise this returns true.
+async fn reconcile(inner: &Arc<Inner>, generation: u64) -> bool {
     let loaded = if take_injected(&inner.fail_reconciles) {
         Err(sqlx::Error::Io(std::io::Error::other(
             "injected for a test",
@@ -473,14 +491,14 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             tracing::warn!(
                 "library monitor: could not load the libraries ({err}); keeping the current monitors"
             );
-            return;
+            return false;
         }
     };
     let limits = Limits::read(inner);
     let mut guard = inner.lock();
     let state = &mut *guard;
     if state.generation != generation {
-        return; // stopped while the libraries were loaded
+        return true; // stopped while the libraries were loaded
     }
     let wanted: HashSet<MonitorKey> = libraries
         .iter()
@@ -561,6 +579,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             );
         }
     }
+    true
 }
 
 /// The libraries with real-time monitoring on.
