@@ -2531,6 +2531,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "image",
+ "libc",
  "libloading",
  "moka",
  "quick-xml",

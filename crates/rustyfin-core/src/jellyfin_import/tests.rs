@@ -13,9 +13,10 @@ use super::merge::{MappedTracks, convert_rating, harmonize, merge};
 use super::paths::{PathMapping, suggest_metadata, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
-    IN_MEMORY_LIMIT, JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob,
-    guid_from_text, locate, open_snapshot, open_snapshot_with, parse_jellyfin_date,
-    parse_old_images, parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
+    FreeSpace, IN_MEMORY_LIMIT, JfImage, JfStream, JfUserData, ProviderIds, StreamKind,
+    copy_at_most, copy_fits, free_space, guid_from_blob, guid_from_text, locate, open_snapshot,
+    open_snapshot_with, open_snapshot_with_free, parse_jellyfin_date, parse_old_images,
+    parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -2361,6 +2362,92 @@ async fn b20_snapshot_refuses_damaged_tables() {
             "jellyfin.db: Permissions is damaged",
             "library.db: People is damaged",
             "read",
+        ]
+    );
+}
+
+// Fix round 3, 3: a copy of a big source holds at most the measured bytes, and starts only when
+// the data folder has room for it and 1 GiB to spare. The free space is injected, so no test fills
+// the disk, and the one copy made is of a small database.
+
+#[tokio::test]
+async fn b20_copies_fit_the_disk() {
+    const SPARE: u64 = 1 << 30;
+    // At, under and past the bound; the -wal counts; sums that would overflow saturate.
+    assert_eq!(
+        [
+            copy_fits(1, 2, 3 + SPARE),
+            copy_fits(1, 2, 4 + SPARE),
+            copy_fits(1, 2, 2 + SPARE),
+            copy_fits(0, 2, 1 + SPARE),
+            copy_fits(u64::MAX, 1, u64::MAX - 1),
+            copy_fits(u64::MAX, u64::MAX, SPARE),
+        ],
+        [true, true, false, false, false, false]
+    );
+    // Fewer bytes than measured are fine; a byte past them means the file grew.
+    let at_most = |bytes: usize, len: u64| {
+        let source = vec![7u8; bytes];
+        let mut into = Vec::new();
+        let whole = copy_at_most(&mut source.as_slice(), &mut into, len).unwrap();
+        (whole, into.len())
+    };
+    assert_eq!(
+        [
+            at_most(3, 5),
+            at_most(5, 5),
+            at_most(6, 5),
+            at_most(70_000, 65_536),
+        ],
+        [(true, 3), (true, 5), (false, 5), (false, 65_536)]
+    );
+    let tmp = TempDir::new();
+    assert!(free_space(&tmp.0).unwrap() > 0, "{}", tmp.0.display());
+    // A limit of 0 always copies. A copy without room, or whose free space can't be taken, is
+    // refused before a byte is copied, and no case leaves a copy folder behind.
+    let file = tmp.0.join("jellyfin.db");
+    write_db(&file, &[USERS_DDL]).await;
+    let data = TempDir::new();
+    let folder = data.0.join("jellyfin-import-copy");
+    let cases: [(&str, FreeSpace); 4] = [
+        ("room", |_| Ok(u64::MAX)),
+        ("none", |_| Ok(0)),
+        ("2 MiB less a byte", |_| Ok((2 << 20) - 1)),
+        ("an error", |_| {
+            Err(std::io::Error::other("no statvfs here"))
+        }),
+    ];
+    let mut outcomes = Vec::new();
+    for (case, free) in cases {
+        let outcome = match open_snapshot_with_free(&file, &data.0, 0, free).await {
+            Ok(conn) => {
+                let copied = folder.is_dir();
+                drop(conn);
+                format!("copied: {copied}")
+            }
+            Err(ImportError::BadSource(message)) => message,
+            Err(other) => format!("{other:?}"),
+        };
+        outcomes.push((case, outcome, std::fs::read_dir(&data.0).unwrap().count()));
+    }
+    let (file, folder) = (file.display(), folder.display());
+    let no_room = |free: &str| {
+        format!(
+            "not enough free space to copy {file} to {folder}: it needs 1 MiB and 1 GiB to spare, \
+             and {free} MiB are free"
+        )
+    };
+    assert_eq!(
+        outcomes,
+        [
+            ("room", "copied: true".to_string(), 0),
+            ("none", no_room("0"), 0),
+            ("2 MiB less a byte", no_room("1"), 0),
+            (
+                "an error",
+                format!("cannot copy {file} to {folder}: no statvfs here"),
+                0
+            ),
         ]
     );
 }

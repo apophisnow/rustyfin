@@ -1225,6 +1225,18 @@ const COPY_DB: &str = "source.db";
 const COPY_WAL: &str = "source.db-wal";
 /// The copy lock: one copy at a time, so that the disk holds one (spec Fix 2).
 static COPY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The space a copy leaves free on the data folder's disk, at least (spec Fix 3).
+const COPY_SPARE: u64 = 1 << 30;
+
+/// Whether a copy of a database of `db_len` bytes and a `-wal` of `wal_len` bytes fits in `free`
+/// bytes with `COPY_SPARE` to spare. The sums saturate (spec Fix 3).
+pub(crate) fn copy_fits(db_len: u64, wal_len: u64, free: u64) -> bool {
+    db_len.saturating_add(wal_len).saturating_add(COPY_SPARE) <= free
+}
+
+/// How a copy learns the free space of its folder: `free_space` in the snapshot, and a stand-in in
+/// the tests.
+pub(crate) type FreeSpace = fn(&Path) -> std::io::Result<u64>;
 
 /// Opens a read-only snapshot of `file` with its `-wal` applied (spec Fix 7, Fix 2). A database
 /// and `-wal` up to `IN_MEMORY_LIMIT` bytes in all are read into memory once; bigger ones are
@@ -1245,8 +1257,19 @@ pub(crate) async fn open_snapshot_with(
     data_dir: &Path,
     limit: u64,
 ) -> Result<SnapshotConn, ImportError> {
+    open_snapshot_with_free(file, data_dir, limit, free_space).await
+}
+
+/// `open_snapshot_with`, with the free space of the copy's folder taken by `free`, which
+/// `open_snapshot_with` gives `free_space` (spec Fix 3).
+pub(crate) async fn open_snapshot_with_free(
+    file: &Path,
+    data_dir: &Path,
+    limit: u64,
+    free: FreeSpace,
+) -> Result<SnapshotConn, ImportError> {
     for attempt in 1..=SNAPSHOT_TRIES {
-        if let Some(snapshot) = snapshot_try(file, data_dir, limit).await? {
+        if let Some(snapshot) = snapshot_try(file, data_dir, limit, free).await? {
             return Ok(snapshot);
         }
         if attempt < SNAPSHOT_TRIES {
@@ -1264,6 +1287,7 @@ async fn snapshot_try(
     file: &Path,
     data_dir: &Path,
     limit: u64,
+    free: FreeSpace,
 ) -> Result<Option<SnapshotConn>, ImportError> {
     let path = file.to_path_buf();
     let (db_len, wal_len) = on_blocking(file, move || source_sizes(&path)).await?;
@@ -1280,7 +1304,11 @@ async fn snapshot_try(
     let lock = COPY_LOCK.lock().await;
     let path = file.to_path_buf();
     let folder = data_dir.join(COPY_FOLDER);
-    let Some(copy) = on_blocking(file, move || copy_once(&path, &folder, lock)).await? else {
+    let Some(copy) = on_blocking(file, move || {
+        copy_once(&path, &folder, lock, db_len, wal_len, free)
+    })
+    .await?
+    else {
         return Ok(None);
     };
     let conn = SqliteConnectOptions::new()
@@ -1471,13 +1499,18 @@ fn source_sizes(file: &Path) -> Result<(u64, u64), ImportError> {
 }
 
 /// One copy of `file` and its `-wal` into `folder`, made while `lock` is held (spec Fix 2). A folder
-/// that a stopped copy left behind is removed first, then the folder is made private. The result
-/// holds the folder, which removes itself when dropped. None when the copy is not one state of the
-/// files, and the folder is removed then too.
+/// that a stopped copy left behind is removed first, then the folder is made private. Once it is
+/// made, `free` must find room for `db_len` and `wal_len` bytes with 1 GiB to spare, else it is a
+/// BadSource (spec Fix 3). Each file is copied at most its measured length, and more bytes than that
+/// is None, since the files changed. The result holds the folder, which removes itself when
+/// dropped. None when the copy is not one state of the files, and the folder is removed then too.
 fn copy_once(
     file: &Path,
     folder: &Path,
     lock: MutexGuard<'static, ()>,
+    db_len: u64,
+    wal_len: u64,
+    free: FreeSpace,
 ) -> Result<Option<CopyFolder>, ImportError> {
     match std::fs::remove_dir_all(folder) {
         Ok(()) => {}
@@ -1490,9 +1523,22 @@ fn copy_once(
         path: folder.to_path_buf(),
         _lock: lock,
     };
+    let space = free(folder).map_err(|e| copy_error(file, folder, &e))?;
+    if !copy_fits(db_len, wal_len, space) {
+        let needs = db_len.saturating_add(wal_len).div_ceil(1 << 20);
+        let free_mib = space >> 20;
+        return Err(ImportError::BadSource(format!(
+            "not enough free space to copy {} to {}: it needs {needs} MiB and 1 GiB to spare, \
+             and {free_mib} MiB are free",
+            file.display(),
+            folder.display()
+        )));
+    }
     let wal_file = wal_path(file);
     let head1 = wal_head(&wal_file)?;
-    copy_bytes(file, folder)?;
+    if !copy_bytes(file, folder, db_len, wal_len)? {
+        return Ok(None);
+    }
     let same = same_file(file, folder)?;
     let head2 = wal_head(&wal_file)?;
     let copied_head = wal_head(&folder.join(COPY_WAL))?;
@@ -1504,20 +1550,43 @@ fn copy_once(
 }
 
 /// Copies the database at `file` to `folder/source.db`, and its `-wal`, if it has one, to
-/// `folder/source.db-wal`. A `-wal` that is not a regular file is a BadSource, as in `open_regular`.
-fn copy_bytes(file: &Path, folder: &Path) -> Result<(), ImportError> {
-    copy_into(file, folder, open_database(file)?, &folder.join(COPY_DB))?;
-    if let Some(wal) = open_regular(&wal_path(file))? {
-        copy_into(file, folder, wal, &folder.join(COPY_WAL))?;
+/// `folder/source.db-wal`, each at most its measured length: `db_len` and `wal_len`. False as soon
+/// as one has more bytes than that, since the files changed (spec Fix 3). A `-wal` that is not a
+/// regular file is a BadSource, as in `open_regular`.
+fn copy_bytes(file: &Path, folder: &Path, db_len: u64, wal_len: u64) -> Result<bool, ImportError> {
+    let db = open_database(file)?;
+    if !copy_into(file, folder, db, &folder.join(COPY_DB), db_len)? {
+        return Ok(false);
     }
-    Ok(())
+    match open_regular(&wal_path(file))? {
+        Some(wal) => copy_into(file, folder, wal, &folder.join(COPY_WAL), wal_len),
+        None => Ok(true),
+    }
 }
 
-/// Copies everything in `from` into a new private file at `to`.
-fn copy_into(file: &Path, folder: &Path, mut from: File, to: &Path) -> Result<(), ImportError> {
+/// Copies `from` into a new private file at `to`, at most `len` bytes (`copy_at_most`). False when
+/// `from` had more, so the copy is not one state of the files (spec Fix 3).
+fn copy_into(
+    file: &Path,
+    folder: &Path,
+    mut from: File,
+    to: &Path,
+    len: u64,
+) -> Result<bool, ImportError> {
     let mut into = create_private_file(to).map_err(|e| copy_error(file, folder, &e))?;
-    std::io::copy(&mut from, &mut into).map_err(|e| copy_error(file, folder, &e))?;
-    Ok(())
+    copy_at_most(&mut from, &mut into, len).map_err(|e| copy_error(file, folder, &e))
+}
+
+/// Copies at most `len` bytes from `from` into `into`, then reads one more byte. False when there
+/// was one: `from` had more than `len` bytes, so the files changed. Fewer bytes are copied as they
+/// are, as `read_up_to` does on the in-memory path (spec Fix 3).
+pub(crate) fn copy_at_most(
+    from: &mut impl Read,
+    into: &mut impl std::io::Write,
+    len: u64,
+) -> std::io::Result<bool> {
+    std::io::copy(&mut (&mut *from).take(len), into)?;
+    Ok(std::io::copy(&mut from.take(1), &mut std::io::sink())? == 0)
 }
 
 /// Whether the database at `file` and its copy in `folder` hold the same bytes, compared in
@@ -1553,6 +1622,31 @@ fn copy_error(file: &Path, folder: &Path, error: &std::io::Error) -> ImportError
         file.display(),
         folder.display()
     ))
+}
+
+/// The free space in bytes that a user without privileges can use on the disk of `dir`: `f_bavail`
+/// blocks of `f_frsize` bytes, saturating (spec Fix 3).
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn free_space(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a NUL-terminated string that lives for the call, and `stat` is writable.
+    let result = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `statvfs` returned 0, so it has filled in `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// Without `statvfs` every copy is taken to fit.
+#[cfg(not(unix))]
+pub(crate) fn free_space(_dir: &Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
 }
 
 /// Creates `path` as a new folder that only this user can use (mode 0700).
