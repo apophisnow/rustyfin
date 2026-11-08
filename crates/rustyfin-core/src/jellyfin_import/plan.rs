@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use rustyfin_db::repo_jellyfin_import::ImportTarget;
 use rustyfin_model::media::MediaType;
 use uuid::Uuid;
@@ -70,6 +71,12 @@ pub fn plan_users(
                     .map(|(account, name)| SuggestedMatch {
                         user_id: *account,
                         name: name.clone(),
+                        // The facts are filled from the database by the caller.
+                        is_administrator: false,
+                        created_at: DateTime::<Utc>::UNIX_EPOCH,
+                        last_login_date: None,
+                        setup_code_pending: false,
+                        other_case_names: case_variant_names(*account, name, rustyfin_users),
                     }),
                 _ => None,
             };
@@ -87,6 +94,21 @@ pub fn plan_users(
         .collect();
     rows.sort_by_cached_key(|row| (row.name.to_lowercase(), row.jellyfin_id));
     rows
+}
+
+/// The names of the other accounts that differ from `account`'s name only in case, sorted by
+/// (lowercase, name).
+fn case_variant_names(account: Uuid, name: &str, rustyfin_users: &[(Uuid, String)]) -> Vec<String> {
+    let lower = name.to_lowercase();
+    let mut names: Vec<String> = rustyfin_users
+        .iter()
+        .filter(|(other, other_name)| {
+            *other != account && other_name != name && other_name.to_lowercase() == lower
+        })
+        .map(|(_, other_name)| other_name.clone())
+        .collect();
+    names.sort_by_cached_key(|other| (other.to_lowercase(), other.clone()));
+    names
 }
 
 /// The action for a picked Jellyfin user (R2). Its data goes into the account its name matches

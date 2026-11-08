@@ -16,7 +16,7 @@ mod tests;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 pub use job::{ImportJob, ImportStage, ImportStatus, JobHandle, JobState};
 pub use metadata::{MetadataMode, MetadataReport};
 use paths::PathMapping;
@@ -157,6 +157,17 @@ pub struct UserRow {
 pub struct SuggestedMatch {
     pub user_id: Uuid,
     pub name: String,
+    /// Whether the suggested account is an administrator.
+    pub is_administrator: bool,
+    /// When the suggested account was created.
+    pub created_at: DateTime<Utc>,
+    /// When the suggested account last signed in; null when it never has.
+    pub last_login_date: Option<DateTime<Utc>>,
+    /// Whether the suggested account still holds an unused setup code: an import created it and
+    /// no one has used the code yet. Nothing else records that an import created an account.
+    pub setup_code_pending: bool,
+    /// Names of other accounts that differ from this one only in case, sorted by lowercase name.
+    pub other_case_names: Vec<String>,
 }
 
 /// What an import does with a Jellyfin user.
@@ -259,6 +270,38 @@ pub async fn prepare(req: &ImportRequest, data_dir: &Path) -> Result<Prepared, I
     })
 }
 
+/// Fills the account facts of each suggested match from the database (B36), so the report shows
+/// the accounts as they are before the import creates any.
+async fn fill_suggested_facts(db: &SqlitePool, users: &mut [UserRow]) -> Result<(), ImportError> {
+    if users.iter().all(|user| user.suggested_match.is_none()) {
+        return Ok(());
+    }
+    let accounts = rustyfin_db::repo_user::get_all_users(db)
+        .await
+        .map_err(ImportError::Db)?;
+    let pending: HashSet<Uuid> = rustyfin_db::repo_setup_code::pending_users(db)
+        .await
+        .map_err(ImportError::Db)?
+        .into_iter()
+        .map(|row| row.user_id)
+        .collect();
+    for suggested in users
+        .iter_mut()
+        .filter_map(|user| user.suggested_match.as_mut())
+    {
+        if let Some(account) = accounts
+            .iter()
+            .find(|account| account.id == suggested.user_id)
+        {
+            suggested.is_administrator = account.is_administrator;
+            suggested.created_at = account.created_at;
+            suggested.last_login_date = account.last_login_date;
+        }
+        suggested.setup_code_pending = pending.contains(&suggested.user_id);
+    }
+    Ok(())
+}
+
 /// The planning `preview` and `run` share (spec 2.20, 2.26). A run passes its handle: it then
 /// reports the Reading, Users and Matching stages and creates the users it plans to create, so
 /// the items are matched with the final actions.
@@ -307,6 +350,7 @@ async fn plan_report(
         &req.confirmed_matches,
         &rustyfin_users,
     );
+    fill_suggested_facts(db, &mut users).await?;
     if let Some(handle) = handle {
         create_users(db, &mut users, rustyfin_users, handle).await?;
     }
