@@ -2531,6 +2531,48 @@ mod kernel {
         assert!(log_lines(&[&again]).is_empty(), "the monitor is kept");
         watcher.stop();
     }
+
+    /// A share mounted inside a watched library path goes away. The kernel drops the share's
+    /// watches and nothing is reported; the path is set up again, so the folder that the share
+    /// covered is watched from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_unmounted_from_inside_a_watched_path_reports_nothing() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        write(&tree.at("Heat (1995)/Heat (1995).mkv"), 10);
+        let mut share = Share::mount(&tree.at("Shares"));
+        write(&tree.at("Shares/Film (2001)/Film (2001).mkv"), 10);
+        let point = std::fs::canonicalize(tree.at("Shares")).unwrap();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount E Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 4).await;
+
+        share.unmount();
+        // The old monitor keeps 2 watches; the new one also watches the folder under the share.
+        wait_watched(&watcher, &tree.root(), 3).await;
+        quiet_period().await;
+        assert!(
+            recorder.calls().is_empty(),
+            "nothing was deleted: {:?}",
+            recorder.calls()
+        );
+        write(&tree.at("Shares/Later (2010)/Later (2010).mkv"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Shares")), 1)
+            .await;
+        let unmounted = format!(
+            "library monitor: '{}' was unmounted; setting up '{}' of 'Mount E Films' again",
+            point.display(),
+            tree.root().display()
+        );
+        assert_eq!(log_lines(&[&unmounted]).len(), 1, "logged once");
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:
