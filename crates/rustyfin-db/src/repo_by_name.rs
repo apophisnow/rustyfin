@@ -56,6 +56,11 @@ pub const BY_NAME_NAMESPACE: Uuid = Uuid::from_u128(0xbba0cef5b5394903ad04cdc449
 ///   polytonic Greek lose their marks, "≠" becomes "=", and NFC turns the CJK compatibility
 ///   ideographs into the unified ones.
 ///
+/// One exception: Jellyfin folds 17 two-code-point sequences, each a table letter followed by a
+/// second mark, together with another spelling that this fold keeps apart (U+0622 U+0654 and
+/// U+0627 U+0654, for one). They are U+0622, U+0623, U+0625 or U+0671 followed by U+0653, U+0654
+/// or U+0655; U+0624, U+0626, U+0649 or U+06C2 followed by U+0654; and U+0B94 followed by U+0BD7.
+///
 /// The fold is frozen: every entry id is built from it (`by_name_id`) and clients store those ids, so
 /// a change would change ids that clients hold.
 pub fn fold_name(name: &str) -> String {
