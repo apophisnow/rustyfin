@@ -55,7 +55,8 @@ pub struct ScanChanges {
     pub added: u32,
     /// Items that the scan no longer collected, and deleted.
     pub removed: u32,
-    /// Existing items that got probe steps again, because their files changed.
+    /// Existing items that got probe steps again, because their files changed or an older probe
+    /// read them.
     pub reread: u32,
 }
 
@@ -367,6 +368,10 @@ async fn scan_flat_library(
             .into_iter()
             .collect();
 
+    // The audio sources that an older probe wrote, by path. Their files are read again, once.
+    let outdated = scan_sync::outdated_audio_sources(pool, library.id, &filter).await?;
+    let rereads = scan_sync::RereadGate::new();
+
     // Collect new items for batch insert in a single transaction
     let mut new_items: Vec<MediaItem> = Vec::new();
     // Probe plans. The plans of new items wait in `new_plans` until their rows are inserted.
@@ -425,6 +430,14 @@ async fn scan_flat_library(
             // Skip if this exact file path already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
+                // An audio file that an older probe wrote is read again, once, when
+                // `rereads` opens.
+                if let Some(&item_id) = outdated.get(&file_path)
+                    && rereads.open().await
+                {
+                    reread += 1;
+                    plans.push((item_id, vec![probe::ProbeStep::Primary(file_path.clone())]));
+                }
                 continue;
             }
 
@@ -473,8 +486,15 @@ async fn scan_flat_library(
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
         scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
-    let outcomes =
-        scan_sync::reconcile_movie_groups(pool, library.id, &filter, &movie_groups, &gone).await?;
+    let outcomes = scan_sync::reconcile_movie_groups(
+        pool,
+        library.id,
+        &filter,
+        &movie_groups,
+        &gone,
+        &rereads,
+    )
+    .await?;
     for (group, outcome) in movie_groups.iter().zip(outcomes) {
         match outcome {
             scan_sync::GroupOutcome::Existing { item_id, steps } => {
@@ -583,6 +603,7 @@ async fn scan_tv_library(
     let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     let mut existing_count = 0u32;
     let mut reread = 0u32;
+    let rereads = scan_sync::RereadGate::new();
     let mut new_item_ids: Vec<Uuid> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
@@ -834,9 +855,15 @@ async fn scan_tv_library(
     // The items whose file is gone are read first: a group with no owner may take one over.
     let gone =
         scan_sync::gone_items(pool, library, &filter, &collected, &unreadable, &loops).await?;
-    let outcomes =
-        scan_sync::reconcile_episode_groups(pool, library.id, &filter, &episode_groups, &gone)
-            .await?;
+    let outcomes = scan_sync::reconcile_episode_groups(
+        pool,
+        library.id,
+        &filter,
+        &episode_groups,
+        &gone,
+        &rereads,
+    )
+    .await?;
     let mut new_episodes: Vec<MediaItem> = Vec::new();
     let mut new_episode_plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
     for (group, outcome) in episode_groups.iter().zip(outcomes) {
@@ -928,13 +955,16 @@ async fn scan_music_library(
     ticket: &ScanTicket,
     counted: bool,
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
-    let _guard = SCAN_LOCK.lock().await;
+    let guard = SCAN_LOCK.lock().await;
     ticket.start();
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut reread = 0u32;
+    let rereads = scan_sync::RereadGate::new();
     let mut new_item_ids: Vec<Uuid> = Vec::new();
+    // Probe plans of the old tracks, read again under the scan lock, see the end of the scan.
+    let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -942,6 +972,9 @@ async fn scan_music_library(
             .await?
             .into_iter()
             .collect();
+
+    // The audio sources that an older probe wrote, by path. Their tracks are read again, once.
+    let outdated = scan_sync::outdated_audio_sources(pool, library.id, &filter).await?;
 
     // The source of each known track, by path: its item, and the stamp that it stores.
     let known_tracks: HashMap<String, (Uuid, Option<i64>, Option<i64>)> =
@@ -1030,9 +1063,16 @@ async fn scan_music_library(
             // Skip if already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
-                // A track whose file changed since it was stamped is probed again, under the same item.
-                // A track that was never stamped is stamped now, without a probe.
-                if let Some(&(item_id, size, modified)) = known_tracks.get(&file_path) {
+                // A track whose source an older probe wrote is read again by this scan's probe
+                // plans, which hold the scan lock until they end, when `rereads` opens. A track
+                // whose file changed since it was stamped is probed again, under the same item. A
+                // track that was never stamped is stamped now, without a probe.
+                if let Some(&item_id) = outdated.get(&file_path)
+                    && rereads.open().await
+                {
+                    reread += 1;
+                    plans.push((item_id, vec![probe::ProbeStep::Primary(file_path.clone())]));
+                } else if let Some(&(item_id, size, modified)) = known_tracks.get(&file_path) {
                     if modified.is_none() {
                         let stamp = scan_sync::file_stamp(&file_path);
                         scan_sync::store_stamp(pool, &item_id.to_string(), &file_path, stamp)
@@ -1335,6 +1375,13 @@ async fn scan_music_library(
         count,
         existing_count
     );
+    spawn_plans_under_lock(
+        pool.clone(),
+        guard,
+        library.name.clone(),
+        plans,
+        ticket.clone(),
+    );
     let changes = ScanChanges {
         added: count,
         removed,
@@ -1422,33 +1469,33 @@ async fn date_metadata(path: &Path) -> Option<std::fs::Metadata> {
 
 /// When the item at `path` was added, as Jellyfin dates it. On Linux .NET has no birth time, so its
 /// creation time is the older of the modification and status-change times, from `date_metadata`, so
-/// a file link is dated by its final target and a folder link by its own times. Now, if they
-/// can't be read.
+/// a file link is dated by its final target and a folder link by its own times. None if they can't
+/// be read, or the time is out of range.
 #[cfg(target_os = "linux")]
-async fn date_added(path: &Path) -> DateTime<Utc> {
+pub(crate) async fn path_date(path: &Path) -> Option<DateTime<Utc>> {
     use std::os::unix::fs::MetadataExt;
-    let Some(meta) = date_metadata(path).await else {
-        return Utc::now();
-    };
+    let meta = date_metadata(path).await?;
     let modified = (meta.mtime(), meta.mtime_nsec());
     let changed = (meta.ctime(), meta.ctime_nsec());
     let (secs, nsecs) = modified.min(changed);
-    DateTime::<Utc>::from_timestamp(secs, nsecs as u32).unwrap_or_else(Utc::now)
+    DateTime::<Utc>::from_timestamp(secs, nsecs as u32)
 }
 
 /// When the item at `path` was added, as Jellyfin dates it: its creation time, else its
 /// modification time, from `date_metadata`, so a file link is dated by its final target and a
-/// folder link by its own times. Now, if they can't be read.
+/// folder link by its own times. None if they can't be read.
 #[cfg(not(target_os = "linux"))]
+pub(crate) async fn path_date(path: &Path) -> Option<DateTime<Utc>> {
+    let meta = date_metadata(path).await?;
+    meta.created()
+        .or_else(|_| meta.modified())
+        .map(DateTime::<Utc>::from)
+        .ok()
+}
+
+/// When the item at `path` was added, as `path_date` gives it. Now, if that is None.
 async fn date_added(path: &Path) -> DateTime<Utc> {
-    match date_metadata(path).await {
-        Some(meta) => meta
-            .created()
-            .or_else(|_| meta.modified())
-            .map(DateTime::<Utc>::from)
-            .unwrap_or_else(|_| Utc::now()),
-        None => Utc::now(),
-    }
+    path_date(path).await.unwrap_or_else(Utc::now)
 }
 
 /// What a scan makes of one entry of a folder.
