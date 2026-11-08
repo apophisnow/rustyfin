@@ -3294,6 +3294,98 @@ async fn b18p2_library_monitor_poll_interval_defaults_to_60_and_round_trips() {
     assert_eq!(old.library_monitor_poll_interval, 60);
 }
 
+/// `LibraryMonitorPollInterval` in `GET /System/Configuration`.
+async fn b18p2_poll_interval(app: &axum::Router, token: &str) -> serde_json::Value {
+    let (status, config) = send_authed(app, "GET", "/System/Configuration", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    config["LibraryMonitorPollInterval"].clone()
+}
+
+#[tokio::test]
+async fn b18p2_a_user_who_is_not_an_administrator_changes_no_monitor_setting() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let library = create_library_via_api(&app, &state, &token, "B18p2 Viewer", "Movies").await;
+    add_user(&state, "b18p2_viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&app, "b18p2_viewer", "viewerpass").await.unwrap();
+    let interval = state.task_scheduler.watcher().poll_interval();
+
+    let uri = format!("/Library/{library}/Options");
+    let off = r#"{"EnableRealtimeMonitor":false}"#;
+    let (status, body) = send_authed(&app, "POST", &uri, &viewer, Some(off)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "library options: {body}");
+    assert_eq!(b18p2_realtime_monitor(&app, &token, library).await, true);
+
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    let mut changed = config.clone();
+    changed["LibraryMonitorPollInterval"] = 5.into();
+    let changed = changed.to_string();
+    let (status, body) = send_authed(
+        &app,
+        "POST",
+        "/System/Configuration",
+        &viewer,
+        Some(&changed),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "configuration: {body}");
+    let uri = "/System/Configuration/LibraryMonitorPollInterval";
+    let (status, body) = send_authed(&app, "POST", uri, &viewer, Some("5")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "poll interval key: {body}");
+    assert_eq!(b18p2_poll_interval(&app, &token).await, 60);
+    assert_eq!(state.task_scheduler.watcher().poll_interval(), interval);
+}
+
+#[tokio::test]
+async fn b18p2_wrongly_typed_monitor_settings_are_refused_and_change_nothing() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let library = create_library_via_api(&app, &state, &token, "B18p2 Typed", "Movies").await;
+    b18p2_save_options(&app, &token, library, r#"{"EnableRealtimeMonitor":false}"#).await;
+    let interval = state.task_scheduler.watcher().poll_interval();
+    // A value that does not fit is the client's mistake: 400 or 422, never a server error.
+    let refused = [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY];
+
+    let uri = format!("/Library/{library}/Options");
+    let yes = r#"{"EnableRealtimeMonitor":"yes"}"#;
+    let (status, body) = send_authed(&app, "POST", &uri, &token, Some(yes)).await;
+    assert!(
+        refused.contains(&status),
+        "library options: {status} {body}"
+    );
+    assert_eq!(b18p2_realtime_monitor(&app, &token, library).await, false);
+
+    let (_, config) = send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    for value in [serde_json::json!("abc"), serde_json::json!(-1)] {
+        let mut changed = config.clone();
+        changed["LibraryMonitorPollInterval"] = value.clone();
+        let changed = changed.to_string();
+        let (status, body) = send_authed(
+            &app,
+            "POST",
+            "/System/Configuration",
+            &token,
+            Some(&changed),
+        )
+        .await;
+        assert!(
+            refused.contains(&status),
+            "configuration with {value}: {status} {body}"
+        );
+
+        let uri = "/System/Configuration/LibraryMonitorPollInterval";
+        let (status, body) = send_authed(&app, "POST", uri, &token, Some(&value.to_string())).await;
+        assert!(
+            refused.contains(&status),
+            "poll interval key {value}: {status} {body}"
+        );
+        assert_eq!(b18p2_poll_interval(&app, &token).await, 60, "after {value}");
+    }
+    assert_eq!(state.task_scheduler.watcher().poll_interval(), interval);
+}
+
 #[tokio::test]
 async fn b18p2_monitoring_off_keeps_media_updated_and_webhook_reports() {
     use rustyfin_core::scanner::ScanScope;
