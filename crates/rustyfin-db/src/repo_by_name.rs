@@ -35,18 +35,26 @@ impl ByNameKind {
 /// The namespace of the entry ids, `bba0cef5-b539-4903-ad04-cdc4497f4ca3`.
 pub const BY_NAME_NAMESPACE: Uuid = Uuid::from_u128(0xbba0cef5b5394903ad04cdc4497f4ca3);
 
-/// Folds a name for comparison and ids: trimmed, lowercased and stripped of accents, so "Ação",
-/// "ACAO" and a decomposed "Ação" are one name.
+/// Folds a name for comparison and ids, so "Ação", "ACAO" and a decomposed "Ação" are one name.
 ///
-/// This is Jellyfin 10.11's clean value, `value.RemoveDiacritics().ToLowerInvariant()`
-/// (`Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:1438-1446`), for names in either
-/// Unicode form. Jellyfin swaps letters through the Diacritics.NET tables one at a time. Here the
-/// name is decomposed (NFD), the combining accents U+0300 to U+036F are dropped, the rest is composed
-/// again (NFC), and the letters that those tables fold but Unicode does not decompose are swapped by
-/// `unaccented`. That equals Jellyfin's fold on every letter of the tables; rarer accented letters
-/// that the tables leave alone, such as "ĉ", lose their accent here too. The characters in `DELETED`
-/// are deleted first, as Jellyfin deletes them, and every "ς" becomes "σ", as .NET's
-/// `ToLowerInvariant` lowercases a word-final "Σ" to "σ".
+/// The fold, in order:
+/// 1. The characters in `DELETED` are deleted.
+/// 2. The name is trimmed and lowercased, and every "ς" becomes "σ".
+/// 3. The name is decomposed (NFD), every combining mark from U+0300 to U+036F is dropped, and the
+///    rest is composed again (NFC).
+/// 4. The letters that Jellyfin's Diacritics.NET tables fold but Unicode does not decompose are
+///    swapped by `unaccented`.
+///
+/// It follows Jellyfin 10.11's clean value, `value.RemoveDiacritics().ToLowerInvariant()`
+/// (`Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:1438-1446`), and folds every
+/// character of those tables as Jellyfin does, but it folds more:
+/// - Jellyfin doesn't trim, and keeps a "ς" that is already lowercase, so it lists "δράμας" apart
+///   from "ΔΡΆΜΑΣ" ("δραμασ"), where this fold makes them one name.
+/// - Jellyfin keeps the combining marks of a decomposed name, so it lists a decomposed "Ação" apart
+///   from a composed one. This fold makes them one name, by choice.
+/// - Step 3 also folds characters that the tables leave alone: rarer letters such as "ĉ" and
+///   polytonic Greek lose their marks, "≠" becomes "=", and NFC turns the CJK compatibility
+///   ideographs into the unified ones.
 ///
 /// The fold is frozen: every entry id is built from it (`by_name_id`) and clients store those ids, so
 /// a change would change ids that clients hold.
@@ -159,7 +167,8 @@ pub struct ByNameEntry {
     /// The id from `by_name_id`.
     pub id: Uuid,
     /// The most common spelling among all the rows of the entry, whatever the filter; a tie goes
-    /// to the smallest spelling.
+    /// to the spelling that comes first in code-point order, so "DRAMA" wins over "Drama" and
+    /// "Acao" over "Ação".
     pub name: String,
     /// The counts of the items behind the entry.
     pub counts: ByNameCounts,
@@ -354,7 +363,8 @@ struct Group {
 }
 
 impl Group {
-    /// The most common spelling; a tie goes to the smallest.
+    /// The most common spelling; a tie goes to the smallest in code-point order ("DRAMA" before
+    /// "Drama", "Acao" before "Ação").
     fn name(&self) -> String {
         self.spellings
             .iter()
