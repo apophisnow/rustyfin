@@ -24,6 +24,25 @@ fn like_search_hints_query() -> &'static str {
      LIMIT ?2"
 }
 
+/// True only when FTS5 cannot parse the search term itself, such as `Star Trek: Discovery*`
+/// (it reads `Trek` as a column) or `Mr. Robot*` (a syntax error). Any other error, such as a
+/// missing index, is not a query error and must not fall back to matching names alone.
+fn is_fts_query_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => {
+            let message = db.message();
+            message.starts_with("fts5: syntax error")
+                || message.starts_with("no such column: ")
+                || message.starts_with("unknown special query")
+                || message.starts_with("expected integer, got ")
+                || message.starts_with("fts5 expression tree is too large")
+                || message == "fts5: parser stack overflow"
+                || message == "unterminated string"
+        }
+        _ => false,
+    }
+}
+
 pub async fn search_hints(
     pool: &SqlitePool,
     query: &str,
@@ -45,7 +64,7 @@ pub async fn search_hints(
 
     let rows = match rows {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) if is_fts_query_error(&e) => {
             // Fallback to LIKE search with prefix matching for index utilization
             // Using `query%` instead of `%query%` enables B-tree index scan on idx_media_items_name
             let like_prefix = format!("{}%", query);
@@ -57,6 +76,7 @@ pub async fn search_hints(
             .fetch_all(pool)
             .await?
         }
+        Err(e) => return Err(e),
     };
 
     Ok(rows
@@ -134,7 +154,7 @@ pub async fn search_items(
     // If FTS5 succeeds, return results
     match rows {
         Ok(rows) => Ok(rows.into_iter().map(Into::into).collect()),
-        Err(_) => {
+        Err(e) if is_fts_query_error(&e) => {
             // Fallback to LIKE search with prefix matching for index utilization
             // Using `query%` instead of `%query%` enables B-tree index scan
             let like_prefix = format!("{}%", query);
@@ -175,5 +195,6 @@ pub async fn search_items(
                 Ok(rows.into_iter().map(Into::into).collect())
             }
         }
+        Err(e) => Err(e),
     }
 }

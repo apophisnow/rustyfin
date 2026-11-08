@@ -2655,6 +2655,79 @@ async fn b30_p5_items_reads_negative_paging_as_jellyfin_does() {
     );
 }
 
+/// Makes the search index again after a test dropped it, as migration 006 made it.
+async fn b30_rebuild_search_index(state: &AppState) {
+    for statement in [
+        "CREATE VIRTUAL TABLE media_items_fts USING fts5(
+            name,
+            overview,
+            genres,
+            content='media_items',
+            content_rowid='rowid'
+        )",
+        "INSERT INTO media_items_fts(media_items_fts) VALUES('rebuild')",
+    ] {
+        sqlx::query(statement).execute(&state.db).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn b30_p6_a_broken_search_index_is_an_error_and_is_not_cached() {
+    let state = test_state().await;
+    let (token, lib) = b27_seed(&state).await;
+    b27_add_item(&state, lib, "Nebula Run", "Movie").await;
+    sqlx::query(
+        "UPDATE media_items SET overview = 'A nebula drifts by.' WHERE name = 'Comet Night'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let app = app(state.clone());
+    let search = "/Search?Term=nebula&IncludeItemTypes=Movie";
+    let hints = "/Search/Hints?SearchTerm=nebula";
+
+    // Without the index, no narrower answer from names alone, and nothing kept.
+    // (No item is written meanwhile: the index's triggers would fail.)
+    sqlx::query("DROP TABLE media_items_fts")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    for uri in [search, hints] {
+        let (status, body) = send_authed(&app, "GET", uri, &token, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {body}");
+    }
+    assert_eq!(b27_cached_answers(&state), 0);
+
+    // Once the index is back, its answer: by name and by overview.
+    b30_rebuild_search_index(&state).await;
+    let found = ["Comet Night (Movie)", "Nebula Run (Movie)"];
+    assert_eq!(b27_found(&app, search, &token).await, found);
+    assert_eq!(b27_found(&app, hints, &token).await, found);
+}
+
+#[tokio::test]
+async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
+    let state = test_state().await;
+    let (token, lib) = b27_seed(&state).await;
+    b27_add_item(&state, lib, "Star Trek: Discovery", "Series").await;
+    b27_add_item(&state, lib, "Mr. Robot", "Series").await;
+    let app = app(state);
+
+    // The index reads "Trek:" as a column and rejects "Mr.", so these go by name.
+    for (term, found) in [
+        (
+            "Star%20Trek%3A%20Discovery",
+            "Star Trek: Discovery (Series)",
+        ),
+        ("Mr.%20Robot", "Mr. Robot (Series)"),
+    ] {
+        let search = format!("/Search?Term={term}&IncludeItemTypes=Series");
+        assert_eq!(b27_found(&app, &search, &token).await, [found]);
+        let hints = format!("/Search/Hints?SearchTerm={term}");
+        assert_eq!(b27_found(&app, &hints, &token).await, [found]);
+    }
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]
