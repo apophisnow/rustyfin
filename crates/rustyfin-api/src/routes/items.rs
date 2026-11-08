@@ -1707,9 +1707,16 @@ async fn get_item(
     let id_str = id.to_string();
     // Check cache first
     if let Some(cached) = state.cache.item_details.get(&id_str)
-        && let Ok(item) = serde_json::from_value(cached.clone())
+        && let Ok(item) = serde_json::from_value::<MediaItem>(cached.clone())
     {
-        return Ok(Json(item));
+        let mut cached_ids: Vec<String> = item.media_sources.iter().map(|s| s.id.clone()).collect();
+        cached_ids.sort();
+        // A scan that reads a file again replaces the item's sources, with new ids. Serve the
+        // cached copy only while its source ids are still the stored ones.
+        let stored = rustyfin_db::repo_media_source::get_media_source_ids(&state.db_ro, &id).await;
+        if stored.is_ok_and(|ids| ids == cached_ids) {
+            return Ok(Json(item));
+        }
     }
     let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?

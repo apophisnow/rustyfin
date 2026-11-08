@@ -280,6 +280,18 @@ pub async fn get_media_sources(
     Ok(result)
 }
 
+/// Get the IDs of an item's media sources, in ID order. A scan that reads a file again
+/// replaces its sources with new IDs.
+pub async fn get_media_source_ids(
+    pool: &SqlitePool,
+    item_id: &Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ? ORDER BY id")
+        .bind(item_id.to_string())
+        .fetch_all(pool)
+        .await
+}
+
 /// Verify that a media item exists and fetch its media sources with streams in a single round-trip.
 /// Returns None if the item does not exist.
 /// Eliminates the N+1 pattern in streaming endpoints where get_item_by_id and get_media_sources
@@ -553,7 +565,8 @@ pub async fn insert_media_source_with_streams(
     Ok(id)
 }
 
-/// Replace all media sources of an item with one source and its streams, in a single transaction, so the item never shows no source. Returns the new source's ID.
+/// Replace all media sources of an item with one source and its streams, in a single
+/// transaction, so the item never shows no source. Returns the new source's ID.
 pub async fn replace_media_sources_with_streams(
     pool: &SqlitePool,
     item_id: &Uuid,
