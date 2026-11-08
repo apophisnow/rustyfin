@@ -354,7 +354,7 @@ fn fallback_reason(inner: &Inner, root: &Path, fallback: Fallback) -> String {
         Fallback::FileLimit => {
             if !inner.file_limit_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "library monitor: the open file limit of the process is reached; polling '{}' instead. Raise it (ulimit -n, systemd LimitNOFILE=, docker run --ulimit nofile=) to watch it; the next SIGHUP or library change tries again.",
+                    "library monitor: the open file limit of the process is reached; polling '{}' instead. Raise it and restart Rustyfin (ulimit -n, systemd LimitNOFILE=, docker run --ulimit nofile=), or raise it live with prlimit --pid; a SIGHUP or library change then tries again.",
                     root.display()
                 );
             }
