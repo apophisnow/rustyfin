@@ -471,6 +471,33 @@ const LIBRARY_TABLES: &[&str] = &["TypedBaseItems", "UserDatas", "mediastreams",
 
 /// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
 /// with generated columns can make a query run without end or make values of any size. It also
+/// Renders a `quick_check` result line for an error message: each control character becomes
+/// `\uXXXX` and the result is cut to 200 bytes on a char boundary, with `…` marking a cut. Keeps a
+/// crafted database from writing megabytes of control bytes, or ANSI escapes, into the log.
+pub(super) fn clip_check_line(line: &str) -> String {
+    use std::fmt::Write as _;
+    const MAX: usize = 200;
+    let mut out = String::new();
+    let mut truncated = false;
+    for ch in line.chars() {
+        // A control character renders as the six bytes `\uXXXX` (its code point is at most U+009F).
+        let piece_len = if ch.is_control() { 6 } else { ch.len_utf8() };
+        if out.len() + piece_len > MAX {
+            truncated = true;
+            break;
+        }
+        if ch.is_control() {
+            let _ = write!(out, "\\u{:04x}", ch as u32);
+        } else {
+            out.push(ch);
+        }
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
 /// refuses a damaged table, found with SQLite's `quick_check` before any row is read; the first row
 /// is enough and is all it reads. A name the file doesn't have is skipped; its query reports that,
 /// as before. `file` is the source's path, never a copy's.
@@ -530,10 +557,11 @@ async fn check_tables(
             .await
             .map_err(|e| unreadable(file, &e))?;
         if let Some((text,)) = first.filter(|(text,)| text.as_str() != "ok") {
-            let line = text
-                .lines()
-                .find(|line| !line.starts_with("***"))
-                .unwrap_or(text.as_str());
+            let line = clip_check_line(
+                text.lines()
+                    .find(|line| !line.starts_with("***"))
+                    .unwrap_or(text.as_str()),
+            );
             return Err(ImportError::BadSource(format!(
                 "{}: {name} is damaged: {line}",
                 file.display()

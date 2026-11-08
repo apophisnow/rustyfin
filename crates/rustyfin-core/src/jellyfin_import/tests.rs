@@ -2580,3 +2580,39 @@ fn b20_mblink_text_is_capped() {
         other => panic!("expected a bad source over the 1 MiB total, got {other:?}"),
     }
 }
+
+// L6 (round 4): a damaged-table line is escaped (each control character -> \uXXXX) and cut to 200
+// bytes on a char boundary with a trailing … , so a crafted quick_check result can't flood the log
+// with control bytes or ANSI escapes. On 8758ca9 clip_check_line returns the line unchanged.
+#[test]
+fn b20_damaged_line_is_clipped_and_escaped() {
+    use super::source::clip_check_line;
+    // A control character becomes \uXXXX; printable text is unchanged.
+    assert_eq!(
+        clip_check_line("page 3\u{1b}[0m bad"),
+        "page 3\\u001b[0m bad"
+    );
+    // A clean short line is returned as-is.
+    assert_eq!(clip_check_line("page 3 is corrupt"), "page 3 is corrupt");
+    // A long line is cut to 200 bytes on a char boundary and ends with a … .
+    let long = "x".repeat(500);
+    let out = clip_check_line(&long);
+    assert!(
+        out.ends_with('…'),
+        "a cut line ends with an ellipsis: {out}"
+    );
+    assert!(
+        out.len() <= 200 + '…'.len_utf8(),
+        "a cut line is at most 200 bytes plus the ellipsis, got {}",
+        out.len()
+    );
+    assert_eq!(&out[..200], &long[..200], "the kept prefix is the input's");
+    // A line of multi-byte characters is cut on a char boundary (no panic) and stays bounded.
+    let wide = "\u{2713}".repeat(100); // 300 bytes of U+2713
+    let out = clip_check_line(&wide);
+    assert!(
+        out.ends_with('…') && out.len() <= 200 + '…'.len_utf8(),
+        "a multi-byte line is cut on a boundary and bounded, got {} bytes",
+        out.len()
+    );
+}
