@@ -149,6 +149,11 @@ struct Monitor {
     /// cannot be canonicalized; the key's path stands in then.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     canonical: Option<PathBuf>,
+    /// The canonical paths of the symlinked folders that the kernel watching checked, as
+    /// `Tree::link_targets` keeps them. A change at one of them restarts a watched monitor; see
+    /// `mount_watch::mark_restarts`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    link_targets: Vec<PathBuf>,
     /// The limits when its kernel setup gave up at a limit; None otherwise.
     limits: Option<Limits>,
     /// Set when a mount change concerns the path. Reconcile then replaces this monitor.
@@ -482,6 +487,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
                     id,
                     info,
                     canonical: None,
+                    link_targets: Vec::new(),
                     limits: None,
                     restart: false,
                     library_paths: library.paths.clone(),

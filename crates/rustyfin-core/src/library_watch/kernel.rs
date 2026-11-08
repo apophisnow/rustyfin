@@ -73,6 +73,10 @@ struct Tree {
     fallback: Option<Fallback>,
     /// The mount table, read by the first check of the walk under way. None between walks.
     mounts: Option<String>,
+    /// The canonical paths of the symlinked folders checked so far, local or not. Forgetting a
+    /// folder keeps its target, so a share mounted there again is still matched; see
+    /// `mount_watch::mark_restarts`.
+    link_targets: BTreeSet<PathBuf>,
 }
 
 /// What a read of the kernel's queue gives: an event copied out of the read buffer, or the
@@ -134,10 +138,13 @@ pub(super) async fn watch(
         }
     };
     let folders = tree.folders.len();
+    // The symlink targets are published with the counts, and again after each batch that adds some.
+    let mut published = tree.link_targets.len();
     inner.with_monitor(key, id, |monitor| {
         monitor.info.folders = folders;
         monitor.info.watches = folders;
         monitor.info.ready = true;
+        monitor.link_targets = tree.link_targets.iter().cloned().collect();
     })?;
     tracing::info!(
         "library monitor: watching '{}' of '{library_name}' ({fs_type}): {folders} folders, {folders} watches, ready in {} ms",
@@ -220,9 +227,15 @@ pub(super) async fn watch(
             return Some(fallback_reason(inner, &root, fallback));
         }
         let folders = tree.folders.len();
+        // The set only grows, so its length tells whether it grew since it was last published.
+        let grown = tree.link_targets.len() != published;
+        published = tree.link_targets.len();
         inner.with_monitor(key, id, |monitor| {
             monitor.info.folders = folders;
             monitor.info.watches = folders;
+            if grown {
+                monitor.link_targets = tree.link_targets.iter().cloned().collect();
+            }
         })?;
     }
 }
@@ -266,6 +279,7 @@ fn setup(
         limit,
         fallback: None,
         mounts: None,
+        link_targets: BTreeSet::new(),
     };
     tree.watch_folder(root, (meta.dev(), meta.ino()))
         .map_err(add_failure)?;
@@ -545,13 +559,18 @@ impl Tree {
 
     /// Checks the folder at `dir`, of identity `id`, whose parent is on device `parent_dev`. A
     /// symlinked folder, or a mount inside the library, must be on a local filesystem, judged by
-    /// the fs type of its canonical path. Sets the fallback when it is not.
+    /// the fs type of its canonical path. Sets the fallback when it is not. The canonical path of
+    /// a symlinked folder is kept in `link_targets`, local or not.
     fn check_folder(&mut self, dir: &Path, id: Id, parent_dev: u64) {
         let is_link = fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
         if !is_link && id.0 == parent_dev {
             return;
         }
-        let fs_type = self.fs_type_at(dir);
+        let canonical = fs::canonicalize(dir).ok();
+        let fs_type = self.fs_type_at(canonical.as_deref());
+        if let Some(target) = canonical.filter(|_| is_link) {
+            self.link_targets.insert(target);
+        }
         if is_local_fs_type(&fs_type) {
             return;
         }
@@ -563,16 +582,17 @@ impl Tree {
         self.fallback.get_or_insert(Fallback::NotLocal(reason));
     }
 
-    /// The fs type of the canonical path of `dir`. The mount table is read at the first check of a
-    /// walk. "unknown" when there is no answer.
-    fn fs_type_at(&mut self, dir: &Path) -> String {
-        let Ok(canonical) = fs::canonicalize(dir) else {
+    /// The fs type of `canonical`, the canonical path of a folder, as the mount table has it. The
+    /// mount table is read at the first check of a walk. "unknown" when there is no canonical path
+    /// or no answer.
+    fn fs_type_at(&mut self, canonical: Option<&Path>) -> String {
+        let Some(canonical) = canonical else {
             return "unknown".to_string();
         };
         let mounts = self
             .mounts
             .get_or_insert_with(|| fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
-        fs_type_from_mountinfo(mounts.as_str(), &canonical).unwrap_or_else(|| "unknown".to_string())
+        fs_type_from_mountinfo(mounts.as_str(), canonical).unwrap_or_else(|| "unknown".to_string())
     }
 
     /// Forgets the folder at `dir`, and removes its watch when `unwatch` is set. The kernel has

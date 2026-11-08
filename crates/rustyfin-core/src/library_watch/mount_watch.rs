@@ -78,7 +78,8 @@ async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
 /// Marks each monitor that a change restarts, by the first such change in `changes`, then wakes
 /// the manager once when any monitor was marked. Each marked monitor is logged once. A polled path
 /// that keeps its last state is marked only when it can be watched in `table`, the mount table
-/// after the changes, or when a mount under it went away.
+/// after the changes, or when a mount under it went away. A watched path is also marked for a
+/// change at the target of one of its symlinked folders.
 fn mark_restarts(inner: &Inner, table: &str, changes: &[(PathBuf, MountChange)]) {
     let automounts = automount_points(table);
     let any = {
@@ -100,9 +101,16 @@ fn mark_restarts(inner: &Inner, table: &str, changes: &[(PathBuf, MountChange)])
                     restarts_polled_monitor(path, point, *change, watchable, &automounts)
                 })
             } else {
-                changes
-                    .iter()
-                    .find(|(point, change)| restarts_monitor(path, point, *change))
+                // A watched path is also set up again for a change at a symlinked folder's target.
+                let watched = monitor.info.method == Method::Watch;
+                changes.iter().find(|(point, change)| {
+                    restarts_monitor(path, point, *change)
+                        || (watched
+                            && monitor
+                                .link_targets
+                                .iter()
+                                .any(|target| restarts_monitor(target, point, *change)))
+                })
             };
             let Some((point, change)) = found else {
                 continue;
