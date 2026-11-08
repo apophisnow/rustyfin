@@ -3337,3 +3337,42 @@ async fn b20_dropped_snapshot_stops_its_worker() {
     }
     assert_eq!(outcomes, ["in memory: stopped", "copy: stopped"]);
 }
+
+// Fix round 5, R6: SQLite's error text can carry text from the file, such as the object name in
+// "malformed database schema (<name>)", so `unreadable` passes it through `clip_check_line` as it
+// does a quick_check line: control characters escaped, at most 200 bytes. Before, a crafted name
+// reached the message, and the log, whole.
+#[tokio::test]
+async fn b20_unreadable_text_is_clipped() {
+    // A schema row with no root page, named by an ANSI escape, 1,000 x's and a line break.
+    const CRAFTED_NAME: &str = "\
+        PRAGMA writable_schema = ON; \
+        INSERT INTO sqlite_schema (type, name, tbl_name, rootpage, sql) \
+            VALUES ('table', char(27) || '[31m' || replace(hex(zeroblob(500)), '0', 'x') \
+                || char(10) || 'end', 'Crafted', NULL, NULL); \
+        PRAGMA writable_schema = OFF;";
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let db = tmp.0.join("jellyfin.db");
+    write_db(&db, &[USERS_DDL, CRAFTED_NAME]).await;
+    let mut texts = Vec::new();
+    for limit in [u64::MAX, 0] {
+        let open =
+            open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX)).await;
+        texts.push(match open.map(drop) {
+            Ok(()) => "read".to_string(),
+            Err(ImportError::BadSource(text)) => text.replace(&db.display().to_string(), "<file>"),
+            Err(other) => format!("{other:?}"),
+        });
+    }
+    // 68 bytes of sqlx's and SQLite's text, the escape's 6 and "[31m", then 122 x's make 200.
+    let clipped = format!(
+        "cannot read <file>: error returned from database: (code: 11) malformed database schema \
+         (\\u001b[31m{}…",
+        "x".repeat(122)
+    );
+    assert_eq!(
+        texts,
+        [clipped.clone(), clipped],
+        "the in-memory path, then the copy path"
+    );
+}

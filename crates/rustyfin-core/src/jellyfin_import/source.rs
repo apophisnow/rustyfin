@@ -2516,7 +2516,13 @@ pub(super) fn unreadable(file: &Path, error: &sqlx::Error) -> ImportError {
     {
         return ImportError::BadSource(format!("{}: its schema is damaged", file.display()));
     }
-    ImportError::BadSource(format!("cannot read {}: {error}", file.display()))
+    // SQLite's text can quote the file, such as an object name in "malformed database schema
+    // (…)", so it is clipped and escaped like a quick_check line (spec Fix round 5, R6).
+    ImportError::BadSource(format!(
+        "cannot read {}: {}",
+        file.display(),
+        clip_check_line(&error.to_string())
+    ))
 }
 
 fn unreadable_path(path: &Path, error: &std::io::Error) -> ImportError {
