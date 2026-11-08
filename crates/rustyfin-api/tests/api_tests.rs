@@ -3336,6 +3336,145 @@ async fn b18p2_monitoring_off_keeps_media_updated_and_webhook_reports() {
     );
 }
 
+/// The library paths the library monitor monitors, as (library, path), sorted.
+fn b18p2_monitored(state: &AppState) -> Vec<(uuid::Uuid, String)> {
+    let mut monitored: Vec<(uuid::Uuid, String)> = state
+        .task_scheduler
+        .watcher()
+        .monitored()
+        .into_iter()
+        .map(|path| (path.library_id, path.path.to_string_lossy().into_owned()))
+        .collect();
+    monitored.sort();
+    monitored
+}
+
+/// Waits up to 5 s until the library monitor monitors `expected`, and nothing else.
+async fn b18p2_wait_monitored(state: &AppState, what: &str, mut expected: Vec<(uuid::Uuid, &str)>) {
+    expected.sort();
+    let expected: Vec<(uuid::Uuid, String)> = expected
+        .into_iter()
+        .map(|(library, path)| (library, path.to_string()))
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let monitored = b18p2_monitored(state);
+        if monitored == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: monitored {monitored:?}, expected {expected:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b18p2_the_library_monitor_follows_the_setting_and_the_libraries() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = create_library_via_api(&app, &state, &token, "B18p2 Watched Films", "Movies").await;
+    let films_dir = media_folder(&state, "b18p2 watched films");
+    // The scheduler starts it at startup; this state's scheduler is never started.
+    state.task_scheduler.watcher().start();
+    b18p2_wait_monitored(&state, "at start", vec![(films, &films_dir)]).await;
+
+    // Added with monitoring off: not monitored. Added with it on: monitored at once.
+    let shows_a = media_folder(&state, "b18p2 watched shows a");
+    let shows_b = media_folder(&state, "b18p2 watched shows b");
+    let body = serde_json::json!({
+        "Name": "B18p2 Watched Shows",
+        "ContentType": "TvShows",
+        "Paths": [shows_a, shows_b],
+        "LibraryOptions": { "EnableRealtimeMonitor": false },
+    })
+    .to_string();
+    let (status, created) =
+        send_authed(&app, "POST", "/Library/VirtualFolders", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let shows: uuid::Uuid = created["Id"].as_str().unwrap().parse().unwrap();
+    let music = create_library_via_api(&app, &state, &token, "B18p2 Watched Music", "Music").await;
+    let music_dir = media_folder(&state, "b18p2 watched music");
+    b18p2_wait_monitored(
+        &state,
+        "libraries added",
+        vec![(films, &films_dir), (music, &music_dir)],
+    )
+    .await;
+
+    // Switched on and off in the library's options.
+    b18p2_save_options(&app, &token, shows, r#"{"EnableRealtimeMonitor":true}"#).await;
+    b18p2_wait_monitored(
+        &state,
+        "switched on",
+        vec![
+            (films, &films_dir),
+            (music, &music_dir),
+            (shows, &shows_a),
+            (shows, &shows_b),
+        ],
+    )
+    .await;
+    b18p2_save_options(&app, &token, films, r#"{"EnableRealtimeMonitor":false}"#).await;
+    b18p2_wait_monitored(
+        &state,
+        "switched off",
+        vec![(music, &music_dir), (shows, &shows_a), (shows, &shows_b)],
+    )
+    .await;
+
+    // A path removed from a library, then a library removed.
+    let body = serde_json::json!({ "LibraryId": shows, "Paths": [shows_b] }).to_string();
+    let uri = "/Library/VirtualFolders/Paths";
+    let (status, removed) = send_authed(&app, "DELETE", uri, &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    b18p2_wait_monitored(
+        &state,
+        "path removed",
+        vec![(music, &music_dir), (shows, &shows_a)],
+    )
+    .await;
+    let uri = format!("/Library/VirtualFolders/{music}");
+    let (status, removed) = send_authed(&app, "DELETE", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    b18p2_wait_monitored(&state, "library removed", vec![(shows, &shows_a)]).await;
+    state.task_scheduler.watcher().stop();
+}
+
+#[tokio::test]
+async fn b18p2_the_poll_interval_follows_the_server_configuration() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let interval = || state.task_scheduler.watcher().poll_interval();
+    let (status, mut config) =
+        send_authed(&app, "GET", "/System/Configuration", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+
+    config["LibraryMonitorPollInterval"] = 15.into();
+    let body = config.to_string();
+    let (status, body) =
+        send_authed(&app, "POST", "/System/Configuration", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(interval(), std::time::Duration::from_secs(15));
+
+    // Zero polls every second.
+    config["LibraryMonitorPollInterval"] = 0.into();
+    let body = config.to_string();
+    let (status, body) =
+        send_authed(&app, "POST", "/System/Configuration", &token, Some(&body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(interval(), std::time::Duration::from_secs(1));
+
+    // Saved as a single key.
+    let uri = "/System/Configuration/LibraryMonitorPollInterval";
+    let (status, body) = send_authed(&app, "POST", uri, &token, Some("120")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(interval(), std::time::Duration::from_secs(120));
+}
+
 // ── Library Modified Volumes Tests ──
 
 #[tokio::test]
