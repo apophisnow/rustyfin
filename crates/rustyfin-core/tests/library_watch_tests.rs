@@ -3,14 +3,16 @@
 // that monitors the library paths whose libraries have real-time monitoring on
 // (`LibraryWatcher`), and watching local paths with the kernel's change notifications.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustyfin_core::library_monitor::ChangeQueue;
 use rustyfin_core::library_watch::{
-    FolderPoller, LibraryWatcher, Method, MonitoredPath, MountChange, coalesce,
+    FolderPoller, LibraryWatcher, Method, MonitoredPath, MountChange, automount_points, coalesce,
     fs_type_from_mountinfo, fs_type_of, is_local_fs_type, mount_changes, restarts_monitor,
+    restarts_polled_monitor,
 };
 use rustyfin_core::scanner::ScanScope;
 use rustyfin_model::library::{Library, LibraryContentType, LibraryOptions};
@@ -335,6 +337,112 @@ fn a_mount_at_above_or_under_a_path_restarts_its_monitor_and_an_unmount_only_und
             restarts_monitor(path, point, MountChange::Unmounted),
             unmounted,
             "an unmount {what}"
+        );
+    }
+}
+
+#[test]
+fn automount_points_are_the_mount_points_of_autofs_mounts() {
+    // An indirect map on /net with a share mounted in it, a direct map with a disk on it, and a
+    // tmpfs whose source is named autofs.
+    let table = MOUNTINFO.to_string()
+        + r"90 22 0:80 / /net rw,relatime shared:20 - autofs -hosts rw,fd=7,pgrp=1,timeout=300,indirect
+91 90 0:81 / /net/nas rw,relatime - nfs4 nas:/export rw
+92 22 0:82 / /mnt/usb\040disk rw,relatime - autofs systemd-1 rw,fd=51,timeout=60,direct
+93 92 8:97 / /mnt/usb\040disk rw,relatime - ext4 /dev/sdh1 rw
+94 22 0:83 / /mnt/scratch rw - tmpfs autofs rw
+";
+    assert_eq!(
+        sorted(automount_points(&table).into_iter().collect()),
+        vec![PathBuf::from("/mnt/usb disk"), PathBuf::from("/net")],
+        "autofs mounts alone, by their type, unescaped"
+    );
+    assert!(automount_points(MOUNTINFO).is_empty());
+}
+
+#[test]
+fn a_polled_path_that_keeps_its_last_state_is_restarted_only_to_be_watched_or_for_an_unmount_under_it()
+ {
+    use MountChange::{Mounted, Unmounted};
+    let path = Path::new("/mnt/nas/Movies");
+    let no_automounts = HashSet::new();
+    for (point, watchable, mounted, unmounted, what) in [
+        ("/mnt/nas/Movies", false, false, false, "at the path"),
+        (
+            "/mnt/nas/Movies",
+            true,
+            true,
+            false,
+            "at the path, watchable",
+        ),
+        ("/mnt/nas", false, false, false, "above the path"),
+        ("/mnt/nas", true, true, false, "above the path, watchable"),
+        (
+            "/mnt/nas/Movies/Heat (1995)",
+            false,
+            false,
+            true,
+            "under the path",
+        ),
+        (
+            "/mnt/nas/Movies/Heat (1995)",
+            true,
+            true,
+            true,
+            "under the path, watchable",
+        ),
+        ("/mnt/other", true, false, false, "elsewhere"),
+    ] {
+        let point = Path::new(point);
+        assert_eq!(
+            restarts_polled_monitor(path, point, Mounted, watchable, &no_automounts),
+            mounted,
+            "a mount {what}"
+        );
+        assert_eq!(
+            restarts_polled_monitor(path, point, Unmounted, watchable, &no_automounts),
+            unmounted,
+            "an unmount {what}"
+        );
+    }
+
+    // An automount comes and goes by itself: a direct map's point, or a folder directly in an
+    // indirect map's point, restarts nothing; a mount deeper in the share keeps the rule.
+    let automounts: HashSet<PathBuf> = ["/mnt/nas/Movies", "/net"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    for (path, point, restarts, what) in [
+        (
+            "/mnt/nas/Movies",
+            "/mnt/nas/Movies",
+            false,
+            "a direct map at the path",
+        ),
+        (
+            "/net/nas/Movies",
+            "/net/nas",
+            false,
+            "an indirect map above the path",
+        ),
+        ("/net/nas/Movies", "/net", false, "the indirect map itself"),
+        (
+            "/net/nas/Movies",
+            "/net/nas/Movies/Heat (1995)",
+            true,
+            "a share deeper in it",
+        ),
+    ] {
+        let (path, point) = (Path::new(path), Path::new(point));
+        assert_eq!(
+            restarts_polled_monitor(path, point, Mounted, true, &automounts),
+            restarts,
+            "a mount: {what}"
+        );
+        assert_eq!(
+            restarts_polled_monitor(path, point, Unmounted, true, &automounts),
+            restarts,
+            "an unmount: {what}"
         );
     }
 }
