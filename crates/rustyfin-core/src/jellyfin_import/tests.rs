@@ -1899,6 +1899,61 @@ async fn b20_snapshot_reads_only_tables() {
             )),
         }
     }
+
+    // Fix round 8 (re-check 7, H3 and H5), on both paths: rows that load but that the kind query
+    // misread. Loading the schema compares a row's type without regard to case, so a `VIEW` row
+    // loads as a view and a `TABLE` row as a table; at 48f90f4 the query matched only lower case, so
+    // the name had no kind and went unchecked (H3). A virtual table whose row has a root page and SQL
+    // that doesn't start `CREATE VIRTUAL` passed as a table, so the checks that followed connected it
+    // through its module, which compiles its content view (H5).
+    const UPPER_CASE_VIEW: &str = "DROP TABLE Users; CREATE VIEW Users AS SELECT 'u1' AS Id, \
+        1 AS InternalId, 'alice' AS Username; PRAGMA writable_schema = ON; \
+        UPDATE sqlite_schema SET type = 'VIEW' WHERE name = 'Users'; PRAGMA writable_schema = OFF";
+    const UPPER_CASE_TABLE: &str = "DROP TABLE Peoples; CREATE TABLE Peoples (Id TEXT, \
+        Name TEXT NOT NULL, PersonType TEXT AS ('Actor') VIRTUAL); PRAGMA writable_schema = ON; \
+        UPDATE sqlite_schema SET type = 'TABLE' WHERE name = 'Peoples'; \
+        PRAGMA writable_schema = OFF";
+    const ROOTED_VIRTUAL_TABLE: &str = "DROP TABLE Peoples; CREATE VIEW cv AS SELECT 'p1' AS Id, \
+        'Ann' AS Name, 'Actor' AS PersonType; CREATE VIRTUAL TABLE Peoples USING fts4(content=cv); \
+        PRAGMA writable_schema = ON; UPDATE sqlite_schema SET rootpage = 2, \
+        sql = 'CREATE/**/VIRTUAL TABLE Peoples USING fts4(content=cv)' WHERE name = 'Peoples'; \
+        PRAGMA writable_schema = OFF";
+    let data = TempDir::new();
+    for (case, change, want) in [
+        (
+            "upper-case view",
+            UPPER_CASE_VIEW,
+            "Users is a view, not a plain table",
+        ),
+        (
+            "upper-case table",
+            UPPER_CASE_TABLE,
+            "Peoples has generated columns",
+        ),
+        (
+            "virtual table with a root page",
+            ROOTED_VIRTUAL_TABLE,
+            "Peoples is a virtual table, not a plain table",
+        ),
+    ] {
+        let db = tmp.0.join(case.replace(' ', "_")).join("jellyfin.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        write_db(&db, &[USERS_DDL, NEW_LIBRARY_DDL, ONE_CREDIT, change]).await;
+        for (path, limit) in [("in memory", u64::MAX), ("copy", 0)] {
+            let open =
+                open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX));
+            match tokio::time::timeout(std::time::Duration::from_secs(5), open).await {
+                Ok(Err(ImportError::BadSource(text)))
+                    if text.contains("jellyfin.db") && text.contains(want) => {}
+                Err(_) => wrong.push(format!("{case} ({path}): still busy after 5 s")),
+                Ok(other) => wrong.push(format!(
+                    "{case} ({path}): {:?}, want a BadSource naming jellyfin.db that says \
+                     \"{want}\"",
+                    other.map(drop)
+                )),
+            }
+        }
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 

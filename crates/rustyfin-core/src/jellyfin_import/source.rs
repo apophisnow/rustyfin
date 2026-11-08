@@ -502,20 +502,23 @@ pub(super) fn clip_check_line(line: &str) -> String {
 /// file has no table or view by that name. It is read from `sqlite_schema` alone, which costs SQLite
 /// only the schema parse. `pragma_table_list` would first compile every view in the file, named or
 /// not, and a crafted view can make that compile take minutes and gigabytes where no guard can stop
-/// it (B20 re-check 6, H2). Loading the schema checks each row's type against its SQL, so a view
-/// can't pass as a table. A virtual table is a table row with no root page, made by `CREATE VIRTUAL
-/// TABLE`; one whose stored SQL hides that is connected through its module by the checks that
-/// follow, as `pragma_table_list` already did (re-check 6, D2). Shadow tables need no kind of their
-/// own: their names hold an underscore, and none of the tables the import reads has one.
+/// it (B20 re-check 6, H2). Loading the schema checks each row's type against its SQL without regard
+/// to case, so the type is read the same way: a row typed `VIEW` is a view (re-check 7, H3). A table
+/// is plain only when it has a root page and its SQL starts with the `CREATE TABLE ` that SQLite
+/// writes for every table it makes. Any other table row is taken for a virtual table, even one whose
+/// SQL hides `CREATE VIRTUAL` behind a comment, so no check connects it through its module
+/// (re-check 7, H5). Shadow tables need no kind of their own: their names hold an underscore, and
+/// none of the tables the import reads has one.
 async fn table_kind(
     conn: &mut SqliteConnection,
     file: &Path,
     name: &str,
 ) -> Result<Option<String>, ImportError> {
     let kind: Option<(String,)> = sqlx::query_as(
-        "SELECT CASE WHEN type = 'view' THEN 'view' \
-         WHEN rootpage = 0 OR sql LIKE 'CREATE VIRTUAL%' THEN 'virtual table' ELSE 'table' END \
-         FROM main.sqlite_schema WHERE name = ?1 COLLATE NOCASE AND type IN ('table', 'view')",
+        "SELECT CASE WHEN lower(type) = 'view' THEN 'view' \
+         WHEN rootpage > 0 AND substr(sql, 1, 13) = 'CREATE TABLE ' THEN 'table' \
+         ELSE 'virtual table' END FROM main.sqlite_schema \
+         WHERE name = ?1 COLLATE NOCASE AND lower(type) IN ('table', 'view')",
     )
     .bind(name)
     .fetch_optional(conn)
