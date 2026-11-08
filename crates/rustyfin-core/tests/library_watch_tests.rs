@@ -2148,9 +2148,9 @@ mod kernel {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_path_over_the_watch_limit_is_watched_once_the_limit_is_lifted_and_libraries_change()
     {
-        // Fix round 1, item 2: a fallback at a limit is not for good. A library change (a SIGHUP
-        // makes one too) sets the path up again: polled again while the limit holds, without a
-        // second warning, and watched once the limit allows it.
+        // Fix round 1, item 2: a fallback at a limit is not for good. Once the limit allows it, a
+        // library change (a SIGHUP makes one too) sets the path up again, watched. While the
+        // limit holds, a change keeps the monitor (fix round 2, item C) and warns no more.
         let _logs = captured_logs();
         let tree = Tree::new();
         movie_tree(&tree);
@@ -2170,16 +2170,14 @@ mod kernel {
         ];
         wait_for_log(&polled).await;
 
-        // The limit still holds: polled again after the change, and warned about once.
+        // The limit still holds: the monitor is kept at a change, and warned about once.
         watcher.libraries_changed();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while log_lines(&polled).len() < 2 {
-            assert!(
-                Instant::now() < deadline,
-                "the path is set up again at a library change"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        quiet_period().await;
+        assert_eq!(
+            log_lines(&polled).len(),
+            1,
+            "the monitor is kept while the limit holds"
+        );
         let warning = format!(
             "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead.",
             tree.root().display()
@@ -2193,6 +2191,38 @@ mod kernel {
         write(&tree.at("Heat (1995)/Heat (1995).en.srt"), 10);
         recorder
             .wait_for(&folder_unit(&lib, tree.at("Heat (1995)")), 1)
+            .await;
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_over_the_watch_limit_keeps_its_baseline_when_libraries_change_and_the_limit_does_not()
+     {
+        // Fix round 2, item C: a library change, a SIGHUP or a mount restart of another path keeps
+        // a monitor that polls for a limit that has not changed, so what changed since its last
+        // poll is still reported. No poll runs until the change has been handled.
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel R Films", &[tree.root()]).await;
+        let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), tree.outside("data"));
+        watcher.set_watch_limit(Some(2));
+        watcher.set_poll_interval(Duration::from_secs(3600));
+        watcher.start();
+        wait_monitored(&watcher, "the baseline at the watch limit", |m| {
+            monitor_of(m, &tree.root())
+                .is_some_and(|p| p.ready && p.reason.as_deref() == Some("watch limit reached"))
+        })
+        .await;
+
+        tick();
+        write(&tree.at("Bravo (2002)/Bravo (2002).mkv"), 10);
+        watcher.libraries_changed();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        watcher.set_poll_interval(Duration::from_millis(100));
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Bravo (2002)")), 1)
             .await;
         watcher.stop();
     }
