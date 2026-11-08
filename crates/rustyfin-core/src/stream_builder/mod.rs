@@ -1,6 +1,7 @@
 //! Stream building: the facts about a media source and the profile conditions that test them.
 //! Ports the parts of Jellyfin's `StreamBuilder` and `ConditionProcessor` that the builder needs.
 
+mod audio;
 pub mod conditions;
 mod facts;
 mod subtitles;
@@ -366,7 +367,9 @@ pub struct DeviceData {
 
 /// The suffix that the transcode URL gets for the request's stream-copy and burn-in flags (MIH
 /// `SetDeviceSpecificData`). Each suffix is written only when its flag differs from the default.
-fn transcode_suffix(request: &StreamRequest) -> String {
+/// The burn-in suffix is written only when `burn_in` is set: MIH reads it from StreamInfo, which
+/// an audio plan never sets.
+fn transcode_suffix(request: &StreamRequest, burn_in: bool) -> String {
     let mut suffix = String::new();
     if !request.allow_video_stream_copy {
         suffix.push_str("&allowVideoStreamCopy=false");
@@ -374,15 +377,16 @@ fn transcode_suffix(request: &StreamRequest) -> String {
     if !request.allow_audio_stream_copy {
         suffix.push_str("&allowAudioStreamCopy=false");
     }
-    if request.always_burn_in_subtitle {
+    if burn_in && request.always_burn_in_subtitle {
         suffix.push_str("&alwaysBurnInSubtitleWhenTranscoding=true");
     }
     suffix
 }
 
 /// Jellyfin's `SetDeviceSpecificData` for one source (MIH steps 1 to 4): what the device can do
-/// with `source`, and the transcode URL when the file needs one. Only the video plan is ported.
-/// An audio request gets the flags of step 2 and no plan, so no subtitles either (T3c).
+/// with `source`, and the transcode URL when the file needs one. The video plan and the audio plan
+/// are ported. An audio request with no plan gets the flags of step 2 and the source's
+/// own default streams.
 pub fn device_data(
     source: &SourceFacts,
     profile: &DeviceProfile,
@@ -404,32 +408,41 @@ pub fn device_data(
     copy.supports_direct_stream &= request.enable_direct_stream && request.allow_video_stream_copy;
     copy.supports_transcoding &= request.enable_transcoding;
 
-    // Step 3: the plan. Audio has no plan yet (T3c), so it keeps the flags of step 2.
+    // Step 3: the plan. With no audio plan (no audio stream, or a transcode the source may not
+    // make), the source keeps the flags of step 2 and its own default streams (MIH 272-348).
     let plan = match request.media_kind {
         MediaKind::Video => video::plan_video(&copy, &options),
-        MediaKind::Audio => {
-            return DeviceData {
-                supports_direct_play: copy.supports_direct_play,
-                supports_direct_stream: copy.supports_direct_stream,
-                supports_transcoding: copy.supports_transcoding,
-                play_method: None,
-                container: source.container.clone(),
-                transcoding_url: None,
-                transcoding_sub_protocol: StreamProtocol::Http,
-                transcoding_container: None,
-                transcode_reasons: TranscodeReasons::default(),
-                default_audio_stream_index: None,
-                default_subtitle_stream_index: None,
-                subtitles: Vec::new(),
-            };
-        }
+        MediaKind::Audio => match audio::plan_audio(&copy, &options) {
+            Some(plan) => plan,
+            None => {
+                return DeviceData {
+                    supports_direct_play: copy.supports_direct_play,
+                    supports_direct_stream: copy.supports_direct_stream,
+                    supports_transcoding: copy.supports_transcoding,
+                    play_method: None,
+                    container: source.container.clone(),
+                    transcoding_url: None,
+                    transcoding_sub_protocol: StreamProtocol::Http,
+                    transcoding_container: None,
+                    transcode_reasons: TranscodeReasons::default(),
+                    default_audio_stream_index: source.default_audio_stream_index,
+                    default_subtitle_stream_index: source.default_subtitle_stream_index,
+                    subtitles: Vec::new(),
+                };
+            }
+        },
     };
 
     // Step 4: the flags follow the plan. A direct stream is the direct play here, since the
-    // DirectStream branch is off (MIH 280-283). A transcode URL needs an applied profile.
+    // DirectStream branch is off (MIH 280-283). A transcode URL needs an applied profile. The
+    // profile is an HLS streaming one of the request's media kind.
     let direct = plan.direct_play;
+    let transcode_type = match request.media_kind {
+        MediaKind::Video => ProfileType::Video,
+        MediaKind::Audio => ProfileType::Audio,
+    };
     let profile_has_hls = profile.transcoding_profiles.iter().any(|tp| {
-        tp.r#type == ProfileType::Video
+        tp.r#type == transcode_type
             && tp.context == EncodingContext::Streaming
             && tp.protocol == StreamProtocol::Hls
     });
@@ -440,14 +453,22 @@ pub fn device_data(
         match &plan.transcode {
             Some(stream) => {
                 play_method = Some(PlayMethod::Transcode);
-                transcoding_url = Some(format!("{}{}", stream.to_url(), transcode_suffix(request)));
+                let burn_in = request.media_kind == MediaKind::Video;
+                transcoding_url = Some(format!(
+                    "{}{}",
+                    stream.to_url(),
+                    transcode_suffix(request, burn_in)
+                ));
             }
             None => supports_transcoding = false,
         }
     }
 
-    // Subtitles (T3b): one delivery per subtitle stream, in source order.
-    let deliveries = subtitles::deliveries(source, profile, request, &plan);
+    // Subtitles: one delivery per subtitle stream, in source order. An audio item has none.
+    let deliveries = match request.media_kind {
+        MediaKind::Video => subtitles::deliveries(source, profile, request, &plan),
+        MediaKind::Audio => Vec::new(),
+    };
 
     let (transcoding_container, transcoding_sub_protocol) = plan
         .transcode

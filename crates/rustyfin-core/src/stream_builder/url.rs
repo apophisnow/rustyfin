@@ -174,6 +174,9 @@ impl StreamInfo {
         if !reasons.is_empty() {
             params.push(format!("TranscodeReasons={}", reasons.join(",")));
         }
+        if self.audio_only {
+            params.push("AudioOnly=true".to_string());
+        }
 
         let path = format!("/Videos/{}/main.m3u8", self.item_id);
         if params.is_empty() {

@@ -91,6 +91,8 @@ pub(super) struct StreamInfo {
     pub(super) stream_options: StreamOptions,
     /// Why the stream can't be copied as it is.
     pub(super) transcode_reasons: TranscodeReasons,
+    /// Whether the transcode is audio only. `to_url` writes `AudioOnly=true` as the last parameter.
+    pub(super) audio_only: bool,
 }
 
 /// The options that BuildVideoItem reads: Jellyfin's `MediaOptions` after the request has been
@@ -276,7 +278,7 @@ fn codec_container(profile: &CodecProfile, use_sub: bool) -> &str {
 }
 
 /// Jellyfin's `CodecProfile.ContainsAnyCodec(codec, container)` for one codec.
-fn codec_profile_matches(
+pub(super) fn codec_profile_matches(
     profile: &CodecProfile,
     codec: &str,
     container: &str,
@@ -335,7 +337,7 @@ fn video_facts(source: &SourceFacts, video: Option<&StreamFacts>) -> VideoFacts 
 }
 
 /// The audio facts that the profile conditions test, for an audio stream.
-fn audio_facts(audio: &StreamFacts, is_secondary: bool) -> AudioFacts {
+pub(super) fn audio_facts(audio: &StreamFacts, is_secondary: bool) -> AudioFacts {
     AudioFacts {
         channels: audio.channels,
         bitrate: audio.bit_rate,
@@ -353,7 +355,10 @@ fn video_stream(source: &SourceFacts) -> Option<&StreamFacts> {
 
 /// Jellyfin's `MediaSourceInfo.GetDefaultAudioStream`: the audio stream at `index` when there is
 /// one, else the first default audio stream, else the first audio stream.
-fn default_audio_stream(source: &SourceFacts, index: Option<i32>) -> Option<&StreamFacts> {
+pub(super) fn default_audio_stream(
+    source: &SourceFacts,
+    index: Option<i32>,
+) -> Option<&StreamFacts> {
     let audio = |s: &&StreamFacts| s.kind == StreamKind::Audio;
     index
         .filter(|i| *i != -1)
@@ -378,7 +383,7 @@ fn is_secondary_audio(source: &SourceFacts, stream: &StreamFacts) -> Option<bool
 
 /// Jellyfin's `IsBitrateLimitExceeded`: a remote source is never over the limit, a limit of zero or
 /// less is no limit, and an unknown bitrate counts as 40 Mbps.
-fn bitrate_limit_exceeded(source: &SourceFacts, max_bitrate: i64) -> bool {
+pub(super) fn bitrate_limit_exceeded(source: &SourceFacts, max_bitrate: i64) -> bool {
     if source.is_remote {
         return false;
     }
@@ -508,7 +513,7 @@ fn direct_play_video_codec(profile: &DirectPlayProfile, codec: &str) -> bool {
 }
 
 /// Whether a direct play profile plays the audio's codec.
-fn direct_play_audio_codec(profile: &DirectPlayProfile, codec: &str) -> bool {
+pub(super) fn direct_play_audio_codec(profile: &DirectPlayProfile, codec: &str) -> bool {
     conditions::contains_container(&profile.audio_codec, codec)
 }
 
@@ -781,7 +786,7 @@ fn set_list_option(
 /// the stream info. `qualifier` is the codec the conditions are for, if any. A condition with an
 /// empty value or a `GreaterThanEqual` type is skipped, as Jellyfin skips it. A property that
 /// Jellyfin doesn't read yet changes nothing.
-fn apply_transcoding_conditions(
+pub(super) fn apply_transcoding_conditions(
     stream: &mut StreamInfo,
     profile_conditions: &[ProfileCondition],
     qualifier: Option<&str>,
@@ -973,7 +978,7 @@ const HLS_AUDIO_CODECS_MP4: [&str; 9] = [
 ];
 
 /// Clamps an `i64` into the `i32` range, so that no conversion can panic or wrap.
-fn saturating_i32(value: i64) -> i32 {
+pub(super) fn saturating_i32(value: i64) -> i32 {
     i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
 }
 
@@ -1013,7 +1018,10 @@ fn audio_candidates<'a>(
 
 /// Jellyfin's `SetStreamInfoOptionsFromTranscodingProfile`: copies the transcoding profile's
 /// container, protocol, seek mode, manifest flags and segment settings into the stream info.
-fn set_stream_info_from_transcoding_profile(stream: &mut StreamInfo, profile: &TranscodingProfile) {
+pub(super) fn set_stream_info_from_transcoding_profile(
+    stream: &mut StreamInfo,
+    profile: &TranscodingProfile,
+) {
     stream.container = Some(profile.container.clone());
     stream.sub_protocol = profile.protocol;
     stream.transcode_seek_info = profile.transcode_seek_info;
