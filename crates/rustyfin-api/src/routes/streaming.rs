@@ -886,7 +886,7 @@ async fn video_playback_info(
 
     // The subtitle files beside each video are listed after its streams
     for source in media_sources.iter_mut() {
-        let external = crate::routes::subtitle::external_streams(source);
+        let external = crate::routes::subtitle::external_streams(source).await;
         source.media_streams.extend(external);
     }
 

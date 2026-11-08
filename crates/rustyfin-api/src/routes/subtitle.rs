@@ -177,8 +177,9 @@ async fn source_subtitle_vtt_from(
 }
 
 /// The external subtitle files of `source` that its streams do not list, as subtitle streams
-/// numbered after the highest stream index, in file-name order.
-pub(crate) fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream> {
+/// numbered after the highest stream index, in file-name order. The directory is read on a
+/// blocking thread, so the async workers do not wait on it; a failed task gives no files.
+pub(crate) async fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream> {
     let listed: Vec<PathBuf> = source
         .media_streams
         .iter()
@@ -192,7 +193,10 @@ pub(crate) fn external_streams(source: &MediaSourceResponse) -> Vec<MediaStream>
         .unwrap_or(-1)
         + 1;
     let media_path = PathBuf::from(&source.path);
-    discover_external_subtitles(&media_path)
+    let found = tokio::task::spawn_blocking(move || discover_external_subtitles(&media_path))
+        .await
+        .unwrap_or_default();
+    found
         .into_iter()
         .filter(|file| !listed.contains(&file.path))
         .enumerate()
@@ -241,7 +245,7 @@ async fn subtitle_vtt(
     })?;
 
     // The stream: an embedded one, or an external one, which must name its file
-    let external = external_streams(source);
+    let external = external_streams(source).await;
     let stream = source
         .media_streams
         .iter()

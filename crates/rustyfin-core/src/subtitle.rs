@@ -83,14 +83,14 @@ pub fn discover_external_subtitles(media_path: &Path) -> Vec<ExternalSubtitle> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_lowercase(),
             None => continue,
         };
         if !SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        if !path.is_file() {
             continue;
         }
         let file_stem_full = match path.file_stem().and_then(|s| s.to_str()) {
