@@ -2871,6 +2871,7 @@ let jiPreviewed = false; // a preview is on screen; from then on the request car
 let jiRunning = false;   // the last status read said Running
 let jiTimer = null;      // the one status poll loop
 const jiChoice = new Map();     // JellyfinId -> checked; kept across previews of the same folder and layout
+const jiConfirm = new Map();    // JellyfinId -> UserId of a ticked suggested match; kept like jiChoice
 let jiPendingNames = new Map(); // UserId -> Name of the pending users (names stay out of onclick attributes)
 const jiShownCodes = new Map(); // UserId -> { name, code } of a new code shown in the pending list
 const jiLayoutKeys = { New: 'jellyfin_import.layout_new', Old: 'jellyfin_import.layout_old' };
@@ -2889,7 +2890,9 @@ const jiActionKeys = {
 };
 const jiReasonKeys = {
     Ambiguous: 'jellyfin_import.reason_ambiguous',
-    NotSelected: 'jellyfin_import.reason_not_selected'
+    NotSelected: 'jellyfin_import.reason_not_selected',
+    NotConfirmed: 'jellyfin_import.reason_not_confirmed',
+    ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other'
 };
 
 function jiPanelHtml() {
@@ -2996,12 +2999,14 @@ function jiPairs() {
         .filter(p => p.From && p.To);
 }
 
-// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs and checked users.
+// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs, checked users and ticked matches.
 function jiRequest() {
     const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value, MetadataMode: $('ji-metadata').value };
     if (jiPreviewed) {
         req.PathMappings = jiPairs();
         req.UserIds = [...document.querySelectorAll('#ji-users .ji-user:checked:not(:disabled)')].map(el => el.value);
+        req.ConfirmedMatches = [...document.querySelectorAll('#ji-users .ji-confirm:checked')]
+            .map(el => ({ JellyfinId: el.value, UserId: el.dataset.userId }));
     }
     return req;
 }
@@ -3019,6 +3024,7 @@ function jiShowError(message) {
 function jiForget() {
     jiPreviewed = false;
     jiChoice.clear();
+    jiConfirm.clear();
     $('ji-pairs').innerHTML = '';
     $('ji-users').innerHTML = '';
     hide('ji-preview');
@@ -3026,6 +3032,11 @@ function jiForget() {
 
 function jiSetChoice(el) {
     jiChoice.set(el.value, el.checked);
+}
+
+function jiSetConfirm(el) {
+    if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
+    else jiConfirm.delete(el.value);
 }
 
 async function jiPreview() {
@@ -3059,13 +3070,28 @@ function jiUsersHtml(users) {
         const ambiguous = u.Reason === 'Ambiguous';
         const checked = !ambiguous && (jiChoice.has(u.JellyfinId) ? jiChoice.get(u.JellyfinId) : true);
         return `
-        <label class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
-            <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
-            <span class="font-semibold">${escapeHtml(u.Name)}</span>
-            ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
-            <span class="text-xs text-white/50">${jiActionText(u)}</span>
-        </label>`;
+        <div>
+            <label class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
+                <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
+                <span class="font-semibold">${escapeHtml(u.Name)}</span>
+                ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
+                <span class="text-xs text-white/50">${jiActionText(u)}</span>
+            </label>${jiConfirmHtml(u)}
+        </div>`;
     }).join('');
+}
+
+// A name match goes into the existing account only when its box is ticked. It starts unticked, and
+// stays ticked only while the suggestion names the same account. Account names are escaped.
+function jiConfirmHtml(u) {
+    const s = u.SuggestedMatch;
+    if (!s) return '';
+    const checked = jiConfirm.get(u.JellyfinId) === s.UserId;
+    return `
+            <label class="flex items-center gap-2 ml-7 mt-1 text-xs text-white/70">
+                <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''}>
+                <span>${t('jellyfin_import.confirm_match', { name: escapeHtml(s.Name) })}</span>
+            </label>`;
 }
 
 // "Action", or "Action: reason" when there is a reason. The translations are static text.
@@ -3294,6 +3320,7 @@ async function loadJellyfinImport() {
         // A new panel has no preview on screen, so the old pairs, choices and codes go.
         jiPreviewed = false;
         jiChoice.clear();
+        jiConfirm.clear();
         jiShownCodes.clear();
     }
     jiLoadPending();

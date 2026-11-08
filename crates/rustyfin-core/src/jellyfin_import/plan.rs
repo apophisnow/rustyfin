@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use super::paths::{PathMapping, translate_path};
 use super::source::{JfItem, JfUser};
-use super::{ItemReport, SkipReason, UnmatchedSample, UserAction, UserRow};
+use super::{
+    ConfirmedMatch, ItemReport, SkipReason, SuggestedMatch, UnmatchedSample, UserAction, UserRow,
+};
 
 /// The most unmatched items the report samples (spec 2.20).
 const SAMPLE_LIMIT: usize = 200;
@@ -40,25 +42,36 @@ pub fn match_user_name(name: &str, users: &[(Uuid, String)]) -> UserMatch {
 }
 
 /// Plans what the import does with each Jellyfin user (spec 2.5-2.7, 2.20). A user outside
-/// `picked` (when given) is skipped as not selected. A picked user matches a Rustyfin user by
-/// name, is created when none matches, and is skipped as ambiguous when several match. The rows
-/// are sorted by name, case-insensitively.
+/// `picked` (when given) is skipped as not selected. A picked user whose name matches a Rustyfin
+/// user gets that account as its suggested match, and is created when no name matches and skipped
+/// as ambiguous when several do. The rows are sorted by name, case-insensitively.
 pub fn plan_users(
     jf_users: &[JfUser],
     picked: Option<&[Uuid]>,
+    confirmed: &[ConfirmedMatch],
     rustyfin_users: &[(Uuid, String)],
 ) -> Vec<UserRow> {
     let mut rows: Vec<UserRow> = jf_users
         .iter()
         .map(|user| {
-            let (action, reason, user_id) = if picked.is_some_and(|ids| !ids.contains(&user.id)) {
-                (UserAction::Skip, Some(SkipReason::NotSelected), None)
+            let found = if picked.is_some_and(|ids| !ids.contains(&user.id)) {
+                None
             } else {
-                match match_user_name(&user.name, rustyfin_users) {
-                    UserMatch::Matched(id) => (UserAction::Match, None, Some(id)),
-                    UserMatch::NoMatch => (UserAction::Create, None, None),
-                    UserMatch::Ambiguous => (UserAction::Skip, Some(SkipReason::Ambiguous), None),
-                }
+                Some(match_user_name(&user.name, rustyfin_users))
+            };
+            let (action, reason, user_id) = match found {
+                None => (UserAction::Skip, Some(SkipReason::NotSelected), None),
+                Some(found) => plan_picked_user(user.id, found, confirmed),
+            };
+            let suggested_match = match found {
+                Some(UserMatch::Matched(id)) => rustyfin_users
+                    .iter()
+                    .find(|(account, _)| *account == id)
+                    .map(|(account, name)| SuggestedMatch {
+                        user_id: *account,
+                        name: name.clone(),
+                    }),
+                _ => None,
             };
             UserRow {
                 jellyfin_id: user.id,
@@ -67,12 +80,40 @@ pub fn plan_users(
                 action,
                 reason,
                 user_id,
+                suggested_match,
                 code: None,
             }
         })
         .collect();
     rows.sort_by_cached_key(|row| (row.name.to_lowercase(), row.jellyfin_id));
     rows
+}
+
+/// The action for a picked Jellyfin user (R2). Its data goes into the account its name matches
+/// only when `confirmed` pairs the two by that account's id; unconfirmed, it's skipped. A
+/// confirmation that names any other account, or comes with no match, is refused, so neither a
+/// rename nor a wrong id redirects the data. Ambiguous names stay skipped.
+fn plan_picked_user(
+    jellyfin_id: Uuid,
+    found: UserMatch,
+    confirmed: &[ConfirmedMatch],
+) -> (UserAction, Option<SkipReason>, Option<Uuid>) {
+    let accounts: Vec<Uuid> = confirmed
+        .iter()
+        .filter(|pair| pair.jellyfin_id == jellyfin_id)
+        .map(|pair| pair.user_id)
+        .collect();
+    match found {
+        UserMatch::Ambiguous => (UserAction::Skip, Some(SkipReason::Ambiguous), None),
+        _ if accounts.iter().any(|&id| found != UserMatch::Matched(id)) => (
+            UserAction::Skip,
+            Some(SkipReason::ConfirmedOtherAccount),
+            None,
+        ),
+        UserMatch::Matched(id) if !accounts.is_empty() => (UserAction::Match, None, Some(id)),
+        UserMatch::Matched(_) => (UserAction::Skip, Some(SkipReason::NotConfirmed), None),
+        UserMatch::NoMatch => (UserAction::Create, None, None),
+    }
 }
 
 /// How a Jellyfin item matched: by path, or by one of the ID passes.

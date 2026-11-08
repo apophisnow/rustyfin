@@ -17107,6 +17107,8 @@ struct B20User {
     reason: Option<String>,
     user_id: Option<uuid::Uuid>,
     code: Option<String>,
+    /// `SuggestedMatch` as (UserId, Name).
+    suggested: Option<(uuid::Uuid, String)>,
 }
 
 fn b20_users(report: &serde_json::Value) -> Vec<B20User> {
@@ -17123,6 +17125,10 @@ fn b20_users(report: &serde_json::Value) -> Vec<B20User> {
             reason: u["Reason"].as_str().map(str::to_string),
             user_id: id(&u["UserId"]),
             code: u["Code"].as_str().map(str::to_string),
+            suggested: id(&u["SuggestedMatch"]["UserId"]).map(|user| {
+                let name = u["SuggestedMatch"]["Name"].as_str().unwrap();
+                (user, name.to_string())
+            }),
         })
         .collect()
 }
@@ -17144,7 +17150,41 @@ fn b20_user(
         reason: reason.map(str::to_string),
         user_id,
         code: None,
+        suggested: None,
     }
+}
+
+/// The report entry expected for the Jellyfin user `name` whose name suggests the Rustyfin
+/// account `account` (id, name): skipped as not confirmed, or matched to it when `confirmed`.
+fn b20_suggested(
+    w: &B20World,
+    name: &str,
+    account: (uuid::Uuid, &str),
+    confirmed: bool,
+) -> B20User {
+    let entry = if confirmed {
+        b20_user(w, name, "Match", None, Some(account.0))
+    } else {
+        b20_user(w, name, "Skip", Some("NotConfirmed"), None)
+    };
+    B20User {
+        suggested: Some((account.0, account.1.to_string())),
+        ..entry
+    }
+}
+
+/// `ConfirmedMatches` pairing each Jellyfin user (by name) with a Rustyfin account id.
+fn b20_confirm(w: &B20World, pairs: &[(&str, uuid::Uuid)]) -> serde_json::Value {
+    let confirm = |(name, user): &(&str, uuid::Uuid)| serde_json::json!({ "JellyfinId": w.source.user(name).id, "UserId": user });
+    pairs.iter().map(confirm).collect()
+}
+
+/// A request for `install` that confirms the world's suggested match, Alice with alice.
+fn b20_body(w: &B20World, install: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "SourcePath": install,
+        "ConfirmedMatches": b20_confirm(w, &[("Alice", w.alice)]),
+    })
 }
 
 /// Row counts of the tables an import may write, then every user and user-data row.
@@ -17261,7 +17301,7 @@ async fn b20_import_preview_reports_without_writing() {
     let w = b20_world().await;
     let install = b20_install(&w, "jf", jf::Layout::New).await;
     let before = b20_db_digest(&w.state).await;
-    let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+    let report = b20_preview(&w, b20_body(&w, &install)).await;
     assert_eq!(
         b20_db_digest(&w.state).await,
         before,
@@ -17288,7 +17328,7 @@ async fn b20_import_preview_reports_without_writing() {
         serde_json::json!(["/data/music"])
     );
     let users = vec![
-        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
         b20_user(&w, "bob", "Create", None, None),
     ];
     assert_eq!(b20_users(&report), users);
@@ -17302,11 +17342,11 @@ async fn b20_import_preview_reports_without_writing() {
 async fn b20_import_preview_reads_the_old_layout() {
     let w = b20_world().await;
     let old = b20_install(&w, "old", jf::Layout::Old).await;
-    let report = b20_preview(&w, serde_json::json!({ "SourcePath": old })).await;
+    let report = b20_preview(&w, b20_body(&w, &old)).await;
     assert_eq!(report["Layout"], "Old");
     assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
     let users = vec![
-        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
         b20_user(&w, "bob", "Create", None, None),
     ];
     assert_eq!(b20_users(&report), users);
@@ -17339,7 +17379,8 @@ async fn b20_import_preview_uses_given_path_pairs() {
     let install = b20_install(&w, "jf", jf::Layout::New).await;
 
     // No pairs: only provider ids match (Beta; the show, its season and its episodes)
-    let body = serde_json::json!({ "SourcePath": install, "PathMappings": [] });
+    let mut body = b20_body(&w, &install);
+    body["PathMappings"] = serde_json::json!([]);
     let report = b20_preview(&w, body).await;
     assert_eq!(
         b20_pairs(&report, "PathMappings"),
@@ -17351,8 +17392,9 @@ async fn b20_import_preview_uses_given_path_pairs() {
     assert_eq!(names, ["Alpha", "Gamma"]);
 
     // One pair, with trailing slashes
-    let pairs = serde_json::json!([{ "From": "/data/movies/", "To": format!("{}/", w.movies) }]);
-    let body = serde_json::json!({ "SourcePath": install, "PathMappings": pairs });
+    let mut body = b20_body(&w, &install);
+    body["PathMappings"] =
+        serde_json::json!([{ "From": "/data/movies/", "To": format!("{}/", w.movies) }]);
     let report = b20_preview(&w, body).await;
     assert_eq!(b20_item_counts(&report), (9, 1, 6, 2));
 }
@@ -17368,12 +17410,13 @@ async fn b20_import_preview_matches_and_picks_users() {
     w.source.users.push(jf::JfUser::new(4, "Erin", true));
     let install = b20_install(&w, "jf", jf::Layout::New).await;
 
+    // A name match is a suggestion, unconfirmed: the exact-case one wins over ERIN
     let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
     let users = vec![
-        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_suggested(&w, "Alice", (w.alice, "alice"), false),
         b20_user(&w, "bob", "Create", None, None),
         b20_user(&w, "dave", "Skip", Some("Ambiguous"), None),
-        b20_user(&w, "Erin", "Match", None, Some(ids["Erin"])),
+        b20_suggested(&w, "Erin", (ids["Erin"], "Erin"), false),
     ];
     assert_eq!(b20_users(&report), users);
 
@@ -17588,13 +17631,14 @@ async fn b20_import_run_creates_picked_users_with_codes() {
     let users_before = b20_user_count(&w.state).await;
     let listing = jf::listing(&install);
     let log = jf::LogCapture::start();
-    let body = serde_json::json!({ "SourcePath": install, "UserIds": picked });
+    let mut body = b20_body(&w, &install);
+    body["UserIds"] = serde_json::json!(picked);
     let report = b20_run(&w, body).await;
     let text = log.text();
     drop(log);
     assert_eq!(jf::listing(&install), listing, "the source changed");
 
-    // Alice matches alice; bob and Carol are created with codes; dave is not picked.
+    // Alice matches alice, confirmed; bob and Carol are created with codes; dave is not picked.
     let bob = b20_entry(&report, "bob");
     let carol = b20_entry(&report, "Carol");
     let (Some(bob_id), Some(bob_code)) = (bob.user_id, bob.code) else {
@@ -17609,7 +17653,7 @@ async fn b20_import_run_creates_picked_users_with_codes() {
         ..b20_user(&w, name, "Create", None, None)
     };
     let expected = vec![
-        b20_user(&w, "Alice", "Match", None, Some(w.alice)),
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
         created("bob", bob_id, &bob_code),
         created("Carol", carol_id, &carol_code),
         b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
@@ -17719,34 +17763,41 @@ async fn b20_import_run_shows_codes_once() {
     assert_eq!(again["Result"], expected, "only the codes go");
 }
 
+/// Nothing records an earlier run's pairings: a second run suggests the accounts the first one
+/// created or confirmed, and imports into them only when they're confirmed again. Either way it
+/// creates and writes nothing.
 #[tokio::test]
 async fn b20_import_second_run_creates_nothing() {
     for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
         let w = b20_world().await;
         let install = b20_install(&w, name, layout).await;
-        let body = serde_json::json!({ "SourcePath": install });
-        let first = b20_run(&w, body.clone()).await;
+        let first = b20_run(&w, b20_body(&w, &install)).await;
         let bob = b20_entry(&first, "bob").user_id.unwrap();
         let digest = b20_db_digest(&w.state).await;
         let codes = b20_code_rows(&w.state).await;
         assert_eq!(codes.len(), 1, "{name}: one code, bob's");
 
-        let second = b20_run(&w, body).await;
-        let users = vec![
-            b20_user(&w, "Alice", "Match", None, Some(w.alice)),
-            b20_user(&w, "bob", "Match", None, Some(bob)),
-        ];
-        assert_eq!(b20_users(&second), users, "{name}");
-        assert_eq!(
-            b20_db_digest(&w.state).await,
-            digest,
-            "{name}: the second run wrote"
-        );
-        assert_eq!(
-            b20_code_rows(&w.state).await,
-            codes,
-            "{name}: the codes changed"
-        );
+        let mut confirmed = serde_json::json!({ "SourcePath": install });
+        confirmed["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let unconfirmed = serde_json::json!({ "SourcePath": install });
+        for (confirm, body) in [(true, confirmed), (false, unconfirmed)] {
+            let again = b20_run(&w, body).await;
+            let users = vec![
+                b20_suggested(&w, "Alice", (w.alice, "alice"), confirm),
+                b20_suggested(&w, "bob", (bob, "bob"), confirm),
+            ];
+            assert_eq!(b20_users(&again), users, "{name} {confirm}");
+            assert_eq!(
+                b20_db_digest(&w.state).await,
+                digest,
+                "{name} {confirm}: the run wrote"
+            );
+            assert_eq!(
+                b20_code_rows(&w.state).await,
+                codes,
+                "{name} {confirm}: the codes changed"
+            );
+        }
         let alice = login(&w.app, "alice", "alicepass").await;
         assert!(alice.is_some(), "{name}: alice's password changed");
     }
@@ -17777,6 +17828,125 @@ async fn b20_import_run_conflicts_while_running() {
     assert!(failed["Result"].is_null(), "{failed}");
     let report = b20_run(&w, body).await;
     assert_eq!(b20_entry(&report, "bob").action, "Create");
+}
+
+/// Fix round 10 (R2): a non-admin who renames themselves to a Jellyfin user's name gets nothing
+/// from a run that doesn't confirm the pairing. That Jellyfin user is skipped, not created, and the
+/// report names the account as the suggested match. Confirmed by the account's id, the data lands.
+/// At 20c0f3f the name alone put bob's watch data into the account.
+#[tokio::test]
+async fn b20_import_name_match_needs_confirmation() {
+    let w = b20_world().await;
+    let mallory = add_user(&w.state, "mallory", "mallorypass", false).await;
+    let (token, _) = login(&w.app, "mallory", "mallorypass").await.unwrap();
+    let rename = serde_json::json!({ "Name": "bob" }).to_string();
+    let uri = format!("/Users/{mallory}");
+    let (status, answer) = send_authed(&w.app, "PUT", &uri, &token, Some(&rename)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    let users_before = b20_user_count(&w.state).await;
+
+    let mut body = serde_json::json!({ "SourcePath": install });
+    let report = b20_run(&w, body.clone()).await;
+    let expected = b20_suggested(&w, "bob", (mallory, "bob"), false);
+    assert_eq!(b20_entry(&report, "bob"), expected, "{report}");
+    assert_eq!(b20_data(&w.state, mallory, beta).await, None);
+    assert_eq!(b20_data(&w.state, mallory, e3).await, None);
+    assert_eq!(b20_user_count(&w.state).await, users_before, "{report}");
+    assert_eq!(b20_code_rows(&w.state).await, Vec::<String>::new());
+
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("bob", mallory)]);
+    let report = b20_run(&w, body).await;
+    let expected = b20_suggested(&w, "bob", (mallory, "bob"), true);
+    assert_eq!(b20_entry(&report, "bob"), expected, "{report}");
+    assert!(
+        b20_data(&w.state, mallory, beta).await.is_some(),
+        "{report}"
+    );
+    assert!(b20_data(&w.state, mallory, e3).await.is_some(), "{report}");
+}
+
+/// Fix round 10 (R2): a confirmation names the account by id and holds only for the suggested
+/// match. One naming another account is refused, and so is the admin's confirmation once a rename
+/// between Preview and Run gives the name to another account: Alice is skipped with the reason
+/// `ConfirmedOtherAccount`, and neither account gets her data. At 20c0f3f the name alone decided.
+#[tokio::test]
+async fn b20_import_refuses_a_confirmation_of_another_account() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let erin = b20_plain_user(&w.state, "erin").await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let refused = |account: (uuid::Uuid, &str)| B20User {
+        suggested: Some((account.0, account.1.to_string())),
+        ..b20_user(&w, "Alice", "Skip", Some("ConfirmedOtherAccount"), None)
+    };
+
+    let mut body = serde_json::json!({ "SourcePath": install });
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", erin)]);
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), refused((w.alice, "alice")));
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None);
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None);
+
+    let body = b20_body(&w, &install);
+    let preview = b20_preview(&w, body.clone()).await;
+    let confirmed = b20_suggested(&w, "Alice", (w.alice, "alice"), true);
+    assert_eq!(b20_entry(&preview, "Alice"), confirmed);
+    let db = &w.state.db;
+    rustyfin_db::repo_user::update_user_name(db, w.alice, "alice2")
+        .await
+        .unwrap();
+    rustyfin_db::repo_user::update_user_name(db, erin, "alice")
+        .await
+        .unwrap();
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), refused((erin, "alice")));
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None);
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None);
+}
+
+/// Fix round 10 (R2): users without a match are created as before, whether or not the request
+/// confirms another user's match, and an unconfirmed match is skipped, not created.
+#[tokio::test]
+async fn b20_import_creates_unmatched_users_as_before() {
+    for confirmed in [false, true] {
+        let w = b20_world().await;
+        let install = b20_install(&w, "jf", jf::Layout::New).await;
+        let users_before = b20_user_count(&w.state).await;
+        let body = if confirmed {
+            b20_body(&w, &install)
+        } else {
+            serde_json::json!({ "SourcePath": install })
+        };
+        let alice = || b20_suggested(&w, "Alice", (w.alice, "alice"), confirmed);
+        let preview = b20_preview(&w, body.clone()).await;
+        let bob = b20_user(&w, "bob", "Create", None, None);
+        assert_eq!(b20_users(&preview), [alice(), bob], "{confirmed}");
+
+        let report = b20_run(&w, body).await;
+        let bob = b20_entry(&report, "bob");
+        let (Some(bob_id), Some(code)) = (bob.user_id, bob.code) else {
+            panic!("{confirmed}: bob has no UserId or Code in {report}");
+        };
+        let bob = B20User {
+            user_id: Some(bob_id),
+            code: Some(code),
+            ..b20_user(&w, "bob", "Create", None, None)
+        };
+        assert_eq!(b20_users(&report), [alice(), bob], "{confirmed}");
+        let count = b20_user_count(&w.state).await;
+        assert_eq!(count, users_before + 1, "{confirmed}: only bob is created");
+        let beta = b20_item(&w.state, "Beta").await;
+        assert!(
+            b20_data(&w.state, bob_id, beta).await.is_some(),
+            "{confirmed}"
+        );
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alices = b20_data(&w.state, w.alice, alpha).await;
+        assert_eq!(alices.is_some(), confirmed, "{confirmed}: {report}");
+    }
 }
 
 // B20 2c: watch data and track choices.
@@ -17915,7 +18085,7 @@ async fn b20_import_preview_counts_watch_data() {
         let install = b20_install(&w, name, layout).await;
         let before = b20_db_digest(&w.state).await;
         let log = jf::LogCapture::start();
-        let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        let report = b20_preview(&w, b20_body(&w, &install)).await;
         let text = log.text();
         drop(log);
         assert_eq!(b20_watch_counts(&report), all, "{name}: {report}");
@@ -17930,7 +18100,8 @@ async fn b20_import_preview_counts_watch_data() {
         );
 
         let alice = w.source.user("Alice").id;
-        let body = serde_json::json!({ "SourcePath": install, "UserIds": [alice] });
+        let mut body = b20_body(&w, &install);
+        body["UserIds"] = serde_json::json!([alice]);
         let report = b20_preview(&w, body).await;
         assert_eq!(
             b20_watch_counts(&report),
@@ -17955,7 +18126,7 @@ async fn b20_import_run_writes_watch_data() {
         // Alice likes Alpha; only the new layout has likes.
         w.source.user_data[0].likes = Some(true);
         let install = b20_install(&w, name, layout).await;
-        let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+        let report = b20_run(&w, b20_body(&w, &install)).await;
         assert_eq!(b20_watch_counts(&report), counts, "{name}: {report}");
         assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
 
@@ -18042,7 +18213,8 @@ async fn b20_import_merges_with_rustyfin_watch_data() {
     b20_put_data(&w.state, w.alice, e1, &e1_row).await;
     b20_put_data(&w.state, bob, beta, &beta_row).await;
     let install = b20_install(&w, "jf", jf::Layout::New).await;
-    let body = serde_json::json!({ "SourcePath": install });
+    let mut body = serde_json::json!({ "SourcePath": install });
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
 
     let preview = b20_preview(&w, body.clone()).await;
     assert_eq!(b20_watch_counts(&preview), (6, 3, 1, 2), "{preview}");
@@ -18106,7 +18278,7 @@ async fn b20_import_keeps_the_newest_of_several_rows() {
         ..Default::default()
     });
     let install = b20_install(&w, "jf", jf::Layout::New).await;
-    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let report = b20_run(&w, b20_body(&w, &install)).await;
     assert_eq!(b20_watch_counts(&report), (6, 4, 0, 2), "{report}");
     let alpha = b20_item(&w.state, "Alpha").await;
     let stored = b20_data(&w.state, w.alice, alpha).await.unwrap();
@@ -18127,7 +18299,7 @@ async fn b20_import_old_rows_apply_to_each_item_of_their_key() {
         .find(|item| item.name == "Show S01E02");
     e2.unwrap().user_data_key = key;
     let install = b20_install(&w, "jf", jf::Layout::Old).await;
-    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let report = b20_run(&w, b20_body(&w, &install)).await;
     assert_eq!(b20_watch_counts(&report), (6, 5, 0, 1), "{report}");
     let e2 = b20_item(&w.state, "Show S01E02").await;
     let stored = b20_data(&w.state, w.alice, e2).await.unwrap();
@@ -18219,7 +18391,7 @@ async fn b20_import_maps_track_choices() {
         b20_insert_source(&w.state, e1, &e1_file, streams).await;
 
         let install = b20_install(&w, name, layout).await;
-        let body = serde_json::json!({ "SourcePath": install });
+        let body = b20_body(&w, &install);
         let preview = b20_preview(&w, body.clone()).await;
         let report = b20_run(&w, body).await;
         // Audio: Alpha and S01E01. Subtitle: Alpha. Off: Beta. Unmapped: Beta's audio 9 and
@@ -18259,7 +18431,7 @@ async fn b20_import_run_leaves_the_source_and_its_secrets_alone() {
         let install = b20_install(&w, name, layout).await;
         let before = jf::listing(&install);
         let log = jf::LogCapture::start();
-        let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+        let report = b20_run(&w, b20_body(&w, &install)).await;
         let status = b20_status(&w).await;
         let text = log.text();
         drop(log);
@@ -18324,6 +18496,7 @@ async fn b20_import_keeps_progress_saved_during_the_run() {
     let body = serde_json::json!({
         "SourcePath": install,
         "UserIds": [alice],
+        "ConfirmedMatches": b20_confirm(&w, &[("Alice", w.alice)]),
         "MetadataMode": "None",
     });
     b20_start(&w, body).await;
@@ -18420,7 +18593,7 @@ async fn b20_import_reads_the_wal_and_leaves_the_source_folder_alone() {
             }
         }
         let before = jf::listing(&install);
-        let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        let report = b20_preview(&w, b20_body(&w, &install)).await;
         assert_eq!(
             jf::listing(&install),
             before,
@@ -18437,7 +18610,8 @@ async fn b20_import_reads_the_wal_and_leaves_the_source_folder_alone() {
             "{name}: samples {samples:?}"
         );
         let alice = w.source.user("Alice").id;
-        let body = serde_json::json!({ "SourcePath": install, "UserIds": [alice] });
+        let mut body = b20_body(&w, &install);
+        body["UserIds"] = serde_json::json!([alice]);
         b20_run(&w, body).await;
         assert_eq!(
             jf::listing(&install),
@@ -18489,7 +18663,8 @@ async fn b20_import_reads_one_state_while_jellyfin_writes() {
             .filename(install.join("data").join(file))
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(30));
-        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "FillEmpty" });
+        let mut body = b20_body(&w, &install);
+        body["MetadataMode"] = serde_json::json!("FillEmpty");
         let mut states = Vec::new();
         for flip in flips {
             let mut conn = options.connect().await.unwrap();
@@ -20078,7 +20253,7 @@ async fn b20_import_metadata_ids_count_for_matching() {
         ("old", jf::Layout::Old, (6, 5, 0, 1), (6, 0, 5, 1)),
     ] {
         let (w, install) = b20_stale_world(name, layout).await;
-        let body = serde_json::json!({ "SourcePath": install });
+        let mut body = b20_body(&w, &install);
         let preview = b20_preview(&w, body.clone()).await;
         let first = b20_run(&w, body.clone()).await;
         for report in [&preview, &first] {
@@ -20113,6 +20288,7 @@ async fn b20_import_metadata_ids_count_for_matching() {
 
         let rows = b20_db_digest(&w.state).await;
         let meta = b20_meta_digest(&w.state).await;
+        body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
         let second = b20_run(&w, body).await;
         assert_eq!(b20_item_counts(&second), (10, 5, 3, 2), "{name}: {second}");
         assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
@@ -20130,7 +20306,8 @@ async fn b20_import_metadata_none_matches_on_stored_ids() {
         ("old", jf::Layout::Old, (6, 4, 0, 2), (6, 0, 4, 2)),
     ] {
         let (w, install) = b20_stale_world(name, layout).await;
-        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "None" });
+        let mut body = b20_body(&w, &install);
+        body["MetadataMode"] = serde_json::json!("None");
         let first = b20_run(&w, body.clone()).await;
         assert_eq!(b20_item_counts(&first), (10, 5, 2, 3), "{name}: {first}");
         assert_eq!(b20_watch_counts(&first), first_watch, "{name}: {first}");
@@ -20144,6 +20321,7 @@ async fn b20_import_metadata_none_matches_on_stored_ids() {
         let bob = b20_entry(&first, "bob").user_id.unwrap();
         let stored = b20_data(&w.state, bob, alpha).await;
         assert_eq!(stored, None, "{name}: the stale entry matched");
+        body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
         let second = b20_run(&w, body).await;
         assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
         assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");

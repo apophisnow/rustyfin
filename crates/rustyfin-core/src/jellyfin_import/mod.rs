@@ -72,9 +72,21 @@ pub struct ImportRequest {
     pub path_mappings: Option<Vec<PathMapping>>,
     /// Jellyfin user ids to import; absent means all users.
     pub user_ids: Option<Vec<Uuid>>,
+    /// The suggested matches the admin confirmed (R2). A Jellyfin user's data goes into an
+    /// existing account only when its pairing with that account's id is here.
+    #[serde(default)]
+    pub confirmed_matches: Vec<ConfirmedMatch>,
     /// How existing metadata is treated (spec 5.1); absent means `FillEmpty`.
     #[serde(default)]
     pub metadata_mode: MetadataMode,
+}
+
+/// A pairing the admin confirmed: the Jellyfin user and the existing account it goes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ConfirmedMatch {
+    pub jellyfin_id: Uuid,
+    pub user_id: Uuid,
 }
 
 /// The preview's answer (spec 2.20), and a run's report. `Metadata` is the spec 5 part.
@@ -130,10 +142,21 @@ pub struct UserRow {
     pub was_administrator: bool,
     pub action: UserAction,
     pub reason: Option<SkipReason>,
-    /// The Rustyfin user: the match for `Match`; null for `Create` in a preview.
+    /// The Rustyfin user: the confirmed match for `Match`; null for `Create` in a preview.
     pub user_id: Option<Uuid>,
+    /// The existing account with this name, for a picked user: the data goes there only when
+    /// the request confirms the pairing (R2).
+    pub suggested_match: Option<SuggestedMatch>,
     /// The one-time code of a created user; only a run has codes.
     pub code: Option<String>,
+}
+
+/// The existing account a Jellyfin user's name matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SuggestedMatch {
+    pub user_id: Uuid,
+    pub name: String,
 }
 
 /// What an import does with a Jellyfin user.
@@ -149,6 +172,10 @@ pub enum UserAction {
 pub enum SkipReason {
     NotSelected,
     Ambiguous,
+    /// The name matches an existing account, and the request doesn't confirm that pairing.
+    NotConfirmed,
+    /// The request confirms a pairing with an account that isn't the suggested match.
+    ConfirmedOtherAccount,
 }
 
 /// The item counts of the report (spec 2.11, 2.20). The three counts add up to `total`.
@@ -277,6 +304,7 @@ async fn plan_report(
     let mut users = plan::plan_users(
         &prepared.snapshot.users,
         req.user_ids.as_deref(),
+        &req.confirmed_matches,
         &rustyfin_users,
     );
     if let Some(handle) = handle {

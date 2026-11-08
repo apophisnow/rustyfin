@@ -12,17 +12,17 @@ use super::job::{ImportJob, ImportStage, ImportStatus, JobState};
 use super::merge::{MappedTracks, convert_rating, harmonize, merge};
 use super::metadata::planned_credits;
 use super::paths::{PathMapping, suggest_metadata, translate_path};
-use super::plan::{UserMatch, match_user_name};
+use super::plan::{UserMatch, match_user_name, plan_users};
 use super::source::{
-    FreeSpace, IN_MEMORY_LIMIT, JELLYFIN_TABLES, JfCredit, JfImage, JfStream, JfUserData,
+    FreeSpace, IN_MEMORY_LIMIT, JELLYFIN_TABLES, JfCredit, JfImage, JfStream, JfUser, JfUserData,
     ProviderIds, StreamKind, copy_at_most, copy_fits, free_space, guid_from_blob, guid_from_text,
     locate, open_snapshot, open_snapshot_with_free, parse_jellyfin_date, parse_old_images,
     parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
-    ImportError, ImportReport, ItemReport, Layout, LayoutChoice, TrackReport, UserAction, UserRow,
-    WatchDataReport,
+    ConfirmedMatch, ImportError, ImportReport, ItemReport, Layout, LayoutChoice, SkipReason,
+    TrackReport, UserAction, UserRow, WatchDataReport,
 };
 
 /// A temp folder removed when the test ends.
@@ -263,6 +263,106 @@ fn b20_match_user_names() {
     assert_eq!(match_user_name("carol", &users), UserMatch::NoMatch);
 }
 
+// R2: a picked user's name match is a suggestion. Its data goes into that account only when the
+// request confirms the pairing by the account's id; any other confirmation is refused.
+#[test]
+fn b20_plan_users_needs_confirmed_matches() {
+    let [alice, bob_title, bob_lower, erin] = [1, 2, 3, 4].map(Uuid::from_u128);
+    let rustyfin = vec![
+        (alice, "alice".to_string()),
+        (bob_title, "Bob".to_string()),
+        (bob_lower, "bob".to_string()),
+        (erin, "erin".to_string()),
+    ];
+    let names = [
+        "Alice", "erin", "BOB", "carol", "dave", "Bob", "bob", "ERIN",
+    ];
+    let jf_users: Vec<JfUser> = (0..)
+        .zip(names)
+        .map(|(n, name)| JfUser {
+            id: Uuid::from_u128(100 + n as u128),
+            name: name.to_string(),
+            internal_id: n,
+            is_admin: false,
+        })
+        .collect();
+    let jf = |name: &str| jf_users.iter().find(|user| user.name == name).unwrap().id;
+    let pair = |name: &str, user_id| ConfirmedMatch {
+        jellyfin_id: jf(name),
+        user_id,
+    };
+    let confirmed = [
+        pair("Alice", alice),
+        pair("Alice", alice),
+        pair("BOB", bob_lower),
+        pair("dave", erin),
+        pair("Bob", bob_lower),
+        pair("bob", bob_lower),
+        pair("bob", alice),
+        pair("ERIN", erin),
+        ConfirmedMatch {
+            jellyfin_id: Uuid::from_u128(999),
+            user_id: alice,
+        },
+    ];
+    let picked: Vec<Uuid> = jf_users
+        .iter()
+        .filter(|user| user.name != "ERIN")
+        .map(|user| user.id)
+        .collect();
+
+    let rows = plan_users(&jf_users, Some(&picked), &confirmed, &rustyfin);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let suggested = row.suggested_match.as_ref();
+            let suggested = suggested.map(|account| (account.user_id, account.name.as_str()));
+            (
+                row.name.as_str(),
+                row.action,
+                row.reason,
+                row.user_id,
+                suggested,
+            )
+        })
+        .collect();
+    let (matched, create, skip) = (UserAction::Match, UserAction::Create, UserAction::Skip);
+    let ambiguous = Some(SkipReason::Ambiguous);
+    let not_selected = Some(SkipReason::NotSelected);
+    let not_confirmed = Some(SkipReason::NotConfirmed);
+    let other = Some(SkipReason::ConfirmedOtherAccount);
+    let expected = [
+        ("Alice", matched, None, Some(alice), Some((alice, "alice"))),
+        ("BOB", skip, ambiguous, None, None),
+        ("Bob", skip, other, None, Some((bob_title, "Bob"))),
+        ("bob", skip, other, None, Some((bob_lower, "bob"))),
+        ("carol", create, None, None, None),
+        ("dave", skip, other, None, None),
+        ("erin", skip, not_confirmed, None, Some((erin, "erin"))),
+        ("ERIN", skip, not_selected, None, None),
+    ];
+    assert_eq!(got, expected);
+
+    // Without confirmations every name match is skipped, and the rest is as before.
+    let rows = plan_users(&jf_users, None, &[], &rustyfin);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|row| (row.name.as_str(), row.action, row.reason))
+        .collect();
+    let expected = [
+        ("Alice", skip, not_confirmed),
+        ("BOB", skip, ambiguous),
+        ("Bob", skip, not_confirmed),
+        ("bob", skip, not_confirmed),
+        ("carol", create, None),
+        ("dave", create, None),
+        ("erin", skip, not_confirmed),
+        ("ERIN", skip, not_confirmed),
+    ];
+    assert_eq!(got, expected);
+    assert!(rows.iter().all(|row| row.user_id.is_none()));
+}
+
 // ── 2b: the import job (spec 2.19, 2.21, 2.25) ──
 
 /// A small report whose one created user holds `code`.
@@ -280,6 +380,7 @@ fn b20_report_with_code(code: &str) -> ImportReport {
             action: UserAction::Create,
             reason: None,
             user_id: Some(Uuid::from_u128(8)),
+            suggested_match: None,
             code: Some(code.to_string()),
         }],
         items: ItemReport {
