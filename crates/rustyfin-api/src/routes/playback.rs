@@ -187,12 +187,22 @@ pub(crate) async fn query_user(
     }
 }
 
+/// A 404 unless `item_id` is a media item, as Jellyfin answers user data on an unknown item.
+/// The ids of the genre, studio and year lists name no media item.
+pub(crate) async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+    rustyfin_db::repo_media::get_item_by_id(&state.db_ro, item_id)
+        .await?
+        .map(|_| ())
+        .ok_or_else(|| ApiError::NotFound("item not found".to_string()))
+}
+
 async fn mark_played(
     State(state): State<AppState>,
     Path((user_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::mark_played(&state.db, user_id, item_id).await?;
     Ok(Json(data))
 }
@@ -203,6 +213,7 @@ async fn mark_unplayed(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::mark_unplayed(&state.db, user_id, item_id).await?;
     Ok(Json(data))
 }
@@ -213,6 +224,7 @@ async fn set_favorite(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, true).await?;
     Ok(Json(data))
 }
@@ -223,6 +235,7 @@ async fn unset_favorite(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::set_favorite(&state.db, user_id, item_id, false).await?;
     Ok(Json(data))
 }
@@ -262,6 +275,7 @@ async fn set_rating(
     Json(req): Json<SetRatingRequest>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user_id = path_user(&state, &claims, user_id).await?;
+    require_item(&state, item_id).await?;
     let data = rustyfin_db::repo_playback::set_user_rating(
         &state.db,
         user_id,

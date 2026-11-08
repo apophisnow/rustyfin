@@ -6744,6 +6744,214 @@ async fn j5_items_with_unknown_or_bad_ids_answer_as_jellyfin_does() {
     }
 }
 
+/// A library with one film (genre "Drama", studio "Studio J5"), and an administrator's token and
+/// user id, for the tests of user data on ids that name no item. Also returns the film's id.
+async fn j5_user_data_app() -> (axum::Router, String, uuid::Uuid, uuid::Uuid) {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let (token, user) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 User Data", LibraryContentType::Movies).await;
+    let film = j5_item(&state, films, None, "Film", "Movie", "Drama", None).await;
+    j5_studio(&state, film, "Studio J5").await;
+    (app(state), token, user, film)
+}
+
+/// Sends each request and checks every status in one comparison, so that a failure shows every
+/// case.
+async fn j5_assert_statuses(
+    app: &axum::Router,
+    token: &str,
+    cases: &[(&str, String, Option<&str>, StatusCode)],
+) {
+    let mut actual = Vec::new();
+    for (method, uri, body, _) in cases {
+        let (status, _) = send_authed(app, method, uri, token, *body).await;
+        actual.push((*method, uri.as_str(), status));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(method, uri, _, status)| (*method, uri.as_str(), *status))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn j5_favouriting_a_genre_or_studio_id_answers_404_not_500() {
+    let (app, token, user, _) = j5_user_data_app().await;
+    // The ids that the lists hand out name no media item, so user data on them is a 404, as in
+    // Jellyfin, and not a failed foreign key.
+    let (_, genres) = send_authed(&app, "GET", "/Genres", &token, None).await;
+    let (_, studios) = send_authed(&app, "GET", "/Studios", &token, None).await;
+    let not_found = StatusCode::NOT_FOUND;
+    let mut cases = Vec::new();
+    for id in [j5_id(&genres, "Drama"), j5_id(&studios, "Studio J5")] {
+        cases.push((
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{id}"),
+            None,
+            not_found,
+        ));
+        cases.push((
+            "DELETE",
+            format!("/Users/{user}/FavoriteItems/{id}"),
+            None,
+            not_found,
+        ));
+        cases.push((
+            "DELETE",
+            format!("/UserFavoriteItems/{id}"),
+            None,
+            not_found,
+        ));
+    }
+    j5_assert_statuses(&app, &token, &cases).await;
+}
+
+#[tokio::test]
+async fn j5_played_and_rating_on_an_unknown_id_answer_404() {
+    let (app, token, user, _) = j5_user_data_app().await;
+    let unknown = uuid::Uuid::new_v4();
+    let not_found = StatusCode::NOT_FOUND;
+    let likes = Some(r#"{"Likes":true}"#);
+    j5_assert_statuses(
+        &app,
+        &token,
+        &[
+            (
+                "POST",
+                format!("/Users/{user}/PlayedItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/Users/{user}/PlayedItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/UserPlayedItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "PUT",
+                format!("/Users/{user}/Items/{unknown}/Rating"),
+                likes,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/Users/{user}/Items/{unknown}/Rating"),
+                None,
+                not_found,
+            ),
+            (
+                "POST",
+                format!("/Users/{user}/FavoriteItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/Users/{user}/FavoriteItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/UserFavoriteItems/{unknown}"),
+                None,
+                not_found,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_user_data_on_a_real_item_still_works() {
+    let (app, token, user, film) = j5_user_data_app().await;
+    let (yes, no) = (Some(true), Some(false));
+    let likes = Some(r#"{"Likes":true}"#);
+    // Each step's status and the IsFavorite, Played and Likes it answers with. The routes that
+    // answer `{}` show nothing, so the step after each shows its change.
+    let steps = [
+        (
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            None,
+            [yes, no, None],
+        ),
+        (
+            "DELETE",
+            format!("/UserFavoriteItems/{film}"),
+            None,
+            [None; 3],
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            None,
+            [no, yes, None],
+        ),
+        (
+            "DELETE",
+            format!("/UserPlayedItems/{film}"),
+            None,
+            [None; 3],
+        ),
+        (
+            "PUT",
+            format!("/Users/{user}/Items/{film}/Rating"),
+            likes,
+            [no, no, yes],
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/Items/{film}/Rating"),
+            None,
+            [None; 3],
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            None,
+            [yes, no, None],
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            None,
+            [no, no, None],
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            None,
+            [no, yes, None],
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            None,
+            [no, no, None],
+        ),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, body, _) in &steps {
+        let (status, data) = send_authed(&app, method, uri, &token, *body).await;
+        let data = ["IsFavorite", "Played", "Likes"].map(|field| data[field].as_bool());
+        actual.push((*method, uri.as_str(), status, data));
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(method, uri, _, data)| (*method, uri.as_str(), StatusCode::OK, *data))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]
