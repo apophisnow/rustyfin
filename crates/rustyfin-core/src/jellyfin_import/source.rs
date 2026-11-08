@@ -1336,8 +1336,15 @@ async fn snapshot_try(
             return Ok(None);
         };
         let budget = progress_budget(page_count(&image, image.len() as u64));
-        let mut conn = connection_of_image(file, image).await?;
+        let mut conn = connection_of_image(file, &image).await?;
         let cancel = guard_connection(file, &mut conn, budget).await?;
+        let roots = read_roots(file, &mut conn).await?;
+        // Walk the schema and roots over the retained image before a quick_check reads them.
+        let owner = file.to_path_buf();
+        on_blocking(file, move || {
+            check_tree_depth(&ImagePages::new(&image), &owner, &roots)
+        })
+        .await?;
         return Ok(Some(SnapshotConn {
             _cancel: CancelOnDrop(cancel),
             conn,
@@ -1363,9 +1370,19 @@ async fn snapshot_try(
         .connect()
         .await
         .map_err(|e| unreadable(file, &e))?;
-    let header = on_blocking(file, move || read_header(&copy_db)).await?;
+    let header_db = copy_db.clone();
+    let header = on_blocking(file, move || read_header(&header_db)).await?;
     let budget = progress_budget(page_count(&header, db_len));
     let cancel = guard_connection(file, &mut conn, budget).await?;
+    let roots = read_roots(file, &mut conn).await?;
+    // Walk the schema and roots over the copied files before a quick_check reads them.
+    let copy_wal = copy.path.join(COPY_WAL);
+    let owner = file.to_path_buf();
+    on_blocking(file, move || {
+        let pages = CopyPages::open(&owner, &copy_db, &copy_wal)?;
+        check_tree_depth(&pages, &owner, &roots)
+    })
+    .await?;
     Ok(Some(SnapshotConn {
         _cancel: CancelOnDrop(cancel),
         conn,
@@ -1384,23 +1401,22 @@ async fn on_blocking<T: Send + 'static>(
 }
 
 /// A read-only in-memory connection to `image`, a database with its `-wal` applied (`read_once`).
-async fn connection_of_image(
-    file: &Path,
-    mut image: Vec<u8>,
-) -> Result<SqliteConnection, ImportError> {
-    // Header bytes 18 and 19 are the file format versions; 2 means WAL, which a deserialized
-    // image refuses. The applied image is a rollback-journal database, so they say 1.
-    if image.len() >= 100 {
-        image[18] = 1;
-        image[19] = 1;
-    }
+/// Borrows `image`: SQLite deserializes a private copy, so the caller keeps `image` for the schema
+/// walk (`check_tree_depth`).
+async fn connection_of_image(file: &Path, image: &[u8]) -> Result<SqliteConnection, ImportError> {
     let mut conn = SqliteConnectOptions::new()
         .connect()
         .await
         .map_err(|e| unreadable(file, &e))?;
-    let buf = sqlx::sqlite::SqliteOwnedBuf::try_from(image.as_slice())
-        .map_err(|e| unreadable(file, &e))?;
-    drop(image);
+    let mut buf =
+        sqlx::sqlite::SqliteOwnedBuf::try_from(image).map_err(|e| unreadable(file, &e))?;
+    // Header bytes 18 and 19 are the file format versions; 2 means WAL, which a deserialized image
+    // refuses. The applied image is a rollback-journal database, so set them to 1 on SQLite's copy,
+    // leaving `image` itself untouched for the walk (which ignores these two bytes).
+    if buf.len() >= 100 {
+        buf[18] = 1;
+        buf[19] = 1;
+    }
     conn.deserialize(None, buf, true)
         .await
         .map_err(|e| unreadable(file, &e))?;
@@ -1487,6 +1503,178 @@ fn read_header(path: &Path) -> Result<Vec<u8>, ImportError> {
         }
     }
     Ok(header[..read].to_vec())
+}
+
+/// Every table's and index's root page in `conn`'s schema, as `(name, rootpage)`. The progress guard
+/// is already installed, so a crafted schema that makes this query spin is still interrupted. A root
+/// that does not fit a page number becomes `u32::MAX`, which the walk refuses as out of range.
+async fn read_roots(
+    file: &Path,
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(String, u32)>, ImportError> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT name, rootpage FROM sqlite_schema WHERE rootpage IS NOT NULL AND rootpage > 0",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| unreadable(file, &e))?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, root)| (name, u32::try_from(root).unwrap_or(u32::MAX)))
+        .collect())
+}
+
+/// Raw page access for `check_tree_depth`: the in-memory image (`ImagePages`) or the copied database
+/// file and its WAL frames (`CopyPages`). `read_page` fills `buf` (one page long) with page `pgno`
+/// (1-indexed) and returns whether it could, so a page past the file is refused, never a panic.
+pub(super) trait Pages {
+    fn page_count(&self) -> u64;
+    fn page_size(&self) -> usize;
+    fn reserved(&self) -> usize;
+    fn read_page(&self, pgno: u32, buf: &mut [u8]) -> bool;
+}
+
+/// The deepest b-tree `check_tree_depth` walks before refusing a source. SQLite's own cursors hold at
+/// most `BTCURSOR_MAX_DEPTH` (20) levels, so a healthy tree never exceeds this; a deeper one would
+/// drive `quick_check`'s recursion past the worker thread's stack, so it is refused first.
+pub(super) const MAX_TREE_DEPTH: u32 = 20;
+
+/// Walks the b-tree rooted at page 1 (the schema) and at each `(name, rootpage)`, sharing one visited
+/// bitmap, and refuses a source whose tree is too deep, revisits a page (a cycle, or a page two trees
+/// share), or holds an out-of-range page number, an unknown page type, or a cell offset outside the
+/// page's usable area. It runs before `quick_check`, so `quick_check`'s own recursion can't overflow
+/// the connection's worker-thread stack (spec Fix round 4, F1). One bitmap over every tree bounds the
+/// work to the page count, so this is O(pages) in time and memory.
+pub(super) fn check_tree_depth(
+    pages: &dyn Pages,
+    file: &Path,
+    roots: &[(String, u32)],
+) -> Result<(), ImportError> {
+    let page_count = pages.page_count();
+    let page_size = pages.page_size();
+    let usable = page_size.saturating_sub(pages.reserved());
+    // One bit per page (page 0 is unused), bounded by the page count, hence by the file size.
+    let mut visited = vec![0u8; (page_count as usize / 8) + 1];
+    let mut buf = vec![0u8; page_size];
+    // Page 1 carries the schema; a violation there damages the schema, not a named table. Each root
+    // follows, sharing `visited`, so a page reached from two roots is a revisit.
+    let targets = std::iter::once((None, 1u32)).chain(
+        roots
+            .iter()
+            .map(|(name, root)| (Some(name.as_str()), *root)),
+    );
+    for (name, root) in targets {
+        let mut stack = vec![(root, 0u32)];
+        while let Some((pgno, depth)) = stack.pop() {
+            if pgno == 0 || u64::from(pgno) > page_count || depth > MAX_TREE_DEPTH {
+                return Err(tree_damaged(file, name));
+            }
+            let (byte, bit) = (pgno as usize / 8, 1u8 << (pgno % 8));
+            if visited[byte] & bit != 0 {
+                return Err(tree_damaged(file, name));
+            }
+            visited[byte] |= bit;
+            if !pages.read_page(pgno, &mut buf) {
+                return Err(tree_damaged(file, name));
+            }
+            match tree_children(&buf, pgno, usable, depth) {
+                Some(children) => stack.extend(children),
+                None => return Err(tree_damaged(file, name)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A b-tree page's children at `depth + 1`: its interior cells' left children and its right child,
+/// or an empty list for a leaf. None when the page's type byte is not a b-tree type, or a cell
+/// pointer or left-child pointer lies outside `[header_end, usable)` — a damaged page. All reads are
+/// bounds-checked, so untrusted bytes can't panic the walk.
+fn tree_children(buf: &[u8], pgno: u32, usable: usize, depth: u32) -> Option<Vec<(u32, u32)>> {
+    // Page 1's b-tree header follows the 100-byte database header; every other page's is at 0.
+    let h = if pgno == 1 { 100 } else { 0 };
+    let (header_len, interior) = match *buf.get(h)? {
+        2 | 5 => (12, true),   // interior index / table
+        10 | 13 => (8, false), // leaf index / table
+        _ => return None,
+    };
+    if !interior {
+        return Some(Vec::new());
+    }
+    let header_end = h + header_len;
+    let cell_count = usize::from(u16::from_be_bytes(buf.get(h + 3..h + 5)?.try_into().ok()?));
+    let right = u32::from_be_bytes(buf.get(h + 8..h + 12)?.try_into().ok()?);
+    let mut children = Vec::with_capacity(cell_count + 1);
+    for i in 0..cell_count {
+        let ptr = header_end + 2 * i;
+        if ptr + 2 > usable {
+            return None;
+        }
+        let cell = usize::from(u16::from_be_bytes(buf.get(ptr..ptr + 2)?.try_into().ok()?));
+        if cell < header_end || cell >= usable {
+            return None;
+        }
+        let child = u32::from_be_bytes(buf.get(cell..cell + 4)?.try_into().ok()?);
+        children.push((child, depth + 1));
+    }
+    children.push((right, depth + 1));
+    Some(children)
+}
+
+/// A damaged tree: the schema when `name` is None (page 1), else the named table or index.
+fn tree_damaged(file: &Path, name: Option<&str>) -> ImportError {
+    match name {
+        Some(name) => ImportError::BadSource(format!("{}: {name} is damaged", file.display())),
+        None => ImportError::BadSource(format!("{}: its schema is damaged", file.display())),
+    }
+}
+
+/// `check_tree_depth`'s page source over the in-memory applied image.
+struct ImagePages<'a> {
+    image: &'a [u8],
+    page_size: usize,
+    reserved: usize,
+    page_count: u64,
+}
+
+impl<'a> ImagePages<'a> {
+    fn new(image: &'a [u8]) -> Self {
+        let page_size = db_page_size(image).unwrap_or(65_536).clamp(512, 65_536);
+        let reserved = image.get(20).copied().map_or(0, usize::from);
+        let page_count = image.len() as u64 / page_size as u64;
+        ImagePages {
+            image,
+            page_size,
+            reserved,
+            page_count,
+        }
+    }
+}
+
+impl Pages for ImagePages<'_> {
+    fn page_count(&self) -> u64 {
+        self.page_count
+    }
+    fn page_size(&self) -> usize {
+        self.page_size
+    }
+    fn reserved(&self) -> usize {
+        self.reserved
+    }
+    fn read_page(&self, pgno: u32, buf: &mut [u8]) -> bool {
+        let start = (u64::from(pgno - 1) * self.page_size as u64) as usize;
+        match self
+            .image
+            .get(start..)
+            .and_then(|rest| rest.get(..self.page_size))
+        {
+            Some(page) => {
+                buf.copy_from_slice(page);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// A read-only connection to one snapshot of a source database, for as long as it lives. It
@@ -1879,10 +2067,19 @@ fn same_bytes(file: &Path, expected: &[u8]) -> Result<bool, ImportError> {
     }
 }
 
-/// `file`'s image with `wal` applied as SQLite's recovery applies it (file format section 4): only
-/// the frames up to the last valid commit frame count. `db` is returned as it is when none does.
-/// Errors name the file and say nothing about its data.
-fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, ImportError> {
+/// A valid `-wal`'s committed frames, shared by `apply_wal` (in-memory) and `CopyPages` (copy path).
+/// `page_size` is the `-wal`'s page size, `pages` the database size its last commit frame names, and
+/// `frames` each committed frame as (page number, byte offset of its page data in `wal`), in order
+/// and truncated to that commit. None when the `-wal` holds no commit (a short or non-SQLite header,
+/// a failed checksum, or no commit frame). An error (a format version this import can't read) names
+/// `file` and says nothing about the data.
+pub(super) struct WalCommit {
+    pub(super) page_size: usize,
+    pub(super) pages: u32,
+    pub(super) frames: Vec<(u32, usize)>,
+}
+
+pub(super) fn wal_commit_frames(file: &Path, wal: &[u8]) -> Result<Option<WalCommit>, ImportError> {
     // The header is 32 bytes. A short one, a magic or page size that isn't SQLite's, or a checksum
     // that fails means no frames at all.
     let (Some(magic), Some(version), Some(page), Some(sum0), Some(sum1)) = (
@@ -1892,20 +2089,20 @@ fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, Import
         be32(wal, 24),
         be32(wal, 28),
     ) else {
-        return Ok(db);
+        return Ok(None);
     };
     let big_endian = match magic {
         0x377f_0683 => true,
         0x377f_0682 => false,
-        _ => return Ok(db),
+        _ => return Ok(None),
     };
     let page = page as usize;
     if !page.is_power_of_two() || !(512..=65_536).contains(&page) {
-        return Ok(db);
+        return Ok(None);
     }
     // The header is 32 bytes long, so its first 24 are there to checksum.
     if checksum(&wal[..24], big_endian, (0, 0)) != (sum0, sum1) {
-        return Ok(db);
+        return Ok(None);
     }
     if version != 3_007_000 {
         return Err(bad_wal(
@@ -1943,9 +2140,29 @@ fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, Import
         at += frame_len;
     }
     let Some((commit_size, applied)) = commit else {
-        return Ok(db);
+        return Ok(None);
     };
     frames.truncate(applied);
+    Ok(Some(WalCommit {
+        page_size: page,
+        pages: commit_size,
+        frames,
+    }))
+}
+
+/// `file`'s image with `wal` applied as SQLite's recovery applies it (file format section 4): only
+/// the frames up to the last valid commit frame count. `db` is returned as it is when none does.
+/// Errors name the file and say nothing about its data.
+fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, ImportError> {
+    let Some(WalCommit {
+        page_size: page,
+        pages: commit_size,
+        frames,
+    }) = wal_commit_frames(file, wal)?
+    else {
+        return Ok(db);
+    };
+    let applied = frames.len();
 
     // A non-empty database file must be a whole database of the -wal's page size; an empty one is
     // built from the frames alone. The commit may not name more pages than the file and frames give.
@@ -1999,7 +2216,7 @@ fn db_page_size(db: &[u8]) -> Option<usize> {
 
 /// SQLite's WAL checksum (file format section 4.2) over the whole 8-byte pairs of `data`, continuing
 /// from `sum`. The words are little-endian for the magic 0x377f0682 and big-endian for 0x377f0683.
-fn checksum(data: &[u8], big_endian: bool, mut sum: (u32, u32)) -> (u32, u32) {
+pub(super) fn checksum(data: &[u8], big_endian: bool, mut sum: (u32, u32)) -> (u32, u32) {
     for pair in data.as_chunks::<8>().0 {
         let word = |at: usize| {
             let bytes = [pair[at], pair[at + 1], pair[at + 2], pair[at + 3]];
@@ -2013,6 +2230,116 @@ fn checksum(data: &[u8], big_endian: bool, mut sum: (u32, u32)) -> (u32, u32) {
         sum.1 = sum.1.wrapping_add(word(4)).wrapping_add(sum.0);
     }
     sum
+}
+
+/// `check_tree_depth`'s page source over a copied database file and its copied `-wal`. `read_page`
+/// returns the page from the latest committed WAL frame that names it, else from the database file,
+/// each by `pread`, so a page is held only as long as the walk needs it. The `-wal` is read once to
+/// validate and map its frames, then dropped; each mapped frame is preaded on demand.
+pub(super) struct CopyPages {
+    db: File,
+    wal: Option<File>,
+    frames: HashMap<u32, u64>,
+    page_size: usize,
+    reserved: usize,
+    page_count: u64,
+}
+
+impl CopyPages {
+    pub(super) fn open(file: &Path, db_path: &Path, wal_path: &Path) -> Result<Self, ImportError> {
+        let db = File::open(db_path).map_err(|e| unreadable_path(db_path, &e))?;
+        let db_len = db
+            .metadata()
+            .map_err(|e| unreadable_path(db_path, &e))?
+            .len();
+        let mut header = [0u8; 100];
+        let read = read_at(&db, 0, &mut header).map_err(|e| unreadable_path(db_path, &e))?;
+        let page_size = db_page_size(&header[..read])
+            .unwrap_or(65_536)
+            .clamp(512, 65_536);
+        let reserved = header.get(20).copied().map_or(0, usize::from);
+        // The copied -wal, when present, overrides pages: its committed frames win over the database
+        // file. Read it once to map its frames, holding offsets so the bytes drop here; the last
+        // frame for a page wins. A copy with no -wal reads the database file alone.
+        let (wal, page_count, frames) = match File::open(wal_path) {
+            Ok(wal) => {
+                let bytes = read_whole(&wal, wal_path)?;
+                match wal_commit_frames(file, &bytes)? {
+                    Some(commit) => {
+                        let mut map = HashMap::with_capacity(commit.frames.len());
+                        for (number, offset) in commit.frames {
+                            map.insert(number, offset as u64);
+                        }
+                        (Some(wal), u64::from(commit.pages), map)
+                    }
+                    None => (Some(wal), db_len / page_size as u64, HashMap::new()),
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                (None, db_len / page_size as u64, HashMap::new())
+            }
+            Err(e) => return Err(unreadable_path(wal_path, &e)),
+        };
+        Ok(CopyPages {
+            db,
+            wal,
+            frames,
+            page_size,
+            reserved,
+            page_count,
+        })
+    }
+}
+
+impl Pages for CopyPages {
+    fn page_count(&self) -> u64 {
+        self.page_count
+    }
+    fn page_size(&self) -> usize {
+        self.page_size
+    }
+    fn reserved(&self) -> usize {
+        self.reserved
+    }
+    fn read_page(&self, pgno: u32, buf: &mut [u8]) -> bool {
+        if let Some(&offset) = self.frames.get(&pgno) {
+            return match &self.wal {
+                Some(wal) => read_at(wal, offset, buf).is_ok_and(|read| read == buf.len()),
+                None => false,
+            };
+        }
+        let offset = u64::from(pgno - 1) * self.page_size as u64;
+        read_at(&self.db, offset, buf).is_ok_and(|read| read == buf.len())
+    }
+}
+
+/// Reads up to `buf.len()` bytes at `offset` with `pread`, returning how many; a short read is not an
+/// error (the caller decides). Retries on `EINTR`. The file offset is never moved, so this is safe on
+/// a shared `&File`.
+fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut read = 0;
+    while read < buf.len() {
+        match file.read_at(&mut buf[read..], offset + read as u64) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(read)
+}
+
+/// The whole of an already-open file, for validating a copied `-wal`. Bounded by the file's size.
+fn read_whole(file: &File, path: &Path) -> Result<Vec<u8>, ImportError> {
+    let len = file
+        .metadata()
+        .map_err(|e| unreadable_path(path, &e))?
+        .len();
+    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+    let read = read_at(file, 0, &mut bytes).map_err(|e| unreadable_path(path, &e))?;
+    bytes.truncate(read);
+    Ok(bytes)
 }
 
 /// The 2.9 type of a .NET type name (its last part, with that part); other types are `None`.

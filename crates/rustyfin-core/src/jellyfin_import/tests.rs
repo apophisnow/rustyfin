@@ -2747,3 +2747,221 @@ async fn b20_progress_interrupt_is_a_damaged_schema() {
         "an interrupted read is a damaged schema, got: {message}"
     );
 }
+
+// F1 (round 4): check_tree_depth walks the schema b-tree (page 1) and every table/index root over
+// raw pages before quick_check runs, refusing a tree that is too deep, shares or revisits a page, or
+// holds a bad page number, type or cell offset — so quick_check can't recurse into it and overflow
+// the sqlx worker thread's stack. These feed the walk synthetic pages through a Vec-backed `Pages`,
+// and exercise `wal_commit_frames`/`CopyPages` (the copy path's WAL-aware page source) on a hand-made
+// WAL. On d5425c6 none of `Pages`, `check_tree_depth`, `wal_commit_frames` or `CopyPages` exist.
+
+/// A `Pages` over a Vec of equal-length pages. Page `n` (1-indexed) is `pages[n - 1]`; `reserved`
+/// trims the usable area as a real database header's byte 20 would.
+struct VecPages {
+    pages: Vec<Vec<u8>>,
+    reserved: usize,
+}
+
+impl super::source::Pages for VecPages {
+    fn page_count(&self) -> u64 {
+        self.pages.len() as u64
+    }
+    fn page_size(&self) -> usize {
+        self.pages.first().map_or(0, Vec::len)
+    }
+    fn reserved(&self) -> usize {
+        self.reserved
+    }
+    fn read_page(&self, pgno: u32, buf: &mut [u8]) -> bool {
+        match self.pages.get(pgno as usize - 1) {
+            Some(page) if page.len() == buf.len() => {
+                buf.copy_from_slice(page);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// An interior b-tree page (type 5) whose header sits at `h` (0, or 100 for page 1), with one cell
+/// per `children` entry (the cell is just its 4-byte left child, laid near the page's end) and
+/// `right` as the right child.
+fn interior_at(ps: usize, h: usize, children: &[u32], right: u32) -> Vec<u8> {
+    let mut page = vec![0u8; ps];
+    page[h] = 5;
+    page[h + 3..h + 5].copy_from_slice(&(children.len() as u16).to_be_bytes());
+    page[h + 8..h + 12].copy_from_slice(&right.to_be_bytes());
+    let mut cell_at = ps - 4;
+    for (i, &child) in children.iter().enumerate() {
+        let ptr = h + 12 + 2 * i;
+        page[ptr..ptr + 2].copy_from_slice(&(cell_at as u16).to_be_bytes());
+        page[cell_at..cell_at + 4].copy_from_slice(&child.to_be_bytes());
+        cell_at -= 4;
+    }
+    page
+}
+
+/// A leaf b-tree page (type 13) whose header sits at `h`.
+fn leaf_at(ps: usize, h: usize) -> Vec<u8> {
+    let mut page = vec![0u8; ps];
+    page[h] = 13;
+    page
+}
+
+#[test]
+fn b20_check_tree_depth_walks_and_refuses() {
+    use super::source::check_tree_depth;
+    let ps = 512;
+    let file = Path::new("jellyfin.db");
+
+    // A healthy shallow tree: page 1 is the schema leaf, the root at page 2 is an interior with two
+    // leaf children (pages 3 and 4). It passes.
+    let good = VecPages {
+        pages: vec![
+            leaf_at(ps, 100),
+            interior_at(ps, 0, &[3], 4),
+            leaf_at(ps, 0),
+            leaf_at(ps, 0),
+        ],
+        reserved: 0,
+    };
+    check_tree_depth(&good, file, &[("Permissions".into(), 2)]).expect("a shallow tree passes");
+
+    // A chain one level past the limit: pages 2..=23 each point to the next, so the walk reaches a
+    // depth of 21 and refuses the named root.
+    let mut pages = vec![leaf_at(ps, 100)];
+    for next in 3..=24u32 {
+        pages.push(interior_at(ps, 0, &[], next));
+    }
+    pages.push(leaf_at(ps, 0));
+    let deep = VecPages { pages, reserved: 0 };
+    let err = check_tree_depth(&deep, file, &[("Permissions".into(), 2)])
+        .expect_err("a chain past the depth limit is refused");
+    assert!(
+        matches!(&err, ImportError::BadSource(m) if m.contains("Permissions is damaged")),
+        "got: {err:?}"
+    );
+
+    // A page shared by two roots: the second visit to page 3 is a revisit, refused with the second
+    // root's name.
+    let shared = VecPages {
+        pages: vec![
+            leaf_at(ps, 100),
+            interior_at(ps, 0, &[], 3),
+            leaf_at(ps, 0),
+            interior_at(ps, 0, &[], 3),
+        ],
+        reserved: 0,
+    };
+    let err = check_tree_depth(&shared, file, &[("A".into(), 2), ("B".into(), 4)])
+        .expect_err("a page shared between two roots is refused");
+    assert!(
+        matches!(&err, ImportError::BadSource(m) if m.contains("B is damaged")),
+        "got: {err:?}"
+    );
+
+    // A violation reached from page 1 (the schema) reports "its schema is damaged", not a table name.
+    let bad_schema = VecPages {
+        pages: vec![interior_at(ps, 100, &[], 99), leaf_at(ps, 0)],
+        reserved: 0,
+    };
+    let err = check_tree_depth(&bad_schema, file, &[])
+        .expect_err("an out-of-range schema child is refused");
+    assert!(
+        matches!(&err, ImportError::BadSource(m) if m.contains("its schema is damaged")),
+        "got: {err:?}"
+    );
+
+    // An unknown page-type byte is refused.
+    let mut odd = leaf_at(ps, 0);
+    odd[0] = 7;
+    let bad_type = VecPages {
+        pages: vec![leaf_at(ps, 100), odd],
+        reserved: 0,
+    };
+    let err = check_tree_depth(&bad_type, file, &[("T".into(), 2)])
+        .expect_err("an unknown page type is refused");
+    assert!(
+        matches!(&err, ImportError::BadSource(m) if m.contains("T is damaged")),
+        "got: {err:?}"
+    );
+}
+
+/// Builds a one-commit `-wal` (big-endian magic) over `page_size` carrying `frames` as
+/// (page number, page bytes); the last frame commits and sets the database size to `db_pages`.
+fn build_wal(page_size: usize, db_pages: u32, frames: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    use super::source::checksum;
+    let mut wal = vec![0u8; 32];
+    wal[0..4].copy_from_slice(&0x377f_0683u32.to_be_bytes());
+    wal[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+    wal[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
+    wal[16..24].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let (h0, h1) = checksum(&wal[0..24], true, (0, 0));
+    wal[24..28].copy_from_slice(&h0.to_be_bytes());
+    wal[28..32].copy_from_slice(&h1.to_be_bytes());
+    let mut running = (h0, h1);
+    for (i, (pgno, page)) in frames.iter().enumerate() {
+        let commit = if i + 1 == frames.len() { db_pages } else { 0 };
+        let mut frame = vec![0u8; 24];
+        frame[0..4].copy_from_slice(&pgno.to_be_bytes());
+        frame[4..8].copy_from_slice(&commit.to_be_bytes());
+        frame[8..16].copy_from_slice(&wal[16..24]);
+        let sum = checksum(&frame[0..8], true, running);
+        let sum = checksum(page, true, sum);
+        frame[16..20].copy_from_slice(&sum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&sum.1.to_be_bytes());
+        running = sum;
+        wal.extend_from_slice(&frame);
+        wal.extend_from_slice(page);
+    }
+    wal
+}
+
+#[test]
+fn b20_wal_commit_frames_maps_the_latest_frame() {
+    use super::source::{CopyPages, Pages, wal_commit_frames};
+    let ps = 512;
+    let file = Path::new("jellyfin.db");
+
+    // Two commit frames for page 2: the first carries X, the last carries Y and commits two pages.
+    let x = vec![0xAAu8; ps];
+    let y = vec![0xBBu8; ps];
+    let wal = build_wal(ps, 2, &[(2, x.clone()), (2, y.clone())]);
+    let commit = wal_commit_frames(file, &wal)
+        .unwrap()
+        .expect("a valid commit");
+    assert_eq!(commit.page_size, ps);
+    assert_eq!(commit.pages, 2);
+    assert_eq!(
+        commit.frames.len(),
+        2,
+        "both frames for page 2 are kept, in order"
+    );
+    assert_eq!(commit.frames[0].0, 2);
+    assert_eq!(commit.frames[1].0, 2);
+    let (_, last_off) = commit.frames[1];
+    assert_eq!(
+        &wal[last_off..last_off + ps],
+        y.as_slice(),
+        "the later frame holds Y"
+    );
+
+    // CopyPages over a db file (page 2 = X on disk) and this WAL reads Y for page 2: the committed
+    // frame overrides the page on disk.
+    let dir = TempDir::new();
+    let mut db = vec![0u8; 2 * ps];
+    db[16..18].copy_from_slice(&(ps as u16).to_be_bytes());
+    db[ps..].copy_from_slice(&x);
+    let db_path = dir.0.join("source.db");
+    let wal_path = dir.0.join("source.db-wal");
+    std::fs::write(&db_path, &db).unwrap();
+    std::fs::write(&wal_path, &wal).unwrap();
+    let pages = CopyPages::open(file, &db_path, &wal_path).expect("open the copy");
+    assert_eq!(pages.page_count(), 2);
+    let mut buf = vec![0u8; ps];
+    assert!(pages.read_page(2, &mut buf));
+    assert_eq!(
+        buf, y,
+        "page 2 reads the WAL frame (Y), overriding the db page (X)"
+    );
+}
