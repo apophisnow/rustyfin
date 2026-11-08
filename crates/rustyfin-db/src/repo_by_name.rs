@@ -305,7 +305,7 @@ struct NameRow {
 // parent come from the recursive `sub` table; the parent itself is never in scope. A value of
 // another SQLite type leaves its row out through the `typeof` guards, so no row fails a query.
 
-/// The genre rows: item id, media type, raw `genres` and scope of each item.
+/// The genre rows: item id, media type, raw `genres` and scope of each item that has genres.
 const GENRE_ROWS: &str = "WITH RECURSIVE sub(id) AS (
         SELECT id FROM media_items WHERE parent_id = ?1
         UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
@@ -313,7 +313,8 @@ const GENRE_ROWS: &str = "WITH RECURSIVE sub(id) AS (
         CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
             THEN 1 ELSE 0 END
     FROM media_items m
-    WHERE typeof(m.id) = 'text' AND typeof(m.media_type) = 'text' AND typeof(m.genres) = 'text'";
+    WHERE typeof(m.id) = 'text' AND typeof(m.media_type) = 'text' AND typeof(m.genres) = 'text'
+        AND m.genres NOT IN ('', '[]')";
 
 /// The studio rows: studio name, item id, media type and scope of each link of an item.
 const STUDIO_ROWS: &str = "WITH RECURSIVE sub(id) AS (
