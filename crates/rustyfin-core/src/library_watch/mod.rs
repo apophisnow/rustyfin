@@ -87,6 +87,9 @@ pub struct LibraryWatcher {
 /// A monitor is keyed by its library id and its path.
 type MonitorKey = (Uuid, PathBuf);
 
+/// The hook that `set_poll_hook` installs. A poll calls it on the polling thread.
+type PollHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 struct Inner {
     pool: SqlitePool,
     changes: ChangeQueue,
@@ -109,6 +112,8 @@ struct Inner {
     /// Whether the warning of the open file limit is logged. It is logged once per watcher.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     file_limit_warned: AtomicBool,
+    /// The hook of `set_poll_hook`, read before each poll. The lock is not held while it runs.
+    poll_hook: Mutex<Option<PollHook>>,
 }
 
 #[derive(Default)]
@@ -158,6 +163,7 @@ impl LibraryWatcher {
                 watch_limit_warned: AtomicBool::new(false),
                 instance_limit_warned: AtomicBool::new(false),
                 file_limit_warned: AtomicBool::new(false),
+                poll_hook: Mutex::new(None),
             }),
         }
     }
@@ -235,6 +241,18 @@ impl LibraryWatcher {
                 monitor.overflow.notify_one();
             }
         }
+    }
+
+    /// Calls `hook` with the library path on the polling thread before each poll of a poll
+    /// monitor, the baseline too; `None` removes it. A hook that blocks stands for a share that
+    /// doesn't answer. For the tests.
+    #[doc(hidden)]
+    pub fn set_poll_hook(&self, hook: Option<PollHook>) {
+        *self
+            .inner
+            .poll_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
     }
 
     /// The monitored library paths, sorted by library name, then path.
@@ -474,7 +492,17 @@ async fn run_monitor(
 
     let mut logged_baseline = false;
     loop {
+        // The lock ends with this statement, so the hook runs without it held.
+        let poll_hook = inner
+            .poll_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let hook_path = path.clone();
         let (returned, reported, took) = match tokio::task::spawn_blocking(move || {
+            if let Some(hook) = poll_hook {
+                hook(&hook_path);
+            }
             let started = std::time::Instant::now();
             let reported = poller.poll();
             (poller, reported, started.elapsed())
