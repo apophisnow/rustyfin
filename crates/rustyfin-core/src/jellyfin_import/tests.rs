@@ -3341,38 +3341,42 @@ async fn b20_dropped_snapshot_stops_its_worker() {
         });
         let open =
             open_snapshot_with_free(&file, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX));
-        let opened = tokio::time::timeout(
-            Duration::from_millis(200),
-            PROGRESS_PROBE.scope(Arc::clone(&probe), open),
-        )
-        .await
-        .is_ok();
-        // The request is dropped when its 200 ms scope ends. A loaded machine may not schedule the
-        // sqlx worker within that window, so keying the outcome on a tick inside it flaked (L2); key
-        // it on the stop instead. Watch the ticks for up to 2 s: once the worker has run they climb,
-        // then plateau when the drop's cancel interrupts it, so a plateau after movement is the stop.
-        // Ticks still climbing at 2 s mean the drop did not stop the worker.
-        let dropped = Instant::now();
-        let mut last = probe.ticks.load(Ordering::Relaxed);
-        let mut moved = false;
-        let stopped = loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let now = probe.ticks.load(Ordering::Relaxed);
-            if now != last {
-                moved = true;
-                last = now;
-            } else if moved {
-                break true; // climbed, then held: the worker stopped
-            }
-            if dropped.elapsed() > Duration::from_secs(2) {
-                // Never climbed: nothing was left spinning. Still climbing: not stopped.
-                break !moved;
+        let ticked = async {
+            while probe.ticks.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        let outcome = match (opened, stopped) {
-            (true, _) => "opened within 200 ms",
-            (false, true) => "stopped",
-            (false, false) => "still spinning 2 s after the drop",
+        // Run the request until the worker's first tick, then drop it: the worker is then inside
+        // the spinning load, which only the drop's cancel can end. A loaded machine may not
+        // schedule the sqlx worker for seconds, so the wait allows 10 s. Dropping the request at a
+        // fixed 200 ms flaked (re-check 5, L2), and could pass without the worker ever running
+        // (re-check 6, L1).
+        let started = tokio::select! {
+            _ = PROGRESS_PROBE.scope(Arc::clone(&probe), open) => "opened before its first tick",
+            () = ticked => "ticked",
+            () = tokio::time::sleep(Duration::from_secs(10)) => "no tick within 10 s",
+        };
+        // The probe counts a tick before the handler checks the cancel, so a working cancel lets
+        // the ticks climb in at most one 100 ms sample after the drop; a broken one lets them climb
+        // in every sample. Two climbs in a row within 2 s mean the drop did not stop the worker.
+        let outcome = if started == "ticked" {
+            let dropped = Instant::now();
+            let mut last = probe.ticks.load(Ordering::Relaxed);
+            let mut climbed = false;
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let now = probe.ticks.load(Ordering::Relaxed);
+                if now != last && climbed {
+                    break "still spinning after the drop";
+                }
+                climbed = now != last;
+                last = now;
+                if dropped.elapsed() > Duration::from_secs(2) {
+                    break "stopped";
+                }
+            }
+        } else {
+            started
         };
         outcomes.push(format!("{path}: {outcome}"));
     }
