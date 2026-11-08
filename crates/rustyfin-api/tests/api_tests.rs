@@ -1840,6 +1840,118 @@ async fn test_full_search_empty_term() {
     assert_eq!(result["TotalRecordCount"], 0);
 }
 
+// ── B27: cache keys ──
+//
+// A search answers only the item types asked for, and a cached answer goes only to a request
+// that gets the same answer.
+
+/// Seeds a movie library with the movie "Comet Night", the series "Comet Hunters", its season
+/// "Comet Hunters Season 1" and its episode "Comet Hunters S01E01". Returns an admin token and
+/// the library's id.
+async fn b27_seed(state: &AppState) -> (String, uuid::Uuid) {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B27 Library".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![media_folder(state, "b27")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    for (name, media_type) in [
+        ("Comet Night", "Movie"),
+        ("Comet Hunters", "Series"),
+        ("Comet Hunters Season 1", "Season"),
+        ("Comet Hunters S01E01", "Episode"),
+    ] {
+        b27_add_item(state, lib.id, name, media_type).await;
+    }
+    (admin_session(state).await.0, lib.id)
+}
+
+/// Adds an item to the database as a scan stores it, without touching any cache.
+async fn b27_add_item(state: &AppState, library_id: uuid::Uuid, name: &str, media_type: &str) {
+    let id = uuid::Uuid::new_v4();
+    let path = state
+        .data_dir
+        .join("media")
+        .join("b27")
+        .join(format!("{id}.mkv"));
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(name)
+    .bind(media_type)
+    .bind(path.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// The items a `/Search` or `/Search/Hints` request answers, as sorted "Name (Type)" strings.
+/// Panics unless the answer is 200.
+async fn b27_found(app: &axum::Router, uri: &str, token: &str) -> Vec<String> {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let items = body
+        .get("Items")
+        .or_else(|| body.get("SearchHints"))
+        .and_then(|items| items.as_array())
+        .unwrap_or_else(|| panic!("{uri}: no Items or SearchHints in {body}"));
+    let mut found: Vec<String> = items
+        .iter()
+        .map(|item| {
+            let name = item["Name"].as_str().unwrap_or("?");
+            let item_type = item["Type"].as_str().unwrap_or("?");
+            format!("{name} ({item_type})")
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[tokio::test]
+async fn b27_typed_search_finds_only_the_listed_types() {
+    let state = test_state().await;
+    let (token, _) = b27_seed(&state).await;
+    let app = app(state);
+
+    // Each request has its own term, so none can get another's cached answer.
+    assert_eq!(
+        b27_found(&app, "/Search?Term=comet&IncludeItemTypes=Movie", &token).await,
+        ["Comet Night (Movie)"]
+    );
+    assert_eq!(
+        b27_found(
+            &app,
+            "/Search?Term=comet%20hunters&IncludeItemTypes=Episode",
+            &token
+        )
+        .await,
+        ["Comet Hunters S01E01 (Episode)"]
+    );
+    assert_eq!(
+        b27_found(
+            &app,
+            "/Search?Term=comet%20h&IncludeItemTypes=Series,%20Episode",
+            &token
+        )
+        .await,
+        ["Comet Hunters (Series)", "Comet Hunters S01E01 (Episode)"]
+    );
+    // Without IncludeItemTypes, the default types: Movie, Series, Episode and Audio.
+    assert_eq!(
+        b27_found(&app, "/Search?Term=com", &token).await,
+        [
+            "Comet Hunters (Series)",
+            "Comet Hunters S01E01 (Episode)",
+            "Comet Night (Movie)"
+        ]
+    );
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]
