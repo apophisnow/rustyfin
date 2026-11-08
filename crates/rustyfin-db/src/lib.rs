@@ -2,6 +2,7 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 pub mod repo_activity;
+pub mod repo_by_name;
 pub mod repo_chapter;
 pub mod repo_collection;
 pub mod repo_device;
@@ -14,6 +15,7 @@ pub mod repo_media_segment;
 pub mod repo_media_source;
 pub mod repo_misc;
 pub mod repo_notification;
+pub mod repo_oidc;
 pub mod repo_package;
 pub mod repo_person;
 pub mod repo_playback;
