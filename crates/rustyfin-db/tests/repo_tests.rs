@@ -1138,3 +1138,81 @@ async fn test_batch_upsert_media_items_round_trip() {
         assert_eq!(stored.popularity, Some(12.5));
     }
 }
+
+/// A batch that saves a stored item again updates it in place (B31): the rows that reference it
+/// and its date added stay, and the year and rating counts follow its new values.
+#[tokio::test]
+async fn test_batch_upsert_updates_a_stored_item_in_place() {
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+
+    let lib = make_library("Movies", LibraryContentType::Movies);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let added: chrono::DateTime<Utc> = "2020-01-02T03:04:05Z".parse().unwrap();
+    let movie = MediaItem {
+        official_rating: Some("R".to_string()),
+        date_created: added,
+        ..make_movie(lib.id, "Stored")
+    };
+    let other = MediaItem {
+        official_rating: Some("R".to_string()),
+        ..make_movie(lib.id, "Other")
+    };
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &[movie.clone(), other])
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_images (item_id, image_type, path) VALUES (?1, 'Primary', ?2)")
+        .bind(movie.id.to_string())
+        .bind("/media/movies/Stored.jpg")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_sources (id, item_id, uid, path) VALUES (?1, ?2, ?1, ?3)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(movie.id.to_string())
+        .bind(&movie.path)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let changed = MediaItem {
+        name: "Renamed".to_string(),
+        production_year: Some(2021),
+        official_rating: Some("PG".to_string()),
+        date_created: Utc::now(),
+        ..movie.clone()
+    };
+    rustyfin_db::repo_media::batch_upsert_media_items(&pool, &[changed])
+        .await
+        .unwrap();
+
+    let stored = rustyfin_db::repo_media::get_item_by_id(&pool, movie.id)
+        .await
+        .unwrap()
+        .expect("the item is still stored under its id");
+    assert_eq!(stored.name, "Renamed");
+    let kept: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM item_images WHERE item_id = ?1), \
+                (SELECT COUNT(*) FROM media_sources WHERE item_id = ?1)",
+    )
+    .bind(movie.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, (1, 1), "the image and the media source stay");
+    assert_eq!(stored.date_created, added);
+    let years: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT year, item_count FROM filter_year_index ORDER BY year")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(years, [(2020, 1), (2021, 1)]);
+    let ratings: Vec<(String, i64)> =
+        sqlx::query_as("SELECT rating, item_count FROM filter_rating_index ORDER BY rating")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ratings, [("PG".to_string(), 1), ("R".to_string(), 1)]);
+}

@@ -91,6 +91,7 @@ pub async fn upsert_media_item(pool: &SqlitePool, item: &MediaItem) -> Result<()
 
 /// Batch-insert multiple media items in a single transaction.
 /// Dramatically reduces WAL contention compared to per-item inserts.
+/// A stored item is updated in place and keeps its stored date added, as in `upsert_media_item`.
 /// Disables filter triggers during insert to avoid write amplification,
 /// then rebuilds filter indexes after the transaction completes.
 pub async fn batch_upsert_media_items(
@@ -124,13 +125,29 @@ pub async fn batch_upsert_media_items(
         let tags = item.tags.join("|");
 
         sqlx::query(
-            "INSERT OR REPLACE INTO media_items \
+            "INSERT INTO media_items \
              (id, name, sort_name, overview, media_type, path, parent_id, library_id, \
               production_year, community_rating, official_rating, genres, date_created, \
               premiere_date, runtime_ticks, index_number, parent_index_number, tmdb_id, tvdb_id, \
               tags, status, original_language, tagline, production_countries, budget, revenue, \
               homepage, end_date, vote_count, popularity) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+              name = excluded.name, sort_name = excluded.sort_name, overview = excluded.overview, \
+              media_type = excluded.media_type, path = excluded.path, \
+              parent_id = excluded.parent_id, library_id = excluded.library_id, \
+              production_year = excluded.production_year, \
+              community_rating = excluded.community_rating, \
+              official_rating = excluded.official_rating, genres = excluded.genres, \
+              premiere_date = excluded.premiere_date, runtime_ticks = excluded.runtime_ticks, \
+              index_number = excluded.index_number, \
+              parent_index_number = excluded.parent_index_number, tmdb_id = excluded.tmdb_id, \
+              tvdb_id = excluded.tvdb_id, tags = excluded.tags, status = excluded.status, \
+              original_language = excluded.original_language, tagline = excluded.tagline, \
+              production_countries = excluded.production_countries, budget = excluded.budget, \
+              revenue = excluded.revenue, homepage = excluded.homepage, \
+              end_date = excluded.end_date, vote_count = excluded.vote_count, \
+              popularity = excluded.popularity",
         )
         .bind(&id)
         .bind(&item.name)
@@ -160,7 +177,8 @@ pub async fn batch_upsert_media_items(
         .bind(item.revenue)
         .bind(&item.homepage)
         .bind(item.end_date.map(|d| d.to_rfc3339()))
-        .bind(item.vote_count)
+        // NOT NULL DEFAULT 0, as in `upsert_media_item`.
+        .bind(item.vote_count.unwrap_or(0))
         .bind(item.popularity)
         .execute(&mut *tx)
         .await?;
