@@ -1661,6 +1661,9 @@ async function openStream(session, startTicks) {
     // This load stays current until the session stops or a newer load starts
     const current = () => activePlayback === session && session.loads === load;
     const startSeconds = startTicks / 1e7;
+    // Capture the subtitle before the request so a change made during it sees this load's burn-in
+    const requestedSubtitle = session.subtitleIndex;
+    session.burnedIn = streamType === 'Videos' && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     let url;
     let isHls = false;
@@ -1669,7 +1672,12 @@ async function openStream(session, startTicks) {
     if (streamType === 'Videos') {
         // Use Universal endpoint to get the optimal playback URL
         try {
-            const data = await API.getUniversalVideoUrl(itemId, { startTimeTicks: startTicks });
+            const data = await API.getUniversalVideoUrl(itemId, {
+                startTimeTicks: startTicks,
+                mediaSourceId: session.mediaSourceId,
+                audioStreamIndex: session.audioIndex,
+                subtitleStreamIndex: session.subtitleIndex,
+            });
             if (!current()) return;
             if (data && data.url) {
                 // Add auth token to the stream URL so the video element can authenticate
@@ -1713,7 +1721,8 @@ async function openStream(session, startTicks) {
     session.startAt = startSeconds;
     session.isHls = isHls;
     session.playSessionId = playSessionId;
-    session.mediaSourceId = mediaSourceId;
+    session.mediaSourceId = mediaSourceId || session.mediaSourceId;
+    session.burnedIn = isHls && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
 
     video.onerror = () => {
         if (!current()) return;
@@ -1767,6 +1776,7 @@ async function openStream(session, startTicks) {
         }
         video.play().catch(e => console.warn('Autoplay block:', e));
     }
+    if (streamType === 'Videos') showTextSubtitle(session);
     updatePlayerControls(session);
 }
 
@@ -1787,6 +1797,8 @@ function seekTo(session, seconds) {
     const total = session.total();
     if (total > 0) seconds = Math.min(seconds, total);
     seconds = Math.max(0, seconds);
+    // A waiting track change restarts at the new point instead
+    if (session.tracksChanged) return scheduleRestart(session, seconds);
     if (!session.isHls) {
         video.currentTime = seconds;
         return;
@@ -1796,10 +1808,16 @@ function seekTo(session, seconds) {
     const end = seekable.length ? seekable.end(seekable.length - 1) : 0;
     if (rel >= 0 && rel <= end) {
         clearTimeout(session.seekTimer);
+        session.seekTimer = null;
         session.pendingSeek = null;
         video.currentTime = rel;
         return;
     }
+    scheduleRestart(session, seconds);
+}
+
+// Waits 400 ms after the last seek, then restarts the transcode at that point
+function scheduleRestart(session, seconds) {
     session.pendingSeek = seconds;
     updatePlayerControls(session);
     clearTimeout(session.seekTimer);
@@ -1808,6 +1826,7 @@ function seekTo(session, seconds) {
 
 // Starts the transcode again at seconds of item time, stopping the old transcode first
 async function restartStream(session, seconds) {
+    session.tracksChanged = false;
     session.pendingSeek = seconds;
     if (hlsInstance) {
         hlsInstance.destroy();
@@ -1839,6 +1858,147 @@ function previewSeek(percent) {
     $('player-cur-time').textContent = formatDurationSeconds(percent / 100 * activePlayback.total());
 }
 
+// Picks another audio track and restarts the transcode at the current point
+function changeAudioTrack(value) {
+    const session = activePlayback;
+    if (!session) return;
+    session.audioIndex = Number(value);
+    session.tracksChanged = true;
+    scheduleRestart(session, session.position());
+}
+
+// A text subtitle is added to the player; a picture one is burned in, so it restarts the transcode
+function changeSubtitleTrack(value) {
+    const session = activePlayback;
+    if (!session) return;
+    session.subtitleIndex = Number(value);
+    if (session.burnedIn || isImageSubtitle(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
+        clearTextSubtitle();
+        session.tracksChanged = true;
+        scheduleRestart(session, session.position());
+    } else {
+        showTextSubtitle(session);
+    }
+}
+
+// CodecType comes lower case from the server: 'audio', 'subtitle' or 'video'
+function isStreamType(s, type) {
+    return (s.CodecType || '').toLowerCase() === type;
+}
+
+// The stream of this type with this index, if the session has one
+function findStream(session, type, index) {
+    return session.streams.find(s => s.Index === index && isStreamType(s, type));
+}
+
+// Picture subtitles are burned in by the transcode (the server's codec names)
+function isImageSubtitle(codec) {
+    const c = (codec || '').toLowerCase();
+    return c.includes('pgs') || ['dvd_subtitle', 'dvdsub', 'vobsub', 'dvb_subtitle', 'dvbsub', 'xsub', 'sup'].includes(c);
+}
+
+// Removes the text subtitle track that showTextSubtitle added
+function clearTextSubtitle() {
+    $('video-player').querySelectorAll('track[data-player-subtitle]').forEach(track => track.remove());
+}
+
+// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone
+function showTextSubtitle(session) {
+    clearTextSubtitle();
+    const stream = findStream(session, 'subtitle', session.subtitleIndex);
+    if (!session.mediaSourceId || !stream || isImageSubtitle(stream.Codec)) return;
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.dataset.playerSubtitle = '1';
+    // The route takes the start in ticks: the transcode's offset, or 0 for direct play
+    track.src = API.base + '/Videos/' + session.itemId + '/' + encodeURIComponent(session.mediaSourceId) +
+        '/Subtitles/' + stream.Index + '/' + Math.round(session.offset * 1e7) + '/Stream.vtt?api_key=' +
+        encodeURIComponent(API.token);
+    track.addEventListener('error', () => {
+        if (activePlayback === session) $('player-subtitle').textContent = t('player.subtitles_error');
+    });
+    $('video-player').appendChild(track);
+    track.track.mode = 'showing';
+}
+
+// Language name in the page's language; und, mis, mul and zxx name no language
+function trackLanguageName(code) {
+    if (!code || ['und', 'mis', 'mul', 'zxx'].includes(code.toLowerCase())) return '';
+    let name = code;
+    try {
+        name = new Intl.DisplayNames([document.documentElement.lang || 'en'], { type: 'language' }).of(code) || code;
+    } catch (e) {
+        // Not a code Intl knows: the code stays as it is
+    }
+    return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+// The title, then each tag the title does not already contain (Jellyfin's DisplayTitle)
+function trackTitle(title, tags) {
+    const parts = tags.filter(Boolean);
+    if (!title) return parts.join(' - ');
+    const extra = parts.filter(tag => !title.toLowerCase().includes(tag.toLowerCase()));
+    return [title, ...extra].join(' - ');
+}
+
+// Audio menu label: language, profile or codec, channel layout or count, then the flags
+function audioTrackLabel(s) {
+    const codec = (s.Codec || '').toLowerCase();
+    const codecNames = { ac3: 'Dolby Digital', eac3: 'Dolby Digital+', dca: 'DTS' };
+    const profile = s.Profile || '';
+    const layout = s.ChannelLayout ? s.ChannelLayout.charAt(0).toUpperCase() + s.ChannelLayout.slice(1) : '';
+    const tags = [
+        trackLanguageName(s.Language),
+        (profile && profile.toLowerCase() !== 'lc') ? profile : (codecNames[codec] || codec.toUpperCase()),
+        layout || (s.Channels ? t('player.track_channels', { count: s.Channels }) : ''),
+        s.IsDefault ? t('player.track_default') : '',
+        s.IsExternal ? t('player.track_external') : '',
+    ];
+    return trackTitle(s.Title, tags) || t('player.track_undefined');
+}
+
+// Subtitle menu label: language, default and forced flags, codec name, then external
+function subtitleTrackLabel(s) {
+    const codec = (s.Codec || '').toLowerCase();
+    const codecNames = { dvb_subtitle: 'DVBSUB', dvb_teletext: 'DVBTXT', dvd_subtitle: 'DVDSUB', hdmv_pgs_subtitle: 'PGSSUB' };
+    const tags = [
+        trackLanguageName(s.Language) || t('player.track_undefined'),
+        s.IsDefault ? t('player.track_default') : '',
+        s.IsForced ? t('player.track_forced') : '',
+        codecNames[codec] || codec.toUpperCase(),
+        s.IsExternal ? t('player.track_external') : '',
+    ];
+    return trackTitle(s.Title, tags) || t('player.track_undefined');
+}
+
+// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default
+function defaultSubtitleIndex(subs, chosenAudio) {
+    const audioLang = (chosenAudio?.Language || '').toLowerCase();
+    let best = null;
+    let bestKey = 0;
+    for (const s of subs) {
+        const sameLanguage = (s.Language || '').toLowerCase() === audioLang;
+        const key = (s.IsExternal ? 8 : 0) + (s.IsForced && sameLanguage ? 4 : 0) + (s.IsForced ? 2 : 0) + (s.IsDefault ? 1 : 0);
+        if (key > bestKey) {
+            best = s;
+            bestKey = key;
+        }
+    }
+    return best ? best.Index : -1;
+}
+
+// Fills the audio and subtitle menus from the session; null hides both
+function renderTrackMenus(session) {
+    const audio = session ? session.streams.filter(s => isStreamType(s, 'audio')) : [];
+    const subs = session ? session.streams.filter(s => isStreamType(s, 'subtitle')) : [];
+    $('player-audio').replaceChildren(...audio.map(s => new Option(audioTrackLabel(s), s.Index)));
+    $('player-subs').replaceChildren(new Option(t('player.subtitles_off'), -1), ...subs.map(s => new Option(subtitleTrackLabel(s), s.Index)));
+    $('player-audio').value = String(session?.audioIndex ?? '');
+    $('player-subs').value = String(session?.subtitleIndex ?? '');
+    $('player-audio-wrap').hidden = audio.length < 2;
+    $('player-subs-wrap').hidden = subs.length < 1;
+}
+
 // --- Video Player (Cinema Mode) ---
 async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
     const video = $('video-player');
@@ -1862,6 +2022,8 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     $('player-duration').textContent = '0:00';
     $('player-seek').value = 0;
     seekDragging = false;
+    clearTextSubtitle();
+    renderTrackMenus(null);
 
     // Show modal immediately while loading
     if (!modal.open) {
@@ -1871,17 +2033,41 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     // Read the resume point only after the Stopped report, so it includes the position just saved
     await pendingStop;
-    let item = null;
-    try {
-        item = await API.get('/Items/' + itemId);
-    } catch (e) {
-        console.warn('Could not load item for resume point:', e);
-    }
+    // The item gives the resume point and PlaybackInfo the tracks; a failed PlaybackInfo leaves no menus
+    const [item, info] = await Promise.all([
+        API.get('/Items/' + itemId).catch(e => {
+            console.warn('Could not load item for resume point:', e);
+            return null;
+        }),
+        streamType === 'Videos'
+            ? API.getPlaybackInfo(itemId).catch(e => {
+                console.warn('Could not load playback info:', e);
+                return null;
+            })
+            : null,
+    ]);
     if (!modal.open || request !== playRequest) return; // closed or replaced while loading
     if (!title && item?.Name) $('player-title').textContent = item.Name;
 
     const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
     const runtimeTicks = item?.RunTimeTicks || 0;
+
+    // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
+    const source = info?.MediaSources?.[0];
+    const streams = source?.MediaStreams || [];
+    const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
+    const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
+    const defaultAudio = source?.DefaultAudioStreamIndex;
+    const chosenAudio = audioStreams.find(s => s.Index === defaultAudio) || audioStreams.find(s => s.IsDefault) || audioStreams[0] || null;
+    let audioIndex = null;
+    let subtitleIndex = null;
+    if (source) {
+        audioIndex = chosenAudio ? chosenAudio.Index : null;
+        const defaultSub = source.DefaultSubtitleStreamIndex;
+        subtitleIndex = (defaultSub === -1 || subStreams.some(s => s.Index === defaultSub))
+            ? defaultSub
+            : defaultSubtitleIndex(subStreams, chosenAudio);
+    }
 
     // The session owns this playback: stop() reports the position once and tears the player down
     let stopped = false;
@@ -1893,7 +2079,12 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
         startAt: startTicks / 1e7,
         isHls: false,
         playSessionId: null,
-        mediaSourceId: null,
+        mediaSourceId: source?.Id || null,
+        streams,
+        audioIndex,
+        subtitleIndex,
+        burnedIn: false,
+        tracksChanged: false,
         loads: 0,
         pendingSeek: null,
         seekTimer: null,
@@ -1911,6 +2102,14 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             const duration = $('video-player').duration;
             return Number.isFinite(duration) && duration > 0 ? this.offset + duration : 0;
         },
+        // The track ids the playback reports carry; a null one is left out
+        reportFields() {
+            const fields = {};
+            if (this.mediaSourceId !== null) fields.MediaSourceId = this.mediaSourceId;
+            if (this.audioIndex !== null) fields.AudioStreamIndex = this.audioIndex;
+            if (this.subtitleIndex !== null) fields.SubtitleStreamIndex = this.subtitleIndex;
+            return fields;
+        },
         stop() {
             if (stopped) return pendingStop;
             stopped = true;
@@ -1921,7 +2120,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
                 playerReportInterval = null;
             }
             if (activePlayback === session) activePlayback = null;
-            const reported = API.reportStopped(itemId, ticks).catch(e => console.warn('Reporting playback stop failed:', e));
+            const reported = API.reportStopped(itemId, ticks, session.reportFields()).catch(e => console.warn('Reporting playback stop failed:', e));
             pendingStop = reported;
             // Once the Stopped report is in, refresh the open view so it shows the new resume point
             reported.then(() => {
@@ -1937,17 +2136,19 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
             }
             video.removeAttribute('src');
             video.load();
+            clearTextSubtitle();
             return reported;
         },
     };
     activePlayback = session;
+    renderTrackMenus(session);
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
     playerReportInterval = setInterval(() => {
         if (!video.paused && !video.ended) {
             const ticks = Math.round(session.position() * 1e7);
-            API.reportProgress(itemId, ticks, false).catch(() => {});
+            API.reportProgress(itemId, ticks, false, session.reportFields()).catch(() => {});
         }
     }, 8000);
 
@@ -1969,7 +2170,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     };
 
     await openStream(session, startTicks);
-    if (activePlayback === session) API.reportPlaying(itemId, startTicks).catch(() => {});
+    if (activePlayback === session) API.reportPlaying(itemId, startTicks, session.reportFields()).catch(() => {});
 }
 
 function closePlayer() {

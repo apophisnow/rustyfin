@@ -297,14 +297,14 @@ const API = {
     },
 
     // Playback
-    reportPlaying(itemId, positionTicks = 0) {
-        return this.post('/Sessions/Playing', { ItemId: itemId, PositionTicks: positionTicks });
+    reportPlaying(itemId, positionTicks = 0, fields = {}) {
+        return this.post('/Sessions/Playing', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
     },
-    reportProgress(itemId, positionTicks, isPaused = false) {
-        return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused });
+    reportProgress(itemId, positionTicks, isPaused = false, fields = {}) {
+        return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused, ...fields });
     },
-    reportStopped(itemId, positionTicks) {
-        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks });
+    reportStopped(itemId, positionTicks, fields = {}) {
+        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
     },
     markPlayed(itemId) { return this.post(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
