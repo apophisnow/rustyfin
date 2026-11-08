@@ -935,13 +935,15 @@ async fn scan_music_library(
     ticket: &ScanTicket,
     counted: bool,
 ) -> Result<(ScanChanges, Vec<Uuid>), sqlx::Error> {
-    let _guard = SCAN_LOCK.lock().await;
+    let guard = SCAN_LOCK.lock().await;
     ticket.start();
     let filter = path_scope(scope);
     let mut count = 0u32;
     let mut existing_count = 0u32;
     let mut reread = 0u32;
     let mut new_item_ids: Vec<Uuid> = Vec::new();
+    // Probe plans of the old tracks, read again under the scan lock, see the end of the scan.
+    let mut plans: Vec<(Uuid, Vec<probe::ProbeStep>)> = Vec::new();
 
     // Load all existing paths into a HashSet for O(1) existence checks.
     let existing_paths: HashSet<String> =
@@ -1040,12 +1042,13 @@ async fn scan_music_library(
             // Skip if already exists (in-memory check)
             if existing_paths.contains(&file_path) {
                 existing_count += 1;
-                // A track whose source an older probe wrote is probed again, under the same item.
-                // A track whose file changed since it was stamped is probed again, under the same
-                // item. A track that was never stamped is stamped now, without a probe.
+                // A track whose source an older probe wrote is read again by this scan's probe
+                // plans, which hold the scan lock until they end. A track whose file changed since
+                // it was stamped is probed again, under the same item. A track that was never
+                // stamped is stamped now, without a probe.
                 if let Some(&item_id) = outdated.get(&file_path) {
                     reread += 1;
-                    probe::spawn_probe_and_save(pool.clone(), item_id, file_path.clone());
+                    plans.push((item_id, vec![probe::ProbeStep::Primary(file_path.clone())]));
                 } else if let Some(&(item_id, size, modified)) = known_tracks.get(&file_path) {
                     if modified.is_none() {
                         let stamp = scan_sync::file_stamp(&file_path);
@@ -1348,6 +1351,13 @@ async fn scan_music_library(
         library.name,
         count,
         existing_count
+    );
+    spawn_plans_under_lock(
+        pool.clone(),
+        guard,
+        library.name.clone(),
+        plans,
+        ticket.clone(),
     );
     let changes = ScanChanges {
         added: count,

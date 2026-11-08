@@ -6114,3 +6114,177 @@ async fn b26_a_probe_keeps_the_old_sources_until_it_ends() {
     assert_eq!(after.len(), 1, "{after:?}");
     assert_ne!(after, [old], "the probe did not replace the source");
 }
+
+/// Scans all of `lib` with no metadata provider, and returns without waiting for the probes that
+/// the scan queued.
+async fn b26_scan_now(pool: &SqlitePool, lib: &Library) -> ScanChanges {
+    scanner::scan_with_metadata(
+        pool,
+        lib,
+        &ScanScope::Library,
+        &reqwest::Client::new(),
+        None,
+        None,
+        None,
+        &ScanTicket::untracked(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("scan of {}: {e}", lib.name))
+}
+
+/// Runs the test `name` again in a child process with `envs` added to its environment, and fails
+/// unless the child passed.
+fn b26_rerun(name: &str, envs: &[(&str, &std::ffi::OsStr)]) {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run the test binary again");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(
+        child.status.success() && out.contains("1 passed"),
+        "{name} failed in its child process:\n{out}"
+    );
+}
+
+/// Runs the test `name` again in a child process whose ffprobe waits 3 s before each run once the
+/// child has created the file that `B26_SLOW_MARKER` names. A scan that does not wait for its
+/// re-reads then ends long before them.
+async fn b26_with_slow_ffprobe(name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new().await;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let ffprobe = std::env::split_paths(&path)
+        .map(|dir| dir.join("ffprobe"))
+        .find(|file| file.is_file())
+        .expect("ffprobe on PATH");
+    let dir = fx.path("slow-ffprobe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let wrapper = dir.join("ffprobe");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\n[ -e \"$B26_SLOW_MARKER\" ] && sleep 3\nexec \"$B26_FFPROBE\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&path))).unwrap();
+    let marker = fx.path("slow");
+    b26_rerun(
+        name,
+        &[
+            ("PATH", path.as_os_str()),
+            ("B26_FFPROBE", ffprobe.as_os_str()),
+            ("B26_SLOW_MARKER", marker.as_os_str()),
+        ],
+    );
+}
+
+/// ffmpeg. B26 criteria 9 and 13: a rescan of one folder of a music library, as the library monitor
+/// runs, reads the old tracks in it again before it ends, and leaves the rest of the library to a
+/// later scan. The test runs itself again with an ffprobe that takes 3 s longer for the re-reads.
+#[tokio::test]
+async fn b26_a_music_folder_rescan_reads_its_old_tracks_again() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let Some(marker) = std::env::var_os("B26_SLOW_MARKER") else {
+        b26_with_slow_ffprobe("b26_a_music_folder_rescan_reads_its_old_tracks_again").await;
+        return;
+    };
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let inside = "Artist A/Album A/01 Song.ogg";
+    let outside = "Artist B/Album B/01 Song.ogg";
+    let files = [inside, outside];
+    for file in files {
+        b26_track(&root, file);
+    }
+    scan(pool, &lib).await;
+    b18_tracks_probed(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+    b26_make_old(pool, &lib, &files).await;
+    std::fs::write(&marker, "").unwrap();
+
+    let folder = ScanScope::Folder(root.join("Artist A"));
+    assert_eq!(
+        b18_rescan(pool, &lib, &folder).await,
+        (0, 0, 1),
+        "the folder rescan did not read its track again"
+    );
+    assert_eq!(
+        b26_streams(pool, &lib, inside).await,
+        b26_track_streams(true),
+        "the folder rescan ended before its re-read"
+    );
+    assert_eq!(
+        b26_streams(pool, &lib, outside).await,
+        b26_track_streams(false),
+        "the folder rescan read a track outside its folder"
+    );
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the full scan did not read the rest again, or read the first track again"
+    );
+    assert_eq!(
+        b26_streams(pool, &lib, outside).await,
+        b26_track_streams(true),
+        "the full scan ended before its re-read"
+    );
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read a track again"
+    );
+}
+
+/// ffmpeg. B26 criterion 9: a scan that starts while another scan reads old tracks again waits for
+/// those re-reads, so it reads none of the tracks a second time. The test runs itself again with an
+/// ffprobe that takes 3 s longer for the re-reads.
+#[tokio::test]
+async fn b26_a_scan_during_music_rereads_waits_for_them() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let Some(marker) = std::env::var_os("B26_SLOW_MARKER") else {
+        b26_with_slow_ffprobe("b26_a_scan_during_music_rereads_waits_for_them").await;
+        return;
+    };
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let files: Vec<String> = (1..=6)
+        .map(|n| format!("Artist C/Album C/0{n} Song.ogg"))
+        .collect();
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
+    for file in &files {
+        b26_track(&root, file);
+    }
+    scan(pool, &lib).await;
+    b18_tracks_probed(pool, &lib).await;
+    let fresh = b26_fresh_versions(pool, &lib, &files).await;
+    b26_make_old(pool, &lib, &files).await;
+    std::fs::write(&marker, "").unwrap();
+
+    let first = b26_scan_now(pool, &lib).await;
+    let second = b26_scan_now(pool, &lib).await;
+    scanner::wait_for_idle().await;
+    assert_eq!(
+        (first.reread, second.reread),
+        (6, 0),
+        "the second scan did not wait for the first one's re-reads"
+    );
+    assert_eq!(b26_versions(pool, &lib).await, fresh);
+}
