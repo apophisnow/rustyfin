@@ -3,6 +3,8 @@
 
 #[cfg(target_os = "linux")]
 mod kernel;
+#[cfg(target_os = "linux")]
+mod mount_watch;
 mod mounts;
 mod poll;
 
@@ -21,7 +23,10 @@ use uuid::Uuid;
 
 use crate::library_monitor::{ChangeQueue, unit_for};
 
-pub use mounts::{fs_type_from_mountinfo, fs_type_of, is_local_fs_type};
+pub use mounts::{
+    MountChange, fs_type_from_mountinfo, fs_type_of, is_local_fs_type, mount_changes,
+    restarts_monitor,
+};
 pub use poll::FolderPoller;
 
 /// The poll interval until `set_poll_interval` changes it.
@@ -121,6 +126,8 @@ struct State {
     /// Bumped by `start` and `stop`. A manager reconciles only while its generation is current.
     generation: u64,
     manager: Option<JoinHandle<()>>,
+    /// Follows the mount table from `start` until `stop`. Linux only; see `mount_watch::follow`.
+    follower: Option<JoinHandle<()>>,
     force_poll: bool,
     next_id: u64,
     monitors: BTreeMap<MonitorKey, Monitor>,
@@ -130,6 +137,12 @@ struct Monitor {
     /// Tells this monitor apart from an earlier one for the same key that may still be running.
     id: u64,
     info: MonitoredPath,
+    /// The canonical path that `choose` found, as the mount table names it. None when the path
+    /// cannot be canonicalized; the key's path stands in then.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    canonical: Option<PathBuf>,
+    /// Set when a mount change concerns the path. Reconcile then replaces this monitor.
+    restart: bool,
     /// All paths of the library: a report is coalesced by them.
     library_paths: Vec<String>,
     /// Notified by `fake_overflow`, which stands in for an overflow of the kernel's queue.
@@ -144,6 +157,8 @@ struct Choice {
     fs_type: String,
     /// Why the path is polled; None when it is watched.
     reason: Option<&'static str>,
+    /// The canonical path, as `Monitor::canonical` keeps it.
+    canonical: Option<PathBuf>,
 }
 
 impl LibraryWatcher {
@@ -175,6 +190,10 @@ impl LibraryWatcher {
         if state.manager.is_none() {
             state.generation += 1;
             let generation = state.generation;
+            #[cfg(target_os = "linux")]
+            {
+                state.follower = mount_watch::follow(&self.inner);
+            }
             state.manager = Some(tokio::spawn(run_manager(
                 Arc::clone(&self.inner),
                 generation,
@@ -182,13 +201,16 @@ impl LibraryWatcher {
         }
     }
 
-    /// Aborts the manager and every monitor, and forgets the monitors.
+    /// Aborts the manager, the mount table follower and every monitor, and forgets the monitors.
     pub fn stop(&self) {
         let mut state = self.inner.lock();
         // A reconcile still running on another thread must not start monitors after this.
         state.generation += 1;
         if let Some(manager) = state.manager.take() {
             manager.abort();
+        }
+        if let Some(follower) = state.follower.take() {
+            follower.abort();
         }
         for (_, monitor) in std::mem::take(&mut state.monitors) {
             monitor.task.abort();
@@ -356,6 +378,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             let key = (library.id, PathBuf::from(path));
             if let Some(monitor) = state.monitors.get_mut(&key) {
                 let replaced = monitor.task.is_finished()
+                    || monitor.restart
                     || matches!(
                         monitor.info.reason.as_deref(),
                         Some(WATCH_LIMIT_REACHED | INSTANCE_LIMIT_REACHED | FILE_LIMIT_REACHED)
@@ -400,6 +423,8 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
                 Monitor {
                     id,
                     info,
+                    canonical: None,
+                    restart: false,
                     library_paths: library.paths.clone(),
                     overflow,
                     task,
@@ -458,11 +483,13 @@ async fn run_monitor(
         method,
         fs_type,
         reason,
+        canonical,
     } = choice;
     let listed = inner.with_monitor(&key, id, |monitor| {
         monitor.info.method = method;
         monitor.info.fs_type.clone_from(&fs_type);
         monitor.info.reason = reason.map(str::to_string);
+        monitor.canonical = canonical;
     });
     if listed.is_none() {
         return;
@@ -652,6 +679,7 @@ fn choose(path: &Path, force_poll: bool) -> Choice {
         },
         fs_type: fs_type.unwrap_or_else(|| "unknown".to_string()),
         reason,
+        canonical,
     }
 }
 

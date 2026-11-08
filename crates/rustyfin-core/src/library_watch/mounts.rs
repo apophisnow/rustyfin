@@ -1,5 +1,8 @@
-//! Filesystem type of a path, from the mount table, to choose between watching and polling.
+//! Filesystem types, and the changes of the mount table, read from mountinfo text. A path's
+//! filesystem type chooses between watching and polling; a mount change says which paths to set
+//! up again.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Types whose changes reach the kernel, so a folder on them can be watched.
@@ -45,6 +48,67 @@ pub fn fs_type_from_mountinfo(mountinfo: &str, path: &Path) -> Option<String> {
 /// Whether a filesystem of this type reports its changes, so the folder can be watched.
 pub fn is_local_fs_type(fs_type: &str) -> bool {
     LOCAL_FS_TYPES.contains(&fs_type)
+}
+
+/// A mount that appeared in the mount table, or went away from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MountChange {
+    /// The mount is in the new table only.
+    Mounted,
+    /// The mount is in the old table only.
+    Unmounted,
+}
+
+/// The mounts that appeared and went away between two readings of the mount table, with their
+/// mount points: sorted by mount point, then `Mounted` before `Unmounted`, without duplicates. A
+/// mount is keyed by its id, `major:minor` and mount point, so a change of its options alone is
+/// no change.
+pub fn mount_changes(before: &str, after: &str) -> Vec<(PathBuf, MountChange)> {
+    let before = mount_keys(before);
+    let after = mount_keys(after);
+    let mut changes: Vec<(PathBuf, MountChange)> = after
+        .difference(&before)
+        .map(|(_, _, point)| (point.clone(), MountChange::Mounted))
+        .chain(
+            before
+                .difference(&after)
+                .map(|(_, _, point)| (point.clone(), MountChange::Unmounted)),
+        )
+        .collect();
+    changes.sort();
+    changes.dedup();
+    changes
+}
+
+/// The keys of the mounts in mountinfo text: mount id, `major:minor` and unescaped mount point. A
+/// line with fewer than five fields is skipped.
+fn mount_keys(mountinfo: &str) -> HashSet<(String, String, PathBuf)> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [id, _, dev, _, point, ..] = fields.as_slice() else {
+                return None;
+            };
+            Some((
+                id.to_string(),
+                dev.to_string(),
+                PathBuf::from(unescape(point)),
+            ))
+        })
+        .collect()
+}
+
+/// Whether a change of the mount at `point` restarts the monitor of the library path `path`. A
+/// mount that appears at, above or under the path does: inotify can't see into a filesystem
+/// mounted over a watched folder, so the path is set up again and its method is picked again. A
+/// mount that goes away strictly under the path does too. One that goes away at or above the path
+/// does not: the monitor handles a path that goes away by itself.
+pub fn restarts_monitor(path: &Path, point: &Path, change: MountChange) -> bool {
+    match change {
+        MountChange::Mounted => path.starts_with(point) || point.starts_with(path),
+        MountChange::Unmounted => point.starts_with(path) && point != path,
+    }
 }
 
 /// Filesystem type of the mount that holds `path`, from `/proc/self/mountinfo`.
