@@ -6868,3 +6868,95 @@ async fn b32_rescans_settle_series_folders_and_tvshow_nfo() {
     );
     assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
 }
+
+// B33: multi-episode files keep their last episode
+
+/// (path, episode, last episode) of each episode of the library, sorted by path.
+async fn b33_episode_ends(
+    pool: &SqlitePool,
+    lib: &Library,
+) -> Vec<(String, Option<i64>, Option<i64>)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT path, index_number, index_number_end FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Episode'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|(path, number, end)| (rel(&root, &path), number, end))
+        .collect();
+    rows.sort();
+    rows
+}
+
+const B33_DOUBLE: &str = "Hotel Series/Season 01/Hotel Series - S01E03-E04 - Double Booking.mkv";
+const B33_SINGLE: &str = "Hotel Series/Season 01/Hotel Series - S01E05.mkv";
+
+#[tokio::test]
+async fn b33_multi_episode_files_store_their_last_episode() {
+    const SPECIAL: &str = "Mushi-Shi/Specials/Mushi-Shi - S00E02-03 - Path of Thorns.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [B33_DOUBLE, B33_SINGLE, SPECIAL] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b33_episode_ends(&fx.pool, &lib).await,
+        [
+            (B33_DOUBLE.to_string(), Some(3), Some(4)),
+            (B33_SINGLE.to_string(), Some(5), None),
+            (SPECIAL.to_string(), Some(2), Some(3)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn b33_rescans_give_stored_episodes_their_last_episode() {
+    const RENAMED: &str = "Hotel Series/Season 01/Hotel Series - S01E05-E06.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, B33_DOUBLE);
+    touch(&root, B33_SINGLE);
+    scan(&fx.pool, &lib).await;
+    let double = item_at(&fx.pool, &lib, B33_DOUBLE).await;
+    let single = item_at(&fx.pool, &lib, B33_SINGLE).await;
+    // 9d9cfb2 stored no end, so 070 leaves its episodes with none.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number_end = NULL WHERE media_type = 'Episode'",
+        &[],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, double, &marks).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, single, &favorite).await;
+    // The single episode's file is replaced by a double one.
+    std::fs::rename(root.join(B33_SINGLE), root.join(RENAMED)).unwrap();
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b33_episode_ends(&fx.pool, &lib).await,
+        [
+            (B33_DOUBLE.to_string(), Some(3), Some(4)),
+            (RENAMED.to_string(), Some(5), Some(6)),
+        ]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, B33_DOUBLE).await, double);
+    assert_eq!(item_at(&fx.pool, &lib, RENAMED).await, single);
+    assert_eq!(marks_of(&fx.pool, &user, double).await, Some(marks));
+    assert_eq!(marks_of(&fx.pool, &user, single).await, Some(favorite));
+}

@@ -207,6 +207,8 @@ pub struct MediaItem {
     pub runtime_ticks: Option<i64>,
     pub index_number: Option<i32>,
     pub parent_index_number: Option<i32>,
+    /// The last episode of a file that holds several, as in `S01E03-E04`: Jellyfin's `IndexNumberEnd`.
+    pub index_number_end: Option<i32>,
     /// TMDb ID for the item, used to fetch cast/crew photos and fanart.tv images
     pub tmdb_id: Option<i64>,
     /// TheTVDB ID for the item, used to fetch fanart.tv images for TV shows
@@ -594,6 +596,7 @@ impl MediaItem {
             runtime_ticks: None,
             index_number: None,
             parent_index_number: None,
+            index_number_end: None,
             tmdb_id: None,
             tvdb_id: None,
             media_sources: Vec::new(),
@@ -742,6 +745,8 @@ impl Serialize for MediaItem {
         s.serialize_field("PremiereDate", &self.premiere_date)?;
         s.serialize_field("RunTimeTicks", &self.runtime_ticks)?;
         s.serialize_field("IndexNumber", &self.index_number)?;
+        // Jellyfin 12.4 gives it for episodes (`Dto/DtoService.cs:1517-1520`); no other item has one.
+        s.serialize_field("IndexNumberEnd", &self.index_number_end)?;
         s.serialize_field("ParentIndexNumber", &self.parent_index_number)?;
         s.serialize_field("MediaSources", &self.media_sources)?;
         // --- MediaItem DTO Fields ---
@@ -1078,5 +1083,37 @@ mod tests {
         assert_eq!(ids.get("tmdb"), Some("123"));
         assert_eq!(ids.get("imdb"), Some("tt456"));
         assert_eq!(ids.get("tvdb"), Some("789"));
+    }
+
+    // ── IndexNumberEnd ──
+
+    #[test]
+    fn b33_items_give_their_last_episode_as_index_number_end() {
+        let double = MediaItem {
+            media_type: MediaType::Episode,
+            index_number: Some(3),
+            index_number_end: Some(4),
+            ..MediaItem::default_dto_fields()
+        };
+        let single = MediaItem {
+            media_type: MediaType::Episode,
+            index_number: Some(5),
+            ..MediaItem::default_dto_fields()
+        };
+        let json = serde_json::to_value(&double).unwrap();
+        assert_eq!(json["IndexNumber"], 3);
+        assert_eq!(json["IndexNumberEnd"], 4);
+        let json = serde_json::to_value(&single).unwrap();
+        assert_eq!(json["IndexNumberEnd"], serde_json::Value::Null);
+        // A copy cached before the field existed reads as one without an end. A photo, since an
+        // episode's "MediaType" ("Video") doesn't read back.
+        let mut cached = serde_json::to_value(MediaItem {
+            media_type: MediaType::Photo,
+            ..MediaItem::default_dto_fields()
+        })
+        .unwrap();
+        cached.as_object_mut().unwrap().remove("IndexNumberEnd");
+        let read: MediaItem = serde_json::from_value(cached).unwrap();
+        assert_eq!(read.index_number_end, None);
     }
 }

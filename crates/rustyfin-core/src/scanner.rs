@@ -894,7 +894,9 @@ async fn scan_tv_library(
     }
 
     // Group the files of each season into episodes, then reconcile the episodes with the items.
-    // The numbers of an episode come from its primary file, the first of its versions.
+    // The numbers of an episode come from its primary file, the first of its versions. The last
+    // episode of a file that holds several is Jellyfin's IndexNumberEnd (12.4
+    // `Library/LibraryManager.cs:3391-3398`).
     let mut episode_groups: Vec<scan_sync::EpisodeGroup> = Vec::new();
     for (&season_id, &(series_id, season_number, ref season_files)) in &episode_files {
         for versions in naming::group_episode_files(season_files, season_number) {
@@ -908,6 +910,7 @@ async fn scan_tv_library(
                 season_id,
                 series_id,
                 index_number: parsed.map(|n| n.episode),
+                index_number_end: parsed.and_then(|n| n.ending),
                 parent_index_number: season_number.or_else(|| parsed.and_then(|n| n.season)),
             });
         }
@@ -953,6 +956,7 @@ async fn scan_tv_library(
                     runtime_ticks: None,
                     index_number: group.index_number,
                     parent_index_number: group.parent_index_number,
+                    index_number_end: group.index_number_end,
                     media_sources: Vec::new(),
                     ..MediaItem::default_dto_fields()
                 };

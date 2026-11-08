@@ -618,6 +618,7 @@ struct ItemRow {
     runtime_ticks: Option<i64>,
     date_created: String,
     index_number: Option<i32>,
+    index_number_end: Option<i32>,
     parent_index_number: Option<i32>,
     parent_id: Option<String>,
     /// The series of the item's season, when the item is an episode.
@@ -643,6 +644,7 @@ enum Wanted {
     Episode {
         name: String,
         index_number: Option<i32>,
+        index_number_end: Option<i32>,
         parent_index_number: Option<i32>,
         parent_id: Uuid,
         series_id: Uuid,
@@ -699,11 +701,13 @@ pub async fn reconcile_movie_groups(
 /// series that holds `season_id`. With a season number, the episode takes over a gone episode of that series
 /// with the same numbers, whatever the name of its season folder was. The season of each is the one in its
 /// file name, else its folder's, so a special in a season folder is no episode of that season.
+/// `index_number_end` is the last episode of a file that holds several, as in `S01E03-E04`.
 pub struct EpisodeGroup {
     pub files: Vec<PathBuf>,
     pub season_id: Uuid,
     pub series_id: Uuid,
     pub index_number: Option<i32>,
+    pub index_number_end: Option<i32>,
     pub parent_index_number: Option<i32>,
 }
 
@@ -731,6 +735,7 @@ pub async fn reconcile_episode_groups(
                     .map(|stem| stem.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 index_number: group.index_number,
+                index_number_end: group.index_number_end,
                 parent_index_number: group.parent_index_number,
                 parent_id: group.season_id,
                 series_id: group.series_id,
@@ -1002,7 +1007,7 @@ async fn reconcile_groups(
     );
     let items: Vec<ItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, path, name, sort_name, production_year, runtime_ticks, date_created,
-                index_number, parent_index_number, parent_id,
+                index_number, index_number_end, parent_index_number, parent_id,
                 (SELECT s.parent_id FROM media_items AS s WHERE s.id = m.parent_id) AS series_id
          FROM media_items AS m
          WHERE m.library_id = ?1 AND m.media_type = ?2 AND {loaded}"
@@ -1292,34 +1297,39 @@ async fn settle_group(
     };
     // A movie takes its year and keeps its episode fields. An episode keeps its year and takes the
     // group's numbers and season.
-    let (production_year, index_number, parent_index_number, parent_id) = match &group.wanted {
-        Wanted::Movie { year, .. } => (
-            if survivor.production_year.is_none() || survivor.production_year == old_year {
-                *year
-            } else {
-                survivor.production_year
-            },
-            survivor.index_number,
-            survivor.parent_index_number,
-            survivor.parent_id.clone(),
-        ),
-        Wanted::Episode {
-            index_number,
-            parent_index_number,
-            parent_id: season,
-            ..
-        } => (
-            survivor.production_year,
-            *index_number,
-            *parent_index_number,
-            Some(season.to_string()),
-        ),
-    };
+    let (production_year, index_number, index_number_end, parent_index_number, parent_id) =
+        match &group.wanted {
+            Wanted::Movie { year, .. } => (
+                if survivor.production_year.is_none() || survivor.production_year == old_year {
+                    *year
+                } else {
+                    survivor.production_year
+                },
+                survivor.index_number,
+                survivor.index_number_end,
+                survivor.parent_index_number,
+                survivor.parent_id.clone(),
+            ),
+            Wanted::Episode {
+                index_number,
+                index_number_end,
+                parent_index_number,
+                parent_id: season,
+                ..
+            } => (
+                survivor.production_year,
+                *index_number,
+                *index_number_end,
+                *parent_index_number,
+                Some(season.to_string()),
+            ),
+        };
     let fields_changed = survivor.path != primary
         || name != survivor.name
         || sort_name != survivor.sort_name
         || production_year != survivor.production_year
         || index_number != survivor.index_number
+        || index_number_end != survivor.index_number_end
         || parent_index_number != survivor.parent_index_number
         || parent_id != survivor.parent_id;
 
@@ -1332,8 +1342,8 @@ async fn settle_group(
         if fields_changed {
             sqlx::query(
                 "UPDATE media_items SET path = ?1, name = ?2, sort_name = ?3, production_year = ?4,
-                 index_number = ?5, parent_index_number = ?6, parent_id = ?7
-                 WHERE id = ?8",
+                 index_number = ?5, parent_index_number = ?6, parent_id = ?7, index_number_end = ?8
+                 WHERE id = ?9",
             )
             .bind(primary)
             .bind(name.as_str())
@@ -1342,6 +1352,7 @@ async fn settle_group(
             .bind(index_number)
             .bind(parent_index_number)
             .bind(parent_id.as_deref())
+            .bind(index_number_end)
             .bind(survivor.id.as_str())
             .execute(&mut *tx)
             .await?;
