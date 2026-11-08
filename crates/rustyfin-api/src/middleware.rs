@@ -1,5 +1,4 @@
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -14,44 +13,25 @@ use std::time::Instant;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+mod credentials;
+pub use credentials::{MediaBrowserAuth, parse_media_browser};
+
 /// Reads the credentials of a request and returns the claims they prove, plus the user token
 /// (`None` for the configured API key, which has no token to revoke).
 ///
-/// The token comes from the Bearer header, `X-Emby-Token`, `X-MediaBrowser-Token` or the `api_key`
-/// query parameter. The configured API key gives administrator claims. Any other token must be a
-/// live user token. Takes the request's headers and URI rather than the request: axum's `Body` is
-/// not `Sync`, so a `&Request` cannot be held across the await.
+/// The token is the first non-blank one from these sources, in order: the `Authorization` header
+/// (`Bearer <token>`, otherwise a `MediaBrowser` token), the `MediaBrowser` token of the
+/// `X-Emby-Authorization` header, the `X-Emby-Token` header, the `X-MediaBrowser-Token` header,
+/// then the `ApiKey` and `api_key` query parameters (see `credentials::request_token`). The
+/// configured API key gives administrator claims. Any other token must be a live user token. Takes
+/// the request's headers and URI rather than the request: axum's `Body` is not `Sync`, so a
+/// `&Request` cannot be held across the await.
 async fn request_claims(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<(Claims, Option<String>), ApiError> {
-    let token = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Jellyfin clients also send token via X-Emby-Token
-            headers
-                .get("X-Emby-Token")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            // Also check X-MediaBrowser-Token
-            headers
-                .get("X-MediaBrowser-Token")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            // Check query parameter api_key
-            uri.query()
-                .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("api_key=")))
-                .map(|s| s.to_string())
-        })
-        .ok_or(ApiError::Unauthorized)?;
+    let token = credentials::request_token(headers, uri).ok_or(ApiError::Unauthorized)?;
 
     // An empty token never authenticates, whatever the configured key.
     if token.trim().is_empty() {
