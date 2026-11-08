@@ -90,25 +90,37 @@ async fn serve_image(
         .await?
         .ok_or_else(|| ApiError::NotFound("image not found".into()))?;
 
+    // A stored size spares the header read, but counts only when both sides are known.
+    let stored_size = match (img.width, img.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+        _ => None,
+    };
+    let rendition = match rustyfin_core::image_proxy::plan_rendition(
+        &img.path,
+        stored_size,
+        max_width,
+        max_height,
+    )
+    .await
+    {
+        Ok(rendition) => rendition,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %img.path, "image could not be read or resized");
+            return Err(ApiError::NotFound(format!("image not found: {}", e)));
+        }
+    };
+
     // Build cache key for in-memory image cache
-    let cache_key = format!(
-        "{}:{}:{}:{}:{}",
-        id,
-        image_type_str,
-        index,
-        max_width.unwrap_or(0),
-        max_height.unwrap_or(0)
-    );
+    let cache_key = format!("{}:{}:{}:{}", id, image_type_str, index, rendition.key());
 
     // Check in-memory cache first
     let bytes = if let Some(cached) = state.image_cache.get(&cache_key) {
         cached
     } else {
         let cache_dir = state.data_dir.join("cache").join("images");
-        let bytes = match rustyfin_core::image_proxy::get_or_resize_image(
+        let bytes = match rustyfin_core::image_proxy::render_image(
             &img.path,
-            max_width,
-            max_height,
+            rendition,
             &cache_dir,
             Some(&state.http_client),
         )
@@ -125,7 +137,10 @@ async fn serve_image(
         bytes
     };
 
-    let content_type = guess_content_type(&img.path, max_width.is_some() || max_height.is_some());
+    let content_type = guess_content_type(
+        &img.path,
+        rendition != rustyfin_core::image_proxy::Rendition::Original,
+    );
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)

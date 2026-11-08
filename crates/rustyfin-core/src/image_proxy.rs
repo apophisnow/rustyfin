@@ -3,6 +3,188 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::fs;
 
+/// The largest side, in pixels, that an image is served at.
+pub const MAX_IMAGE_SIDE: u32 = 4096;
+
+/// The size an image of `width`x`height` is served at: it fits the bounds and is never upscaled.
+pub fn target_size(
+    width: u32,
+    height: u32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> (u32, u32) {
+    let Some((bw, bh)) = capped_bounds(max_width, max_height) else {
+        return (width, height);
+    };
+    if width == 0 || height == 0 || (width <= bw && height <= bh) {
+        return (width, height);
+    }
+    if u64::from(width) * u64::from(bh) >= u64::from(height) * u64::from(bw) {
+        (bw, scale_rounded(height, bw, width).max(1))
+    } else {
+        (scale_rounded(width, bh, height).max(1), bh)
+    }
+}
+
+/// `a * b / c` rounded half up, in u64 so that the product cannot overflow.
+fn scale_rounded(a: u32, b: u32, c: u32) -> u32 {
+    let (a, b, c) = (u64::from(a), u64::from(b), u64::from(c));
+    ((2 * a * b + c) / (2 * c)) as u32
+}
+
+/// The bounds a request asks for, each capped at `MAX_IMAGE_SIDE`. `Some(0)` counts as no bound,
+/// and the result is `None` when neither side is bounded.
+fn capped_bounds(max_width: Option<u32>, max_height: Option<u32>) -> Option<(u32, u32)> {
+    let max_width = max_width.filter(|&w| w > 0);
+    let max_height = max_height.filter(|&h| h > 0);
+    if max_width.is_none() && max_height.is_none() {
+        return None;
+    }
+    Some((
+        max_width.unwrap_or(MAX_IMAGE_SIDE).min(MAX_IMAGE_SIDE),
+        max_height.unwrap_or(MAX_IMAGE_SIDE).min(MAX_IMAGE_SIDE),
+    ))
+}
+
+/// What a request is served as: the source's own bytes, or a JPEG copy at a size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rendition {
+    /// The source's own bytes.
+    Original,
+    /// A JPEG that fits within `width`x`height`, exactly that size when the source size is known.
+    Copy { width: u32, height: u32 },
+}
+
+impl Rendition {
+    /// The rendition's name in a cache key: `0x0` for the original, else `{width}x{height}`.
+    pub fn key(&self) -> String {
+        match self {
+            Rendition::Original => "0x0".to_string(),
+            Rendition::Copy { width, height } => format!("{width}x{height}"),
+        }
+    }
+}
+
+/// The rendition for a request. `known_size` is the source's size when it is known.
+pub fn rendition_for(
+    known_size: Option<(u32, u32)>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Rendition {
+    let Some((bw, bh)) = capped_bounds(max_width, max_height) else {
+        return Rendition::Original;
+    };
+    match known_size {
+        Some((width, height)) if width > 0 && height > 0 => {
+            let (w, h) = target_size(width, height, max_width, max_height);
+            if (w, h) == (width, height) {
+                Rendition::Original
+            } else {
+                Rendition::Copy {
+                    width: w,
+                    height: h,
+                }
+            }
+        }
+        _ => Rendition::Copy {
+            width: bw,
+            height: bh,
+        },
+    }
+}
+
+/// Plans how a request is served. A local image's size is read from its header unless it is known.
+pub async fn plan_rendition(
+    source_path: &str,
+    known_size: Option<(u32, u32)>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<Rendition, String> {
+    if capped_bounds(max_width, max_height).is_none() {
+        return Ok(Rendition::Original);
+    }
+    let remote = source_path.starts_with("http://") || source_path.starts_with("https://");
+    if known_size.is_some() || remote {
+        return Ok(rendition_for(known_size, max_width, max_height));
+    }
+    let path = source_path.to_string();
+    let size = tokio::task::spawn_blocking(move || read_dimensions(&path))
+        .await
+        .map_err(|e| format!("failed to read local image: {}", e))??;
+    Ok(rendition_for(Some(size), max_width, max_height))
+}
+
+/// Reads a local image's size from its header alone.
+fn read_dimensions(path: &str) -> Result<(u32, u32), String> {
+    image::ImageReader::open(path)
+        .map_err(|e| format!("failed to read local image: {}", e))?
+        .with_guessed_format()
+        .map_err(|e| format!("failed to read local image: {}", e))?
+        .into_dimensions()
+        .map_err(|e| format!("failed to decode image: {}", e))
+}
+
+/// Serves a rendition of an image. `Original` is the source's own bytes; a `Copy` is a JPEG
+/// cached on disk under its size.
+pub async fn render_image(
+    source_path: &str,
+    rendition: Rendition,
+    cache_dir: &Path,
+    http_client: Option<&reqwest::Client>,
+) -> Result<Vec<u8>, String> {
+    let Rendition::Copy { width, height } = rendition else {
+        return read_image_bytes(source_path, http_client).await;
+    };
+
+    // The name is a full SHA-256: a short hash let different paths share a file.
+    let hash: String = Sha256::digest(source_path.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let cache_name = format!("{}_{}x{}.jpg", hash, width, height);
+    let cache_path = cache_dir.join(&cache_name);
+
+    // Return cached version if exists
+    if cache_path.exists()
+        && let Ok(bytes) = fs::read(&cache_path).await
+    {
+        return Ok(bytes);
+    }
+
+    // Read and resize. The target comes from the decoded size, so a stale size cannot upscale.
+    let source_bytes = read_image_bytes(source_path, http_client).await?;
+    let img = image::load_from_memory(&source_bytes)
+        .map_err(|e| format!("failed to decode image: {}", e))?;
+    // Fitting to both bounds at once re-rounds, so try each bound alone and keep the larger.
+    let (w, h) = (img.width(), img.height());
+    let target = [
+        target_size(w, h, Some(width), None),
+        target_size(w, h, None, Some(height)),
+    ]
+    .into_iter()
+    .filter(|&(tw, th)| tw <= width && th <= height)
+    .max_by_key(|&(tw, th)| u64::from(tw) * u64::from(th))
+    .unwrap_or_else(|| target_size(w, h, Some(width), Some(height)));
+    let img = if target != (w, h) {
+        img.resize_exact(target.0, target.1, FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    // Encode as JPEG; the encoder rejects alpha, so the image goes in as RGB
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img.to_rgb8())
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("failed to encode image: {}", e))?;
+    let bytes = buf.into_inner();
+
+    // Cache
+    let _ = fs::create_dir_all(cache_dir).await;
+    let _ = fs::write(&cache_path, &bytes).await;
+
+    Ok(bytes)
+}
+
 /// Serve an image with optional resizing, using a cache directory.
 /// If `http_client` is provided, it will be reused for remote image downloads,
 /// avoiding the overhead of creating a new client per request.
@@ -13,58 +195,8 @@ pub async fn get_or_resize_image(
     cache_dir: &Path,
     http_client: Option<&reqwest::Client>,
 ) -> Result<Vec<u8>, String> {
-    // If no resize requested, return original
-    if max_width.is_none() && max_height.is_none() {
-        return read_image_bytes(source_path, http_client).await;
-    }
-
-    let w = max_width.unwrap_or(0);
-    let h = max_height.unwrap_or(0);
-
-    // The name is a full SHA-256: a short hash let different paths share a file.
-    let hash: String = Sha256::digest(source_path.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let cache_name = format!("{}_{}x{}.jpg", hash, w, h);
-    let cache_path = cache_dir.join(&cache_name);
-
-    // Return cached version if exists
-    if cache_path.exists()
-        && let Ok(bytes) = fs::read(&cache_path).await
-    {
-        return Ok(bytes);
-    }
-
-    // Read and resize
-    let source_bytes = read_image_bytes(source_path, http_client).await?;
-    let img = image::load_from_memory(&source_bytes)
-        .map_err(|e| format!("failed to decode image: {}", e))?;
-
-    let resized = if w > 0 && h > 0 {
-        img.resize(w, h, FilterType::Lanczos3)
-    } else if w > 0 {
-        let ratio = w as f64 / img.width() as f64;
-        let new_h = (img.height() as f64 * ratio) as u32;
-        img.resize(w, new_h, FilterType::Lanczos3)
-    } else {
-        let ratio = h as f64 / img.height() as f64;
-        let new_w = (img.width() as f64 * ratio) as u32;
-        img.resize(new_w, h, FilterType::Lanczos3)
-    };
-
-    // Encode as JPEG
-    let mut buf = std::io::Cursor::new(Vec::new());
-    resized
-        .write_to(&mut buf, image::ImageFormat::Jpeg)
-        .map_err(|e| format!("failed to encode image: {}", e))?;
-    let bytes = buf.into_inner();
-
-    // Cache
-    let _ = fs::create_dir_all(cache_dir).await;
-    let _ = fs::write(&cache_path, &bytes).await;
-
-    Ok(bytes)
+    let rendition = plan_rendition(source_path, None, max_width, max_height).await?;
+    render_image(source_path, rendition, cache_dir, http_client).await
 }
 
 async fn read_image_bytes(
@@ -209,7 +341,7 @@ mod tests {
         let [r, _, b] = mean_rgb(&blue_small);
         assert!(b > 200 && r < 60, "bA's poster came back {:?}", [r, b]);
 
-        // Each has its own file, named by a full hash (64 hex digits) and the size...
+        // Each has its own file, named by a full hash (64 hex digits) and the size it holds...
         let mut names: Vec<String> = std::fs::read_dir(&cache_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -222,12 +354,131 @@ mod tests {
                 hash.len() == 64 && hash.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
                 "{name}"
             );
-            assert_eq!(size, "8x0.jpg", "{name}");
+            assert_eq!(size, "8x12.jpg", "{name}");
         }
         // ...from which each is served again.
         let again = get_or_resize_image(red, Some(8), None, &cache_dir, None).await;
         assert_eq!(again.unwrap(), red_small);
         let again = get_or_resize_image(blue, Some(8), None, &cache_dir, None).await;
         assert_eq!(again.unwrap(), blue_small);
+    }
+
+    // B30: image and search bounds
+
+    #[test]
+    fn b30_p1_target_size_never_upscales_and_caps_each_side() {
+        // (source, maxWidth, maxHeight, the size served)
+        let cases = [
+            ((1000, 1500), Some(300), None, (300, 450)),
+            ((1000, 1500), None, Some(300), (200, 300)),
+            ((1000, 1500), Some(300), Some(300), (200, 300)),
+            ((1920, 1080), Some(300), Some(300), (300, 169)),
+            // Bounds at or above the source never upscale it.
+            ((1000, 1500), Some(40000), None, (1000, 1500)),
+            ((1000, 1500), Some(40000), Some(40000), (1000, 1500)),
+            ((1000, 1500), Some(1000), None, (1000, 1500)),
+            // No side above 4096, whatever is asked.
+            ((8000, 12000), Some(40000), None, (2731, 4096)),
+            ((12000, 8000), None, Some(40000), (4096, 2731)),
+            ((8000, 12000), Some(5000), None, (2731, 4096)),
+            ((4096, 4096), Some(4096), None, (4096, 4096)),
+            ((4097, 1), Some(40000), None, (4096, 1)),
+            ((1000, 5000), Some(1000), None, (819, 4096)),
+            ((10, 5000), Some(5000), None, (8, 4096)),
+            ((u32::MAX, 1), Some(u32::MAX), None, (4096, 1)),
+            // Halves round up, and a side never rounds to 0.
+            ((4, 2), Some(3), None, (3, 2)),
+            ((5000, 10), Some(300), None, (300, 1)),
+            ((3, 2), Some(1), None, (1, 1)),
+            ((1000, 1), Some(10), None, (10, 1)),
+            // No bound, or 0, leaves that side free.
+            ((1000, 1500), None, None, (1000, 1500)),
+            ((1000, 1500), Some(0), Some(0), (1000, 1500)),
+            ((1000, 1500), Some(0), Some(300), (200, 300)),
+            ((0, 0), Some(300), None, (0, 0)),
+        ];
+        for ((width, height), max_width, max_height, served) in cases {
+            assert_eq!(
+                target_size(width, height, max_width, max_height),
+                served,
+                "{width}x{height} with maxWidth {max_width:?}, maxHeight {max_height:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn b30_p1_rendition_for_maps_oversize_requests_to_one_rendition() {
+        let poster = Some((1000, 1500));
+        // At or above the source's size: the original, whatever the bounds.
+        assert_eq!(
+            rendition_for(poster, Some(40000), None),
+            Rendition::Original
+        );
+        assert_eq!(
+            rendition_for(poster, Some(1000), Some(1500)),
+            Rendition::Original
+        );
+        assert_eq!(rendition_for(poster, None, None), Rendition::Original);
+        assert_eq!(rendition_for(poster, Some(0), Some(0)), Rendition::Original);
+        // Below it: a copy of the size served, so bounds that give one size share it.
+        let copy = Rendition::Copy {
+            width: 300,
+            height: 450,
+        };
+        assert_eq!(rendition_for(poster, Some(300), None), copy);
+        assert_eq!(rendition_for(poster, None, Some(450)), copy);
+        assert_eq!(rendition_for(poster, Some(300), Some(450)), copy);
+        assert_eq!(rendition_for(poster, Some(300), Some(40000)), copy);
+        // An unknown size: a copy within the bounds, each capped at 4096.
+        let capped = Rendition::Copy {
+            width: 4096,
+            height: 4096,
+        };
+        assert_eq!(rendition_for(None, Some(40000), None), capped);
+        let narrow = Rendition::Copy {
+            width: 300,
+            height: 4096,
+        };
+        assert_eq!(rendition_for(None, Some(300), None), narrow);
+        assert_eq!(rendition_for(None, None, None), Rendition::Original);
+        // The key names a rendition in the memory cache.
+        assert_eq!(Rendition::Original.key(), "0x0");
+        assert_eq!(copy.key(), "300x450");
+    }
+
+    #[tokio::test]
+    async fn b30_p1_a_copy_has_the_size_planned_for_it() {
+        let root = std::env::temp_dir().join(format!("rustyfin_b30_{}", uuid::Uuid::new_v4()));
+        let _remove = RemoveOnDrop(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let cache_dir = root.join("cache");
+        // A banner and a tall poster: fitting them to the planned box again, with both bounds,
+        // came out a few pixels short of it.
+        for ((width, height), max_width, max_height, planned) in [
+            ((758, 140), Some(300), None, (300, 55)),
+            ((140, 758), None, Some(300), (55, 300)),
+        ] {
+            let path = root.join(format!("{width}x{height}.jpg"));
+            image::RgbImage::from_pixel(width, height, image::Rgb([255, 0, 0]))
+                .save(&path)
+                .unwrap();
+            let path = path.to_str().unwrap();
+            assert_eq!(
+                rendition_for(Some((width, height)), max_width, max_height),
+                Rendition::Copy {
+                    width: planned.0,
+                    height: planned.1,
+                }
+            );
+            let bytes = get_or_resize_image(path, max_width, max_height, &cache_dir, None)
+                .await
+                .unwrap();
+            let served = image::load_from_memory(&bytes).unwrap();
+            assert_eq!(
+                (served.width(), served.height()),
+                planned,
+                "{width}x{height}"
+            );
+        }
     }
 }

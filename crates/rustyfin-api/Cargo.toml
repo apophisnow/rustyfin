@@ -39,3 +39,4 @@ rustyfin-db = { workspace = true }
 rustyfin-auth = { workspace = true }
 rustyfin-core = { workspace = true }
 uuid = { workspace = true }
+image = { workspace = true }

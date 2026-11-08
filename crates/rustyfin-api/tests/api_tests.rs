@@ -2262,6 +2262,171 @@ async fn b27_a_repeated_search_gets_the_first_answer_again() {
     assert_eq!(b27_answer(&app_after, movie, &token).await, first_movie);
 }
 
+// ── B30: image and search bounds ──
+
+/// A `width`x`height` JPEG of one colour.
+fn b30_jpeg(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(width, height, image::Rgb(rgb))
+        .write_to(&mut out, image::ImageFormat::Jpeg)
+        .unwrap();
+    out.into_inner()
+}
+
+/// A `width`x`height` PNG of one colour.
+fn b30_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(width, height, image::Rgb(rgb))
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+/// The size of a picture and its colour: "red", "blue", or the mean colour when neither.
+fn b30_picture(bytes: &[u8]) -> ((u32, u32), String) {
+    let img = image::load_from_memory(bytes).unwrap().to_rgb8();
+    let mut sum = [0u64; 3];
+    for pixel in img.pixels() {
+        for (total, channel) in sum.iter_mut().zip(pixel.0) {
+            *total += u64::from(channel);
+        }
+    }
+    let pixels = u64::from(img.width()) * u64::from(img.height());
+    let [r, g, b] = sum.map(|total| total / pixels);
+    let colour = match (r, g, b) {
+        (200.., ..60, ..60) => "red".to_string(),
+        (..60, ..60, 200..) => "blue".to_string(),
+        _ => format!("{r},{g},{b}"),
+    };
+    (img.dimensions(), colour)
+}
+
+/// Sends a GET and returns the status, the content type and the body.
+async fn b30_get(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, String, Vec<u8>) {
+    let request = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|value| value.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, content_type, bytes.to_vec())
+}
+
+/// Uploads `bytes` as the item's Primary image.
+async fn b30_upload(app: &axum::Router, token: &str, id: uuid::Uuid, bytes: &[u8]) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/Items/{id}/Images/Primary"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(bytes.to_vec()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Adds a photo library holding one Photo item, with no image yet, and returns the item's id.
+async fn b30_photo(state: &AppState) -> uuid::Uuid {
+    let folder = media_folder(state, "b30 photos");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B30 Photos".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Photos,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let path = std::path::Path::new(&folder).join("B30 Photo.jpg");
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(lib.id.to_string())
+    .bind("B30 Photo")
+    .bind("Photo")
+    .bind(path.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// The names of the files in the folder of resized copies, sorted; none when it is missing.
+fn b30_copies(state: &AppState) -> Vec<String> {
+    let dir = state.data_dir.join("cache").join("images");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn b30_p1_bounds_at_or_above_the_source_return_the_original() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    let png = b30_png(16, 24, [0, 160, 0]);
+    b30_upload(&app, &token, id, &png).await;
+
+    for bounds in [
+        "maxWidth=64",
+        "maxHeight=100",
+        "maxWidth=64&maxHeight=100",
+        "maxWidth=16",
+        "maxWidth=16&maxHeight=24",
+    ] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{bounds}");
+        assert_eq!(content_type, "image/png", "{bounds}");
+        assert!(bytes == png, "{bounds}: not the uploaded file's own bytes");
+    }
+    assert_eq!(b30_copies(&state), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn b30_p1_bounds_that_give_one_size_share_one_copy() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+
+    let mut answers = Vec::new();
+    for bounds in ["maxWidth=32", "maxHeight=48", "maxWidth=32&maxHeight=48"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{bounds}");
+        assert_eq!(content_type, "image/jpeg", "{bounds}");
+        assert_eq!(
+            b30_picture(&bytes),
+            ((32, 48), "red".to_string()),
+            "{bounds}"
+        );
+        answers.push(bytes);
+    }
+    assert!(
+        answers.iter().all(|bytes| *bytes == answers[0]),
+        "the three answers differ"
+    );
+    let copies = b30_copies(&state);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]
