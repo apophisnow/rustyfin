@@ -22,8 +22,8 @@ tokio = { workspace = true }
 libc = "0.2.191"
 libloading = "0.9"
 # The bundled SQLite that sqlx already builds, for `sqlite3_limit` (jellyfin_import). No features of
-# its own, so the build is unchanged.
-libsqlite3-sys = { version = "=0.30.1", default-features = false }
+# its own, so the build is unchanged, and sqlx-sqlite's version range, so it moves with sqlx.
+libsqlite3-sys = { version = ">=0.30.1, <0.38.0", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 dashmap = "6"
 moka = { workspace = true }
