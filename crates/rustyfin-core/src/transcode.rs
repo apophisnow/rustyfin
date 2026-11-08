@@ -34,6 +34,16 @@ impl HwAccel {
     }
 }
 
+/// An image subtitle (PGS, VobSub, DVB) to burn in with an overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSubtitle {
+    /// The subtitle's absolute stream index in the input (MediaStream.Index)
+    pub stream_index: u32,
+    /// The source video's width and height, which the subtitle is scaled to first; None
+    /// leaves it at its own size
+    pub video_size: Option<(u32, u32)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscodeProfile {
     pub max_video_bitrate_kbps: u32,
@@ -46,7 +56,8 @@ pub struct TranscodeProfile {
     pub segment_duration: u32,
     pub burn_subtitles: bool,
     pub subtitle_stream_index: Option<u32>,
-    /// Audio stream index to transcode (for multi-audio support)
+    /// The audio stream to transcode: its absolute stream index (MediaStream.Index), not its
+    /// place among the audio streams. None takes the first audio stream.
     pub audio_stream_index: Option<u32>,
     /// Whether to transcode audio only (no video)
     pub audio_only: bool,
@@ -59,6 +70,9 @@ pub struct TranscodeProfile {
     /// Where the transcode starts, in ticks; 0 or less starts at the beginning.
     /// Output time 0 is this point.
     pub start_time_ticks: i64,
+    /// An image subtitle burned in with an overlay. It wins over the text burn-in, and it turns
+    /// the video copy and hardware acceleration off.
+    pub image_subtitle: Option<ImageSubtitle>,
 }
 
 impl Default for TranscodeProfile {
@@ -80,6 +94,7 @@ impl Default for TranscodeProfile {
             copy_video: false,
             copy_audio: false,
             start_time_ticks: 0,
+            image_subtitle: None,
         }
     }
 }
@@ -596,6 +611,27 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
 // FFmpeg argument builder
 // ---------------------------------------------------------------------------
 
+/// Ticks as seconds with milliseconds truncated, in integer math (`600.000`)
+fn seconds_text(ticks: i64) -> String {
+    format!(
+        "{}.{:03}",
+        ticks / 10_000_000,
+        (ticks % 10_000_000) / 10_000
+    )
+}
+
+/// The text subtitle filter. After an input seek the frames start at 0, but the filter reads
+/// the file from its start, so the frames move to the file's time for it and back after.
+fn subtitles_filter(input: &str, sub_idx: u32, start_time_ticks: i64) -> String {
+    let subtitles = format!("subtitles='{input}':si={sub_idx}");
+    if start_time_ticks > 0 {
+        let secs = seconds_text(start_time_ticks);
+        format!("setpts=PTS+{secs}/TB,{subtitles},setpts=PTS-{secs}/TB")
+    } else {
+        subtitles
+    }
+}
+
 fn build_ffmpeg_args(
     input: &str,
     playlist_output: &str,
@@ -608,12 +644,23 @@ fn build_ffmpeg_args(
     args.push("-y".to_string());
     args.extend(["-hide_banner".to_string(), "-nostats".to_string()]);
 
-    // Burn-in needs a re-encode, so it turns the video copy off
-    let copy_video = profile.copy_video && !profile.audio_only && !profile.burn_subtitles;
+    // An image subtitle is overlaid in software, so it turns hardware acceleration off
+    let image_subtitle = profile.image_subtitle.filter(|_| !profile.audio_only);
+    let hw_accel = if image_subtitle.is_some() {
+        HwAccel::None
+    } else {
+        profile.hw_accel
+    };
+
+    // Burn-in and the overlay need a re-encode, so they turn the video copy off
+    let copy_video = profile.copy_video
+        && !profile.audio_only
+        && !profile.burn_subtitles
+        && image_subtitle.is_none();
 
     // Hardware acceleration input flags (skip for audio-only and copied video)
     if !profile.audio_only && !copy_video {
-        match profile.hw_accel {
+        match hw_accel {
             HwAccel::Vaapi => {
                 args.extend([
                     "-hwaccel".to_string(),
@@ -646,14 +693,7 @@ fn build_ffmpeg_args(
 
     // Resume or seek point: an input seek, so output time 0 is the start point
     if profile.start_time_ticks > 0 {
-        let ticks = profile.start_time_ticks;
-        // Seconds with milliseconds truncated, in integer math
-        let start = format!(
-            "{}.{:03}",
-            ticks / 10_000_000,
-            (ticks % 10_000_000) / 10_000
-        );
-        args.extend(["-ss".to_string(), start]);
+        args.extend(["-ss".to_string(), seconds_text(profile.start_time_ticks)]);
     }
 
     // Input
@@ -666,7 +706,7 @@ fn build_ffmpeg_args(
         args.extend(["-c:v".to_string(), "copy".to_string()]);
     } else {
         // Video codec
-        let video_codec = match profile.hw_accel {
+        let video_codec = match hw_accel {
             HwAccel::Vaapi => "h264_vaapi".to_string(),
             HwAccel::Nvenc => "h264_nvenc".to_string(),
             HwAccel::Qsv => "h264_qsv".to_string(),
@@ -685,7 +725,7 @@ fn build_ffmpeg_args(
         ]);
 
         // Scale filter
-        let scale_filter = match profile.hw_accel {
+        let scale_filter = match hw_accel {
             HwAccel::Vaapi => format!(
                 "scale_vaapi=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease",
                 profile.max_width, profile.max_height
@@ -704,26 +744,37 @@ fn build_ffmpeg_args(
             ),
         };
 
-        // Subtitle burn-in
-        if profile.burn_subtitles {
+        // Subtitle burn-in: an image subtitle is overlaid, and it wins over a text burn-in
+        if let Some(sub) = image_subtitle {
+            // The subtitle is scaled to the video's size first when that is known, laid over the
+            // video, and the result is scaled like any video. hw_accel is None here, so
+            // scale_filter is the software scale.
+            let graph = match sub.video_size {
+                Some((w, h)) => format!(
+                    "[0:{}]scale={w}:{h}[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{scale_filter}[v]",
+                    sub.stream_index
+                ),
+                None => format!(
+                    "[0:V:0][0:{}]overlay=eof_action=pass:repeatlast=0,{scale_filter}[v]",
+                    sub.stream_index
+                ),
+            };
+            args.extend(["-filter_complex".to_string(), graph]);
+        } else if profile.burn_subtitles {
             let sub_idx = profile.subtitle_stream_index.unwrap_or(0);
-            if profile.hw_accel == HwAccel::None {
+            let burn = subtitles_filter(input, sub_idx, profile.start_time_ticks);
+            if hw_accel == HwAccel::None {
                 // Software: combine scale + subtitles in one filter chain
                 let sw_scale = format!(
                     "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease",
                     profile.max_width, profile.max_height
                 );
-                args.extend([
-                    "-vf".to_string(),
-                    format!("{sw_scale},subtitles='{input}':si={sub_idx}"),
-                ]);
+                args.extend(["-vf".to_string(), format!("{sw_scale},{burn}")]);
             } else {
                 // HW accel: need to download → burn subs → upload (complex, use sw fallback for subs)
                 args.extend([
                     "-vf".to_string(),
-                    format!(
-                        "{scale_filter},hwdownload,format=nv12,subtitles='{input}':si={sub_idx}",
-                    ),
+                    format!("{scale_filter},hwdownload,format=nv12,{burn}"),
                 ]);
             }
         } else {
@@ -731,11 +782,19 @@ fn build_ffmpeg_args(
         }
     }
 
-    // Audio stream selection and encoding
-    if let Some(audio_idx) = profile.audio_stream_index {
-        // Select specific audio stream for multi-audio support
-        args.extend(["-map".to_string(), format!("0:a:{}", audio_idx)]);
+    // Maps: the video first, then the audio. The overlay's output is the video; audio-only has none.
+    if image_subtitle.is_some() {
+        args.extend(["-map".to_string(), "[v]".to_string()]);
+    } else if !profile.audio_only {
+        args.extend(["-map".to_string(), "0:V:0?".to_string()]);
     }
+    let audio_map = match profile.audio_stream_index {
+        Some(idx) => format!("0:{idx}"),
+        None => "0:a:0?".to_string(),
+    };
+    args.extend(["-map".to_string(), audio_map]);
+
+    // Audio encoding
 
     if profile.copy_audio {
         args.extend(["-c:a".to_string(), "copy".to_string()]);
@@ -771,7 +830,7 @@ fn build_ffmpeg_args(
     ]);
 
     // Preset for speed (skip for HW accel, audio-only and copied video)
-    if profile.hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
+    if hw_accel == HwAccel::None && !profile.audio_only && !copy_video {
         args.extend(["-preset".to_string(), "veryfast".to_string()]);
     }
 
@@ -1121,6 +1180,148 @@ mod tests {
             assert!(!args.contains(&"-copypriorss".to_string()), "{args:?}");
         }
         assert_eq!(TranscodeProfile::default().start_time_ticks, 0);
+    }
+
+    /// The values of every `-map` in `args`, in order.
+    fn maps(args: &[String]) -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_maps_the_video_and_the_chosen_audio() {
+        // The audio index is the stream's absolute index (MediaStream.Index), not its place
+        // among the audio streams; an explicit map must not drop the video either
+        let profile = TranscodeProfile {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(maps(&args_for(&profile)), ["0:V:0?", "0:2"]);
+        // No choice: the first audio stream, if there is one
+        assert_eq!(
+            maps(&args_for(&TranscodeProfile::default())),
+            ["0:V:0?", "0:a:0?"]
+        );
+        let profile = TranscodeProfile {
+            copy_video: true,
+            copy_audio: true,
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(maps(&args_for(&profile)), ["0:V:0?", "0:1"]);
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_audio_only_maps_only_the_audio() {
+        let profile = TranscodeProfile {
+            audio_only: true,
+            audio_stream_index: Some(3),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert_eq!(maps(&args), ["0:3"]);
+        assert!(args.contains(&"-vn".to_string()), "{args:?}");
+        let profile = TranscodeProfile {
+            audio_only: true,
+            ..Default::default()
+        };
+        assert_eq!(maps(&args_for(&profile)), ["0:a:0?"]);
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_image_subtitle_is_overlaid() {
+        let sw_scale = "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease";
+        // Hardware acceleration and a video copy give way to the software overlay
+        for hw_accel in [HwAccel::None, HwAccel::Vaapi, HwAccel::Nvenc, HwAccel::Qsv] {
+            let profile = TranscodeProfile {
+                image_subtitle: Some(ImageSubtitle {
+                    stream_index: 5,
+                    video_size: Some((1440, 1080)),
+                }),
+                audio_stream_index: Some(1),
+                copy_video: true,
+                hw_accel,
+                ..Default::default()
+            };
+            let args = args_for(&profile);
+            // The subtitle is scaled to the source video's size, laid over it, then the
+            // result is scaled like any encoded video
+            assert!(
+                has_pair(
+                    &args,
+                    "-filter_complex",
+                    &format!(
+                        "[0:5]scale=1440:1080[sub];[0:V:0][sub]overlay=eof_action=pass:repeatlast=0,{sw_scale}[v]"
+                    )
+                ),
+                "{hw_accel:?}: {args:?}"
+            );
+            assert_eq!(maps(&args), ["[v]", "0:1"], "{hw_accel:?}");
+            assert!(has_pair(&args, "-c:v", "libx264"), "{hw_accel:?}: {args:?}");
+            for flag in ["-vf", "-hwaccel", "-vaapi_device"] {
+                assert!(!args.contains(&flag.to_string()), "{hw_accel:?}: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_image_subtitle_of_unknown_size_is_not_scaled() {
+        let profile = TranscodeProfile {
+            image_subtitle: Some(ImageSubtitle {
+                stream_index: 3,
+                video_size: None,
+            }),
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        assert!(
+            has_pair(
+                &args,
+                "-filter_complex",
+                "[0:V:0][0:3]overlay=eof_action=pass:repeatlast=0,scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease[v]"
+            ),
+            "{args:?}"
+        );
+        assert_eq!(maps(&args), ["[v]", "0:a:0?"]);
+        // The image subtitle wins over a text burn-in asked for at the same time
+        let profile = TranscodeProfile {
+            burn_subtitles: true,
+            subtitle_stream_index: Some(0),
+            ..profile
+        };
+        let args = args_for(&profile);
+        assert!(!args.iter().any(|a| a.contains("subtitles=")), "{args:?}");
+    }
+
+    #[test]
+    fn test_build_ffmpeg_args_text_burn_in_after_a_seek_keeps_the_subtitle_times() {
+        // After an input seek the frames start at 0, but the subtitle filter reads the file
+        // from its start: shift the frames to the file's time for the filter and back
+        let profile = TranscodeProfile {
+            burn_subtitles: true,
+            subtitle_stream_index: Some(1),
+            start_time_ticks: 6_000_000_000,
+            ..Default::default()
+        };
+        let args = args_for(&profile);
+        let vf = &args[position(&args, "-vf") + 1];
+        assert!(
+            vf.ends_with(
+                ",setpts=PTS+600.000/TB,subtitles='/input.mkv':si=1,setpts=PTS-600.000/TB"
+            ),
+            "{vf}"
+        );
+        // From the start there is nothing to shift
+        let profile = TranscodeProfile {
+            start_time_ticks: 0,
+            ..profile
+        };
+        let args = args_for(&profile);
+        let vf = &args[position(&args, "-vf") + 1];
+        assert!(vf.ends_with(",subtitles='/input.mkv':si=1"), "{vf}");
+        assert!(!vf.contains("setpts"), "{vf}");
     }
 
     #[tokio::test]
