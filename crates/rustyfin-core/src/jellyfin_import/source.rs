@@ -1341,9 +1341,10 @@ async fn snapshot_try(
         let Some(image) = on_blocking(file, move || read_once(&path, limit)).await? else {
             return Ok(None);
         };
-        let budget = progress_budget(page_count(&image, image.len() as u64));
+        let pages = page_count(&image, image.len() as u64);
+        let budget = progress_budget(pages);
         let mut conn = connection_of_image(file, &image).await?;
-        let cancel = guard_connection(file, &mut conn, budget).await?;
+        let guarded = guard_connection(file, &mut conn, budget).await?;
         let roots = read_roots(file, &mut conn, tables).await?;
         // Walk the schema and roots over the retained image before a quick_check reads them.
         let owner = file.to_path_buf();
@@ -1352,9 +1353,14 @@ async fn snapshot_try(
         })
         .await?;
         return Ok(Some(SnapshotConn {
-            _cancel: cancel,
+            _cancel: guarded.cancel,
             conn,
             _copy: None,
+            budget: BudgetReport {
+                ticks: guarded.ticks,
+                pages,
+                budget,
+            },
         }));
     }
     // The lock moves into the blocking task that copies, so a request dropped while the copy runs
@@ -1384,16 +1390,22 @@ async fn snapshot_try(
         .connect()
         .await
         .map_err(|e| unreadable(file, &e))?;
-    let budget = progress_budget(pages.page_count());
-    let cancel = guard_connection(file, &mut conn, budget).await?;
+    let page_count = pages.page_count();
+    let budget = progress_budget(page_count);
+    let guarded = guard_connection(file, &mut conn, budget).await?;
     let roots = read_roots(file, &mut conn, tables).await?;
     // Walk the schema and roots over the copied files before a quick_check reads them.
     let owner = file.to_path_buf();
     on_blocking(file, move || check_tree_depth(&pages, &owner, &roots)).await?;
     Ok(Some(SnapshotConn {
-        _cancel: cancel,
+        _cancel: guarded.cancel,
         conn,
         _copy: Some(copy),
+        budget: BudgetReport {
+            ticks: guarded.ticks,
+            pages: page_count,
+            budget,
+        },
     }))
 }
 
@@ -1435,7 +1447,7 @@ async fn connection_of_image(file: &Path, image: &[u8]) -> Result<SqliteConnecti
 /// have passed or `cancel` is set. So neither a crafted schema that makes a read spin nor a request
 /// dropped mid-read can hold the connection's worker thread (spec Fix round 4, F4).
 pub(super) struct ProgressGuard {
-    ticks: AtomicU64,
+    ticks: Arc<AtomicU64>,
     budget: u64,
     cancel: Arc<AtomicBool>,
 }
@@ -1443,10 +1455,16 @@ pub(super) struct ProgressGuard {
 impl ProgressGuard {
     pub(super) fn new(budget: u64, cancel: Arc<AtomicBool>) -> Self {
         ProgressGuard {
-            ticks: AtomicU64::new(0),
+            ticks: Arc::new(AtomicU64::new(0)),
             budget,
             cancel,
         }
+    }
+
+    /// The shared tick counter, so the snapshot can log how much of the budget the import spent
+    /// (spec Fix round 5, R5).
+    pub(super) fn ticks(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.ticks)
     }
 
     /// Whether the query may continue: false once the cancel flag is set or the budget is spent.
@@ -1487,13 +1505,14 @@ pub(super) async fn guard_connection(
     file: &Path,
     conn: &mut SqliteConnection,
     budget: u64,
-) -> Result<CancelOnDrop, ImportError> {
+) -> Result<Guarded, ImportError> {
     let cancel = Arc::new(AtomicBool::new(false));
     #[cfg(test)]
     let probe = PROGRESS_PROBE.try_with(Arc::clone).ok();
     #[cfg(test)]
     let budget = probe.as_ref().map_or(budget, |probe| probe.budget);
     let guard = ProgressGuard::new(budget, Arc::clone(&cancel));
+    let ticks = guard.ticks();
     let handler = move || {
         #[cfg(test)]
         if let Some(probe) = &probe {
@@ -1505,7 +1524,17 @@ pub(super) async fn guard_connection(
         .await
         .map_err(|e| unreadable(file, &e))?
         .set_progress_handler(PROGRESS_OPS, handler);
-    Ok(CancelOnDrop(cancel))
+    Ok(Guarded {
+        cancel: CancelOnDrop(cancel),
+        ticks,
+    })
+}
+
+/// What `guard_connection` hands back: the cancel that interrupts the worker when dropped (spec Fix
+/// round 5, R4), and the guard's shared tick counter so the snapshot can log the budget it spent (R5).
+pub(super) struct Guarded {
+    pub(super) cancel: CancelOnDrop,
+    pub(super) ticks: Arc<AtomicU64>,
 }
 
 /// A test's hold on the guards `guard_connection` installs while a future runs inside
@@ -1751,6 +1780,31 @@ pub(crate) struct SnapshotConn {
     conn: SqliteConnection,
     /// The copy, None on the in-memory path. Only its drop matters.
     _copy: Option<CopyFolder>,
+    /// The progress budget this snapshot ran under and its shared tick counter, logged when the
+    /// snapshot is dropped (spec Fix round 5, R5).
+    budget: BudgetReport,
+}
+
+/// A snapshot's progress budget and the ticks its reads spent, so `SnapshotConn`'s drop can log how
+/// much of the budget an import used — counts only, no source names or values (spec Fix round 5, R5).
+struct BudgetReport {
+    ticks: Arc<AtomicU64>,
+    pages: u64,
+    budget: u64,
+}
+
+impl Drop for SnapshotConn {
+    fn drop(&mut self) {
+        // Measures the F4 budget against a real import, so a legitimate one is not cut off. Runs
+        // before the fields drop, so the tick counter is still read before the connection is torn
+        // down; the cancel flag is set afterwards, as its declaration order ensures.
+        let ticks = self.budget.ticks.load(Ordering::Relaxed);
+        let budget = self.budget.budget;
+        let pages = self.budget.pages;
+        tracing::debug!(
+            "jellyfin import: progress budget spent {ticks} of {budget} ticks over {pages} pages"
+        );
+    }
 }
 
 impl Deref for SnapshotConn {

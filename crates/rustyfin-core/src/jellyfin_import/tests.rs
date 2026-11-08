@@ -2855,6 +2855,41 @@ async fn b20_progress_interrupt_is_a_damaged_schema() {
     );
 }
 
+// Fix round 5, R5: guard_connection shares the guard's tick counter, so a snapshot can log how much
+// of the budget an import spent (SnapshotConn's drop). The counter starts at zero and grows as the
+// guarded connection steps, so the margin (budget / ticks) the log reports reflects real work.
+#[tokio::test]
+async fn b20_guard_connection_counts_ticks() {
+    use super::source::guard_connection;
+    use sqlx::ConnectOptions;
+    use std::sync::atomic::Ordering;
+
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .connect()
+        .await
+        .unwrap();
+    // A budget beyond any real work, so the tick counter, not an interrupt, is what is exercised.
+    let guarded = guard_connection(Path::new("jellyfin.db"), &mut conn, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        guarded.ticks.load(Ordering::Relaxed),
+        0,
+        "no ticks before any query runs"
+    );
+    sqlx::query(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) \
+         SELECT count(*) FROM c",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert!(
+        guarded.ticks.load(Ordering::Relaxed) > 0,
+        "the shared counter grows as the guarded connection steps"
+    );
+}
+
 // F1 (round 4): check_tree_depth walks the schema b-tree (page 1) and every table/index root over
 // raw pages before quick_check runs, refusing a tree that is too deep, shares or revisits a page, or
 // holds a bad page number, type or cell offset — so quick_check can't recurse into it and overflow
