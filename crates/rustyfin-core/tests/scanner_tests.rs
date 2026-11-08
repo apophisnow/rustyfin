@@ -3142,6 +3142,56 @@ async fn b28_a_file_link_is_dated_by_its_target_and_a_folder_link_by_its_own_tim
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_saving_an_item_read_before_the_backfill_keeps_its_new_date() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let movie = "Old Film (1999)/Old Film (1999).mkv";
+    touch(&root_of(&film), movie);
+    b23_set_mtime(&root_of(&film).join(movie), 1_000_000_000);
+    scan(&fx.pool, &film).await;
+    b28_date_all(&fx.pool, &film, chrono::Utc::now()).await;
+    // A metadata refresh reads its items, then saves each whole item once it has new metadata. By
+    // then the copy it read can hold the date the backfill has replaced.
+    let id = item_at(&fx.pool, &film, movie).await;
+    let mut refreshed = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+        .await
+        .unwrap()
+        .expect("the film");
+    b28_run(&fx.pool).await;
+    refreshed.overview = Some("Found by the refresh.".to_string());
+    rustyfin_db::repo_media::upsert_media_item(&fx.pool, &refreshed)
+        .await
+        .unwrap();
+    assert_eq!(
+        b28_date(&fx.pool, &film, movie).await,
+        b28_at(1_000_000_000)
+    );
+    let saved = rustyfin_db::repo_media::get_item_by_id(&fx.pool, id)
+        .await
+        .unwrap()
+        .expect("the film");
+    assert_eq!(saved.overview.as_deref(), Some("Found by the refresh."));
+    // A new item still gets the date it's saved with.
+    let mut new = refreshed.clone();
+    new.id = Uuid::new_v4();
+    new.path = root_of(&film)
+        .join("New Film (2005)/New Film (2005).mkv")
+        .to_str()
+        .unwrap()
+        .to_string();
+    new.date_created = b28_at(1_100_000_000);
+    rustyfin_db::repo_media::upsert_media_item(&fx.pool, &new)
+        .await
+        .unwrap();
+    let stored = rustyfin_db::repo_media::get_item_by_id(&fx.pool, new.id)
+        .await
+        .unwrap()
+        .expect("the new film");
+    assert_eq!(stored.date_created, b28_at(1_100_000_000));
+}
+
 // B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
 // its updates go 0, then up to at most 99, then 100 once its probes have finished. B18 adds the
 // state to each update: Queued, Active from the start, and Idle with the 100.
