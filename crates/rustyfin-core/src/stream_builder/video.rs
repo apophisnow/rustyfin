@@ -4,14 +4,16 @@
 
 use rustyfin_model::device_profile::{
     CodecProfile, CodecType, ConditionProperty, ConditionType, DeviceProfile, DirectPlayProfile,
-    EncodingContext, ProfileCondition, ProfileType, StreamProtocol, TranscodeSeekInfo,
-    TranscodingProfile,
+    EncodingContext, ProfileCondition, ProfileType, StreamProtocol, SubtitleDeliveryMethod,
+    TranscodeSeekInfo, TranscodingProfile,
 };
 
 use super::conditions::{self, AudioFacts, VideoFacts};
+use super::subtitles;
 use super::url::StreamOptions;
 use super::{
-    SourceFacts, StreamFacts, StreamKind, StreamRequest, TranscodeReason, TranscodeReasons,
+    PlayMethod, SourceFacts, StreamFacts, StreamKind, StreamRequest, TranscodeReason,
+    TranscodeReasons,
 };
 
 /// The stream info that a transcoding URL is written from: Jellyfin's `StreamInfo`, for the fields
@@ -35,6 +37,13 @@ pub(super) struct StreamInfo {
     pub(super) audio_codecs: Vec<String>,
     /// The audio stream the transcode uses.
     pub(super) audio_stream_index: Option<i32>,
+    /// The plan's subtitle stream, when its index names one (-1 never does).
+    pub(super) subtitle_stream_index: Option<i32>,
+    /// How that subtitle stream is delivered by this transcode (SB 818-824), when it has one.
+    pub(super) subtitle_method: Option<SubtitleDeliveryMethod>,
+    /// The request's AlwaysBurnInSubtitleWhenTranscoding, which names the subtitle in the URL even
+    /// when it is delivered as a file.
+    pub(super) always_burn_in_subtitle: bool,
     /// The video bitrate in bits per second.
     pub(super) video_bitrate: Option<i32>,
     /// The audio bitrate in bits per second.
@@ -110,7 +119,7 @@ pub(super) struct VideoPlan {
     pub(super) transcode_reasons: TranscodeReasons,
     /// The audio stream that plays.
     pub(super) audio_stream_index: Option<i32>,
-    /// The subtitle stream index (SB 660), before any subtitle delivery is chosen.
+    /// The subtitle stream index (SB 660): the chosen one, or the source's default. -1 means none.
     pub(super) subtitle_stream_index: Option<i32>,
     /// The transcode's stream info, when a transcoding profile was applied.
     pub(super) transcode: Option<StreamInfo>,
@@ -532,14 +541,16 @@ fn normalize_container(
 
 /// Jellyfin's `GetVideoDirectPlayProfile`. A profile plays the video directly when its container,
 /// video codec and audio codec all match, the video and audio conditions hold, the request allows
-/// a direct play, and the source's own direct play flag is set. When nothing plays, the reasons of
-/// the best-ranked failure are returned, or `DirectPlayError` when there are none.
+/// a direct play, and the source's own direct play flag is set. `subtitle_found` is the chosen
+/// subtitle's failure (SB 1319-1332), which every profile shares (SB 1377). When nothing plays,
+/// the reasons of the best-ranked failure are returned, or `DirectPlayError` when there are none.
 fn direct_play_choice<'a>(
     profile: &'a DeviceProfile,
     source: &SourceFacts,
     video: Option<&StreamFacts>,
     candidates: &[&StreamFacts],
     eligible: bool,
+    subtitle_found: TranscodeReasons,
 ) -> DirectPlayChoice<'a> {
     let container = source.container.as_str();
     let container_found = compat_container(profile, source, container, video);
@@ -584,7 +595,7 @@ fn direct_play_choice<'a>(
                 }
             }
 
-            let mut failure = failure | container_found;
+            let mut failure = failure | container_found | subtitle_found;
             if !failure.contains(TranscodeReason::VideoCodecNotSupported) {
                 failure |= video_found;
             }
@@ -1436,6 +1447,8 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
             .or(source.default_audio_stream_index),
     );
     let candidates = audio_candidates(source, audio, options.audio_stream_index);
+    let subtitle_index = subtitles::chosen_index(source, options.subtitle_stream_index);
+    let subtitle = subtitles::subtitle_stream(source, subtitle_index);
 
     let exceeded = bitrate_limit_exceeded(source, i64::from(options.max_bitrate.unwrap_or(0)));
     let eligible =
@@ -1448,7 +1461,8 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
     let mut container = normalize_container(&source.container, profile, None);
     let mut audio_index = audio.map(|a| a.index);
     if eligible {
-        let choice = direct_play_choice(profile, source, video, &candidates, true);
+        let subtitle_found = subtitles::direct_play_reason(&source.container, profile, subtitle);
+        let choice = direct_play_choice(profile, source, video, &candidates, true, subtitle_found);
         reasons |= choice.reasons;
         if let Some((direct, index)) = choice.matched {
             direct_play = true;
@@ -1468,6 +1482,17 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
             play_session_id: request.play_session_id.clone(),
             access_token: request.access_token.clone(),
             audio_stream_index: audio_index,
+            subtitle_stream_index: subtitle.map(|s| s.index),
+            subtitle_method: subtitle.map(|s| {
+                subtitles::subtitle_method(
+                    s,
+                    &profile.subtitle_profiles,
+                    PlayMethod::Transcode,
+                    Some(tp.container.as_str()),
+                    tp.protocol,
+                )
+            }),
+            always_burn_in_subtitle: request.always_burn_in_subtitle,
             start_position_ticks: request.start_time_ticks,
             transcode_reasons: reasons,
             ..StreamInfo::default()
@@ -1492,9 +1517,7 @@ pub(super) fn plan_video(source: &SourceFacts, options: &VideoOptions<'_>) -> Vi
         container,
         transcode_reasons: reasons,
         audio_stream_index,
-        subtitle_stream_index: options
-            .subtitle_stream_index
-            .or(source.default_subtitle_stream_index),
+        subtitle_stream_index: subtitle_index,
         transcode,
     }
 }

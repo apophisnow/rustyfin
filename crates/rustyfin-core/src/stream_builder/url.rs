@@ -1,6 +1,6 @@
 //! The transcoding URL, a port of Jellyfin's `StreamInfo.ToUrl` for an HLS transcode.
 
-use rustyfin_model::device_profile::TranscodeSeekInfo;
+use rustyfin_model::device_profile::{SubtitleDeliveryMethod, TranscodeSeekInfo};
 
 use super::video::StreamInfo;
 
@@ -89,6 +89,14 @@ impl StreamInfo {
         if let Some(index) = self.audio_stream_index {
             params.push(format!("AudioStreamIndex={index}"));
         }
+        // The subtitle is named for a burn-in, or when it is not delivered as a file (SI 955-959).
+        // Index -1 has no stream, so it is never named.
+        let subtitle = self.subtitle_stream_index.zip(self.subtitle_method);
+        if let Some((index, _)) = subtitle.filter(|(_, method)| {
+            self.always_burn_in_subtitle || *method != SubtitleDeliveryMethod::External
+        }) {
+            params.push(format!("SubtitleStreamIndex={index}"));
+        }
         if let Some(bitrate) = self.video_bitrate {
             params.push(format!("VideoBitrate={}", kbps(bitrate)));
         }
@@ -151,6 +159,13 @@ impl StreamInfo {
             "EnableAudioVbrEncoding={}",
             self.enable_audio_vbr_encoding
         ));
+        // SubtitleMethod is written for a chosen stream that isn't delivered as a file. Jellyfin
+        // writes it for index -1 too (SI 1103-1112), but Rustyfin's transcoder takes
+        // SubtitleMethod=Encode without an index as "burn in the first subtitle".
+        if let Some((_, method)) = subtitle.filter(|(_, m)| *m != SubtitleDeliveryMethod::External)
+        {
+            params.push(format!("SubtitleMethod={}", method.as_str()));
+        }
         for (name, value) in self.stream_options.iter() {
             // Spaces are stripped so that profile names such as "constrained baseline" need no escaping.
             params.push(format!("{name}={}", value.replace(' ', "")));

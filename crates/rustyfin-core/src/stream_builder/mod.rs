@@ -3,6 +3,7 @@
 
 pub mod conditions;
 mod facts;
+mod subtitles;
 mod url;
 mod video;
 
@@ -322,8 +323,7 @@ impl Default for StreamRequest {
     }
 }
 
-/// How one subtitle stream reaches the client. Subtitle delivery is not ported yet (T3b), so
-/// [`DeviceData::subtitles`] is empty.
+/// How one subtitle stream reaches the client (SetDeviceSpecificSubtitleInfo's per-stream result).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubtitleDelivery {
     /// The index of the subtitle stream.
@@ -382,7 +382,7 @@ fn transcode_suffix(request: &StreamRequest) -> String {
 
 /// Jellyfin's `SetDeviceSpecificData` for one source (MIH steps 1 to 4): what the device can do
 /// with `source`, and the transcode URL when the file needs one. Only the video plan is ported.
-/// An audio request gets the flags of step 2 and no plan. Subtitles are not delivered yet (T3b).
+/// An audio request gets the flags of step 2 and no plan, so no subtitles either (T3c).
 pub fn device_data(
     source: &SourceFacts,
     profile: &DeviceProfile,
@@ -446,6 +446,9 @@ pub fn device_data(
         }
     }
 
+    // Subtitles (T3b): one delivery per subtitle stream, in source order.
+    let deliveries = subtitles::deliveries(source, profile, request, &plan);
+
     let (transcoding_container, transcoding_sub_protocol) = plan
         .transcode
         .as_ref()
@@ -466,6 +469,6 @@ pub fn device_data(
         transcode_reasons: plan.transcode_reasons,
         default_audio_stream_index: plan.audio_stream_index,
         default_subtitle_stream_index: plan.subtitle_stream_index,
-        subtitles: Vec::new(),
+        subtitles: deliveries,
     }
 }
