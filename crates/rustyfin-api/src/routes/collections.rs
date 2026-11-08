@@ -208,13 +208,8 @@ async fn get_playlist_items(
     Path(id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<QueryResult>, ApiError> {
+    ensure_playlist_visible(&state, id, &claims).await?;
     let caller = playlist_caller(&claims);
-    if rustyfin_db::repo_playlist::get_playlist(&state.db_ro, id, caller)
-        .await?
-        .is_none()
-    {
-        return Err(playlist_not_found());
-    }
     let items = rustyfin_db::repo_playlist::get_playlist_items(&state.db_ro, id, caller).await?;
     let count = items.len() as i64;
     Ok(Json(QueryResult {
@@ -263,13 +258,8 @@ async fn add_items_to_playlist(
     Extension(claims): Extension<Claims>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
+    ensure_playlist_visible(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
-    if rustyfin_db::repo_playlist::get_playlist(&state.db, playlist_id, caller)
-        .await?
-        .is_none()
-    {
-        return Err(playlist_not_found());
-    }
     if let Some(ids) = body.get("Ids").and_then(|v| v.as_array()) {
         for id_val in ids {
             if let Some(id_str) = id_val.as_str()
@@ -296,13 +286,8 @@ async fn remove_items_from_playlist(
     Extension(claims): Extension<Claims>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
+    ensure_playlist_visible(&state, playlist_id, &claims).await?;
     let caller = playlist_caller(&claims);
-    if rustyfin_db::repo_playlist::get_playlist(&state.db, playlist_id, caller)
-        .await?
-        .is_none()
-    {
-        return Err(playlist_not_found());
-    }
     if let Some(ids) = body.get("Ids").and_then(|v| v.as_array()) {
         for id_val in ids {
             if let Some(id_str) = id_val.as_str()
@@ -322,7 +307,7 @@ async fn remove_items_from_playlist(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Shared visibility check for the Users stubs: 404 unless the caller can see the playlist.
+/// Shared visibility check for the playlist routes: 404 unless the caller can see the playlist.
 async fn ensure_playlist_visible(
     state: &AppState,
     id: Uuid,
