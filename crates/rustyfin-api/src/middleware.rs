@@ -23,24 +23,26 @@ pub use credentials::{MediaBrowserAuth, parse_media_browser};
 /// (`Bearer <token>`, otherwise a `MediaBrowser` token), the `MediaBrowser` token of the
 /// `X-Emby-Authorization` header, the `X-Emby-Token` header, the `X-MediaBrowser-Token` header,
 /// then the `ApiKey` and `api_key` query parameters (see `credentials::request_token`). The
-/// configured API key gives administrator claims. Any other token must be a live user token. Takes
-/// the request's headers and URI rather than the request: axum's `Body` is not `Sync`, so a
-/// `&Request` cannot be held across the await.
+/// configured API key gives administrator claims. The `api_key` value also counts as sent when it
+/// is compared with that key, because URLs such as an *arr Webhook's carry the key as typed. Any
+/// other token must be a live user token. Takes the request's headers and URI rather than the
+/// request: axum's `Body` is not `Sync`, so a `&Request` cannot be held across the await.
 async fn request_claims(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<(Claims, Option<String>), ApiError> {
-    let token = credentials::request_token(headers, uri).ok_or(ApiError::Unauthorized)?;
+    let presented = credentials::request_token(headers, uri).ok_or(ApiError::Unauthorized)?;
 
     // An empty token never authenticates, whatever the configured key.
-    if token.trim().is_empty() {
+    if presented.token.trim().is_empty() {
         return Err(ApiError::Unauthorized);
     }
 
-    // Check if the token matches a configured API key
+    // Check if the token, or the `api_key` value as sent, matches a configured API key
     if let Some(ref api_key) = state.api_key
-        && token == **api_key
+        && (presented.token == **api_key
+            || presented.raw_api_key.as_deref() == Some(api_key.as_str()))
     {
         // API key auth: create admin claims
         return Ok((
@@ -56,10 +58,10 @@ async fn request_claims(
     }
 
     // Otherwise the token must be a live user token
-    let claims = rustyfin_auth::validate_token(&state.db_ro, &token)
+    let claims = rustyfin_auth::validate_token(&state.db_ro, &presented.token)
         .await
         .map_err(|_| ApiError::Unauthorized)?;
-    Ok((claims, Some(token)))
+    Ok((claims, Some(presented.token)))
 }
 
 pub async fn require_auth(
