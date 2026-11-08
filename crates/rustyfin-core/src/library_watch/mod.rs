@@ -15,7 +15,7 @@ use std::time::Duration;
 use rustyfin_db::repo_library;
 use rustyfin_model::library::Library;
 use sqlx::SqlitePool;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -439,7 +439,7 @@ async fn run_monitor(
     // Canonicalizing can hang on a dead share, so the setup runs on a blocking thread.
     let setup_path = path.clone();
     let data_dir = inner.data_dir.clone();
-    let setup = tokio::task::spawn_blocking(move || {
+    let setup = off_runtime(move || {
         let choice = choose(&setup_path, force_poll);
         (choice, FolderPoller::new(setup_path, Some(data_dir)))
     })
@@ -499,7 +499,7 @@ async fn run_monitor(
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let hook_path = path.clone();
-        let (returned, reported, took) = match tokio::task::spawn_blocking(move || {
+        let (returned, reported, took) = match off_runtime(move || {
             if let Some(hook) = poll_hook {
                 hook(&hook_path);
             }
@@ -606,6 +606,25 @@ async fn sleep_between_polls(last: tokio::time::Instant, interval: &mut watch::R
             }
         }
     }
+}
+
+/// Runs `work` on a new thread and waits for its result. Unlike `spawn_blocking`, the runtime
+/// doesn't wait for the thread when it shuts down, so a read of a share that doesn't answer
+/// doesn't hold up the server's exit; the thread ends when the read does. Errs when the thread
+/// can't be started or `work` panics.
+pub(super) async fn off_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<T> {
+    let (done, result) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("library-monitor".into())
+        .spawn(move || {
+            // Nobody waits for a result once its caller is gone, so the result is dropped here.
+            let _ = done.send(work());
+        })?;
+    result
+        .await
+        .map_err(|_| std::io::Error::other("the library monitor thread panicked"))
 }
 
 /// How a path is monitored, and why, and its filesystem type. It reads the disk, so it runs on a

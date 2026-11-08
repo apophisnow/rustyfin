@@ -19,7 +19,7 @@ use tokio::time::Instant;
 
 use super::{
     FILE_LIMIT_REACHED, INSTANCE_LIMIT_REACHED, Inner, LIBRARY_PATH_GONE, MonitorKey,
-    WATCH_LIMIT_REACHED, fs_type_from_mountinfo, is_local_fs_type,
+    WATCH_LIMIT_REACHED, fs_type_from_mountinfo, is_local_fs_type, off_runtime,
 };
 use crate::library_monitor::unit_for;
 use crate::naming::is_ignored_dir;
@@ -121,7 +121,7 @@ pub(super) async fn watch(
         .watch_limit
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let setup = tokio::task::spawn_blocking(move || setup(&setup_root, &data_dir, limit)).await;
+    let setup = off_runtime(move || setup(&setup_root, &data_dir, limit)).await;
     let (inotify, mut tree, took) = match setup {
         Ok(Ok(setup)) => setup,
         Ok(Err(fallback)) => return Some(fallback_reason(inner, &root, fallback)),
@@ -360,11 +360,8 @@ fn seen_of(wd: WatchDescriptor, mask: EventMask, name: Option<OsString>) -> Seen
 
 /// Applies the events to the tree on a blocking thread, since a walk of a new folder reads the
 /// disk. Returns the tree and the paths to report.
-async fn apply_on_thread(
-    mut tree: Tree,
-    seen: Vec<Seen>,
-) -> Result<(Tree, Vec<PathBuf>), tokio::task::JoinError> {
-    tokio::task::spawn_blocking(move || {
+async fn apply_on_thread(mut tree: Tree, seen: Vec<Seen>) -> io::Result<(Tree, Vec<PathBuf>)> {
+    off_runtime(move || {
         let mut reported = Vec::new();
         for event in seen {
             tree.apply(event, &mut reported);
