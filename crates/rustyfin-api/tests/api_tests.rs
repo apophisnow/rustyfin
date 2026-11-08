@@ -89,6 +89,8 @@ async fn test_state() -> AppState {
             reqwest::Client::new(),
             Default::default(),
         ),
+        oidc: rustyfin_api::oidc::OidcState::new(),
+        jellyfin_import: Default::default(),
     }
 }
 
@@ -480,6 +482,691 @@ async fn test_b8_socket_accepts_a_user_token_while_an_api_key_is_set() {
     let state = b8_with_key(&base, Some("b8-key"));
     assert_eq!(b8_socket_status(state, "?api_key=b8-key").await, 101);
     std::fs::remove_dir_all(base.data_dir.as_path()).ok();
+}
+
+// ── J1: Jellyfin credentials ──
+// Jellyfin's apps send the token as `Authorization: MediaBrowser …, Token="…"` (older ones in
+// `X-Emby-Authorization`) and as `?ApiKey=` in URLs; master's styles keep working. The first
+// source that holds a token decides.
+
+/// jellyfin-web's credentials header for `token`, under `scheme`.
+fn j1_mb(scheme: &str, token: &str) -> String {
+    format!(
+        r#"{scheme} Client="Jellyfin Web", Device="Firefox", DeviceId="j1-device", Version="10.10.0", Token="{token}""#
+    )
+}
+
+/// A user who is not an administrator, and a token for them.
+async fn j1_user(state: &AppState) -> (String, uuid::Uuid) {
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: "j1-user".to_string(),
+        password_hash: String::new(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::Value::Null,
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &user)
+        .await
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, user.id)
+}
+
+/// A `GET path` request with `credentials`: (header, value) pairs, where the header `?` adds the
+/// value to the query string instead.
+fn j1_request(path: &str, credentials: &[(&str, &str)]) -> axum::http::request::Builder {
+    let query: Vec<&str> = credentials
+        .iter()
+        .filter(|(name, _)| *name == "?")
+        .map(|(_, value)| *value)
+        .collect();
+    let uri = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", query.join("&"))
+    };
+    let mut builder = Request::builder().uri(uri);
+    for (name, value) in credentials.iter().filter(|(name, _)| *name != "?") {
+        builder = builder.header(*name, *value);
+    }
+    builder
+}
+
+/// The status and body of the answer to `request`.
+async fn j1_send(state: &AppState, request: axum::http::request::Builder) -> (StatusCode, String) {
+    let resp = app(state.clone())
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The status and body of `GET path` with `credentials` (see `j1_request`).
+async fn j1_get(
+    state: &AppState,
+    path: &str,
+    credentials: &[(&str, &str)],
+) -> (StatusCode, String) {
+    j1_send(state, j1_request(path, credentials)).await
+}
+
+/// The id of the user `GET /Users/Me` returns for `credentials`, or the status when it isn't 200.
+async fn j1_me(state: &AppState, credentials: &[(&str, &str)]) -> Result<uuid::Uuid, StatusCode> {
+    let (status, body) = j1_get(state, "/Users/Me", credentials).await;
+    if status != StatusCode::OK {
+        return Err(status);
+    }
+    let user: serde_json::Value = serde_json::from_str(&body).unwrap();
+    Ok(uuid::Uuid::parse_str(user["Id"].as_str().unwrap()).unwrap())
+}
+
+/// Checks that the credential `(name, style)`, with `<t>` in place of the token, gives a user
+/// token that user's claims and the configured API key an administrator's.
+async fn j1_assert_style(state: &AppState, user: &(String, uuid::Uuid), name: &str, style: &str) {
+    let (token, user_id) = user;
+    let value = style.replace("<t>", token);
+    let me = j1_me(state, &[(name, value.as_str())]).await;
+    assert_eq!(me, Ok(*user_id), "user token, {name}: {style}");
+    let (status, _) = j1_get(state, "/System/Info/Storage", &[(name, value.as_str())]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "user token, {name}: {style}");
+    let value = style.replace("<t>", state.api_key.as_deref().unwrap());
+    let (status, _) = j1_get(state, "/System/Info/Storage", &[(name, value.as_str())]).await;
+    assert_eq!(status, StatusCode::OK, "API key, {name}: {style}");
+}
+
+#[tokio::test]
+async fn test_j1_jellyfin_styles_authenticate_a_user_token_and_the_api_key() {
+    let state = test_state().await;
+    let user = j1_user(&state).await;
+    let styles = [
+        ("Authorization", j1_mb("MediaBrowser", "<t>")),
+        ("Authorization", j1_mb("mediabrowser", "<t>")),
+        ("Authorization", j1_mb("Emby", "<t>")),
+        ("Authorization", j1_mb("EMBY", "<t>")),
+        // rustyfin-cli's header
+        ("Authorization", r#"MediaBrowser Token="<t>""#.to_string()),
+        ("X-Emby-Authorization", j1_mb("MediaBrowser", "<t>")),
+        ("X-Emby-Authorization", j1_mb("emby", "<t>")),
+        ("?", "ApiKey=<t>".to_string()),
+        ("?", "apikey=<t>".to_string()),
+        ("?", "static=true&APIKEY=<t>&DeviceId=j1-device".to_string()),
+    ];
+    for (name, style) in &styles {
+        j1_assert_style(&state, &user, name, style).await;
+    }
+}
+
+#[tokio::test]
+async fn test_j1_master_styles_keep_working() {
+    let state = test_state().await;
+    let user = j1_user(&state).await;
+    let styles = [
+        ("Authorization", "Bearer <t>"),
+        ("X-Emby-Token", "<t>"),
+        ("X-MediaBrowser-Token", "<t>"),
+        ("?", "api_key=<t>"),
+        ("?", "static=true&api_key=<t>"),
+    ];
+    for (name, style) in styles {
+        j1_assert_style(&state, &user, name, style).await;
+    }
+}
+
+#[tokio::test]
+async fn test_j1_percent_encoded_values_and_a_quoted_comma() {
+    let mut state = test_state().await;
+    // The configured key may hold any character but surrounding whitespace
+    let key = "j1 key+,100%";
+    state.api_key = Some(Arc::new(key.to_string()));
+    // Values in the MediaBrowser header and the query are decoded like Jellyfin's
+    // `WebUtility.UrlDecode`: `+` is a space, `%XX` a byte, and a `%` without two hex digits stays.
+    // Token headers are used as sent. The configured key also matches a MediaBrowser token and
+    // `api_key` as sent (J1 re-check R1, review F1).
+    let accepted = [
+        ("Authorization", r#"MediaBrowser Token="j1 key+,100%""#),
+        (
+            "Authorization",
+            r#"MediaBrowser Token="j1%20key%2B%2C100%25""#,
+        ),
+        ("Authorization", r#"MediaBrowser Token="j1+key%2b,100%""#),
+        (
+            "X-Emby-Authorization",
+            r#"Emby Token="j1%20key%2B%2C100%25""#,
+        ),
+        ("?", "ApiKey=j1%20key%2B%2C100%25"),
+        ("?", "apikey=j1+key%2b%2c100%25"),
+        ("?", "api_key=j1%20key%2B%2C100%25"),
+        ("?", "Api%4Bey=j1%20key%2B%2C100%25"),
+        ("Authorization", "Bearer j1 key+,100%"),
+        ("X-Emby-Token", key),
+        ("X-MediaBrowser-Token", key),
+    ];
+    for (name, value) in accepted {
+        let (status, _) = j1_get(&state, "/System/Info/Storage", &[(name, value)]).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {value}");
+    }
+    let refused = [
+        // A raw `+` is a space, and these spellings aren't the key as sent either
+        ("Authorization", r#"MediaBrowser Token="j1+key+,100%""#),
+        ("?", "ApiKey=j1+key+,100%25"),
+        // Token headers are not decoded
+        ("Authorization", "Bearer j1%20key%2B%2C100%25"),
+        ("X-Emby-Token", "j1%20key%2B%2C100%25"),
+    ];
+    for (name, value) in refused {
+        let (status, _) = j1_get(&state, "/System/Info/Storage", &[(name, value)]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{name}: {value}");
+    }
+
+    // A user token sent percent-encoded, and quoted commas in the other values
+    let (token, user_id) = j1_user(&state).await;
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let styles = [
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{encoded}""#),
+        ),
+        ("?", format!("ApiKey={encoded}")),
+        (
+            "Authorization",
+            format!(
+                r#"MediaBrowser Client="Jellyfin Android", Device="Phone, 2", DeviceId="j1", Version="2.6.0", Token="{token}""#
+            ),
+        ),
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{token}", Device="Phone, 2""#),
+        ),
+        // jellyfin-web encodes the device name
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Device="T%C3%A9l%C3%A9phone", Token="{token}""#),
+        ),
+        // Quoted text that looks like a key is part of the value
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Device="Phone, Token=j1-bad", Token="{token}""#),
+        ),
+        (
+            "Authorization",
+            format!(r#"MediaBrowser Token="{token}", Client="a, Token=j1-bad""#),
+        ),
+    ];
+    for (i, (name, value)) in styles.iter().enumerate() {
+        let me = j1_me(&state, &[(*name, value.as_str())]).await;
+        assert_eq!(me, Ok(user_id), "style {i}, {name}");
+    }
+}
+
+#[tokio::test]
+async fn test_j1_the_first_source_with_a_token_decides() {
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let key = state.api_key.clone().unwrap();
+    // A well-formed token that this server never issued
+    let bad = "0123456789abcdef0123456789abcdef";
+    let mb_good = r#"MediaBrowser Client="Jellyfin Web", Token="<good>""#;
+    let mb_bad = r#"MediaBrowser Client="Jellyfin Web", Token="<bad>""#;
+    let ok = StatusCode::OK;
+    let unauthorized = StatusCode::UNAUTHORIZED;
+    // (credentials, expected), with <good> a user token, <key> the configured key and <bad> a
+    // token nobody issued
+    let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
+        // An invalid first token is refused, whatever a later source holds
+        (
+            vec![("Authorization", mb_bad), ("?", "api_key=<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("?", "api_key=<key>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("?", "ApiKey=<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("X-Emby-Token", "<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("Authorization", mb_bad), ("X-Emby-Authorization", mb_good)],
+            unauthorized,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer <bad>"),
+                ("X-Emby-Authorization", mb_good),
+            ],
+            unauthorized,
+        ),
+        (
+            vec![("X-Emby-Authorization", mb_bad), ("X-Emby-Token", "<good>")],
+            unauthorized,
+        ),
+        (
+            vec![("X-Emby-Token", "<bad>"), ("X-MediaBrowser-Token", "<key>")],
+            unauthorized,
+        ),
+        (
+            vec![("X-MediaBrowser-Token", "<bad>"), ("?", "ApiKey=<good>")],
+            unauthorized,
+        ),
+        (vec![("?", "ApiKey=<bad>&api_key=<good>")], unauthorized),
+        (vec![("?", "api_key=<key>&ApiKey=<bad>")], unauthorized),
+        (vec![("?", "ApiKey=<bad>&ApiKey=<good>")], unauthorized),
+        // A valid first token is used, whatever a later source holds
+        (
+            vec![
+                ("Authorization", mb_good),
+                ("X-Emby-Token", "<bad>"),
+                ("?", "ApiKey=<bad>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer <good>"),
+                ("X-Emby-Authorization", mb_bad),
+            ],
+            ok,
+        ),
+        (
+            vec![("X-Emby-Authorization", mb_good), ("X-Emby-Token", "<bad>")],
+            ok,
+        ),
+        (vec![("X-Emby-Token", "<key>"), ("?", "ApiKey=<bad>")], ok),
+        (vec![("?", "api_key=<bad>&ApiKey=<good>")], ok),
+        // An empty, blank or missing token is no token: the next source decides
+        (
+            vec![
+                (
+                    "Authorization",
+                    r#"MediaBrowser Client="Jellyfin Web", Token="""#,
+                ),
+                ("X-Emby-Token", "<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", r#"MediaBrowser Token="  ""#),
+                ("?", "ApiKey=<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                (
+                    "Authorization",
+                    r#"MediaBrowser Client="Jellyfin Web", Device="Firefox""#,
+                ),
+                ("?", "ApiKey=<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Bearer "),
+                ("X-Emby-Authorization", mb_good),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("Authorization", "Basic ZHVtbXk6cHc="),
+                ("X-Emby-Token", "<good>"),
+            ],
+            ok,
+        ),
+        (
+            vec![
+                ("X-Emby-Authorization", r#"Emby Token="""#),
+                ("X-MediaBrowser-Token", "<key>"),
+            ],
+            ok,
+        ),
+        (
+            vec![("X-Emby-Token", ""), ("X-MediaBrowser-Token", "<good>")],
+            ok,
+        ),
+        (
+            vec![("X-MediaBrowser-Token", "  "), ("?", "ApiKey=<good>")],
+            ok,
+        ),
+        (vec![("?", "ApiKey=&api_key=<good>")], ok),
+        (vec![("?", "ApiKey=%20&api_key=<key>")], ok),
+        // Blank tokens alone
+        (
+            vec![
+                ("Authorization", r#"MediaBrowser Token="""#),
+                ("X-Emby-Authorization", r#"MediaBrowser Token=" ""#),
+                ("X-Emby-Token", " "),
+                ("X-MediaBrowser-Token", ""),
+                ("?", "ApiKey=&api_key=+"),
+            ],
+            unauthorized,
+        ),
+    ];
+    for (credentials, expected) in &cases {
+        let values: Vec<String> = credentials
+            .iter()
+            .map(|(_, value)| {
+                value
+                    .replace("<good>", &good)
+                    .replace("<key>", &key)
+                    .replace("<bad>", bad)
+            })
+            .collect();
+        let sent: Vec<(&str, &str)> = credentials
+            .iter()
+            .zip(&values)
+            .map(|((name, _), value)| (*name, value.as_str()))
+            .collect();
+        let (status, body) = j1_get(&state, "/System/Info", &sent).await;
+        assert_eq!(status, *expected, "{credentials:?}");
+        for token in [good.as_str(), key.as_str(), bad] {
+            assert!(
+                !body.contains(token),
+                "the answer to {credentials:?} holds a token"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_j1_malformed_credentials_never_authenticate() {
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let key = state.api_key.clone().unwrap();
+    for t in [good.as_str(), key.as_str()] {
+        // The well-formed header is accepted
+        let well_formed = format!(r#"MediaBrowser Token="{t}""#);
+        let credentials = [("Authorization", well_formed.as_str())];
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, StatusCode::OK);
+        let cases = [
+            // Other schemes, or no space after the scheme
+            ("Authorization", format!("Basic {t}")),
+            ("Authorization", format!("bearer {t}")),
+            ("Authorization", format!(r#"Digest Token="{t}""#)),
+            ("Authorization", format!(r#"MediaBrowserToken="{t}""#)),
+            ("Authorization", format!(r#"Token="{t}""#)),
+            // No Token key; keys are case-sensitive, like Jellyfin's
+            (
+                "Authorization",
+                j1_mb("MediaBrowser", t).replace("Token=", "Tok="),
+            ),
+            ("Authorization", format!(r#"MediaBrowser token="{t}""#)),
+            ("Authorization", format!(r#"MediaBrowser TOKEN="{t}""#)),
+            // Unbalanced quotes
+            ("Authorization", format!(r#"MediaBrowser Token="{t}"#)),
+            ("Authorization", format!(r#"MediaBrowser Token={t}""#)),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Client="a, Token="{t}""#),
+            ),
+            (
+                "X-Emby-Authorization",
+                format!(r#"MediaBrowser Token="{t}"#),
+            ),
+            // Text around the value
+            ("Authorization", format!(r#"MediaBrowser Token="{t}"x"#)),
+            ("Authorization", format!(r#"MediaBrowser Token=" {t}""#)),
+            // Bad escapes and bytes that are not ASCII
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%""#)),
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%zz""#)),
+            ("Authorization", format!(r#"MediaBrowser Token="{t}%FF""#)),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Token="{t}%C3%A9""#),
+            ),
+            (
+                "Authorization",
+                format!(r#"MediaBrowser Device="Téléphone", Token="{t}""#),
+            ),
+            ("X-Emby-Token", format!("{t}é")),
+            ("?", format!("ApiKey={t}%")),
+            ("?", format!("ApiKey=%zz{t}")),
+            ("?", format!("ApiKey={t}%FF")),
+            ("?", format!("ApiKey={t}%C3%A9")),
+            // Fragments
+            ("Authorization", "MediaBrowser".to_string()),
+            ("Authorization", "MediaBrowser ".to_string()),
+            ("Authorization", r#"MediaBrowser ,,=,"",=="""#.to_string()),
+            ("Authorization", "Emby".to_string()),
+            ("Authorization", String::new()),
+        ];
+        for (i, (name, value)) in cases.iter().enumerate() {
+            let (status, body) = j1_get(&state, "/System/Info", &[(*name, value.as_str())]).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "case {i}, {name}");
+            assert!(!body.contains(t), "the answer to case {i} holds the token");
+        }
+    }
+    // A byte that is not UTF-8
+    let raw = [
+        b"MediaBrowser Device=\"Phone\xff\", Token=\"".as_slice(),
+        good.as_bytes(),
+        b"\"",
+    ]
+    .concat();
+    let request = j1_request("/System/Info", &[]).header(
+        "Authorization",
+        axum::http::HeaderValue::from_bytes(&raw).unwrap(),
+    );
+    let (status, _) = j1_send(&state, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_j1_a_repeated_token_takes_the_last_value_like_jellyfin() {
+    // Jellyfin's `GetParts` stores each pair with `result[key] = …`, so the last Token wins
+    // (Jellyfin.Server.Implementations/Security/AuthorizationContext.cs:296, 313 at v12.4), and
+    // it reads the first value of a repeated header (`auth[0]`, line 238).
+    let state = test_state().await;
+    let (good, _) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let mb_good = format!(r#"MediaBrowser Token="{good}""#);
+    let mb_bad = format!(r#"MediaBrowser Token="{bad}""#);
+    let cases = [
+        (
+            format!(r#"MediaBrowser Token="{bad}", Token="{good}""#),
+            StatusCode::OK,
+        ),
+        (
+            format!(r#"MediaBrowser Token="{good}", Token="{bad}""#),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!(r#"MediaBrowser Token="{good}", Client="a", Token="""#),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (i, (value, expected)) in cases.iter().enumerate() {
+        let credentials = [("Authorization", value.as_str())];
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, *expected, "case {i}");
+    }
+    let repeated = [
+        ([mb_good.as_str(), mb_bad.as_str()], StatusCode::OK),
+        (
+            [mb_bad.as_str(), mb_good.as_str()],
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (i, (values, expected)) in repeated.iter().enumerate() {
+        let credentials = values.map(|value| ("Authorization", value));
+        let (status, _) = j1_get(&state, "/System/Info", &credentials).await;
+        assert_eq!(status, *expected, "repeated header, case {i}");
+    }
+}
+
+// J1 review F1: master compared `api_key` as sent, and URLs such as an *arr Webhook's carry the
+// configured key as typed. A key that holds `+` or `%XX` keeps working there, and works
+// percent-encoded too. `ApiKey` is decoded only, as in Jellyfin.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_raw_and_encoded_in_api_key() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    // (key, as typed, percent-encoded)
+    for (key, typed, encoded) in [
+        ("j1+key/A=", "j1+key/A=", "j1%2Bkey%2FA%3D"),
+        ("j1%41key", "j1%41key", "j1%2541key"),
+    ] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            format!("api_key={typed}"),
+            format!("api_key={encoded}"),
+            format!("static=true&API_KEY={typed}&DeviceId=j1-device"),
+            format!("ApiKey=&api_key={typed}"),
+            format!("ApiKey={encoded}"),
+        ];
+        for query in &accepted {
+            let (status, _) =
+                j1_get(&state, "/System/Info/Storage", &[("?", query.as_str())]).await;
+            assert_eq!(status, StatusCode::OK, "{key}: {query}");
+        }
+        let refused = [
+            // `ApiKey` is decoded only
+            vec![("?", format!("ApiKey={typed}"))],
+            // Either spelling must hold the whole key
+            vec![("?", format!("api_key={}", &typed[..typed.len() - 1]))],
+            // An invalid earlier token still decides
+            vec![
+                ("X-Emby-Token", bad.to_string()),
+                ("?", format!("api_key={typed}")),
+            ],
+            vec![("?", format!("ApiKey={bad}&api_key={typed}"))],
+        ];
+        for (i, credentials) in refused.iter().enumerate() {
+            let credentials: Vec<(&str, &str)> = credentials
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect();
+            let (status, body) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{key}: refused case {i}");
+            assert!(!body.contains(typed), "{key}: refused case {i}: {body}");
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let query = format!("api_key={encoded}");
+    assert_eq!(j1_me(&state, &[("?", query.as_str())]).await, Ok(user_id));
+}
+
+#[tokio::test]
+async fn test_j1_basic_authorization_next_to_api_key_is_not_refused() {
+    // An *arr Webhook URL with a user name and password: the app sends them as Basic, next to the
+    // URL's `api_key`. Basic gives no token, so `api_key` decides. The test guards that
+    // fall-through and doesn't reproduce a failure: Basic next to `api_key` was never refused, and
+    // before review F1's fix only the plus-sign key failed here, because `api_key` was decoded.
+    let mut state = test_state().await;
+    let headers = [
+        ("Authorization", "Basic YXJyOnNlY3JldA=="),
+        ("Content-Type", "application/json"),
+    ];
+    for key in ["test-api-key", "j1+key/A="] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let uri = format!("/Library/Media/Webhook?api_key={key}");
+        for method in ["POST", "PUT"] {
+            let body = Some(r#"{"eventType":"Test"}"#);
+            let (status, text) = b18_send(&app(state.clone()), method, &uri, &headers, body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{key}, {method}: {text}");
+        }
+    }
+}
+
+// J1 re-check R1: Sonarr's and Radarr's Emby / Jellyfin connection sends the configured key as typed
+// in `X-MediaBrowser-Token` and in `Authorization: MediaBrowser Token="…"` (`B18_ARR_AUTH`'s shape).
+// On master the raw `X-MediaBrowser-Token` decided; now the `MediaBrowser` token does, so its
+// `Token` matches the key as typed or decoded, like `api_key`. User tokens count decoded only.
+
+#[tokio::test]
+async fn test_j1_a_configured_key_with_plus_or_percent_works_as_typed_in_media_browser_headers() {
+    let mut state = test_state().await;
+    let (token, user_id) = j1_user(&state).await;
+    let bad = "0123456789abcdef0123456789abcdef";
+    let body = serde_json::json!({ "updates": [
+        { "path": "/elsewhere/Other (2001)/Other (2001).mkv", "updateType": "Modified" },
+    ]})
+    .to_string();
+    // (key, percent-encoded)
+    for (key, encoded) in [("j1+key/A=", "j1%2Bkey%2FA%3D"), ("j1%41key", "j1%2541key")] {
+        state.api_key = Some(Arc::new(key.to_string()));
+        let arr = format!("MediaBrowser Token=\"{key}\"");
+        let headers = [
+            ("X-MediaBrowser-Token", key),
+            ("Authorization", arr.as_str()),
+            ("Content-Type", "application/json"),
+        ];
+        let uri = "/Library/Media/Updated";
+        let (status, text) =
+            b18_send(&app(state.clone()), "POST", uri, &headers, Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{key}: {text}");
+
+        // `/System/Info/Storage` needs administrator claims.
+        let accepted = [
+            vec![
+                ("X-MediaBrowser-Token", key.to_string()),
+                ("Authorization", arr.clone()),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", key))],
+            vec![("X-Emby-Authorization", j1_mb("Emby", key))],
+            vec![
+                ("X-Emby-Token", key.to_string()),
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", key)),
+            ],
+            vec![("Authorization", j1_mb("MediaBrowser", encoded))],
+        ];
+        let refused = [
+            // An invalid `MediaBrowser` token still decides over a valid token header.
+            vec![
+                ("Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-MediaBrowser-Token", key.to_string()),
+            ],
+            vec![
+                ("X-Emby-Authorization", j1_mb("MediaBrowser", bad)),
+                ("X-Emby-Token", key.to_string()),
+            ],
+            // Either spelling must hold the whole key.
+            vec![(
+                "Authorization",
+                j1_mb("MediaBrowser", &key[..key.len() - 1]),
+            )],
+        ];
+        for (expected, cases) in [
+            (StatusCode::OK, &accepted[..]),
+            (StatusCode::UNAUTHORIZED, &refused[..]),
+        ] {
+            for (i, credentials) in cases.iter().enumerate() {
+                let credentials: Vec<(&str, &str)> = credentials
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str()))
+                    .collect();
+                let (status, text) = j1_get(&state, "/System/Info/Storage", &credentials).await;
+                assert_eq!(status, expected, "{key}: case {i}");
+                assert!(!text.contains(key), "{key}: case {i}: {text}");
+            }
+        }
+    }
+
+    // A user token still counts in its decoded spelling.
+    let encoded: String = token.bytes().map(|b| format!("%{b:02X}")).collect();
+    let credentials = j1_mb("MediaBrowser", &encoded);
+    assert_eq!(
+        j1_me(&state, &[("Authorization", credentials.as_str())]).await,
+        Ok(user_id)
+    );
 }
 
 // ── Error Response Format Tests ──
@@ -1801,11 +2488,8 @@ async fn test_search_hints_empty_term() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(result["SearchHints"].is_array());
-    assert_eq!(result["TotalRecordCount"], 0);
+    // Jellyfin's searchTerm is required, so a blank one is a 400 (J6).
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -2600,15 +3284,15 @@ async fn b30_p5_search_rejects_negative_and_oversized_paging() {
     let app = app(state);
 
     // Negative values were cast to huge ones: Limit=-1 read as no limit, and StartIndex=-1
-    // overflowed where it met the limit.
+    // overflowed where it met the limit. The 400 names the parameter as J6's `count_param` does.
     for (query, parameter) in [
-        ("Term=comet&Limit=-1", "limit"),
-        ("Term=comet&Limit=2147483648", "limit"),
-        ("Term=comet&Limit=9223372036854775807", "limit"),
-        ("Term=comet&StartIndex=2147483648", "startIndex"),
-        ("Term=&Limit=-1", "limit"),
-        ("Term=&StartIndex=-1", "startIndex"),
-        ("Term=comet&StartIndex=-1", "startIndex"),
+        ("Term=comet&Limit=-1", "Limit"),
+        ("Term=comet&Limit=2147483648", "Limit"),
+        ("Term=comet&Limit=9223372036854775807", "Limit"),
+        ("Term=comet&StartIndex=2147483648", "StartIndex"),
+        ("Term=&Limit=-1", "Limit"),
+        ("Term=&StartIndex=-1", "StartIndex"),
+        ("Term=comet&StartIndex=-1", "StartIndex"),
     ] {
         let uri = format!("/Search?{query}");
         let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
@@ -2726,6 +3410,1702 @@ async fn b30_p6_terms_the_index_cannot_parse_still_find_by_name() {
         let hints = format!("/Search/Hints?SearchTerm={term}");
         assert_eq!(b27_found(&app, &hints, &token).await, [found]);
     }
+}
+
+// ── J6: search parity ──
+
+/// The J6 library and the ids of its items, with an administrator's token and id.
+struct J6Library {
+    token: String,
+    admin: uuid::Uuid,
+    library: uuid::Uuid,
+    movie: uuid::Uuid,
+    series: uuid::Uuid,
+    season: uuid::Uuid,
+    episode: uuid::Uuid,
+    artist: uuid::Uuid,
+    album: uuid::Uuid,
+    track: uuid::Uuid,
+}
+
+/// The hints a search for "comet" finds in the J6 library, sorted.
+const J6_COMETS: [&str; 7] = [
+    "Comet Band (MusicAlbum)",
+    "Comet Hunters (Series)",
+    "Comet Hunters S01E01 (Episode)",
+    "Comet Hunters Season 1 (Season)",
+    "Comet Night (Movie)",
+    "Comet Song (Audio)",
+    "Comet Songs (MusicAlbum)",
+];
+
+/// Creates an empty library and returns its id.
+async fn j6_library(state: &AppState, name: &str) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![media_folder(
+            state,
+            &format!("j6-{}", uuid::Uuid::new_v4().simple()),
+        )],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Adds an item under `parent` as a scan stores it, without touching any cache, and returns its
+/// id.
+async fn j6_add_item(
+    state: &AppState,
+    library_id: uuid::Uuid,
+    parent: Option<uuid::Uuid>,
+    name: &str,
+    media_type: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let path = state
+        .data_dir
+        .join("media")
+        .join("j6")
+        .join(format!("{id}.mkv"));
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, parent_id, name, media_type, path)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(parent.map(|parent| parent.to_string()))
+    .bind(name)
+    .bind(media_type)
+    .bind(path.to_string_lossy().to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Sets an item's `tags` (pipe-joined, as scans store them), `overview`, `status` or `end_date`
+/// (RFC 3339, as scans store it).
+async fn j6_set_text(state: &AppState, id: uuid::Uuid, column: &str, value: &str) {
+    let sql = match column {
+        "tags" => "UPDATE media_items SET tags = ? WHERE id = ?",
+        "overview" => "UPDATE media_items SET overview = ? WHERE id = ?",
+        "status" => "UPDATE media_items SET status = ? WHERE id = ?",
+        "end_date" => "UPDATE media_items SET end_date = ? WHERE id = ?",
+        _ => panic!("j6_set_text cannot set {column}"),
+    };
+    sqlx::query(sql)
+        .bind(value)
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Seeds the J6 library: the movie "Comet Night"; the series "Comet Hunters" with its season
+/// "Comet Hunters Season 1" and the season's episode "Comet Hunters S01E01"; the artist
+/// "Comet Band", a MusicAlbum without a parent as scans store artists, with its album
+/// "Comet Songs" and the album's track "Comet Song"; and the folder "Comet Folder". A search for
+/// "comet" finds `J6_COMETS`: all but the folder.
+async fn j6_seed(state: &AppState) -> J6Library {
+    let library = j6_library(state, "J6 Library").await;
+    let movie = j6_add_item(state, library, None, "Comet Night", "Movie").await;
+    let series = j6_add_item(state, library, None, "Comet Hunters", "Series").await;
+    let season = j6_add_item(
+        state,
+        library,
+        Some(series),
+        "Comet Hunters Season 1",
+        "Season",
+    )
+    .await;
+    let episode = j6_add_item(
+        state,
+        library,
+        Some(season),
+        "Comet Hunters S01E01",
+        "Episode",
+    )
+    .await;
+    let artist = j6_add_item(state, library, None, "Comet Band", "MusicAlbum").await;
+    let album = j6_add_item(state, library, Some(artist), "Comet Songs", "MusicAlbum").await;
+    let track = j6_add_item(state, library, Some(album), "Comet Song", "Audio").await;
+    j6_add_item(state, library, None, "Comet Folder", "Folder").await;
+    let (token, admin) = admin_session(state).await;
+    J6Library {
+        token,
+        admin,
+        library,
+        movie,
+        series,
+        season,
+        episode,
+        artist,
+        album,
+        track,
+    }
+}
+
+/// A token for a new user who is not an administrator, and the user's id.
+async fn j6_user_session(state: &AppState) -> (String, uuid::Uuid) {
+    let name = format!("user_{}", uuid::Uuid::new_v4().simple());
+    let id = add_user(state, &name, "j6-password", false).await;
+    let user = rustyfin_db::repo_user::get_user_by_name(&state.db, &name)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = rustyfin_auth::create_token(&state.db, &user, &Default::default())
+        .await
+        .unwrap();
+    (token, id)
+}
+
+/// The hints a `/Search/Hints` request answers, as "Name (Type)" in answer order, and its
+/// `TotalRecordCount`. Panics unless the answer is 200.
+async fn j6_hints(app: &axum::Router, uri: &str, token: &str) -> (Vec<String>, i64) {
+    let body = b27_answer(app, uri, token).await;
+    let hints = body["SearchHints"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{uri}: no SearchHints in {body}"));
+    let found = hints
+        .iter()
+        .map(|hint| {
+            let name = hint["Name"].as_str().unwrap_or("?");
+            let item_type = hint["Type"].as_str().unwrap_or("?");
+            format!("{name} ({item_type})")
+        })
+        .collect();
+    (found, body["TotalRecordCount"].as_i64().unwrap_or(-1))
+}
+
+/// Owned copies of `names`.
+fn j6_names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+/// Sets an item's `index_number` or `parent_index_number`.
+async fn j6_set_int(state: &AppState, id: uuid::Uuid, column: &str, value: i64) {
+    let sql = match column {
+        "index_number" => "UPDATE media_items SET index_number = ? WHERE id = ?",
+        "parent_index_number" => "UPDATE media_items SET parent_index_number = ? WHERE id = ?",
+        _ => panic!("j6_set_int cannot set {column}"),
+    };
+    sqlx::query(sql)
+        .bind(value)
+        .bind(id.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Stores an image of `item_id` as a scan does, with its width and height when `size` is given.
+async fn j6_add_image(
+    state: &AppState,
+    item_id: uuid::Uuid,
+    image_type: rustyfin_model::image::ImageType,
+    image_index: i32,
+    size: Option<(i32, i32)>,
+) {
+    let path = state.data_dir.join("j6-images").join(format!(
+        "{item_id}-{}-{image_index}.jpg",
+        image_type.as_str()
+    ));
+    let image = rustyfin_model::image::ItemImage {
+        item_id,
+        image_type,
+        image_index,
+        path: path.to_string_lossy().to_string(),
+        provider: "local".to_string(),
+        width: size.map(|(width, _)| width),
+        height: size.map(|(_, height)| height),
+        blurhash: None,
+        stamp: None,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &image)
+        .await
+        .unwrap();
+}
+
+/// The hint for `id` in a `/Search/Hints` answer. Panics if there is none.
+fn j6_hint(body: &serde_json::Value, id: uuid::Uuid) -> &serde_json::Value {
+    body["SearchHints"]
+        .as_array()
+        .and_then(|hints| {
+            hints
+                .iter()
+                .find(|hint| hint["Id"] == serde_json::json!(id))
+        })
+        .unwrap_or_else(|| panic!("no hint for {id} in {body}"))
+}
+
+/// Asserts that `hint` has none of `fields`.
+fn j6_assert_absent(hint: &serde_json::Value, fields: &[&str]) {
+    for field in fields {
+        assert!(hint.get(field).is_none(), "{field} in {hint}");
+    }
+}
+
+/// The `BaseItemKind` names of the Kotlin SDK. A hint's Type must be one of them.
+const J6_SDK_KINDS: [&str; 37] = [
+    "AggregateFolder",
+    "Audio",
+    "AudioBook",
+    "BasePluginFolder",
+    "Book",
+    "BoxSet",
+    "Channel",
+    "ChannelFolderItem",
+    "CollectionFolder",
+    "Episode",
+    "Folder",
+    "Genre",
+    "ManualPlaylistsFolder",
+    "Movie",
+    "LiveTvChannel",
+    "LiveTvProgram",
+    "MusicAlbum",
+    "MusicArtist",
+    "MusicGenre",
+    "MusicVideo",
+    "Person",
+    "Photo",
+    "PhotoAlbum",
+    "Playlist",
+    "PlaylistsFolder",
+    "Program",
+    "Recording",
+    "Season",
+    "Series",
+    "Studio",
+    "Trailer",
+    "TvChannel",
+    "TvProgram",
+    "UserRootFolder",
+    "UserView",
+    "Video",
+    "Year",
+];
+
+/// The fields of the Kotlin SDK's `SearchHint`, by their JSON names.
+const J6_SDK_HINT_FIELDS: [&str; 29] = [
+    "ItemId",
+    "Id",
+    "Name",
+    "MatchedTerm",
+    "IndexNumber",
+    "ProductionYear",
+    "ParentIndexNumber",
+    "PrimaryImageTag",
+    "ThumbImageTag",
+    "ThumbImageItemId",
+    "BackdropImageTag",
+    "BackdropImageItemId",
+    "Type",
+    "IsFolder",
+    "RunTimeTicks",
+    "MediaType",
+    "StartDate",
+    "EndDate",
+    "Series",
+    "Status",
+    "Album",
+    "AlbumId",
+    "AlbumArtist",
+    "Artists",
+    "SongCount",
+    "EpisodeCount",
+    "ChannelId",
+    "ChannelName",
+    "PrimaryImageAspectRatio",
+];
+
+/// Asserts that the Kotlin SDK reads `hint` as a `SearchHint`. The SDK's JSON is not lenient:
+/// ItemId, Id, Name, Type and Artists are required, the ids are UUIDs (hyphenated, or 32 lowercase
+/// hex digits), Type is a `BaseItemKind`, and every other field has its type when present. On top
+/// of that, the hint has no nulls and no field the SDK would drop, MediaType is one of Jellyfin's
+/// media types, and the image item ids have Jellyfin's 32-digit form.
+fn j6_assert_sdk_hint(hint: &serde_json::Value) {
+    let fields = hint
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {hint}"));
+    let is_simple = |text: &str| {
+        text.len() == 32
+            && text
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    };
+    let is_uuid = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|text| {
+            is_simple(text) || (text.len() == 36 && uuid::Uuid::parse_str(text).is_ok())
+        })
+    };
+    let is_i32 = |value: &serde_json::Value| {
+        value
+            .as_i64()
+            .is_some_and(|number| i32::try_from(number).is_ok())
+    };
+    for (field, value) in fields {
+        assert!(
+            J6_SDK_HINT_FIELDS.contains(&field.as_str()),
+            "{field} is no SearchHint field: {hint}"
+        );
+        assert!(!value.is_null(), "{field} is null: {hint}");
+        let fits = match field.as_str() {
+            "ItemId" | "Id" | "AlbumId" | "ChannelId" => is_uuid(value),
+            "Name" | "MatchedTerm" | "PrimaryImageTag" | "ThumbImageTag" | "BackdropImageTag"
+            | "Series" | "Status" | "Album" | "AlbumArtist" | "ChannelName" => value.is_string(),
+            "ThumbImageItemId" | "BackdropImageItemId" => value.as_str().is_some_and(is_simple),
+            "Type" => value
+                .as_str()
+                .is_some_and(|kind| J6_SDK_KINDS.contains(&kind)),
+            "MediaType" => value.as_str().is_some_and(|media_type| {
+                ["Unknown", "Video", "Audio", "Photo", "Book"].contains(&media_type)
+            }),
+            "IndexNumber" | "ProductionYear" | "ParentIndexNumber" | "SongCount"
+            | "EpisodeCount" => is_i32(value),
+            "RunTimeTicks" => value.is_i64(),
+            "IsFolder" => value.is_boolean(),
+            "StartDate" | "EndDate" => value
+                .as_str()
+                .is_some_and(|date| chrono::DateTime::parse_from_rfc3339(date).is_ok()),
+            "Artists" => value
+                .as_array()
+                .is_some_and(|artists| artists.iter().all(serde_json::Value::is_string)),
+            "PrimaryImageAspectRatio" => value.is_number(),
+            _ => false,
+        };
+        assert!(fits, "{field} has the wrong type: {hint}");
+    }
+    for required in ["ItemId", "Id", "Name", "Type", "Artists"] {
+        assert!(fields.contains_key(required), "no {required}: {hint}");
+    }
+    assert_eq!(hint["ItemId"], hint["Id"], "{hint}");
+}
+
+#[tokio::test]
+async fn j6_hints_read_names_and_values_in_any_case() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    for uri in [
+        "/Search/Hints?SearchTerm=comet",
+        "/Search/Hints?searchTerm=comet",
+        "/Search/Hints?SEARCHTERM=comet",
+        "/Search/Hints?searchterm=%20comet%20",
+    ] {
+        assert_eq!(b27_found(&app, uri, &lib.token).await, J6_COMETS, "{uri}");
+    }
+    for (query, expected) in [
+        ("INCLUDEITEMTYPES=movie", vec!["Comet Night (Movie)"]),
+        (
+            "ExcludeItemTypes=MOVIE,series,SEASON,episode,musicalbum",
+            vec!["Comet Song (Audio)"],
+        ),
+        ("mediatypes=AUDIO", vec!["Comet Song (Audio)"]),
+        (
+            "IncludeItemTypes=MusicAlbum&ISSERIES=FALSE&includemedia=True",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_filter_item_types() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    let series_and_episode = vec!["Comet Hunters (Series)", "Comet Hunters S01E01 (Episode)"];
+    for (query, expected) in [
+        ("includeItemTypes=Movie", vec!["Comet Night (Movie)"]),
+        (
+            "includeItemTypes=Series,Episode",
+            series_and_episode.clone(),
+        ),
+        // A repeated key is not split: each value is one kind, and "Series,Episode" is none.
+        (
+            "includeItemTypes=Series&includeItemTypes=Episode",
+            series_and_episode,
+        ),
+        (
+            "includeItemTypes=Series,Episode&includeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        (
+            "includeItemTypes=MusicAlbum,Audio&excludeItemTypes=Audio",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+        (
+            "excludeItemTypes=MusicAlbum,Audio,Season,Episode",
+            vec!["Comet Hunters (Series)", "Comet Night (Movie)"],
+        ),
+        // A kind Rustyfin never stores finds nothing; Folder, Year and CollectionFolder never
+        // come back.
+        ("includeItemTypes=Person", vec![]),
+        ("includeItemTypes=Folder", vec![]),
+        ("includeItemTypes=Year,CollectionFolder", vec![]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // A list that parses to nothing is Jellyfin's empty list, which filters nothing.
+    for query in [
+        "includeItemTypes=Bogus",
+        "includeItemTypes=",
+        "includeItemTypes=,",
+        "includeItemTypes=1",
+        "excludeItemTypes=Bogus",
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, J6_COMETS, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_filter_media_types() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    for (query, expected) in [
+        ("mediaTypes=Audio", vec!["Comet Song (Audio)"]),
+        (
+            "mediaTypes=Video",
+            vec!["Comet Hunters S01E01 (Episode)", "Comet Night (Movie)"],
+        ),
+        (
+            "mediaTypes=Video,Audio",
+            vec![
+                "Comet Hunters S01E01 (Episode)",
+                "Comet Night (Movie)",
+                "Comet Song (Audio)",
+            ],
+        ),
+        ("mediaTypes=Photo", vec![]),
+        ("mediaTypes=Video&includeItemTypes=Series", vec![]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // "Movie" is a kind, not a media type, so these lists parse to nothing.
+    for query in ["mediaTypes=Bogus", "mediaTypes=Movie", "mediaTypes="] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, J6_COMETS, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_scope_to_a_parent() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let other = j6_library(&state, "J6 Other").await;
+    j6_add_item(&state, other, None, "Comet Elsewhere", "Movie").await;
+    let app = app(state);
+    let scoped = |parent: String| format!("/Search/Hints?searchTerm=comet&parentId={parent}");
+
+    let below_series = vec![
+        "Comet Hunters S01E01 (Episode)",
+        "Comet Hunters Season 1 (Season)",
+    ];
+    for (parent, expected) in [
+        // An item holds its descendants, not itself, whichever way its id is written.
+        (lib.series.to_string(), below_series.clone()),
+        (lib.series.simple().to_string(), below_series),
+        (
+            lib.season.to_string(),
+            vec!["Comet Hunters S01E01 (Episode)"],
+        ),
+        (
+            lib.artist.to_string(),
+            vec!["Comet Song (Audio)", "Comet Songs (MusicAlbum)"],
+        ),
+        (lib.album.to_string(), vec!["Comet Song (Audio)"]),
+        (lib.episode.to_string(), vec![]),
+        // A library holds every item in it, and only those.
+        (lib.library.to_string(), J6_COMETS.to_vec()),
+        // An id that names nothing holds nothing.
+        (uuid::Uuid::new_v4().to_string(), vec![]),
+    ] {
+        let uri = scoped(parent);
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // No parent, or the nil id, searches every library.
+    let mut everywhere = J6_COMETS.to_vec();
+    everywhere.push("Comet Elsewhere (Movie)");
+    everywhere.sort();
+    for uri in [
+        "/Search/Hints?searchTerm=comet".to_string(),
+        scoped(uuid::Uuid::nil().to_string()),
+    ] {
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, everywhere, "{uri}");
+    }
+    let uri = scoped("bogus".to_string());
+    let (status, body) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+}
+
+#[tokio::test]
+async fn j6_hints_follow_the_include_flags() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    for (name, kind) in [
+        ("Comet Genre", "Genre"),
+        ("Comet Beat", "MusicGenre"),
+        ("Comet Person", "Person"),
+        ("Comet Studio", "Studio"),
+        ("Comet Artist", "MusicArtist"),
+    ] {
+        j6_add_item(&state, lib.library, None, name, kind).await;
+    }
+    let app = app(state);
+
+    let all = b27_found(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!(all.len(), 12, "{all:?}");
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|hint| !gone.contains(&hint.as_str()))
+            .cloned()
+            .collect()
+    };
+    for (query, gone) in [
+        (
+            "includeGenres=false",
+            vec!["Comet Beat (MusicGenre)", "Comet Genre (Genre)"],
+        ),
+        ("includePeople=false", vec!["Comet Person (Person)"]),
+        ("includeStudios=false", vec!["Comet Studio (Studio)"]),
+        ("includeArtists=false", vec!["Comet Artist (MusicArtist)"]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            without(&gone),
+            "{uri}"
+        );
+    }
+    // Without media, only the first group still on: genres, then people, studios, artists.
+    for (query, expected) in [
+        (
+            "includeMedia=false",
+            vec!["Comet Beat (MusicGenre)", "Comet Genre (Genre)"],
+        ),
+        (
+            "includeMedia=false&includeGenres=false",
+            vec!["Comet Person (Person)"],
+        ),
+        (
+            "includeMedia=false&includeGenres=false&includePeople=false",
+            vec!["Comet Studio (Studio)"],
+        ),
+        (
+            "includeMedia=false&includeGenres=false&includePeople=false&includeStudios=false",
+            vec!["Comet Artist (MusicArtist)"],
+        ),
+        (
+            "includeMedia=false&includeItemTypes=Studio",
+            vec!["Comet Studio (Studio)"],
+        ),
+        (
+            "includeMedia=false&includeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // With every group off nothing is added, so the media the excludes leave come back.
+    let uri = "/Search/Hints?searchTerm=comet&includeMedia=false&includeGenres=false\
+               &includePeople=false&includeStudios=false&includeArtists=false";
+    assert_eq!(b27_found(&app, uri, &lib.token).await, J6_COMETS);
+}
+
+#[tokio::test]
+async fn j6_hints_leave_out_folders_by_default() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Comet 1999", "Year").await;
+    j6_add_item(&state, lib.library, None, "Comet Shelf", "CollectionFolder").await;
+    // A stored kind that is not a BaseItemKind reads as a Folder.
+    j6_add_item(&state, lib.library, None, "Comet Stray", "Unknown").await;
+    let app = app(state);
+
+    assert_eq!(
+        b27_found(&app, "/Search/Hints?searchTerm=comet", &lib.token).await,
+        J6_COMETS
+    );
+    for query in [
+        "includeItemTypes=Folder",
+        "includeItemTypes=Folder,Year,CollectionFolder",
+        "includeMedia=false&includeItemTypes=Folder",
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        let found = b27_found(&app, &uri, &lib.token).await;
+        assert!(found.is_empty(), "{uri}: {found:?}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_page_after_counting() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    let (full, total) = j6_hints(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!((full.len(), total), (7, 7), "{full:?}");
+    for (query, range) in [
+        ("startIndex=2&limit=3", 2..5),
+        ("startIndex=6&limit=5", 6..7),
+        ("limit=0", 0..0),
+        ("startIndex=7", 7..7),
+        ("limit=2147483647", 0..7),
+        ("startIndex=2147483647&limit=2147483647", 7..7),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        let (page, total) = j6_hints(&app, &uri, &lib.token).await;
+        assert_eq!(page, full[range].to_vec(), "{uri}");
+        assert_eq!(total, 7, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_follow_jellyfins_order() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let hunters = j6_add_item(&state, lib.library, None, "Hunters", "Movie").await;
+    let of_comets = j6_add_item(&state, lib.library, None, "Hunters of Comets", "Movie").await;
+    let night_sky = j6_add_item(&state, lib.library, None, "Night Sky", "Movie").await;
+    j6_set_text(&state, night_sky, "overview", "Two hunters watch the sky.").await;
+    let app = app(state);
+
+    // SqlSearchProvider's scores: 100 when the clean name is the term, 80 when it starts with
+    // it, 75 when it holds the term and a space, 50 otherwise (here a last word and an
+    // overview); ties by id.
+    let mut expected = [
+        (100, hunters, "Hunters (Movie)"),
+        (80, of_comets, "Hunters of Comets (Movie)"),
+        (75, lib.season, "Comet Hunters Season 1 (Season)"),
+        (75, lib.episode, "Comet Hunters S01E01 (Episode)"),
+        (50, lib.series, "Comet Hunters (Series)"),
+        (50, night_sky, "Night Sky (Movie)"),
+    ];
+    expected.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let expected: Vec<&str> = expected.iter().map(|(_, _, hint)| *hint).collect();
+    let (found, total) = j6_hints(&app, "/Search/Hints?searchTerm=hunters", &lib.token).await;
+    assert_eq!(found, expected);
+    assert_eq!(total, 6);
+    // Pages keep that order.
+    let uri = "/Search/Hints?searchTerm=hunters&startIndex=3&limit=2";
+    let (page, total) = j6_hints(&app, uri, &lib.token).await;
+    assert_eq!(page, expected[3..5].to_vec());
+    assert_eq!(total, 6);
+}
+
+#[tokio::test]
+async fn j6_hints_is_movie_and_is_series_match_no_library_programs() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    // Library items are never Live TV programs. isMovie=true filters nothing when the include
+    // list is empty or names Movie or Trailer, and otherwise asks for program movies; false
+    // asks for items that are not program movies or series, which is all of them.
+    for (query, expected) in [
+        ("isMovie=true", J6_COMETS.to_vec()),
+        ("isMovie=false", J6_COMETS.to_vec()),
+        ("isSeries=false", J6_COMETS.to_vec()),
+        (
+            "isMovie=true&includeItemTypes=Movie",
+            vec!["Comet Night (Movie)"],
+        ),
+        (
+            "isMovie=true&includeItemTypes=Trailer,Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        ("isMovie=true&includeItemTypes=Series", vec![]),
+        (
+            "isMovie=false&includeItemTypes=Series",
+            vec!["Comet Hunters (Series)"],
+        ),
+        ("isSeries=true", vec![]),
+        ("isSeries=true&includeItemTypes=Series", vec![]),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_is_kids_news_and_sports_match_tags() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let kids = j6_add_item(&state, lib.library, None, "Comet Kids", "Movie").await;
+    let sports = j6_add_item(&state, lib.library, None, "Comet Match", "Movie").await;
+    let news = j6_add_item(&state, lib.library, None, "Comet Report", "Movie").await;
+    j6_set_text(&state, kids, "tags", "Family|Kids").await;
+    j6_set_text(&state, sports, "tags", "SPORTS").await;
+    j6_set_text(&state, news, "tags", " News |Weekly").await;
+    let app = app(state);
+
+    let all = b27_found(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!(all.len(), 10, "{all:?}");
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|hint| !gone.contains(&hint.as_str()))
+            .cloned()
+            .collect()
+    };
+    // Each flag is a tag filter, matched by clean value: true needs one of the named tags,
+    // false needs none of them.
+    for (query, expected) in [
+        ("isKids=true", j6_names(&["Comet Kids (Movie)"])),
+        ("isSports=true", j6_names(&["Comet Match (Movie)"])),
+        ("isNews=true", j6_names(&["Comet Report (Movie)"])),
+        (
+            "isKids=true&isSports=true",
+            j6_names(&["Comet Kids (Movie)", "Comet Match (Movie)"]),
+        ),
+        (
+            "isKids=true&isSports=false",
+            j6_names(&["Comet Kids (Movie)"]),
+        ),
+        ("isKids=false", without(&["Comet Kids (Movie)"])),
+        (
+            "isSports=false&isNews=false",
+            without(&["Comet Match (Movie)", "Comet Report (Movie)"]),
+        ),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_answer_bad_input_with_400() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    for query in [
+        "",
+        "searchTerm=",
+        "searchTerm=%20%20",
+        "term=comet",
+        "searchTerm=comet&startIndex=-1",
+        "searchTerm=comet&StartIndex=ten",
+        "searchTerm=comet&limit=-1",
+        "searchTerm=comet&Limit=2147483648",
+        "searchTerm=comet&limit=99999999999999999999",
+        "searchTerm=comet&parentId=bogus",
+        "searchTerm=comet&userId=bogus",
+        "searchTerm=comet&isKids=yes",
+        "searchTerm=comet&includePeople=0",
+    ] {
+        let uri = format!("/Search/Hints?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_survive_odd_terms() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Amélie", "Movie").await;
+    j6_add_item(&state, lib.library, None, "東京物語", "Movie").await;
+    let app = app(state);
+
+    // A term that cleans to nothing finds nothing, as in SqlSearchProvider.
+    for term in ["%22", "*", "%22*", "(", "%25", "_", "'"] {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        let (found, total) = j6_hints(&app, &uri, &lib.token).await;
+        assert_eq!((found.len(), total), (0, 0), "{uri}: {found:?}");
+    }
+    // No other term is a 500 or a panic either.
+    for term in [
+        "A,,B",
+        "comet%22",
+        "comet*",
+        "comet%20OR",
+        "NOT",
+        "%E2%80%9Ccomet%E2%80%9D",
+        "%F0%9F%9A%80",
+    ] {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        let (status, body) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body["SearchHints"].is_array(), "{uri}: {body}");
+    }
+    // FTS folds case and diacritics, so each spelling finds "Amélie".
+    for term in ["amelie", "Am%C3%A9lie", "AM%C3%89LIE"] {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            ["Amélie (Movie)"],
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        b27_found(
+            &app,
+            "/Search/Hints?searchTerm=%E6%9D%B1%E4%BA%AC",
+            &lib.token
+        )
+        .await,
+        ["東京物語 (Movie)"]
+    );
+}
+
+#[tokio::test]
+async fn j6_hints_check_the_user() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let (user_token, user) = j6_user_session(&state).await;
+    let app = app(state);
+
+    // RequestHelpers.GetUserId: a user may name themselves, and naming anyone else needs an
+    // administrator. A nil id names nobody, and an id nobody has is not looked up. The answer
+    // is cached by the first request, so the user check must come before the cache.
+    for (token, user_id, status) in [
+        (&user_token, user.to_string(), StatusCode::OK),
+        (&user_token, user.simple().to_string(), StatusCode::OK),
+        (&user_token, uuid::Uuid::nil().to_string(), StatusCode::OK),
+        (&user_token, lib.admin.to_string(), StatusCode::FORBIDDEN),
+        (
+            &user_token,
+            uuid::Uuid::new_v4().to_string(),
+            StatusCode::FORBIDDEN,
+        ),
+        (&lib.token, user.to_string(), StatusCode::OK),
+        (&lib.token, uuid::Uuid::new_v4().to_string(), StatusCode::OK),
+        (&user_token, "bogus".to_string(), StatusCode::BAD_REQUEST),
+    ] {
+        let uri = format!("/Search/Hints?searchTerm=comet&userId={user_id}");
+        let (got, body) = send_authed(&app, "GET", &uri, token, None).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        if status == StatusCode::OK {
+            assert_eq!(body["TotalRecordCount"], 7, "{uri}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn j6_hints_share_one_entry_per_trimmed_term() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+
+    let first = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    assert_eq!(first["TotalRecordCount"], 7);
+    assert_eq!(b27_cached_answers(&state), 1);
+    // The term is trimmed before the key, names match in any case, and the user is not part
+    // of the key.
+    for uri in [
+        "/Search/Hints?searchTerm=%20comet%20".to_string(),
+        "/Search/Hints?SearchTerm=comet%09".to_string(),
+        format!("/Search/Hints?searchTerm=comet&userId={}", lib.admin),
+    ] {
+        assert_eq!(b27_answer(&app, &uri, &lib.token).await, first, "{uri}");
+    }
+    assert_eq!(b27_cached_answers(&state), 1);
+}
+
+#[tokio::test]
+async fn j6_hints_answers_differ_by_each_parameter_also_from_l2() {
+    let state = b27_restarted(&test_state().await).await;
+    let lib = j6_seed(&state).await;
+    for (name, kind) in [
+        ("Comet Genre", "Genre"),
+        ("Comet Person", "Person"),
+        ("Comet Studio", "Studio"),
+        ("Comet Artist", "MusicArtist"),
+    ] {
+        j6_add_item(&state, lib.library, None, name, kind).await;
+    }
+    let kids = j6_add_item(&state, lib.library, None, "Comet Kids", "Movie").await;
+    j6_set_text(&state, kids, "tags", "Kids").await;
+
+    let base = "/Search/Hints?searchTerm=comet";
+    let app_before = app(state.clone());
+    let (ordered, total) = j6_hints(&app_before, base, &lib.token).await;
+    assert_eq!(total, 12, "{ordered:?}");
+    let sorted = |mut hints: Vec<String>| {
+        hints.sort();
+        hints
+    };
+    let all = sorted(ordered.clone());
+    let without = |gone: &[&str]| -> Vec<String> {
+        all.iter()
+            .filter(|hint| !gone.contains(&hint.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    // Each request differs from the first, or from the one above it, in one parameter.
+    let requests = [
+        (base.to_string(), all.clone()),
+        (
+            "/Search/Hints?searchTerm=hunters".to_string(),
+            j6_names(&[
+                "Comet Hunters (Series)",
+                "Comet Hunters S01E01 (Episode)",
+                "Comet Hunters Season 1 (Season)",
+            ]),
+        ),
+        (
+            format!("{base}&includeItemTypes=Movie"),
+            j6_names(&["Comet Kids (Movie)", "Comet Night (Movie)"]),
+        ),
+        (
+            format!("{base}&excludeItemTypes=Movie"),
+            without(&["Comet Kids (Movie)", "Comet Night (Movie)"]),
+        ),
+        (
+            format!("{base}&mediaTypes=Audio"),
+            j6_names(&["Comet Song (Audio)"]),
+        ),
+        (
+            format!("{base}&parentId={}", lib.season),
+            j6_names(&["Comet Hunters S01E01 (Episode)"]),
+        ),
+        (
+            format!("{base}&startIndex=1"),
+            sorted(ordered[1..].to_vec()),
+        ),
+        (format!("{base}&limit=1"), ordered[..1].to_vec()),
+        (
+            format!("{base}&isKids=true"),
+            j6_names(&["Comet Kids (Movie)"]),
+        ),
+        (
+            format!("{base}&isKids=false"),
+            without(&["Comet Kids (Movie)"]),
+        ),
+        (format!("{base}&isNews=true"), vec![]),
+        (format!("{base}&isSports=true"), vec![]),
+        (format!("{base}&isSeries=true"), vec![]),
+        (
+            format!("{base}&includeItemTypes=Series"),
+            j6_names(&["Comet Hunters (Series)"]),
+        ),
+        (
+            format!("{base}&includeItemTypes=Series&isMovie=true"),
+            vec![],
+        ),
+        (
+            format!("{base}&includeMedia=false"),
+            j6_names(&["Comet Genre (Genre)"]),
+        ),
+        (
+            format!("{base}&includeGenres=false"),
+            without(&["Comet Genre (Genre)"]),
+        ),
+        (
+            format!("{base}&includePeople=false"),
+            without(&["Comet Person (Person)"]),
+        ),
+        (
+            format!("{base}&includeStudios=false"),
+            without(&["Comet Studio (Studio)"]),
+        ),
+        (
+            format!("{base}&includeArtists=false"),
+            without(&["Comet Artist (MusicArtist)"]),
+        ),
+    ];
+    for (uri, expected) in &requests {
+        assert_eq!(
+            &b27_found(&app_before, uri, &lib.token).await,
+            expected,
+            "{uri}"
+        );
+    }
+    // One answer each: no two requests shared a key.
+    let answers = requests.len();
+    assert_eq!(b27_cached_answers(&state), answers as u64);
+
+    // After a restart the L2 copy answers each request with its own items.
+    b27_wait_for_l2_rows(&state, answers as i64).await;
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), answers as u64);
+    let app_after = app(state.clone());
+    for (uri, expected) in &requests {
+        assert_eq!(
+            &b27_found(&app_after, uri, &lib.token).await,
+            expected,
+            "{uri}"
+        );
+    }
+    assert_eq!(b27_cached_answers(&state), answers as u64);
+}
+
+#[tokio::test]
+async fn j6_hints_carry_item_id_and_jellyfin_media_types() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    sqlx::query("UPDATE media_items SET production_year = ?, runtime_ticks = ? WHERE id = ?")
+        .bind(2024)
+        .bind(72_000_000_000i64)
+        .bind(lib.movie.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    let hints = body["SearchHints"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no SearchHints in {body}"));
+    assert_eq!(hints.len(), 7, "{body}");
+    for hint in hints {
+        // ItemId repeats Id, Artists is always a list, and MediaType is Jellyfin's media type
+        // of the kind, never the kind itself.
+        assert_eq!(hint["ItemId"], hint["Id"], "{hint}");
+        assert!(hint["Artists"].is_array(), "{hint}");
+        let media_type = match hint["Type"].as_str() {
+            Some("Movie" | "Episode") => "Video",
+            Some("Audio") => "Audio",
+            _ => "Unknown",
+        };
+        assert_eq!(hint["MediaType"], media_type, "{hint}");
+    }
+    let hint = |id: uuid::Uuid| {
+        hints
+            .iter()
+            .find(|hint| hint["Id"] == serde_json::json!(id))
+            .unwrap_or_else(|| panic!("no hint for {id} in {body}"))
+    };
+    let movie = hint(lib.movie);
+    assert_eq!(movie["Type"], "Movie");
+    assert_eq!(movie["MediaType"], "Video");
+    assert_eq!(movie["ProductionYear"], 2024);
+    assert_eq!(movie["RunTimeTicks"], 72_000_000_000i64);
+    let track = hint(lib.track);
+    assert_eq!(track["Type"], "Audio");
+    assert_eq!(track["MediaType"], "Audio");
+}
+
+#[tokio::test]
+async fn j6_hint_fields_for_series() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_set_int(&state, lib.season, "index_number", 1).await;
+    j6_set_int(&state, lib.episode, "index_number", 3).await;
+    j6_set_int(&state, lib.episode, "parent_index_number", 1).await;
+    for id in [lib.series, lib.season, lib.episode] {
+        j6_set_text(&state, id, "status", "Ended").await;
+    }
+    j6_set_text(&state, lib.series, "end_date", "2024-05-01T00:00:00+00:00").await;
+    // An end date that does not parse is left out, not an error.
+    j6_set_text(&state, lib.season, "end_date", "someday").await;
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // Jellyfin fills Status for series only, and EndDate for any item that has one.
+    let series = j6_hint(&body, lib.series);
+    assert_eq!(series["IsFolder"], true, "{series}");
+    assert_eq!(series["Status"], "Ended", "{series}");
+    let end_date = series["EndDate"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no EndDate in {series}"));
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(end_date).unwrap(),
+        chrono::DateTime::parse_from_rfc3339("2024-05-01T00:00:00Z").unwrap(),
+        "{series}"
+    );
+    j6_assert_absent(series, &["Series", "IndexNumber", "ParentIndexNumber"]);
+    // Seasons and episodes name their series.
+    let season = j6_hint(&body, lib.season);
+    assert_eq!(season["IsFolder"], true, "{season}");
+    assert_eq!(season["IndexNumber"], 1, "{season}");
+    assert_eq!(season["Series"], "Comet Hunters", "{season}");
+    j6_assert_absent(season, &["Status", "EndDate", "ParentIndexNumber"]);
+    let episode = j6_hint(&body, lib.episode);
+    assert_eq!(episode["IndexNumber"], 3, "{episode}");
+    assert_eq!(episode["ParentIndexNumber"], 1, "{episode}");
+    assert_eq!(episode["Series"], "Comet Hunters", "{episode}");
+    j6_assert_absent(episode, &["IsFolder", "Status", "EndDate"]);
+    // A movie has none of them, and no artists.
+    let movie = j6_hint(&body, lib.movie);
+    j6_assert_absent(
+        movie,
+        &[
+            "IsFolder",
+            "IndexNumber",
+            "ParentIndexNumber",
+            "Series",
+            "Status",
+            "EndDate",
+            "Album",
+            "AlbumId",
+            "AlbumArtist",
+        ],
+    );
+    assert_eq!(movie["Artists"], serde_json::json!([]), "{movie}");
+}
+
+#[tokio::test]
+async fn j6_hint_fields_for_music() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    // An album without an artist: scans store it without a parent, like an artist.
+    let loose_album = j6_add_item(&state, lib.library, None, "Comet Loose", "MusicAlbum").await;
+    let loose_track = j6_add_item(
+        &state,
+        lib.library,
+        Some(loose_album),
+        "Comet Loose Track",
+        "Audio",
+    )
+    .await;
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // A track names its album and the album's artist.
+    let track = j6_hint(&body, lib.track);
+    assert_eq!(track["Album"], "Comet Songs", "{track}");
+    assert_eq!(track["AlbumId"], serde_json::json!(lib.album), "{track}");
+    assert_eq!(track["AlbumArtist"], "Comet Band", "{track}");
+    assert_eq!(
+        track["Artists"],
+        serde_json::json!(["Comet Band"]),
+        "{track}"
+    );
+    j6_assert_absent(track, &["IsFolder", "Series"]);
+    // An album names its artist.
+    let album = j6_hint(&body, lib.album);
+    assert_eq!(album["IsFolder"], true, "{album}");
+    assert_eq!(album["AlbumArtist"], "Comet Band", "{album}");
+    assert_eq!(
+        album["Artists"],
+        serde_json::json!(["Comet Band"]),
+        "{album}"
+    );
+    j6_assert_absent(album, &["Album", "AlbumId"]);
+    // An artist names nobody.
+    let artist = j6_hint(&body, lib.artist);
+    assert_eq!(artist["IsFolder"], true, "{artist}");
+    assert_eq!(artist["Artists"], serde_json::json!([]), "{artist}");
+    j6_assert_absent(artist, &["Album", "AlbumId", "AlbumArtist"]);
+    // A track of an album without an artist names the album only.
+    let loose = j6_hint(&body, loose_track);
+    assert_eq!(loose["Album"], "Comet Loose", "{loose}");
+    assert_eq!(loose["AlbumId"], serde_json::json!(loose_album), "{loose}");
+    assert_eq!(loose["Artists"], serde_json::json!([]), "{loose}");
+    j6_assert_absent(loose, &["AlbumArtist"]);
+}
+
+#[tokio::test]
+async fn j6_hint_images_follow_jellyfin() {
+    use rustyfin_model::image::ImageType::{Backdrop, Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let watch = j6_add_item(&state, lib.library, None, "Comet Watch", "Series").await;
+    let watch_season = j6_add_item(
+        &state,
+        lib.library,
+        Some(watch),
+        "Comet Watch Season 1",
+        "Season",
+    )
+    .await;
+    let watch_episode = j6_add_item(
+        &state,
+        lib.library,
+        Some(watch_season),
+        "Comet Watch S01E01",
+        "Episode",
+    )
+    .await;
+    j6_add_image(&state, lib.movie, Primary, 0, Some((1000, 1500))).await;
+    j6_add_image(&state, lib.movie, Thumb, 0, None).await;
+    j6_add_image(&state, lib.movie, Backdrop, 2, None).await;
+    j6_add_image(&state, lib.movie, Backdrop, 1, None).await;
+    j6_add_image(&state, lib.series, Thumb, 0, None).await;
+    j6_add_image(&state, lib.series, Backdrop, 0, None).await;
+    j6_add_image(&state, lib.season, Thumb, 0, None).await;
+    j6_add_image(&state, lib.episode, Primary, 0, None).await;
+    j6_add_image(&state, watch_season, Primary, 0, Some((0, 100))).await;
+    j6_add_image(&state, watch_season, Thumb, 0, None).await;
+    j6_add_image(&state, watch_season, Backdrop, 0, None).await;
+    j6_add_image(&state, lib.album, Primary, 0, None).await;
+    let app = app(state);
+
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // An item's own images, the lowest index of each type; the aspect ratio of the primary image
+    // when its size is known.
+    let movie = j6_hint(&body, lib.movie);
+    assert_eq!(movie["PrimaryImageTag"], "Primary_0", "{movie}");
+    let ratio = movie["PrimaryImageAspectRatio"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no PrimaryImageAspectRatio in {movie}"));
+    assert!((ratio - 1000.0 / 1500.0).abs() < 1e-9, "{movie}");
+    assert_eq!(movie["ThumbImageTag"], "Thumb_0", "{movie}");
+    assert_eq!(movie["ThumbImageItemId"], lib.movie.simple().to_string());
+    assert_eq!(movie["BackdropImageTag"], "Backdrop_1", "{movie}");
+    assert_eq!(movie["BackdropImageItemId"], lib.movie.simple().to_string());
+    // An episode without a thumb takes its series' thumb before its season's, and the backdrop of
+    // the nearest parent that has one.
+    let episode = j6_hint(&body, lib.episode);
+    assert_eq!(episode["PrimaryImageTag"], "Primary_0", "{episode}");
+    j6_assert_absent(episode, &["PrimaryImageAspectRatio"]);
+    assert_eq!(episode["ThumbImageTag"], "Thumb_0", "{episode}");
+    assert_eq!(episode["ThumbImageItemId"], lib.series.simple().to_string());
+    assert_eq!(episode["BackdropImageTag"], "Backdrop_0", "{episode}");
+    assert_eq!(
+        episode["BackdropImageItemId"],
+        lib.series.simple().to_string()
+    );
+    let season = j6_hint(&body, lib.season);
+    assert_eq!(season["ThumbImageItemId"], lib.season.simple().to_string());
+    assert_eq!(
+        season["BackdropImageItemId"],
+        lib.series.simple().to_string()
+    );
+    j6_assert_absent(season, &["PrimaryImageTag", "PrimaryImageAspectRatio"]);
+    let series = j6_hint(&body, lib.series);
+    assert_eq!(series["ThumbImageItemId"], lib.series.simple().to_string());
+    assert_eq!(
+        series["BackdropImageItemId"],
+        lib.series.simple().to_string()
+    );
+    j6_assert_absent(series, &["PrimaryImageTag", "PrimaryImageAspectRatio"]);
+    // A size of zero gives a tag but no aspect ratio. Without a series thumb, an episode takes
+    // the thumb of its nearest parent that has one.
+    let watch_season_hint = j6_hint(&body, watch_season);
+    assert_eq!(watch_season_hint["PrimaryImageTag"], "Primary_0");
+    j6_assert_absent(watch_season_hint, &["PrimaryImageAspectRatio"]);
+    let watch_episode_hint = j6_hint(&body, watch_episode);
+    assert_eq!(
+        watch_episode_hint["ThumbImageItemId"],
+        watch_season.simple().to_string()
+    );
+    assert_eq!(
+        watch_episode_hint["BackdropImageItemId"],
+        watch_season.simple().to_string()
+    );
+    j6_assert_absent(watch_episode_hint, &["PrimaryImageTag"]);
+    j6_assert_absent(
+        j6_hint(&body, watch),
+        &["PrimaryImageTag", "ThumbImageTag", "BackdropImageTag"],
+    );
+    // A track does not take its album's primary image.
+    let album = j6_hint(&body, lib.album);
+    assert_eq!(album["PrimaryImageTag"], "Primary_0", "{album}");
+    j6_assert_absent(
+        j6_hint(&body, lib.track),
+        &[
+            "PrimaryImageTag",
+            "ThumbImageTag",
+            "ThumbImageItemId",
+            "BackdropImageTag",
+            "BackdropImageItemId",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn j6_hint_fields_parse_as_the_kotlin_sdk_reads_them() {
+    use rustyfin_model::image::ImageType::{Backdrop, Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    sqlx::query("UPDATE media_items SET production_year = ?, runtime_ticks = ? WHERE id = ?")
+        .bind(2024)
+        .bind(72_000_000_000i64)
+        .bind(lib.movie.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    j6_set_int(&state, lib.season, "index_number", 1).await;
+    j6_set_int(&state, lib.episode, "index_number", 3).await;
+    j6_set_int(&state, lib.episode, "parent_index_number", 1).await;
+    j6_set_text(&state, lib.series, "status", "Continuing").await;
+    j6_set_text(&state, lib.series, "end_date", "2024-05-01T00:00:00+00:00").await;
+    j6_add_image(&state, lib.movie, Primary, 0, Some((1000, 1500))).await;
+    j6_add_image(&state, lib.series, Thumb, 0, None).await;
+    j6_add_image(&state, lib.series, Backdrop, 0, None).await;
+    // Two items whose parents point at each other, as a broken scan could leave them.
+    let loop_season = j6_add_item(&state, lib.library, None, "Comet Loop", "Season").await;
+    let loop_episode = j6_add_item(
+        &state,
+        lib.library,
+        Some(loop_season),
+        "Comet Loop Episode",
+        "Episode",
+    )
+    .await;
+    sqlx::query("UPDATE media_items SET parent_id = ? WHERE id = ?")
+        .bind(loop_episode.to_string())
+        .bind(loop_season.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state);
+
+    // The search the web client sends, and the one the Kotlin SDK's getSearchHints sends.
+    let mut seen = std::collections::BTreeSet::new();
+    for uri in [
+        "/Search/Hints?searchTerm=comet",
+        "/Search/Hints?searchTerm=comet&includePeople=true&includeMedia=true\
+         &includeGenres=true&includeStudios=true&includeArtists=true",
+    ] {
+        let body = b27_answer(&app, uri, &lib.token).await;
+        let hints = body["SearchHints"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: no SearchHints in {body}"));
+        assert_eq!(hints.len(), 9, "{uri}: {body}");
+        let total = body["TotalRecordCount"].as_i64();
+        assert!(
+            total.is_some_and(|total| i32::try_from(total).is_ok()),
+            "{body}"
+        );
+        for hint in hints {
+            j6_assert_sdk_hint(hint);
+            seen.extend(hint.as_object().unwrap().keys().cloned());
+        }
+    }
+    // Every field Rustyfin has data for appeared, so its type was checked.
+    for field in [
+        "ItemId",
+        "Id",
+        "Name",
+        "IndexNumber",
+        "ProductionYear",
+        "ParentIndexNumber",
+        "PrimaryImageTag",
+        "ThumbImageTag",
+        "ThumbImageItemId",
+        "BackdropImageTag",
+        "BackdropImageItemId",
+        "Type",
+        "IsFolder",
+        "RunTimeTicks",
+        "MediaType",
+        "EndDate",
+        "Series",
+        "Status",
+        "Album",
+        "AlbumId",
+        "AlbumArtist",
+        "Artists",
+        "PrimaryImageAspectRatio",
+    ] {
+        assert!(seen.contains(field), "no hint had {field}");
+    }
+}
+
+/// What `/Search?Term=comet` finds in the J6 library without a list of item types: its movies,
+/// series, episodes and audio, sorted.
+const J6_SEARCH_COMETS: [&str; 4] = [
+    "Comet Hunters (Series)",
+    "Comet Hunters S01E01 (Episode)",
+    "Comet Night (Movie)",
+    "Comet Song (Audio)",
+];
+
+#[tokio::test]
+async fn j6_search_reads_names_and_values_in_any_case() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    // Term, else SearchTerm, each in any case and trimmed.
+    for query in [
+        "Term=comet",
+        "term=comet",
+        "TERM=comet",
+        "SearchTerm=comet",
+        "searchTerm=comet",
+        "SEARCHTERM=comet",
+        "searchterm=%20comet%20",
+        "Term=&searchTerm=comet",
+    ] {
+        let uri = format!("/Search?{query}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            J6_SEARCH_COMETS,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        b27_found(&app, "/Search?term=night&SearchTerm=hunters", &lib.token).await,
+        ["Comet Night (Movie)"]
+    );
+    for (query, expected) in [
+        ("includeitemtypes=MOVIE", vec!["Comet Night (Movie)"]),
+        (
+            "INCLUDEITEMTYPES=musicalbum",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+    ] {
+        let uri = format!("/Search?term=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    for query in ["limit=1", "LIMIT=1", "startindex=3", "STARTINDEX=3&Limit=5"] {
+        let uri = format!("/Search?Term=comet&{query}");
+        let body = b27_answer(&app, &uri, &lib.token).await;
+        assert_eq!(
+            body["Items"].as_array().map(Vec::len),
+            Some(1),
+            "{uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn j6_search_parses_every_stored_kind() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Comet Photo", "Photo").await;
+    j6_add_item(&state, lib.library, None, "Comet Genre", "Genre").await;
+    j6_add_item(&state, lib.library, None, "Comet Unknown", "Unknown").await;
+    let app = app(state);
+
+    for (types, expected) in [
+        ("movie", vec!["Comet Night (Movie)"]),
+        ("SERIES", vec!["Comet Hunters (Series)"]),
+        ("season", vec!["Comet Hunters Season 1 (Season)"]),
+        ("Episode", vec!["Comet Hunters S01E01 (Episode)"]),
+        ("AUDIO", vec!["Comet Song (Audio)"]),
+        (
+            "MusicAlbum",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+        ("photo", vec!["Comet Photo (Photo)"]),
+        ("Genre", vec!["Comet Genre (Genre)"]),
+        ("BoxSet", vec![]),
+        ("Folder,Movie", vec!["Comet Night (Movie)"]),
+        (
+            "Season,%20Episode",
+            vec![
+                "Comet Hunters S01E01 (Episode)",
+                "Comet Hunters Season 1 (Season)",
+            ],
+        ),
+    ] {
+        let uri = format!("/Search?Term=comet&IncludeItemTypes={types}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // A list that parses to nothing answers like a missing list, which never finds a folder, a
+    // year, a collection folder or an item of unknown kind.
+    for types in [
+        "Bogus",
+        "",
+        "%20,%20",
+        "Unknown",
+        "1",
+        "Folder",
+        "Year,CollectionFolder",
+    ] {
+        let uri = format!("/Search?Term=comet&IncludeItemTypes={types}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            J6_SEARCH_COMETS,
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn j6_search_answers_bad_counts_with_400() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // The counts are checked before a blank term gets its empty answer.
+    for query in [
+        "Term=comet&StartIndex=-1",
+        "Term=comet&startIndex=ten",
+        "Term=comet&Limit=-1",
+        "Term=comet&limit=2147483648",
+        "Term=comet&LIMIT=99999999999999999999",
+        "Term=&Limit=-1",
+        "StartIndex=-5",
+    ] {
+        let uri = format!("/Search?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn j6_search_survives_odd_terms_and_huge_counts() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Amélie", "Movie").await;
+    let app = app(state);
+
+    for query in [
+        "Term=A,,B",
+        "Term=%22",
+        "Term=*",
+        "Term=comet%22",
+        "Term=comet*",
+        "Term=%E2%80%9Ccomet%E2%80%9D",
+        "Term=%F0%9F%9A%80",
+        "Term=%E6%9D%B1%E4%BA%AC",
+        "Term=comet&Limit=0",
+    ] {
+        let uri = format!("/Search?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body["Items"].is_array(), "{uri}: {body}");
+    }
+    // FTS folds case and diacritics, so the term is searched as sent.
+    for term in ["amelie", "AM%C3%89LIE"] {
+        let uri = format!("/Search?term={term}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            ["Amélie (Movie)"],
+            "{uri}"
+        );
+    }
+    // The largest counts: every match, and a page past the end.
+    assert_eq!(
+        b27_found(&app, "/Search?term=comet&limit=2147483647", &lib.token).await,
+        J6_SEARCH_COMETS
+    );
+    let body = b27_answer(
+        &app,
+        "/Search?term=comet&startIndex=2147483647&limit=2147483647",
+        &lib.token,
+    )
+    .await;
+    assert_eq!(body["Items"], serde_json::json!([]), "{body}");
+}
+
+#[tokio::test]
+async fn j6_search_shares_one_entry_per_trimmed_term() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+
+    let first = b27_answer(&app, "/Search?Term=comet", &lib.token).await;
+    assert_eq!(first["TotalRecordCount"], 4, "{first}");
+    assert_eq!(b27_cached_answers(&state), 1);
+    // The term is trimmed before the key, names match in any case, a list that parses to nothing
+    // is the missing list, a list is a set, and the default counts are the defaults.
+    for query in [
+        "Term=%20comet%20",
+        "term=comet%09",
+        "SearchTerm=comet",
+        "Term=comet&IncludeItemTypes=Bogus",
+        "Term=comet&IncludeItemTypes=series,Audio,MOVIE,episode,Movie",
+        "Term=comet&StartIndex=0&Limit=100",
+    ] {
+        let uri = format!("/Search?{query}");
+        assert_eq!(b27_answer(&app, &uri, &lib.token).await, first, "{uri}");
+    }
+    assert_eq!(b27_cached_answers(&state), 1);
+}
+
+#[tokio::test]
+async fn j6_search_answers_differ_by_kinds_also_from_l2() {
+    let state = b27_restarted(&test_state().await).await;
+    let lib = j6_seed(&state).await;
+    let base = "/Search?Term=comet";
+    let app_before = app(state.clone());
+
+    // Each request differs from the first in one parameter.
+    let requests = [
+        (base.to_string(), Some(j6_names(&J6_SEARCH_COMETS))),
+        (
+            "/Search?Term=hunters".to_string(),
+            Some(j6_names(&[
+                "Comet Hunters (Series)",
+                "Comet Hunters S01E01 (Episode)",
+            ])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=Movie"),
+            Some(j6_names(&["Comet Night (Movie)"])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=Season"),
+            Some(j6_names(&["Comet Hunters Season 1 (Season)"])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=MusicAlbum"),
+            Some(j6_names(&[
+                "Comet Band (MusicAlbum)",
+                "Comet Songs (MusicAlbum)",
+            ])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=Movie,Season"),
+            Some(j6_names(&[
+                "Comet Hunters Season 1 (Season)",
+                "Comet Night (Movie)",
+            ])),
+        ),
+        // The order of a page is not defined, so these check only its length.
+        (format!("{base}&StartIndex=1"), None),
+        (format!("{base}&Limit=1"), None),
+    ];
+    let mut answers = Vec::new();
+    for (uri, expected) in &requests {
+        let answer = b27_answer(&app_before, uri, &lib.token).await;
+        match expected {
+            Some(expected) => {
+                assert_eq!(
+                    &b27_found(&app_before, uri, &lib.token).await,
+                    expected,
+                    "{uri}"
+                )
+            }
+            None => {
+                let length = if uri.ends_with("Limit=1") { 1 } else { 3 };
+                assert_eq!(
+                    answer["Items"].as_array().map(Vec::len),
+                    Some(length),
+                    "{uri}: {answer}"
+                );
+            }
+        }
+        answers.push(answer);
+    }
+    // One answer each: no two requests shared a key.
+    let count = requests.len();
+    assert_eq!(b27_cached_answers(&state), count as u64);
+
+    // Rows that master saved under its key format, with answers that found nothing.
+    b27_wait_for_l2_rows(&state, count as i64).await;
+    for key in [
+        "search:search2:Movie:0:100:comet",
+        "search:search2:Audio,Episode,Movie,Series:0:100:comet",
+    ] {
+        sqlx::query(
+            "INSERT OR REPLACE INTO api_cache (cache_key, cache_value, expires_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(key)
+        .bind(r#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#)
+        .bind("2999-01-01T00:00:00+00:00")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    // After a restart the L2 copy gives each request its own answer, and never master's rows.
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), count as u64 + 2);
+    let app_after = app(state.clone());
+    for ((uri, _), answer) in requests.iter().zip(&answers) {
+        assert_eq!(
+            &b27_answer(&app_after, uri, &lib.token).await,
+            answer,
+            "{uri}"
+        );
+    }
+    assert_eq!(b27_cached_answers(&state), count as u64 + 2);
 }
 
 // ── System Endpoint Tests ──
@@ -3101,6 +5481,4517 @@ async fn test_quick_connect_generate() {
 
     // May return 404 if the endpoint is not yet fully implemented
     assert!(resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND);
+}
+
+// ── B21: OIDC ──
+//
+// Sign-in through one OpenID Connect provider, Quick Connect's token step and the password
+// switch (B21 spec AC1-AC31). A fake provider on 127.0.0.1 signs ID tokens with fixed P-256
+// keys; Rustyfin is driven over HTTP and checked with plain SQL, so these tests compile before
+// the feature exists. Each is ignored until the task that makes it pass.
+
+const B21_CLIENT_ID: &str = "rustyfin-b21";
+/// A test-only value: it never leaves this process.
+const B21_CLIENT_SECRET: &str = "b21-test-client-secret";
+const B21_PUBLIC_URL: &str = "http://rf.test:8121";
+const B21_CALLBACK: &str = "http://rf.test:8121/Auth/Oidc/Callback";
+/// The browser's device header at `Complete`.
+const B21_DEVICE: &str =
+    r#"MediaBrowser Client="B21", Device="web", DeviceId="b21-web", Version="1.0""#;
+
+/// How a token request authenticated the client, as the fake provider saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum B21Auth {
+    /// `client_secret_basic`: an `Authorization: Basic` header.
+    Basic,
+    /// `client_secret_post`: the id and the secret in the form.
+    Post,
+    /// A public client: only the id in the form.
+    None,
+    /// Anything else, a wrong secret for example.
+    Bad,
+}
+
+/// How the fake provider signs an ID token.
+#[derive(Clone, Copy, Debug)]
+enum B21Sign {
+    /// With published key n, naming its `kid`.
+    Key(usize),
+    /// Naming published key n's `kid`, signed with a key the provider never published.
+    Forged(usize),
+    /// With published key n, naming another `kid`.
+    Kid(usize, &'static str),
+    /// HS256 with the client secret as the key.
+    Hs256,
+    /// `alg: none` and no signature.
+    Unsigned,
+}
+
+/// An approval at the provider, redeemed once by its code.
+struct B21Grant {
+    redirect_uri: String,
+    challenge: String,
+    claims: serde_json::Value,
+    sign: B21Sign,
+}
+
+/// What the fake provider serves and what it saw.
+struct B21OpState {
+    discovery: serde_json::Map<String, serde_json::Value>,
+    /// Served as the discovery document instead, when set.
+    discovery_text: Option<String>,
+    /// The published keys: `kid` and the private key.
+    keys: Vec<(String, p256::ecdsa::SigningKey)>,
+    /// Served as the JWKS instead, when set.
+    jwks_text: Option<String>,
+    grants: HashMap<String, B21Grant>,
+    /// Access tokens and the claims of their grants, for userinfo.
+    access: HashMap<String, serde_json::Value>,
+    /// The client authentication the token endpoint accepts.
+    expect_auth: B21Auth,
+    token_requests: Vec<(B21Auth, HashMap<String, String>)>,
+    last_id_token: Option<String>,
+    /// Served by userinfo instead of the grant's claims, when set.
+    userinfo: Option<serde_json::Value>,
+    discovery_fetches: usize,
+    jwks_fetches: usize,
+    userinfo_calls: usize,
+    /// When set, the next userinfo request reports through the sender that it arrived, then waits
+    /// until the receiver fires.
+    userinfo_hold: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    /// Every endpoint answers 503.
+    down: bool,
+}
+
+/// A fixed P-256 key.
+fn b21_key(seed: u8) -> p256::ecdsa::SigningKey {
+    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap()
+}
+
+/// A healthy provider at `base`: ES256, PKCE with S256, one key.
+fn b21_op_state(base: &str) -> B21OpState {
+    let serde_json::Value::Object(discovery) = serde_json::json!({
+        "issuer": base,
+        "authorization_endpoint": format!("{base}/authorize"),
+        "token_endpoint": format!("{base}/token"),
+        "userinfo_endpoint": format!("{base}/userinfo"),
+        "jwks_uri": format!("{base}/jwks"),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["ES256"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "scopes_supported": ["openid", "profile", "email", "groups"],
+        "grant_types_supported": ["authorization_code"],
+    }) else {
+        unreachable!()
+    };
+    B21OpState {
+        discovery,
+        discovery_text: None,
+        keys: vec![("b21-key-a".to_string(), b21_key(0x11))],
+        jwks_text: None,
+        grants: HashMap::new(),
+        access: HashMap::new(),
+        expect_auth: B21Auth::Basic,
+        token_requests: Vec::new(),
+        last_id_token: None,
+        userinfo: None,
+        discovery_fetches: 0,
+        jwks_fetches: 0,
+        userinfo_calls: 0,
+        userinfo_hold: None,
+        down: false,
+    }
+}
+
+/// A fake OpenID provider on 127.0.0.1. The browser's visit to its authorization endpoint is
+/// `approve`; discovery, JWKS, token and userinfo are served over HTTP.
+#[derive(Clone)]
+struct B21Op {
+    base: String,
+    st: Arc<std::sync::Mutex<B21OpState>>,
+}
+
+impl B21Op {
+    fn with<R>(&self, f: impl FnOnce(&mut B21OpState) -> R) -> R {
+        f(&mut self.st.lock().unwrap())
+    }
+
+    /// The user approves `flow` with `claims` on top of `iss`, `aud`, `iat`, `exp` and the flow's
+    /// `nonce`; a null claim is left out. Returns the code for the callback.
+    fn approve(&self, flow: &B21Flow, claims: serde_json::Value, sign: B21Sign) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let mut all = serde_json::json!({
+            "iss": self.base,
+            "aud": B21_CLIENT_ID,
+            "iat": now,
+            "exp": now + 300,
+            "nonce": flow.param("nonce"),
+        });
+        let map = all.as_object_mut().unwrap();
+        for (name, value) in claims.as_object().expect("claims are an object") {
+            if value.is_null() {
+                map.remove(name);
+            } else {
+                map.insert(name.clone(), value.clone());
+            }
+        }
+        let code = format!("b21-code-{}", uuid::Uuid::new_v4().simple());
+        let grant = B21Grant {
+            redirect_uri: flow.param("redirect_uri"),
+            challenge: flow.param("code_challenge"),
+            claims: all,
+            sign,
+        };
+        self.with(|st| st.grants.insert(code.clone(), grant));
+        code
+    }
+}
+
+/// Starts a fake provider on a free port.
+async fn b21_op() -> B21Op {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let op = B21Op {
+        st: Arc::new(std::sync::Mutex::new(b21_op_state(&base))),
+        base,
+    };
+    let router = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(b21_op_discovery),
+        )
+        .route("/jwks", axum::routing::get(b21_op_jwks))
+        .route("/token", axum::routing::post(b21_op_token))
+        .route(
+            "/userinfo",
+            axum::routing::get(b21_op_userinfo).post(b21_op_userinfo),
+        )
+        .with_state(op.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    op
+}
+
+fn b21_down() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (StatusCode::SERVICE_UNAVAILABLE, "down").into_response()
+}
+
+/// A text the test wrote, valid JSON or not, served as JSON.
+fn b21_json_text(text: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        text,
+    )
+        .into_response()
+}
+
+async fn b21_op_discovery(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (down, text, discovery) = op.with(|st| {
+        st.discovery_fetches += 1;
+        (st.down, st.discovery_text.clone(), st.discovery.clone())
+    });
+    if down {
+        return b21_down();
+    }
+    match text {
+        Some(text) => b21_json_text(text),
+        None => axum::Json(serde_json::Value::Object(discovery)).into_response(),
+    }
+}
+
+async fn b21_op_jwks(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (down, text, keys) = op.with(|st| {
+        st.jwks_fetches += 1;
+        let keys: Vec<serde_json::Value> =
+            st.keys.iter().map(|(kid, key)| b21_jwk(kid, key)).collect();
+        (st.down, st.jwks_text.clone(), keys)
+    });
+    if down {
+        return b21_down();
+    }
+    match text {
+        Some(text) => b21_json_text(text),
+        None => axum::Json(serde_json::json!({ "keys": keys })).into_response(),
+    }
+}
+
+/// The public half of a key as a JWK.
+fn b21_jwk(kid: &str, key: &p256::ecdsa::SigningKey) -> serde_json::Value {
+    let point = key.verifying_key().to_sec1_point(false);
+    serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": kid,
+        "x": b21_b64(point.x().unwrap().as_slice()),
+        "y": b21_b64(point.y().unwrap().as_slice()),
+    })
+}
+
+/// The token endpoint: checks the client authentication, the code, the redirect URI and the
+/// PKCE verifier, then signs the grant's ID token.
+async fn b21_op_token(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    let basic = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .map(|v| {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(v)
+                .unwrap_or_default();
+            let raw = String::from_utf8(raw).unwrap_or_default();
+            let (id, secret) = raw.split_once(':').unwrap_or_default();
+            (b21_unescape(id), b21_unescape(secret))
+        });
+    let form_id = form.get("client_id").map(String::as_str);
+    let form_secret = form.get("client_secret").map(String::as_str);
+    let auth = match (&basic, form_secret) {
+        (Some((id, secret)), None)
+            if id == B21_CLIENT_ID
+                && secret == B21_CLIENT_SECRET
+                && form_id.is_none_or(|f| f == B21_CLIENT_ID) =>
+        {
+            B21Auth::Basic
+        }
+        (None, Some(secret)) if secret == B21_CLIENT_SECRET && form_id == Some(B21_CLIENT_ID) => {
+            B21Auth::Post
+        }
+        (None, None) if form_id == Some(B21_CLIENT_ID) => B21Auth::None,
+        _ => B21Auth::Bad,
+    };
+
+    let mut st = op.st.lock().unwrap();
+    if st.down {
+        return b21_down();
+    }
+    st.token_requests.push((auth, form.clone()));
+    if auth != st.expect_auth {
+        let error = serde_json::json!({ "error": "invalid_client" });
+        return (StatusCode::UNAUTHORIZED, axum::Json(error)).into_response();
+    }
+    let invalid_grant = || {
+        let error = serde_json::json!({ "error": "invalid_grant" });
+        (StatusCode::BAD_REQUEST, axum::Json(error)).into_response()
+    };
+    let Some(grant) = form.get("code").and_then(|code| st.grants.remove(code)) else {
+        return invalid_grant();
+    };
+    let verifier = form
+        .get("code_verifier")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if form.get("grant_type").map(String::as_str) != Some("authorization_code")
+        || form.get("redirect_uri") != Some(&grant.redirect_uri)
+        || b21_b64(sha2::Sha256::digest(verifier.as_bytes()).as_slice()) != grant.challenge
+    {
+        return invalid_grant();
+    }
+    let id_token = b21_sign(&st.keys, &grant.claims, grant.sign);
+    let access_token = format!("b21-at-{}", uuid::Uuid::new_v4().simple());
+    st.access.insert(access_token.clone(), grant.claims);
+    st.last_id_token = Some(id_token.clone());
+    axum::Json(serde_json::json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "id_token": id_token,
+    }))
+    .into_response()
+}
+
+/// Userinfo: the grant's claims without the token-only ones, or `userinfo` when set. It waits first
+/// when `userinfo_hold` is set.
+async fn b21_op_userinfo(
+    axum::extract::State(op): axum::extract::State<B21Op>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let hold = op.st.lock().unwrap().userinfo_hold.take();
+    if let Some((arrived, release)) = hold {
+        let _ = arrived.send(());
+        let _ = release.await;
+    }
+    let mut st = op.st.lock().unwrap();
+    st.userinfo_calls += 1;
+    if st.down {
+        return b21_down();
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let Some(claims) = st.access.get(token) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if let Some(info) = &st.userinfo {
+        return axum::Json(info.clone()).into_response();
+    }
+    let mut claims = claims.clone();
+    let map = claims.as_object_mut().unwrap();
+    for name in ["iss", "aud", "azp", "exp", "iat", "nonce"] {
+        map.remove(name);
+    }
+    axum::Json(claims).into_response()
+}
+
+/// A compact JWS over `claims`.
+fn b21_sign(
+    keys: &[(String, p256::ecdsa::SigningKey)],
+    claims: &serde_json::Value,
+    sign: B21Sign,
+) -> String {
+    use hmac::Mac as _;
+    let (alg, kid) = match sign {
+        B21Sign::Key(n) | B21Sign::Forged(n) => ("ES256", Some(keys[n].0.as_str())),
+        B21Sign::Kid(_, kid) => ("ES256", Some(kid)),
+        B21Sign::Hs256 => ("HS256", None),
+        B21Sign::Unsigned => ("none", None),
+    };
+    let mut header = serde_json::json!({ "alg": alg, "typ": "JWT" });
+    if let Some(kid) = kid {
+        header["kid"] = kid.into();
+    }
+    let input = format!(
+        "{}.{}",
+        b21_b64(header.to_string().as_bytes()),
+        b21_b64(claims.to_string().as_bytes())
+    );
+    let signature = match sign {
+        B21Sign::Key(n) | B21Sign::Kid(n, _) => b21_es256(&keys[n].1, &input),
+        B21Sign::Forged(_) => b21_es256(&b21_key(0x5a), &input),
+        B21Sign::Hs256 => {
+            let mut mac =
+                hmac::Hmac::<sha2::Sha256>::new_from_slice(B21_CLIENT_SECRET.as_bytes()).unwrap();
+            mac.update(input.as_bytes());
+            mac.finalize().into_bytes().as_slice().to_vec()
+        }
+        B21Sign::Unsigned => Vec::new(),
+    };
+    format!("{input}.{}", b21_b64(&signature))
+}
+
+fn b21_es256(key: &p256::ecdsa::SigningKey, input: &str) -> Vec<u8> {
+    use p256::ecdsa::signature::Signer as _;
+    let signature: p256::ecdsa::Signature = key.sign(input.as_bytes());
+    signature.to_bytes().as_slice().to_vec()
+}
+
+fn b21_b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Undoes the form encoding of a client id or secret in a Basic header (RFC 6749 §2.3.1).
+fn b21_unescape(value: &str) -> String {
+    url::form_urlencoded::parse(format!("v={value}").as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default()
+}
+
+/// A Rustyfin whose owner is signed in, next to a fake provider.
+struct B21 {
+    state: AppState,
+    app: axum::Router,
+    op: B21Op,
+    /// The owner's token.
+    admin: String,
+    admin_id: String,
+}
+
+async fn b21() -> B21 {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "owner", "pw-owner").await,
+        StatusCode::NO_CONTENT
+    );
+    let (admin, admin_id) = login(&app, "owner", "pw-owner")
+        .await
+        .expect("owner signs in");
+    B21 {
+        state,
+        app,
+        op: b21_op().await,
+        admin,
+        admin_id,
+    }
+}
+
+/// Settings that turn OIDC on against `op`, with `extra` on top.
+fn b21_settings_body(op: &B21Op, extra: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "Enabled": true,
+        "IssuerUrl": op.base,
+        "ClientId": B21_CLIENT_ID,
+        "ClientSecret": B21_CLIENT_SECRET,
+        "PublicUrl": B21_PUBLIC_URL,
+    });
+    for (name, value) in extra.as_object().expect("extra is an object") {
+        body[name] = value.clone();
+    }
+    body
+}
+
+/// A Rustyfin with OIDC on against its fake provider.
+async fn b21_on(extra: serde_json::Value) -> B21 {
+    let t = b21().await;
+    let (status, body) = t.save(b21_settings_body(&t.op, extra)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "saving the OIDC settings: {}",
+        body["Detail"]
+    );
+    t
+}
+
+/// A started flow: the browser's cookie and the authorization URL.
+struct B21Flow {
+    /// `rustyfin_oidc=<flow id>`, as the browser sends it back.
+    cookie: String,
+    /// The whole `Set-Cookie` header.
+    set_cookie: String,
+    url: String,
+    params: HashMap<String, String>,
+}
+
+impl B21Flow {
+    fn param(&self, name: &str) -> String {
+        self.params
+            .get(name)
+            .unwrap_or_else(|| panic!("no {name} in the authorization URL"))
+            .clone()
+    }
+
+    /// The query the provider sends the browser back with after an approval.
+    fn callback_query(&self, code: &str) -> String {
+        b21_query(&[("code", code), ("state", &self.param("state"))])
+    }
+}
+
+fn b21_query(pairs: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+}
+
+/// A header's value, or "" without one.
+fn b21_header(headers: &axum::http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Checks a 200 from Start or Link and reads the flow from it.
+fn b21_flow(status: StatusCode, headers: &axum::http::HeaderMap, body: &str) -> B21Flow {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "starting a flow: {}",
+        json["Detail"]
+    );
+    let url = json["AuthorizationUrl"]
+        .as_str()
+        .expect("an AuthorizationUrl")
+        .to_string();
+    let params = url::Url::parse(&url)
+        .expect("the AuthorizationUrl is a URL")
+        .query_pairs()
+        .into_owned()
+        .collect();
+    let set_cookie = b21_header(headers, "set-cookie");
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(
+        cookie.len() > "rustyfin_oidc=".len() && cookie.starts_with("rustyfin_oidc="),
+        "the answer sets the flow cookie"
+    );
+    B21Flow {
+        cookie,
+        set_cookie,
+        url,
+        params,
+    }
+}
+
+/// The attributes of a `Set-Cookie` header, lowercased, without the name and value.
+fn b21_cookie_attrs(set_cookie: &str) -> Vec<String> {
+    set_cookie
+        .split(';')
+        .skip(1)
+        .map(|a| a.trim().to_lowercase())
+        .collect()
+}
+
+fn b21_clears_cookie(set_cookie: &str) -> bool {
+    set_cookie.starts_with("rustyfin_oidc=")
+        && b21_cookie_attrs(set_cookie)
+            .iter()
+            .any(|a| a == "max-age=0")
+}
+
+impl B21 {
+    async fn raw(&self, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (
+            parts.status,
+            parts.headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    async fn save(&self, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let req = request("POST", "/Auth/Oidc/Settings", Some(&self.admin), Some(body));
+        send(&self.app, req).await
+    }
+
+    async fn settings(&self) -> serde_json::Value {
+        let req = request("GET", "/Auth/Oidc/Settings", Some(&self.admin), None);
+        let (status, body) = send(&self.app, req).await;
+        assert_eq!(status, StatusCode::OK, "reading the OIDC settings");
+        body
+    }
+
+    async fn start_raw(&self) -> (StatusCode, axum::http::HeaderMap, String) {
+        self.raw(request("POST", "/Auth/Oidc/Start", None, None))
+            .await
+    }
+
+    async fn start(&self) -> B21Flow {
+        let (status, headers, body) = self.start_raw().await;
+        b21_flow(status, &headers, &body)
+    }
+
+    /// Starts linking the token's user from the profile.
+    async fn start_link(&self, token: &str) -> B21Flow {
+        let req = request("POST", "/Auth/Oidc/Link", Some(token), None);
+        let (status, headers, body) = self.raw(req).await;
+        b21_flow(status, &headers, &body)
+    }
+
+    /// The browser comes back from the provider. Returns the Location and the Set-Cookie header.
+    async fn callback(&self, cookie: Option<&str>, query: &str) -> (String, String) {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("/Auth/Oidc/Callback?{query}"));
+        if let Some(cookie) = cookie {
+            req = req.header("Cookie", cookie);
+        }
+        let (status, headers, _) = self.raw(req.body(Body::empty()).unwrap()).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "the callback always redirects"
+        );
+        (
+            b21_header(&headers, "location"),
+            b21_header(&headers, "set-cookie"),
+        )
+    }
+
+    /// The user approves `flow` at the provider and the browser comes back. Returns the Location.
+    async fn approve(&self, flow: &B21Flow, claims: serde_json::Value, sign: B21Sign) -> String {
+        let code = self.op.approve(flow, claims, sign);
+        self.callback(Some(&flow.cookie), &flow.callback_query(&code))
+            .await
+            .0
+    }
+
+    /// `POST /Auth/Oidc/Complete` from the browser. Returns the status, the body and Set-Cookie.
+    async fn complete(&self, cookie: Option<&str>) -> (StatusCode, serde_json::Value, String) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/Auth/Oidc/Complete")
+            .header("X-Emby-Authorization", B21_DEVICE);
+        if let Some(cookie) = cookie {
+            req = req.header("Cookie", cookie);
+        }
+        let (status, headers, body) = self.raw(req.body(Body::empty()).unwrap()).await;
+        let json = serde_json::from_str(&body).unwrap_or_default();
+        (status, json, b21_header(&headers, "set-cookie"))
+    }
+
+    async fn sign_in(&self, claims: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.sign_in_as(claims, B21Sign::Key(0)).await
+    }
+
+    /// A whole sign-in: Start, approval, callback, Complete. Ok is the `AuthenticationResult`,
+    /// Err the error code of the redirect.
+    async fn sign_in_as(
+        &self,
+        claims: serde_json::Value,
+        sign: B21Sign,
+    ) -> Result<serde_json::Value, String> {
+        let flow = self.start().await;
+        let location = self.approve(&flow, claims, sign).await;
+        let error = format!("{B21_PUBLIC_URL}/web/#login/oidc-error/");
+        if let Some(code) = location.strip_prefix(&error) {
+            return Err(code.to_string());
+        }
+        assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+        let (status, body, _) = self.complete(Some(&flow.cookie)).await;
+        assert_eq!(status, StatusCode::OK, "Complete after a good callback");
+        Ok(body)
+    }
+
+    /// Links the token's user from the profile. Err is the error code of the redirect.
+    async fn link(&self, token: &str, claims: serde_json::Value) -> Result<(), String> {
+        let flow = self.start_link(token).await;
+        let location = self.approve(&flow, claims, B21Sign::Key(0)).await;
+        let error = format!("{B21_PUBLIC_URL}/web/#settings/oidc-error/");
+        if let Some(code) = location.strip_prefix(&error) {
+            return Err(code.to_string());
+        }
+        assert_eq!(
+            location,
+            format!("{B21_PUBLIC_URL}/web/#settings/oidc-linked")
+        );
+        Ok(())
+    }
+
+    async fn user_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    async fn link_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_oidc_links")
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    /// The named user's link: issuer, subject and provider username.
+    async fn link_row(&self, name: &str) -> Option<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT l.issuer, l.subject, l.username FROM user_oidc_links l \
+             JOIN users u ON u.id = l.user_id WHERE u.name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.state.db)
+        .await
+        .unwrap()
+    }
+
+    async fn admin_from_group(&self, name: &str) -> bool {
+        sqlx::query_scalar("SELECT admin_from_group FROM users WHERE name = ?")
+            .bind(name)
+            .fetch_one(&self.state.db)
+            .await
+            .unwrap()
+    }
+
+    async fn is_admin(&self, name: &str) -> bool {
+        user_flags(&self.state, name)
+            .await
+            .expect("the user exists")
+            .0
+    }
+
+    /// The client secret as stored, "" without one.
+    async fn stored_secret(&self) -> String {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT client_secret FROM oidc_settings WHERE id = 1",
+        )
+        .fetch_optional(&self.state.db)
+        .await
+        .unwrap()
+        .flatten()
+        .unwrap_or_default()
+    }
+}
+
+/// Reads one text column of the named user's row; `sql` binds the name once.
+async fn b21_text(state: &AppState, sql: &'static str, name: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(sql)
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Runs a statement that binds the name once.
+async fn b21_exec(state: &AppState, sql: &'static str, name: &str) {
+    sqlx::query(sql)
+        .bind(name)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// Log output, collected for the secret checks and never printed.
+#[derive(Clone, Default)]
+struct B21Log(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl B21Log {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for B21Log {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for B21Log {
+    type Writer = B21Log;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Collects this thread's log lines at every level until the guard drops. The tests run on a
+/// current-thread runtime, so this includes Rustyfin's tasks.
+fn b21_capture() -> (B21Log, tracing::subscriber::DefaultGuard) {
+    let log = B21Log::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("b21 log capture works");
+    assert!(log.text().contains("b21 log capture works"));
+    (log, guard)
+}
+
+/// A URL on a port nothing listens on.
+fn b21_closed_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// The name of the token's user, or the status when the token doesn't work.
+async fn b21_me(app: &axum::Router, token: &str) -> Result<String, StatusCode> {
+    let (status, body) = send(app, request("GET", "/Users/Me", Some(token), None)).await;
+    if status != StatusCode::OK {
+        return Err(status);
+    }
+    Ok(body["Name"].as_str().unwrap_or_default().to_string())
+}
+
+/// A plain user without a password, as an OIDC sign-in makes them, and a token for them.
+async fn b21_passwordless(state: &AppState, name: &str) -> (uuid::Uuid, String) {
+    let id = add_user(state, name, "temporary-pw", false).await;
+    b21_exec(
+        state,
+        "UPDATE users SET password_hash = '' WHERE name = ?",
+        name,
+    )
+    .await;
+    let user = rustyfin_db::repo_user::get_user_by_id(&state.db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    let device = rustyfin_auth::TokenDevice {
+        device_id: format!("b21-{name}"),
+        device_name: "test".to_string(),
+        app_name: "B21".to_string(),
+        app_version: "1.0".to_string(),
+    };
+    let token = rustyfin_auth::create_token(&state.db, &user, &device)
+        .await
+        .unwrap();
+    (id, token)
+}
+
+/// A Quick Connect request approved by the token's user. Returns its secret.
+async fn b21_qc_approved(app: &axum::Router, token: &str) -> String {
+    let (status, init) = send(app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap();
+    let uri = format!("/QuickConnect/Authorize?code={code}");
+    let (status, _) = send(app, request("POST", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "approving the Quick Connect code");
+    init["Secret"].as_str().unwrap().to_string()
+}
+
+/// A TV's `POST /Users/AuthenticateWithQuickConnect`, with the secret when given.
+fn b21_qc_sign_in(secret: Option<&str>) -> Request<Body> {
+    let body = match secret {
+        Some(secret) => serde_json::json!({ "Secret": secret }),
+        None => serde_json::json!({}),
+    };
+    Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .header("Content-Type", "application/json")
+        .header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="B21 TV", Device="Living room", DeviceId="b21-tv", Version="2.0""#,
+        )
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Asks for a password reset and reads the PIN from the PIN file; None when none was written within
+/// 2 s. The reset work may finish after the 250 ms answer under load, so the file is awaited.
+async fn b21_reset_pin(app: &axum::Router, name: &str) -> Option<String> {
+    b21_reset_pin_at(app, name).await.1
+}
+
+/// `b21_reset_pin`, with the answer's `PinFile` path.
+async fn b21_reset_pin_at(app: &axum::Router, name: &str) -> (String, Option<String>) {
+    let path = b21_pin_file(app, name).await;
+    for _ in 0..20 {
+        // The file is created before it is written, so an empty or partial file is read again.
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(file) = file {
+            let pin = file["Pin"].as_str().map(str::to_string);
+            return (path, pin);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    (path, None)
+}
+
+/// Asks for a password reset and returns the answer's `PinFile` path without waiting for the file.
+async fn b21_pin_file(app: &axum::Router, name: &str) -> String {
+    let body = serde_json::json!({ "EnteredUsername": name });
+    let req = request("POST", "/Users/ForgotPassword", None, Some(body));
+    let (status, answer) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    answer["PinFile"]
+        .as_str()
+        .expect("a PinFile path")
+        .to_string()
+}
+
+/// Redeems a reset PIN through `POST /Users/ForgotPassword/Pin`.
+async fn b21_redeem_pin(app: &axum::Router, pin: &str) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Pin": pin });
+    send(
+        app,
+        request("POST", "/Users/ForgotPassword/Pin", None, Some(body)),
+    )
+    .await
+}
+
+/// Password sign-in. Returns the status and the Detail.
+async fn b21_password_sign_in(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+) -> (StatusCode, String) {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    let (status, answer) = send(app, req).await;
+    (
+        status,
+        answer["Detail"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// Reads one boolean expression about the named user; `sql` binds the name once.
+async fn b21_true(state: &AppState, sql: &'static str, name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(sql)
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// SQL: whether the named user's link has a last sign-in.
+const B21_SIGNED_IN: &str = "SELECT l.last_sign_in_at IS NOT NULL FROM user_oidc_links l \
+     JOIN users u ON u.id = l.user_id WHERE u.name = ?";
+
+/// An unknown Quick Connect secret in the format Rustyfin hands out.
+const B21_UNKNOWN_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+/// The fake provider on its own: discovery, a code redeemed once for an ES256 ID token over the
+/// grant's claims, and userinfo.
+#[tokio::test]
+async fn b21_fake_provider_works() {
+    use base64::Engine as _;
+    use p256::ecdsa::signature::Verifier as _;
+    use sha2::Digest as _;
+    let op = b21_op().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/.well-known/openid-configuration", op.base);
+    let text = http.get(url).send().await.unwrap().text().await.unwrap();
+    let discovery: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(discovery["issuer"], op.base);
+
+    let verifier = "b21-verifier-0123456789-0123456789-0123456789";
+    let challenge = b21_b64(sha2::Sha256::digest(verifier.as_bytes()).as_slice());
+    let params = [
+        ("nonce", "b21-nonce"),
+        ("redirect_uri", B21_CALLBACK),
+        ("code_challenge", challenge.as_str()),
+    ];
+    let flow = B21Flow {
+        cookie: String::new(),
+        set_cookie: String::new(),
+        url: String::new(),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let code = op.approve(&flow, b21_user("pat-sub", "pat"), B21Sign::Key(0));
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", B21_CALLBACK),
+        ("code_verifier", verifier),
+    ];
+    let token = || {
+        http.post(format!("{}/token", op.base))
+            .basic_auth(B21_CLIENT_ID, Some(B21_CLIENT_SECRET))
+            .form(&form)
+    };
+    let resp = token().send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+
+    let id_token = body["id_token"].as_str().expect("an ID token");
+    let (input, signature) = id_token.rsplit_once('.').unwrap();
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature)
+        .unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&signature).unwrap();
+    b21_key(0x11)
+        .verifying_key()
+        .verify(input.as_bytes(), &signature)
+        .expect("signed with the published key");
+    let decode = |part: &str| -> serde_json::Value {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let (header, claims) = input.split_once('.').unwrap();
+    assert_eq!(decode(header)["kid"], "b21-key-a");
+    let claims = decode(claims);
+    assert_eq!(claims["iss"], op.base);
+    assert_eq!(claims["aud"], B21_CLIENT_ID);
+    assert_eq!(claims["nonce"], "b21-nonce");
+    assert_eq!(claims["sub"], "pat-sub");
+
+    let again = token().send().await.unwrap();
+    assert_eq!(again.status().as_u16(), 400, "a code is redeemed once");
+
+    let access = body["access_token"].as_str().unwrap();
+    let url = format!("{}/userinfo", op.base);
+    let text = http
+        .get(url)
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(info["preferred_username"], "pat");
+    assert!(
+        info.get("nonce").is_none(),
+        "userinfo has no token-only claims"
+    );
+    assert_eq!(
+        op.with(|st| (st.discovery_fetches, st.userinfo_calls)),
+        (1, 1)
+    );
+}
+
+// Task 1: Quick Connect's token step (AC26).
+
+#[tokio::test]
+async fn b21_quick_connect_secret_signs_in_the_approver() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, alice_id) = login(&app, "alice", "pw-alice").await.unwrap();
+    let secret = b21_qc_approved(&app, &alice).await;
+
+    let (status, body) = send(&app, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::OK, "signing in with an approved secret");
+    assert_eq!(body["User"]["Id"], alice_id.as_str());
+    assert_eq!(body["User"]["Name"], "alice");
+    let session = &body["SessionInfo"];
+    assert_eq!(session["DeviceId"], "b21-tv", "the session is the TV's");
+    assert_eq!(session["DeviceName"], "Living room");
+    assert_eq!(session["Client"], "B21 TV");
+    assert_eq!(session["ApplicationVersion"], "2.0");
+    assert_eq!(body["ServerId"], "test-server-id");
+    let token = body["AccessToken"].as_str().expect("an AccessToken");
+    assert_eq!(b21_me(&app, token).await, Ok("alice".to_string()));
+    assert_eq!(
+        b21_me(&app, &alice).await,
+        Ok("alice".to_string()),
+        "the approving session stays"
+    );
+    assert!(
+        !state.quick_connect.read().await.contains_key(&secret),
+        "the request is used up"
+    );
+
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a secret signs in once");
+}
+
+#[tokio::test]
+async fn b21_quick_connect_refuses_unknown_unapproved_and_expired() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app, "alice", "pw-alice").await.unwrap();
+    let approved = b21_qc_approved(&app, &alice).await;
+    let (status, started) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let waiting = started["Secret"].as_str().unwrap().to_string();
+    let expired = b21_qc_approved(&app, &alice).await;
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&expired)
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&approved))).await;
+    assert_eq!(status, StatusCode::OK, "an approved secret");
+    let refused = [
+        (B21_UNKNOWN_SECRET, "an unknown secret"),
+        (waiting.as_str(), "a secret nobody approved"),
+        (expired.as_str(), "an expired secret"),
+    ];
+    for (secret, what) in refused {
+        let (status, _) = send(&app, b21_qc_sign_in(Some(secret))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{what}");
+    }
+    let (status, _) = send(&app, b21_qc_sign_in(None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no Secret");
+}
+
+#[tokio::test]
+async fn b21_quick_connect_refuses_a_disabled_approver() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app, "alice", "pw-alice").await.unwrap();
+    let first = b21_qc_approved(&app, &alice).await;
+    let second = b21_qc_approved(&app, &alice).await;
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&first))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    b21_exec(
+        &state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "alice",
+    )
+    .await;
+    let (status, _) = send(&app, b21_qc_sign_in(Some(&second))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a disabled user's approval signs nobody in"
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_replaces_the_device_token() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (web, _) = login(&app, "alice", "pw-alice").await.unwrap();
+    let (old_tv, _) = g2_login_device(&app, "alice", "pw-alice", "b21-tv")
+        .await
+        .unwrap();
+    let secret = b21_qc_approved(&app, &web).await;
+
+    let (status, body) = send(&app, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::OK);
+    let new_tv = body["AccessToken"].as_str().unwrap();
+    assert_eq!(
+        b21_me(&app, &old_tv).await,
+        Err(StatusCode::UNAUTHORIZED),
+        "the TV's old token is replaced, like at password sign-in"
+    );
+    assert_eq!(b21_me(&app, new_tv).await, Ok("alice".to_string()));
+    assert_eq!(b21_me(&app, &web).await, Ok("alice".to_string()));
+}
+
+#[tokio::test]
+async fn b21_quick_connect_sign_in_shares_the_login_limit() {
+    let state = test_state().await;
+    add_user(&state, "alice", "pw-alice", false).await;
+    let open = app(state.clone());
+    let (alice, _) = login(&open, "alice", "pw-alice").await.unwrap();
+    let secret = b21_qc_approved(&open, &alice).await;
+
+    let mut limited = state.clone();
+    limited.rate_limiter = RateLimiter::new(3, 60);
+    let remote = remote_app(limited);
+    let (status, _) = send(&remote, b21_qc_sign_in(Some(&secret))).await;
+    assert_eq!(status, StatusCode::OK);
+    for _ in 0..2 {
+        let (status, _) = send(&remote, b21_qc_sign_in(Some(B21_UNKNOWN_SECRET))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, _) = send(&remote, b21_qc_sign_in(Some(B21_UNKNOWN_SECRET))).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth attempt in a minute"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "password sign-in shares the limit"
+    );
+}
+
+// Task 2: settings, the public info and the password switch (AC1-AC5, AC20-AC25, AC28).
+
+#[tokio::test]
+async fn b21_settings_are_admin_only() {
+    let t = b21().await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    assert_eq!(t.settings().await["ButtonLabel"], "");
+    for method in ["GET", "POST"] {
+        let body = (method == "POST").then(|| serde_json::json!({ "ButtonLabel": "Hacked" }));
+        let req = request(method, "/Auth/Oidc/Settings", None, body.clone());
+        assert_eq!(
+            send(&t.app, req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{method} without a token"
+        );
+        let req = request(method, "/Auth/Oidc/Settings", Some(&bob), body);
+        assert_eq!(
+            send(&t.app, req).await.0,
+            StatusCode::FORBIDDEN,
+            "{method} as a plain user"
+        );
+    }
+    assert_eq!(t.settings().await["ButtonLabel"], "", "nothing was saved");
+}
+
+#[tokio::test]
+async fn b21_settings_defaults() {
+    let t = b21().await;
+    assert_eq!(
+        t.settings().await,
+        serde_json::json!({
+            "Enabled": false,
+            "IssuerUrl": "",
+            "ClientId": "",
+            "HasClientSecret": false,
+            "Scopes": "",
+            "EffectiveScopes": "openid profile email",
+            "ButtonLabel": "",
+            "UsernameClaim": "preferred_username",
+            "GroupClaim": "groups",
+            "AllowedGroup": "",
+            "AdminGroup": "",
+            "PublicUrl": "",
+            "CallbackUrl": "",
+            "AllowPasswordSignIn": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn b21_settings_merge_and_keep_the_secret_write_only() {
+    let t = b21().await;
+    let extra = serde_json::json!({
+        "ClientSecret": "b21-saved-secret",
+        "PublicUrl": "http://rf.test:8121/",
+        "ButtonLabel": "Pocket ID",
+    });
+    let (status, saved) = t.save(b21_settings_body(&t.op, extra)).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", saved["Detail"]);
+    assert_eq!(saved["Enabled"], true);
+    assert_eq!(saved["IssuerUrl"], t.op.base.as_str());
+    assert_eq!(saved["ClientId"], B21_CLIENT_ID);
+    assert_eq!(saved["HasClientSecret"], true);
+    assert_eq!(saved["ButtonLabel"], "Pocket ID");
+    assert_eq!(
+        saved["PublicUrl"], B21_PUBLIC_URL,
+        "saved without the trailing /"
+    );
+    assert_eq!(saved["CallbackUrl"], B21_CALLBACK);
+    assert!(
+        saved.get("ClientSecret").is_none(),
+        "the secret is write-only"
+    );
+    assert!(
+        !saved.to_string().contains("b21-saved-secret"),
+        "the answer holds the secret"
+    );
+    assert_eq!(t.settings().await, saved, "GET shows what POST answered");
+    assert_eq!(t.stored_secret().await, "b21-saved-secret");
+
+    let keep =
+        serde_json::json!({ "AdminGroup": "admins", "ButtonLabel": null, "ClientSecret": null });
+    let (status, saved) = t.save(keep).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", saved["Detail"]);
+    assert_eq!(saved["AdminGroup"], "admins");
+    assert_eq!(saved["ButtonLabel"], "Pocket ID", "null keeps a value");
+    assert_eq!(saved["Enabled"], true, "a missing field keeps its value");
+    assert_eq!(saved["HasClientSecret"], true, "null keeps the secret");
+    assert_eq!(t.stored_secret().await, "b21-saved-secret");
+
+    let (status, saved) = t.save(serde_json::json!({ "ClientSecret": "" })).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", saved["Detail"]);
+    assert_eq!(saved["HasClientSecret"], false, "\"\" removes the secret");
+    assert_eq!(t.stored_secret().await, "");
+}
+
+#[tokio::test]
+async fn b21_settings_scopes() {
+    let t = b21().await;
+    let cases = [
+        (serde_json::json!({}), "", "openid profile email"),
+        (
+            serde_json::json!({ "AdminGroup": "admins" }),
+            "",
+            "openid profile email groups",
+        ),
+        (
+            serde_json::json!({ "Scopes": "profile email" }),
+            "profile email",
+            "openid profile email",
+        ),
+        (
+            serde_json::json!({ "Scopes": "email,openid  groups email" }),
+            "email,openid  groups email",
+            "openid email groups",
+        ),
+        (
+            serde_json::json!({ "Scopes": "", "AdminGroup": "", "AllowedGroup": "family" }),
+            "",
+            "openid profile email groups",
+        ),
+        (
+            serde_json::json!({ "AllowedGroup": "" }),
+            "",
+            "openid profile email",
+        ),
+    ];
+    for (body, scopes, effective) in cases {
+        let (status, saved) = t.save(body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "saving {body}: {}", saved["Detail"]);
+        assert_eq!(saved["Enabled"], false);
+        assert_eq!(saved["Scopes"], scopes, "after {body}");
+        assert_eq!(saved["EffectiveScopes"], effective, "after {body}");
+    }
+}
+
+#[tokio::test]
+async fn b21_settings_refuse_bad_values() {
+    let t = b21().await;
+    let base = t.op.base.clone();
+    let cases = [
+        serde_json::json!({ "IssuerUrl": "" }),
+        serde_json::json!({ "IssuerUrl": "ftp://op.test" }),
+        serde_json::json!({ "IssuerUrl": "op.test" }),
+        serde_json::json!({ "IssuerUrl": format!("{base}?x=1") }),
+        serde_json::json!({ "IssuerUrl": format!("{base}#x") }),
+        serde_json::json!({ "PublicUrl": "" }),
+        serde_json::json!({ "PublicUrl": "rf.test:8121" }),
+        serde_json::json!({ "PublicUrl": "http://rf.test:8121/?x=1" }),
+        serde_json::json!({ "ClientId": "" }),
+        serde_json::json!({ "UsernameClaim": "" }),
+        serde_json::json!({ "GroupClaim": "", "AdminGroup": "admins" }),
+        serde_json::json!({ "GroupClaim": "", "AllowedGroup": "family" }),
+    ];
+    for extra in cases {
+        let (status, body) = t.save(b21_settings_body(&t.op, extra.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "saving with {extra}");
+        let detail = body["Detail"].as_str().unwrap_or_default();
+        assert!(!detail.is_empty(), "the 400 for {extra} says what is wrong");
+        let settings = t.settings().await;
+        assert_eq!(settings["Enabled"], false, "nothing saved after {extra}");
+        assert_eq!(settings["IssuerUrl"], "", "nothing saved after {extra}");
+    }
+    let body = b21_settings_body(&t.op, serde_json::json!({ "GroupClaim": "" }));
+    let (status, body) = t.save(body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an empty group claim without a group: {}",
+        body["Detail"]
+    );
+}
+
+/// Breaks the fake provider in one way; the second argument is a closed URL.
+type B21Break = fn(&mut B21OpState, &str);
+
+#[tokio::test]
+async fn b21_settings_check_the_provider() {
+    let t = b21().await;
+    let off = serde_json::json!({ "IssuerUrl": t.op.base, "ClientId": B21_CLIENT_ID });
+    let (status, body) = t.save(off).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a save with OIDC off: {}",
+        body["Detail"]
+    );
+    assert_eq!(
+        t.op.with(|st| (st.discovery_fetches, st.jwks_fetches)),
+        (0, 0),
+        "nothing is fetched while OIDC is off"
+    );
+
+    let closed = b21_closed_url();
+    let cases: [(&str, B21Break); 12] = [
+        ("discovery is not JSON", |st, _| {
+            st.discovery_text = Some("<html>not json</html>".to_string())
+        }),
+        ("the provider is down", |st, _| st.down = true),
+        ("no authorization_endpoint", |st, _| {
+            st.discovery.remove("authorization_endpoint");
+        }),
+        ("no token_endpoint", |st, _| {
+            st.discovery.remove("token_endpoint");
+        }),
+        ("no jwks_uri", |st, _| {
+            st.discovery.remove("jwks_uri");
+        }),
+        ("another issuer", |st, _| {
+            st.discovery
+                .insert("issuer".into(), "http://evil.test".into());
+        }),
+        ("no code flow", |st, _| {
+            let types = serde_json::json!(["id_token"]);
+            st.discovery
+                .insert("response_types_supported".into(), types);
+        }),
+        ("PKCE without S256", |st, _| {
+            let methods = serde_json::json!(["plain"]);
+            st.discovery
+                .insert("code_challenge_methods_supported".into(), methods);
+        }),
+        ("no algorithm Rustyfin accepts", |st, _| {
+            let algs = serde_json::json!(["HS256"]);
+            st.discovery
+                .insert("id_token_signing_alg_values_supported".into(), algs);
+        }),
+        ("the JWKS is not JSON", |st, _| {
+            st.jwks_text = Some("not json".to_string())
+        }),
+        ("the JWKS has no keys", |st, _| {
+            st.jwks_text = Some(r#"{"keys":[]}"#.to_string())
+        }),
+        ("the JWKS is unreachable", |st, closed| {
+            st.discovery
+                .insert("jwks_uri".into(), format!("{closed}/jwks").into());
+        }),
+    ];
+    for (what, change) in cases {
+        t.op.with(|st| {
+            *st = b21_op_state(&t.op.base);
+            change(st, &closed);
+        });
+        let (status, body) = t
+            .save(b21_settings_body(&t.op, serde_json::json!({})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}");
+        let detail = body["Detail"].as_str().unwrap_or_default();
+        assert!(!detail.is_empty(), "the 400 says what is wrong when {what}");
+        assert_eq!(
+            t.settings().await["Enabled"],
+            false,
+            "nothing saved when {what}"
+        );
+    }
+
+    t.op.with(|st| *st = b21_op_state(&t.op.base));
+    let body = b21_settings_body(&t.op, serde_json::json!({ "IssuerUrl": closed }));
+    let (status, _) = t.save(body).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an issuer nobody answers at"
+    );
+
+    t.op.with(|st| {
+        st.discovery.remove("code_challenge_methods_supported");
+    });
+    let (status, body) = t
+        .save(b21_settings_body(&t.op, serde_json::json!({})))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a provider that lists no PKCE methods: {}",
+        body["Detail"]
+    );
+    let (discovery, jwks) = t.op.with(|st| (st.discovery_fetches, st.jwks_fetches));
+    assert!(
+        discovery > 0 && jwks > 0,
+        "the save fetched discovery and the JWKS"
+    );
+    assert_eq!(t.settings().await["Enabled"], true);
+}
+
+#[tokio::test]
+async fn b21_info_is_public_and_minimal() {
+    let t = b21().await;
+    let info = || send(&t.app, request("GET", "/Auth/Oidc/Info", None, None));
+    assert_eq!(
+        info().await,
+        (
+            StatusCode::OK,
+            serde_json::json!({ "Enabled": false, "ButtonLabel": "" })
+        )
+    );
+    let body = b21_settings_body(&t.op, serde_json::json!({ "ButtonLabel": "Pocket ID" }));
+    let (status, body) = t.save(body).await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", body["Detail"]);
+    assert_eq!(
+        info().await,
+        (
+            StatusCode::OK,
+            serde_json::json!({ "Enabled": true, "ButtonLabel": "Pocket ID" })
+        )
+    );
+}
+
+#[tokio::test]
+async fn b21_password_switch_refuses_non_admins() {
+    let t = b21().await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (status, body) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "saving: {}", body["Detail"]);
+    assert_eq!(body["AllowPasswordSignIn"], false);
+
+    assert_eq!(
+        b21_password_sign_in(&t.app, "bob", "pw-bob").await,
+        (
+            StatusCode::FORBIDDEN,
+            "Password sign-in is turned off for this account.".to_string()
+        )
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "bob", "wrong").await.0,
+        StatusCode::UNAUTHORIZED,
+        "the password is checked first"
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "ghost", "pw-ghost").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "ada", "pw-ada").await.0,
+        StatusCode::OK,
+        "administrators still sign in"
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "owner", "pw-owner").await.0,
+        StatusCode::OK
+    );
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        b21_password_sign_in(&t.app, "bob", "pw-bob").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn b21_password_switch_stops_reset_pins_for_non_admins() {
+    let t = b21().await;
+    for name in ["bob", "cy", "dee"] {
+        add_user(&t.state, name, &format!("pw-{name}"), false).await;
+    }
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let bob_pin = b21_reset_pin(&t.app, "bob").await.expect("a PIN for bob");
+    let cy_pin = b21_reset_pin(&t.app, "cy").await.expect("a PIN for cy");
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        b21_reset_pin(&t.app, "dee").await,
+        None,
+        "no PIN for a plain user"
+    );
+    let req = request(
+        "POST",
+        "/Users/ForgotPassword/Pin",
+        None,
+        Some(serde_json::json!({ "Pin": bob_pin })),
+    );
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "a plain user's PIN resets nothing"
+    );
+    let reset = |pin: &str| {
+        let body =
+            serde_json::json!({ "Pin": pin, "Username": "cy", "TempPassword": "b21-temp-pw" });
+        request("POST", "/Users/ResetPassword", None, Some(body))
+    };
+    assert_eq!(
+        send(&t.app, reset("ZZ-ZZ-ZZ-ZZ")).await.0,
+        StatusCode::BAD_REQUEST,
+        "the PIN is checked first"
+    );
+    assert_eq!(send(&t.app, reset(&cy_pin)).await.0, StatusCode::FORBIDDEN);
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        login(&t.app, "bob", "pw-bob").await.is_some(),
+        "bob's password is unchanged"
+    );
+    assert!(
+        login(&t.app, "cy", "pw-cy").await.is_some(),
+        "cy's password is unchanged"
+    );
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        b21_reset_pin(&t.app, "ada").await.is_some(),
+        "administrators still get a PIN"
+    );
+}
+
+#[tokio::test]
+async fn b21_passwordless_user_is_refused_at_password_sign_in() {
+    let t = b21().await;
+    b21_passwordless(&t.state, "pat").await;
+    for allow in [true, false] {
+        let (status, _) = t
+            .save(serde_json::json!({ "AllowPasswordSignIn": allow }))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        for pw in ["", "anything"] {
+            assert_eq!(
+                b21_password_sign_in(&t.app, "pat", pw).await.0,
+                StatusCode::UNAUTHORIZED,
+                "password {pw:?}, password sign-in allowed: {allow}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b21_passwordless_user_sets_a_first_password() {
+    let t = b21().await;
+    let (pat_id, pat) = b21_passwordless(&t.state, "pat").await;
+    let uri = format!("/Users/{pat_id}/Password");
+    let change =
+        |body: serde_json::Value| send(&t.app, request("POST", &uri, Some(&pat), Some(body)));
+
+    let (status, _) = change(serde_json::json!({ "NewPw": "first-pw" })).await;
+    assert!(
+        status.is_success(),
+        "a first password without CurrentPw: {status}"
+    );
+    assert!(login(&t.app, "pat", "first-pw").await.is_some());
+
+    let (status, _) = change(serde_json::json!({ "NewPw": "second-pw" })).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "CurrentPw is needed once there is a password"
+    );
+    let (status, _) =
+        change(serde_json::json!({ "CurrentPw": "wrong", "NewPw": "second-pw" })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) =
+        change(serde_json::json!({ "CurrentPw": "first-pw", "NewPw": "second-pw" })).await;
+    assert!(status.is_success(), "changing the password: {status}");
+    assert!(login(&t.app, "pat", "second-pw").await.is_some());
+}
+
+// Task 3: the sign-in flow and the account rules (AC6-AC16).
+
+/// Claims of a provider user with a subject and a username.
+fn b21_user(sub: &str, username: &str) -> serde_json::Value {
+    serde_json::json!({ "sub": sub, "preferred_username": username })
+}
+
+/// The Location of a failed sign-in.
+fn b21_login_error(code: &str) -> String {
+    format!("{B21_PUBLIC_URL}/web/#login/oidc-error/{code}")
+}
+
+#[tokio::test]
+async fn b21_start_needs_oidc_on() {
+    let t = b21().await;
+    let (status, headers, _) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "OIDC was never set up");
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+    let off =
+        serde_json::json!({ "IssuerUrl": t.op.base, "ClientId": B21_CLIENT_ID, "Enabled": false });
+    let (status, _) = t.save(off).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, _) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "OIDC is off");
+    assert_eq!(b21_header(&headers, "set-cookie"), "");
+}
+
+#[tokio::test]
+async fn b21_start_builds_the_authorization_request() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let flow = t.start().await;
+    assert!(
+        flow.url.starts_with(&format!("{}/authorize?", t.op.base)),
+        "the URL is the provider's authorization endpoint"
+    );
+    assert_eq!(flow.param("response_type"), "code");
+    assert_eq!(flow.param("client_id"), B21_CLIENT_ID);
+    assert_eq!(flow.param("redirect_uri"), B21_CALLBACK);
+    assert_eq!(flow.param("scope"), "openid profile email groups");
+    assert_eq!(flow.param("code_challenge_method"), "S256");
+    assert_eq!(
+        flow.param("code_challenge").len(),
+        43,
+        "a base64url SHA-256"
+    );
+    assert!(
+        flow.param("state").len() >= 22,
+        "a state of 128 bits or more"
+    );
+    assert!(
+        flow.param("nonce").len() >= 22,
+        "a nonce of 128 bits or more"
+    );
+    let attrs = b21_cookie_attrs(&flow.set_cookie);
+    for attr in ["httponly", "samesite=lax", "path=/auth/oidc", "max-age=600"] {
+        assert!(
+            attrs.iter().any(|a| a == attr),
+            "the flow cookie has {attr}"
+        );
+    }
+    assert!(!attrs.iter().any(|a| a == "secure"), "no Secure over http");
+    let id = flow.cookie.trim_start_matches("rustyfin_oidc=");
+    assert!(id.len() >= 22, "the flow id is unguessable");
+    assert_ne!(id, flow.param("state"));
+    assert_ne!(id, flow.param("nonce"));
+    assert!(!flow.url.contains(id), "the flow id stays out of the URL");
+    assert!(!flow.url.contains(B21_CLIENT_SECRET));
+
+    let other = t.start().await;
+    for name in ["state", "nonce", "code_challenge"] {
+        assert_ne!(
+            other.param(name),
+            flow.param(name),
+            "each flow has its own {name}"
+        );
+    }
+    assert_ne!(other.cookie, flow.cookie);
+}
+
+#[tokio::test]
+async fn b21_start_under_an_https_path_prefix() {
+    let t = b21_on(serde_json::json!({ "PublicUrl": "https://media.example/jf/" })).await;
+    let settings = t.settings().await;
+    assert_eq!(settings["PublicUrl"], "https://media.example/jf");
+    assert_eq!(
+        settings["CallbackUrl"],
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let flow = t.start().await;
+    assert_eq!(
+        flow.param("redirect_uri"),
+        "https://media.example/jf/Auth/Oidc/Callback"
+    );
+    let attrs = b21_cookie_attrs(&flow.set_cookie);
+    assert!(
+        attrs.iter().any(|a| a == "path=/jf/auth/oidc"),
+        "the cookie path has the prefix"
+    );
+    assert!(attrs.iter().any(|a| a == "secure"), "Secure over https");
+    let location = t
+        .approve(&flow, b21_user("pat-sub", "pat"), B21Sign::Key(0))
+        .await;
+    assert_eq!(location, "https://media.example/jf/web/#login/oidc");
+}
+
+#[tokio::test]
+async fn b21_start_reports_a_provider_that_is_down() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.op.with(|st| st.down = true);
+    let (status, headers, body) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        b21_header(&headers, "set-cookie"),
+        "",
+        "no flow without a provider"
+    );
+    assert!(!body.contains(B21_CLIENT_SECRET));
+    t.op.with(|st| st.down = false);
+    t.start().await;
+}
+
+#[tokio::test]
+async fn b21_discovery_is_cached_until_the_settings_change() {
+    let t = b21_on(serde_json::json!({})).await;
+    let fetches = || t.op.with(|st| (st.discovery_fetches, st.jwks_fetches));
+    assert_eq!(fetches(), (1, 1), "the save checked the provider");
+    t.start().await;
+    t.start().await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    assert_eq!(
+        fetches(),
+        (2, 2),
+        "fetched once after the save, then cached"
+    );
+    let (status, _) = t
+        .save(serde_json::json!({ "ButtonLabel": "Pocket ID" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetches(), (3, 3), "the save checked the provider again");
+    t.start().await;
+    assert_eq!(fetches().0, 4, "the save emptied the cache");
+}
+
+#[tokio::test]
+async fn b21_sign_in_creates_a_user() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "plain", "pw-plain", false).await;
+    let count = t.user_count().await;
+    let result = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("pat signs in");
+    assert_eq!(result["User"]["Name"], "pat");
+    assert_eq!(result["User"]["IsAdministrator"], false);
+    assert_eq!(
+        result["SessionInfo"]["DeviceId"], "b21-web",
+        "the browser's device"
+    );
+    assert_eq!(result["SessionInfo"]["Client"], "B21");
+    assert_eq!(t.user_count().await, count + 1);
+    let token = result["AccessToken"].as_str().expect("an AccessToken");
+    assert_eq!(b21_me(&t.app, token).await, Ok("pat".to_string()));
+    assert_eq!(
+        user_flags(&t.state, "pat").await,
+        Some((false, false, false)),
+        "not admin, not owner, not disabled"
+    );
+    let hash = "SELECT password_hash FROM users WHERE name = ?";
+    assert_eq!(
+        b21_text(&t.state, hash, "pat").await.as_deref(),
+        Some(""),
+        "no password"
+    );
+    let config = "SELECT configuration FROM users WHERE name = ?";
+    assert_eq!(
+        b21_text(&t.state, config, "pat").await,
+        b21_text(&t.state, config, "plain").await,
+        "the default configuration"
+    );
+    assert_eq!(
+        t.link_row("pat").await,
+        Some((t.op.base.clone(), "pat-sub".to_string(), "pat".to_string()))
+    );
+    let login_date = "SELECT last_login_date IS NOT NULL FROM users WHERE name = ?";
+    assert!(
+        b21_true(&t.state, login_date, "pat").await,
+        "the last login is set"
+    );
+    assert!(
+        b21_true(&t.state, B21_SIGNED_IN, "pat").await,
+        "the link's last sign-in is set"
+    );
+    assert_eq!(
+        t.op.with(|st| st.userinfo_calls),
+        0,
+        "the ID token had every claim"
+    );
+}
+
+#[tokio::test]
+async fn b21_sign_in_again_follows_the_link() {
+    let t = b21_on(serde_json::json!({})).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let count = t.user_count().await;
+    let second = t.sign_in(b21_user("pat-sub", "patricia")).await.unwrap();
+    assert_eq!(
+        second["User"]["Id"], first["User"]["Id"],
+        "the link wins over the username"
+    );
+    assert_eq!(second["User"]["Name"], "pat", "the Rustyfin name stays");
+    assert_eq!(t.user_count().await, count);
+    let link = t.link_row("pat").await.expect("pat is linked");
+    assert_eq!(link.2, "patricia", "the provider username is updated");
+    let old = first["AccessToken"].as_str().unwrap();
+    let new = second["AccessToken"].as_str().unwrap();
+    assert_eq!(
+        b21_me(&t.app, old).await,
+        Err(StatusCode::UNAUTHORIZED),
+        "the browser's old token is replaced"
+    );
+    assert_eq!(b21_me(&t.app, new).await, Ok("pat".to_string()));
+}
+
+#[tokio::test]
+async fn b21_sign_in_refuses_a_taken_name() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "Alice", "pw-alice", false).await;
+    let count = t.user_count().await;
+    for name in ["Alice", "alice", "ALICE", "aLiCe"] {
+        let result = t.sign_in(b21_user("alice-sub", name)).await;
+        assert_eq!(result.err().as_deref(), Some("name_taken"), "{name}");
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "no link");
+
+    let (alice, _) = login(&t.app, "Alice", "pw-alice")
+        .await
+        .expect("the password still works");
+    t.link(&alice, b21_user("alice-sub", "alice"))
+        .await
+        .expect("Alice links from the profile");
+    let result = t
+        .sign_in(b21_user("alice-sub", "alice"))
+        .await
+        .expect("from then on the link signs Alice in");
+    assert_eq!(result["User"]["Name"], "Alice");
+    assert_eq!(t.user_count().await, count);
+}
+
+#[tokio::test]
+async fn b21_sign_in_refuses_taken_names() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    add_user(&t.state, "linked", "pw-linked", false).await;
+    let (linked, _) = login(&t.app, "linked", "pw-linked").await.unwrap();
+    t.link(&linked, b21_user("first-sub", "linked"))
+        .await
+        .unwrap();
+    add_user(&t.state, "dis", "pw-dis", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "dis",
+    )
+    .await;
+    add_user(&t.state, "Sam", "pw-sam", false).await;
+    add_user(&t.state, "sam", "pw-sam", false).await;
+    let count = t.user_count().await;
+
+    let cases = [
+        (b21_user("ada-sub", "ada"), "name_taken"),
+        (b21_user("other-sub", "Linked"), "name_taken"),
+        (b21_user("dis-sub", "dis"), "name_taken_ask_admin"),
+        (b21_user("sam-sub", "SAM"), "name_taken"),
+        (
+            serde_json::json!({ "sub": "anon-sub", "preferred_username": null }),
+            "no_username",
+        ),
+        (b21_user("blank-sub", "  "), "no_username"),
+        (
+            serde_json::json!({ "sub": "num-sub", "preferred_username": 42 }),
+            "no_username",
+        ),
+    ];
+    for (claims, code) in cases {
+        let result = t.sign_in(claims.clone()).await;
+        assert_eq!(result.err().as_deref(), Some(code), "{claims}");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 1, "nothing linked");
+
+    let (status, _) = t
+        .save(serde_json::json!({ "UsernameClaim": "email" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let claims = serde_json::json!({ "sub": "mail-sub", "preferred_username": "ignored", "email": "mail@x.test" });
+    let result = t
+        .sign_in(claims)
+        .await
+        .expect("the username claim is configurable");
+    assert_eq!(result["User"]["Name"], "mail@x.test");
+}
+
+#[tokio::test]
+async fn b21_linked_user_that_is_disabled_is_refused() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "pat",
+    )
+    .await;
+    let result = t.sign_in(b21_user("pat-sub", "pat")).await;
+    assert_eq!(result.err().as_deref(), Some("account_disabled"));
+}
+
+#[tokio::test]
+async fn b21_deleting_a_user_removes_the_link() {
+    let t = b21_on(serde_json::json!({})).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let id = first["User"]["Id"].as_str().unwrap();
+    let req = request("DELETE", &format!("/Users/{id}"), Some(&t.admin), None);
+    let (status, _) = send(&t.app, req).await;
+    assert!(status.is_success(), "deleting pat: {status}");
+    assert_eq!(t.link_count().await, 0, "the link went with the user");
+    let again = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    assert_ne!(again["User"]["Id"], first["User"]["Id"], "a new user");
+}
+
+#[tokio::test]
+async fn b21_userinfo_fills_missing_claims() {
+    let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
+    let info =
+        serde_json::json!({ "sub": "uma-sub", "preferred_username": "uma", "groups": ["family"] });
+    t.op.with(|st| st.userinfo = Some(info));
+    let result = t
+        .sign_in(serde_json::json!({ "sub": "uma-sub" }))
+        .await
+        .expect("uma signs in with the claims from userinfo");
+    assert_eq!(result["User"]["Name"], "uma");
+    assert_eq!(
+        t.op.with(|st| st.userinfo_calls),
+        1,
+        "userinfo is read once"
+    );
+
+    let info = serde_json::json!({ "sub": "someone-else", "preferred_username": "uma", "groups": ["family"] });
+    t.op.with(|st| st.userinfo = Some(info));
+    let result = t.sign_in(serde_json::json!({ "sub": "uma-sub" })).await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some("invalid_token"),
+        "userinfo about another subject"
+    );
+
+    let calls = t.op.with(|st| st.userinfo_calls);
+    let claims =
+        serde_json::json!({ "sub": "uma-sub", "preferred_username": "uma", "groups": ["family"] });
+    t.sign_in(claims).await.unwrap();
+    assert_eq!(
+        t.op.with(|st| st.userinfo_calls),
+        calls,
+        "no userinfo call when the ID token has every claim"
+    );
+}
+
+#[tokio::test]
+async fn b21_callback_checks_the_browser_binding() {
+    let t = b21_on(serde_json::json!({})).await;
+    let pat = || b21_user("pat-sub", "pat");
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let (location, _) = t.callback(None, &flow.callback_query(&code)).await;
+    assert_eq!(location, b21_login_error("state_mismatch"), "no cookie");
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let query = b21_query(&[("code", code.as_str()), ("state", "not-the-state")]);
+    let (location, set_cookie) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, b21_login_error("state_mismatch"), "another state");
+    assert!(
+        b21_clears_cookie(&set_cookie),
+        "the error clears the cookie"
+    );
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "the mismatch ended the flow"
+    );
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let (location, _) = t
+        .callback(Some("rustyfin_oidc=unknown-flow-id"), &query)
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "a cookie without a flow"
+    );
+
+    let a = t.start().await;
+    let b = t.start().await;
+    let code = t.op.approve(&b, pat(), B21Sign::Key(0));
+    let (location, _) = t.callback(Some(&a.cookie), &b.callback_query(&code)).await;
+    assert_eq!(
+        location,
+        b21_login_error("state_mismatch"),
+        "flow A's cookie with flow B's state"
+    );
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, format!("{B21_PUBLIC_URL}/web/#login/oidc"));
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "a second callback for the same flow"
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the replay ended the flow"
+    );
+}
+
+#[tokio::test]
+async fn b21_callback_maps_provider_answers() {
+    let t = b21_on(serde_json::json!({})).await;
+    let pat = || b21_user("pat-sub", "pat");
+
+    let flow = t.start().await;
+    let state = flow.param("state");
+    let query = b21_query(&[("error", "access_denied"), ("state", state.as_str())]);
+    let (location, set_cookie) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, b21_login_error("cancelled"));
+    assert!(
+        b21_clears_cookie(&set_cookie),
+        "the error clears the cookie"
+    );
+
+    let flow = t.start().await;
+    let state = flow.param("state");
+    let query = b21_query(&[("error", "server_error"), ("state", state.as_str())]);
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(location, b21_login_error("provider_error"));
+
+    let flow = t.start().await;
+    let query = flow.callback_query("b21-code-unknown");
+    let (location, _) = t.callback(Some(&flow.cookie), &query).await;
+    assert_eq!(
+        location,
+        b21_login_error("provider_error"),
+        "the provider refuses the code"
+    );
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    t.op.with(|st| st.down = true);
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("provider_error"),
+        "the provider is down"
+    );
+    t.op.with(|st| st.down = false);
+
+    let flow = t.start().await;
+    let code = t.op.approve(&flow, pat(), B21Sign::Key(0));
+    let (status, _) = t.save(serde_json::json!({ "Enabled": false })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("disabled"),
+        "OIDC was turned off during the flow"
+    );
+}
+
+#[tokio::test]
+async fn b21_id_token_checks() {
+    let t = b21_on(serde_json::json!({})).await;
+    let now = chrono::Utc::now().timestamp();
+    let cases = [
+        (
+            "signed by an unpublished key",
+            serde_json::json!({}),
+            B21Sign::Forged(0),
+        ),
+        ("unsigned", serde_json::json!({}), B21Sign::Unsigned),
+        (
+            "HS256 with the client secret",
+            serde_json::json!({}),
+            B21Sign::Hs256,
+        ),
+        (
+            "another issuer",
+            serde_json::json!({ "iss": "http://evil.test" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "another audience",
+            serde_json::json!({ "aud": "other-client" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "an extra audience",
+            serde_json::json!({ "aud": [B21_CLIENT_ID, "other-client"] }),
+            B21Sign::Key(0),
+        ),
+        (
+            "another authorized party",
+            serde_json::json!({ "azp": "other-client" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "expired",
+            serde_json::json!({ "iat": now - 7200, "exp": now - 3600 }),
+            B21Sign::Key(0),
+        ),
+        (
+            "another nonce",
+            serde_json::json!({ "nonce": "not-the-nonce" }),
+            B21Sign::Key(0),
+        ),
+        (
+            "no nonce",
+            serde_json::json!({ "nonce": null }),
+            B21Sign::Key(0),
+        ),
+        (
+            "no subject",
+            serde_json::json!({ "sub": null }),
+            B21Sign::Key(0),
+        ),
+    ];
+    for (what, extra, sign) in cases {
+        let mut claims = b21_user("tok-sub", "tok");
+        for (name, value) in extra.as_object().unwrap() {
+            claims[name] = value.clone();
+        }
+        let result = t.sign_in_as(claims, sign).await;
+        assert_eq!(result.err().as_deref(), Some("invalid_token"), "{what}");
+    }
+    assert_eq!(
+        user_flags(&t.state, "tok").await,
+        None,
+        "no user from a bad token"
+    );
+    t.sign_in(b21_user("tok-sub", "tok"))
+        .await
+        .expect("a good token");
+}
+
+#[tokio::test]
+async fn b21_unknown_kid_triggers_one_jwks_refetch() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let before = t.op.with(|st| st.jwks_fetches);
+    let result = t
+        .sign_in_as(b21_user("pat-sub", "pat"), B21Sign::Kid(0, "b21-key-x"))
+        .await;
+    assert_eq!(result.err().as_deref(), Some("invalid_token"));
+    assert_eq!(
+        t.op.with(|st| st.jwks_fetches),
+        before + 1,
+        "one refetch for the unknown kid"
+    );
+}
+
+#[tokio::test]
+async fn b21_rotated_keys_are_refetched_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let before = t.op.with(|st| st.jwks_fetches);
+    t.op.with(|st| st.keys = vec![("b21-key-b".to_string(), b21_key(0x22))]);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the new key is fetched");
+    assert_eq!(t.op.with(|st| st.jwks_fetches), before + 1);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the new key is kept");
+    assert_eq!(
+        t.op.with(|st| st.jwks_fetches),
+        before + 1,
+        "the refetched JWKS is cached"
+    );
+}
+
+#[tokio::test]
+async fn b21_token_request_authenticates_the_client() {
+    let t = b21_on(serde_json::json!({})).await;
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("client_secret_basic");
+    let (auth, form) =
+        t.op.with(|st| st.token_requests.last().cloned())
+            .expect("a token request");
+    assert_eq!(auth, B21Auth::Basic);
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert_eq!(
+        form.get("redirect_uri").map(String::as_str),
+        Some(B21_CALLBACK)
+    );
+    let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+    assert!((43..=128).contains(&verifier.len()), "an RFC 7636 verifier");
+    assert!(
+        verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)),
+        "an RFC 7636 verifier"
+    );
+    assert!(
+        !form.contains_key("client_secret"),
+        "the secret goes only in the header"
+    );
+
+    t.op.with(|st| {
+        let methods = serde_json::json!(["client_secret_post"]);
+        st.discovery
+            .insert("token_endpoint_auth_methods_supported".into(), methods);
+        st.expect_auth = B21Auth::Post;
+    });
+    let (status, _) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("client_secret_post");
+    assert_eq!(
+        t.op.with(|st| st.token_requests.last().unwrap().0),
+        B21Auth::Post
+    );
+
+    t.op.with(|st| st.expect_auth = B21Auth::None);
+    let (status, _) = t.save(serde_json::json!({ "ClientSecret": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    t.sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("a public client");
+    let (auth, form) = t.op.with(|st| st.token_requests.last().cloned()).unwrap();
+    assert_eq!(auth, B21Auth::None);
+    assert_eq!(
+        form.get("client_id").map(String::as_str),
+        Some(B21_CLIENT_ID)
+    );
+}
+
+#[tokio::test]
+async fn b21_complete_hands_out_the_token_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    let flow = t.start().await;
+    let early = t.complete(Some(&flow.cookie)).await.0;
+    assert_eq!(early, StatusCode::UNAUTHORIZED, "before the callback");
+    assert_eq!(
+        t.complete(None).await.0,
+        StatusCode::UNAUTHORIZED,
+        "no cookie"
+    );
+    let unknown = t.complete(Some("rustyfin_oidc=unknown-flow-id")).await.0;
+    assert_eq!(unknown, StatusCode::UNAUTHORIZED, "an unknown flow");
+    let location = t
+        .approve(&flow, b21_user("comp-sub", "comp"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        format!("{B21_PUBLIC_URL}/web/#login/oidc"),
+        "the flow survived the early Complete"
+    );
+    let (status, body, set_cookie) = t.complete(Some(&flow.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["User"]["Name"], "comp");
+    assert!(b21_clears_cookie(&set_cookie), "Complete clears the cookie");
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the token is handed out once"
+    );
+}
+
+#[tokio::test]
+async fn b21_allowed_group_gates_every_sign_in() {
+    let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
+    let count = t.user_count().await;
+    let outsiders = [
+        serde_json::json!({ "sub": "out-sub", "preferred_username": "outsider", "groups": ["friends"] }),
+        b21_user("nog-sub", "nogroups"),
+        serde_json::json!({ "sub": "eve-sub", "preferred_username": "eve", "groups": [] }),
+    ];
+    for claims in outsiders {
+        let result = t.sign_in(claims.clone()).await;
+        assert_eq!(result.err().as_deref(), Some("not_allowed"), "{claims}");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+
+    let member = |groups: serde_json::Value| serde_json::json!({ "sub": "mem-sub", "preferred_username": "member", "groups": groups });
+    t.sign_in(member(serde_json::json!(["family"])))
+        .await
+        .expect("a member signs in");
+    let result = t.sign_in(member(serde_json::json!(["friends"]))).await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some("not_allowed"),
+        "a linked user who left the group"
+    );
+
+    let (status, _) = t.save(serde_json::json!({ "GroupClaim": "roles" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let claims = serde_json::json!({ "sub": "mem-sub", "preferred_username": "member", "roles": ["family"] });
+    t.sign_in(claims)
+        .await
+        .expect("the group claim is configurable");
+}
+
+#[tokio::test]
+async fn b21_oidc_endpoints_share_the_login_limit() {
+    let t = b21_on(serde_json::json!({})).await;
+    let mut limited = t.state.clone();
+    limited.rate_limiter = RateLimiter::new(3, 60);
+    let remote = remote_app(limited.clone());
+    let start = || request("POST", "/Auth/Oidc/Start", None, None);
+    assert_eq!(send(&remote, start()).await.0, StatusCode::OK);
+    let callback = request("GET", "/Auth/Oidc/Callback?code=x&state=y", None, None);
+    assert_eq!(send(&remote, callback).await.0, StatusCode::SEE_OTHER);
+    let complete = request("POST", "/Auth/Oidc/Complete", None, None);
+    assert_eq!(send(&remote, complete).await.0, StatusCode::UNAUTHORIZED);
+
+    assert_eq!(
+        send(&remote, start()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth request in a minute"
+    );
+    let body = serde_json::json!({ "Username": "owner", "Pw": "pw-owner" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "password sign-in shares the limit"
+    );
+    assert_eq!(
+        send(&remote, b21_qc_sign_in(Some(B21_UNKNOWN_SECRET)))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "so does Quick Connect"
+    );
+    assert_eq!(
+        send(&app(limited), start()).await.0,
+        StatusCode::OK,
+        "loopback is exempt"
+    );
+}
+
+#[tokio::test]
+async fn b21_flows_are_capped() {
+    let t = b21_on(serde_json::json!({})).await;
+    let first = t.start().await;
+    let second = t.start().await;
+    for _ in 0..999 {
+        assert_eq!(t.start_raw().await.0, StatusCode::OK);
+    }
+    let location = t
+        .approve(&first, b21_user("pat-sub", "pat"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        b21_login_error("expired"),
+        "the oldest of 1001 flows was dropped"
+    );
+    let location = t
+        .approve(&second, b21_user("pat-sub", "pat"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        format!("{B21_PUBLIC_URL}/web/#login/oidc"),
+        "the 1000 newest flows live"
+    );
+}
+
+#[tokio::test]
+async fn b21_secrets_stay_out_of_answers_and_logs() {
+    use base64::Engine as _;
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AllowedGroup": "family" })).await;
+    let family = |sub: &str, name: &str, group: &str| serde_json::json!({ "sub": sub, "preferred_username": name, "groups": [group] });
+    let basic = format!("{B21_CLIENT_ID}:{B21_CLIENT_SECRET}");
+    let mut secrets = vec![
+        ("the client secret", B21_CLIENT_SECRET.to_string()),
+        (
+            "the Basic credentials",
+            base64::engine::general_purpose::STANDARD.encode(basic),
+        ),
+    ];
+    let mut flow_ids = Vec::new();
+    let mut answers = vec![t.settings().await.to_string()];
+    let info = send(&t.app, request("GET", "/Auth/Oidc/Info", None, None)).await;
+    answers.push(info.1.to_string());
+
+    let flow = t.start().await;
+    answers.push(flow.url.clone());
+    flow_ids.push(flow.cookie.trim_start_matches("rustyfin_oidc=").to_string());
+    let code =
+        t.op.approve(&flow, family("pat-sub", "pat", "family"), B21Sign::Key(0));
+    let (location, _) = t
+        .callback(Some(&flow.cookie), &flow.callback_query(&code))
+        .await;
+    answers.push(location);
+    secrets.push(("an authorization code", code));
+    secrets.push((
+        "an ID token",
+        t.op.with(|st| st.last_id_token.clone().unwrap()),
+    ));
+    let (status, body, _) = t.complete(Some(&flow.cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    let access_token = body["AccessToken"].as_str().unwrap().to_string();
+
+    let closed = b21_settings_body(&t.op, serde_json::json!({ "IssuerUrl": b21_closed_url() }));
+    let (status, body) = t.save(closed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    answers.push(body.to_string());
+    let (status, _) = t.save(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "a save empties the cache");
+    t.op.with(|st| st.down = true);
+    let (status, _, body) = t.start_raw().await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    answers.push(body);
+    t.op.with(|st| st.down = false);
+
+    let refused = [
+        (family("pat-sub", "pat", "family"), B21Sign::Forged(0)),
+        (family("fr-sub", "fr", "friends"), B21Sign::Key(0)),
+    ];
+    for (claims, sign) in refused {
+        let flow = t.start().await;
+        flow_ids.push(flow.cookie.trim_start_matches("rustyfin_oidc=").to_string());
+        let code = t.op.approve(&flow, claims, sign);
+        let (location, _) = t
+            .callback(Some(&flow.cookie), &flow.callback_query(&code))
+            .await;
+        assert!(
+            location.contains("/web/#login/oidc-error/"),
+            "the sign-in is refused"
+        );
+        answers.push(location);
+        secrets.push(("an authorization code", code));
+        secrets.push((
+            "an ID token",
+            t.op.with(|st| st.last_id_token.clone().unwrap()),
+        ));
+    }
+    for token in
+        t.op.with(|st| st.access.keys().cloned().collect::<Vec<_>>())
+    {
+        secrets.push(("a provider access token", token));
+    }
+
+    let text = log.text();
+    for (what, secret) in &secrets {
+        for answer in &answers {
+            assert!(!answer.contains(secret.as_str()), "an answer holds {what}");
+        }
+        assert!(!text.contains(secret.as_str()), "the log holds {what}");
+    }
+    for id in &flow_ids {
+        assert!(!text.contains(id.as_str()), "the log holds a flow id");
+    }
+    assert!(
+        !text.contains(&access_token),
+        "the log holds Rustyfin's token"
+    );
+}
+
+// Task 4: admin rights from a group, linking and unlinking (AC12, AC17-AC19, AC29-AC31).
+
+/// Claims of gus, a provider user in `groups`.
+fn b21_gus(groups: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "sub": "gus-sub", "preferred_username": "gus", "groups": groups })
+}
+
+#[tokio::test]
+async fn b21_admin_group_grants_and_takes_back_admin() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["User"]["IsAdministrator"], true,
+        "the group grants admin rights"
+    );
+    assert!(t.is_admin("gus").await);
+    assert!(t.admin_from_group("gus").await);
+    let token = result["AccessToken"].as_str().unwrap();
+    let req = request("GET", "/Auth/Oidc/Settings", Some(token), None);
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::OK,
+        "gus acts as an admin"
+    );
+
+    let result = t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert_eq!(
+        result["User"]["IsAdministrator"], false,
+        "leaving the group takes the rights back"
+    );
+    assert!(!t.is_admin("gus").await);
+    assert!(!t.admin_from_group("gus").await);
+
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("gus").await, "rejoining grants them again");
+    assert!(t.admin_from_group("gus").await);
+
+    add_user(&t.state, "lou", "pw-lou", false).await;
+    let (lou, _) = login(&t.app, "lou", "pw-lou").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "lou-sub", "preferred_username": "lou", "groups": ["admins"] });
+    t.link(&lou, claims)
+        .await
+        .expect("lou links from the profile");
+    assert!(t.is_admin("lou").await, "a link applies the group too");
+    assert!(t.admin_from_group("lou").await);
+
+    let (status, _) = t.save(serde_json::json!({ "AdminGroup": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(
+        !t.is_admin("gus").await,
+        "without an admin group the group-granted rights go"
+    );
+    assert!(!t.admin_from_group("gus").await);
+}
+
+#[tokio::test]
+async fn b21_admin_group_keeps_hand_granted_admins() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (ada, _) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let claims = |groups: serde_json::Value| serde_json::json!({ "sub": "ada-sub", "preferred_username": "ada", "groups": groups });
+    t.link(&ada, claims(serde_json::json!([])))
+        .await
+        .expect("an admin links from the profile");
+    assert!(
+        t.is_admin("ada").await,
+        "a hand-granted admin outside the group"
+    );
+    assert!(!t.admin_from_group("ada").await);
+    t.sign_in(claims(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("ada").await);
+    assert!(
+        !t.admin_from_group("ada").await,
+        "the group did not grant the rights"
+    );
+    t.sign_in(claims(serde_json::json!([]))).await.unwrap();
+    assert!(
+        t.is_admin("ada").await,
+        "leaving the group keeps hand-granted rights"
+    );
+}
+
+#[tokio::test]
+async fn b21_admin_group_keeps_the_last_admin() {
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "owner",
+    )
+    .await;
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(
+        t.is_admin("gus").await,
+        "the last enabled admin keeps the rights"
+    );
+    assert!(t.admin_from_group("gus").await, "and the flag");
+    let warned = log
+        .text()
+        .lines()
+        .any(|line| line.contains("WARN") && line.to_lowercase().contains("admin"));
+    assert!(warned, "a warning says why");
+}
+
+#[tokio::test]
+async fn b21_hand_changes_clear_the_group_flag() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    let uri = format!("/Users/{}/Policy", result["User"]["Id"].as_str().unwrap());
+    let policy = |admin: bool| {
+        let body = serde_json::json!({ "IsAdministrator": admin });
+        request("POST", &uri, Some(&t.admin), Some(body))
+    };
+    let (status, _) = send(&t.app, policy(false)).await;
+    assert!(status.is_success(), "revoking by hand: {status}");
+    assert!(!t.is_admin("gus").await);
+    assert!(
+        !t.admin_from_group("gus").await,
+        "a hand change clears the flag"
+    );
+
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("gus").await, "while in the group the group wins");
+    assert!(t.admin_from_group("gus").await);
+
+    // Resending IsAdministrator keeps the flag (AC42), so a revoke and a grant hand the rights over.
+    let (status, _) = send(&t.app, policy(false)).await;
+    assert!(status.is_success(), "revoking by hand: {status}");
+    let (status, _) = send(&t.app, policy(true)).await;
+    assert!(status.is_success(), "granting by hand: {status}");
+    assert!(t.is_admin("gus").await);
+    assert!(
+        !t.admin_from_group("gus").await,
+        "a hand grant clears the flag"
+    );
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(
+        t.is_admin("gus").await,
+        "hand-granted rights stay outside the group"
+    );
+}
+
+#[tokio::test]
+async fn b21_link_from_the_profile() {
+    let t = b21().await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    let link_req = |token: &str| request("POST", "/Auth/Oidc/Link", Some(token), None);
+    let (status, _) = send(&t.app, link_req(&bob)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "OIDC is off");
+    let (status, _) = t
+        .save(b21_settings_body(&t.op, serde_json::json!({})))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let anonymous = request("POST", "/Auth/Oidc/Link", None, None);
+    assert_eq!(send(&t.app, anonymous).await.0, StatusCode::UNAUTHORIZED);
+
+    let flow = t.start_link(&bob).await;
+    let location = t
+        .approve(&flow, b21_user("bob-sub", "robert"), B21Sign::Key(0))
+        .await;
+    assert_eq!(
+        location,
+        format!("{B21_PUBLIC_URL}/web/#settings/oidc-linked")
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a link hands out no token"
+    );
+    assert_eq!(
+        t.link_row("bob").await,
+        Some((
+            t.op.base.clone(),
+            "bob-sub".to_string(),
+            "robert".to_string()
+        ))
+    );
+    assert!(
+        !b21_true(&t.state, B21_SIGNED_IN, "bob").await,
+        "a link is not a sign-in"
+    );
+    let (status, _) = send(&t.app, link_req(&bob)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "bob is linked already");
+
+    let result = t.sign_in(b21_user("bob-sub", "robert")).await.unwrap();
+    assert_eq!(result["User"]["Name"], "bob", "robert signs in as bob");
+    assert!(b21_true(&t.state, B21_SIGNED_IN, "bob").await);
+
+    add_user(&t.state, "cy", "pw-cy", false).await;
+    let (cy, _) = login(&t.app, "cy", "pw-cy").await.unwrap();
+    let result = t.link(&cy, b21_user("bob-sub", "robert")).await;
+    assert_eq!(
+        result.err().as_deref(),
+        Some("already_linked"),
+        "robert is bob's"
+    );
+    assert_eq!(t.link_row("cy").await, None);
+
+    t.link(&t.admin, b21_user("owner-sub", "owner"))
+        .await
+        .expect("admins may link this way");
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowedGroup": "family" }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    add_user(&t.state, "eve", "pw-eve", false).await;
+    let (eve, _) = login(&t.app, "eve", "pw-eve").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "eve-sub", "preferred_username": "eve", "groups": ["friends"] });
+    let result = t.link(&eve, claims).await;
+    assert_eq!(result.err().as_deref(), Some("not_allowed"));
+    assert_eq!(t.link_row("eve").await, None, "nothing linked");
+}
+
+#[tokio::test]
+async fn b21_accounts_show_the_link_status() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, bob_id) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    t.link(&bob, b21_user("bob-sub", "robert")).await.unwrap();
+    let pat = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = pat["User"]["Id"].as_str().unwrap().to_string();
+    add_user(&t.state, "cy", "pw-cy", false).await;
+    t.link(&t.admin, b21_user("owner-sub", "owner"))
+        .await
+        .unwrap();
+
+    let req = request("GET", "/Auth/Oidc/Accounts", Some(&t.admin), None);
+    let (status, list) = send(&t.app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = list.as_array().expect("an array").clone();
+    assert_eq!(
+        list.len() as i64,
+        t.user_count().await,
+        "one entry per user"
+    );
+    for entry in &list {
+        assert_eq!(entry.as_object().map(|o| o.len()), Some(10), "{entry}");
+    }
+    let find = |name: &str| {
+        list.iter()
+            .find(|e| e["UserName"] == name)
+            .unwrap_or_else(|| panic!("no entry for {name}"))
+            .clone()
+    };
+    let same_id = |value: &serde_json::Value, id: &str| {
+        let parsed = uuid::Uuid::parse_str(value.as_str().unwrap_or_default()).ok();
+        parsed.is_some() && parsed == uuid::Uuid::parse_str(id).ok()
+    };
+    let rfc3339 = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+    };
+
+    let b = find("bob");
+    assert!(same_id(&b["UserId"], &bob_id), "{}", b["UserId"]);
+    assert_eq!(b["Linked"], true);
+    assert_eq!(b["HasPassword"], true);
+    assert_eq!(b["ProviderUsername"], "robert");
+    assert_eq!(b["IsAdministrator"], false);
+    assert_eq!(b["AdminFromGroup"], false);
+    assert_eq!(
+        b["CanUnlink"], true,
+        "bob can still sign in with the password"
+    );
+    assert!(rfc3339(&b["LinkedAt"]), "{}", b["LinkedAt"]);
+    assert!(
+        b["LastSignInAt"].is_null(),
+        "bob never signed in through OIDC"
+    );
+
+    let p = find("pat");
+    assert!(same_id(&p["UserId"], &pat_id), "{}", p["UserId"]);
+    assert_eq!(p["Linked"], true);
+    assert_eq!(p["HasPassword"], false);
+    assert_eq!(p["CanUnlink"], false, "pat has no other way in");
+    assert!(rfc3339(&p["LastSignInAt"]), "{}", p["LastSignInAt"]);
+
+    let c = find("cy");
+    assert_eq!(c["Linked"], false);
+    assert_eq!(c["HasPassword"], true);
+    for name in ["ProviderUsername", "LinkedAt", "LastSignInAt"] {
+        assert!(c[name].is_null(), "cy has no {name}");
+    }
+    assert_eq!(c["CanUnlink"], false, "nothing to unlink");
+
+    let o = find("owner");
+    assert_eq!(o["IsAdministrator"], true);
+    assert_eq!(o["CanUnlink"], true);
+
+    let one = |id: &str, token: &str| {
+        request(
+            "GET",
+            &format!("/Auth/Oidc/Accounts/{id}"),
+            Some(token),
+            None,
+        )
+    };
+    let req = request("GET", "/Auth/Oidc/Accounts", Some(&bob), None);
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "the list is for admins"
+    );
+    assert_eq!(
+        send(&t.app, one(&bob_id, &bob)).await,
+        (StatusCode::OK, b.clone()),
+        "a user reads their own entry"
+    );
+    assert_eq!(
+        send(&t.app, one(&pat_id, &bob)).await.0,
+        StatusCode::FORBIDDEN,
+        "not another user's"
+    );
+    assert_eq!(
+        send(&t.app, one(&pat_id, &t.admin)).await,
+        (StatusCode::OK, p.clone())
+    );
+    let unknown = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        send(&t.app, one(&unknown, &t.admin)).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, b) = send(&t.app, one(&bob_id, &t.admin)).await;
+    assert_eq!(b["CanUnlink"], false, "bob's password no longer works");
+    let (_, o) = send(&t.app, one(&t.admin_id, &t.admin)).await;
+    assert_eq!(o["CanUnlink"], true, "admins keep password sign-in");
+}
+
+#[tokio::test]
+async fn b21_unlink_needs_another_way_in() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let (bob, bob_id) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    t.link(&bob, b21_user("bob-sub", "robert")).await.unwrap();
+    let pat = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = pat["User"]["Id"].as_str().unwrap().to_string();
+    let pat_token = pat["AccessToken"].as_str().unwrap().to_string();
+    let unlink = |id: &str, token: &str| {
+        request(
+            "DELETE",
+            &format!("/Auth/Oidc/Accounts/{id}/Link"),
+            Some(token),
+            None,
+        )
+    };
+
+    let (status, body) = send(&t.app, unlink(&pat_id, &pat_token)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "pat has no password");
+    let detail = body["Detail"].as_str().unwrap_or_default();
+    assert!(!detail.is_empty(), "the answer says why");
+    assert_eq!(
+        send(&t.app, unlink(&pat_id, &bob)).await.0,
+        StatusCode::FORBIDDEN,
+        "not bob's link"
+    );
+    assert_eq!(
+        send(&t.app, unlink(&bob_id, &bob)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_row("bob").await, None);
+    assert_eq!(
+        send(&t.app, unlink(&bob_id, &bob)).await.0,
+        StatusCode::NOT_FOUND,
+        "no link left"
+    );
+
+    t.link(&bob, b21_user("bob-sub", "robert"))
+        .await
+        .expect("bob links again");
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(&t.app, unlink(&bob_id, &bob)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "bob's password no longer works"
+    );
+    let detail = body["Detail"].as_str().unwrap_or_default();
+    assert!(!detail.is_empty(), "the answer says why");
+    assert_eq!(
+        send(&t.app, unlink(&bob_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT,
+        "an admin may"
+    );
+    assert_eq!(
+        send(&t.app, unlink(&pat_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_count().await, 0);
+    let unknown = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        send(&t.app, unlink(&unknown, &t.admin)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+// Fix round 1: the review of 9cc903a (spec §10, AC37-AC42).
+
+#[tokio::test]
+async fn b21_admin_group_member_links_from_the_profile() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "cy", "pw-cy", false).await;
+    let count = t.user_count().await;
+    let boss =
+        serde_json::json!({ "sub": "boss-sub", "preferred_username": "bob", "groups": ["admins"] });
+
+    assert_eq!(
+        t.sign_in(boss.clone()).await.err().as_deref(),
+        Some("name_taken"),
+        "an admin-group member doesn't get a user by name"
+    );
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+    assert!(!t.is_admin("bob").await, "nothing granted");
+
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    t.link(&bob, boss.clone())
+        .await
+        .expect("bob links from the profile");
+    assert!(t.is_admin("bob").await, "the link applies the group");
+    assert!(t.admin_from_group("bob").await);
+    let result = t.sign_in(boss).await.expect("the linked identity signs in");
+    assert_eq!(result["User"]["Name"], "bob");
+
+    let cy =
+        serde_json::json!({ "sub": "cy-sub", "preferred_username": "cy", "groups": ["users"] });
+    assert_eq!(
+        t.sign_in(cy).await.err().as_deref(),
+        Some("name_taken"),
+        "outside the admin group a taken name is refused too"
+    );
+    assert_eq!(t.user_count().await, count);
+
+    let dee =
+        serde_json::json!({ "sub": "dee-sub", "preferred_username": "dee", "groups": ["admins"] });
+    let result = t
+        .sign_in(dee)
+        .await
+        .expect("a new admin-group member gets a new user");
+    assert_eq!(result["User"]["IsAdministrator"], true);
+    assert_eq!(t.user_count().await, count + 1);
+}
+
+#[tokio::test]
+async fn b21_self_rename_works_with_oidc_on() {
+    let t = b21_on(serde_json::json!({})).await;
+    let bob_id = add_user(&t.state, "bob", "pw-bob", false).await;
+    let ada_id = add_user(&t.state, "ada", "pw-ada", true).await;
+    let (bob, _) = login(&t.app, "bob", "pw-bob").await.unwrap();
+    let (ada, _) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let rename = |id: uuid::Uuid, token: &str, name: &str| {
+        let body = serde_json::json!({ "Name": name });
+        request("PUT", &format!("/Users/{id}"), Some(token), Some(body))
+    };
+
+    let (status, _) = send(&t.app, rename(bob_id, &bob, "gus")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a user renames themselves with OIDC on"
+    );
+    assert_eq!(b21_me(&t.app, &bob).await, Ok("gus".to_string()));
+    let (status, body) = send(&t.app, rename(ada_id, &bob, "bob")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "but nobody else");
+    assert_eq!(body["Detail"], "User update not allowed.");
+
+    let (status, _) = send(&t.app, rename(bob_id, &ada, "robert")).await;
+    assert_eq!(status, StatusCode::OK, "an administrator renames anyone");
+    assert_eq!(b21_me(&t.app, &bob).await, Ok("robert".to_string()));
+}
+
+#[tokio::test]
+async fn b21_quick_connect_initiate_shares_the_login_limit() {
+    let mut state = test_state().await;
+    add_user(&state, "alice", "pw-alice", false).await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let remote = remote_app(state);
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let mut secret = String::new();
+    for _ in 0..3 {
+        let (status, body) = send(&remote, initiate()).await;
+        assert_eq!(status, StatusCode::OK);
+        secret = body["Secret"].as_str().unwrap().to_string();
+    }
+    assert_eq!(
+        send(&remote, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth request in a minute"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "password sign-in shares the limit"
+    );
+    let uri = format!("/QuickConnect/Connect?secret={secret}");
+    assert_eq!(
+        send(&remote, request("GET", &uri, None, None)).await.0,
+        StatusCode::OK,
+        "apps keep polling Connect"
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_caps_live_requests() {
+    let state = test_state().await;
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let mut first = String::new();
+    let mut codes = std::collections::HashSet::new();
+    for client in 1..=20 {
+        let app = g2f_app_from(state.clone(), &format!("192.0.2.{client}:40000"));
+        for _ in 0..5 {
+            let (status, body) = send(&app, initiate()).await;
+            assert_eq!(status, StatusCode::OK, "client {client}");
+            if first.is_empty() {
+                first = body["Secret"].as_str().unwrap().to_string();
+            }
+            codes.insert(body["Code"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(codes.len(), 100, "live requests have different codes");
+    let app = g2f_app_from(state.clone(), "192.0.2.21:40000");
+    assert_eq!(
+        send(&app, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a 101st live request, from a new client"
+    );
+    assert_eq!(
+        state.quick_connect.read().await.len(),
+        100,
+        "nothing more is stored"
+    );
+
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&first)
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+    assert_eq!(
+        send(&app, initiate()).await.0,
+        StatusCode::OK,
+        "an expired request makes room"
+    );
+    assert_eq!(
+        send(&app, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_authorize_skips_expired_requests() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, alice_id) = login(&app, "alice", "pw-alice").await.unwrap();
+    let (status, init) = send(&app, request("POST", "/QuickConnect/Initiate", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap();
+    let live = init["Secret"].as_str().unwrap().to_string();
+    {
+        // Expired requests with the same code, as earlier requests can leave behind.
+        let mut store = state.quick_connect.write().await;
+        let template = store[&live].clone();
+        for n in 0..200 {
+            let mut old = template.clone();
+            old.secret = format!("{n:032x}");
+            old.date_added -= chrono::Duration::seconds(301);
+            store.insert(old.secret.clone(), old);
+        }
+    }
+
+    let uri = format!("/QuickConnect/Authorize?code={code}");
+    let (status, _) = send(&app, request("POST", &uri, Some(&alice), None)).await;
+    assert_eq!(status, StatusCode::OK, "the live request is approved");
+    let (status, body) = send(&app, b21_qc_sign_in(Some(&live))).await;
+    assert_eq!(status, StatusCode::OK, "its secret signs in");
+    assert_eq!(body["User"]["Id"], alice_id.as_str());
+    let (status, _) = send(&app, request("POST", &uri, Some(&alice), None)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "only expired requests carry the code now"
+    );
+}
+
+#[tokio::test]
+async fn b21_taken_names_fold_case_and_compatibility_forms() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "kelvin", "pw-kelvin", false).await;
+    add_user(&t.state, "Änne", "pw-anne", false).await;
+    add_user(&t.state, "strauss", "pw-strauss", false).await;
+    let count = t.user_count().await;
+
+    let variants = [
+        "\u{212A}elvin",
+        "KELVIN",
+        "ｋｅｌｖｉｎ",
+        "änne",
+        "A\u{0308}nne",
+        "ÄNNE",
+        "Strauß",
+        "STRAUß",
+    ];
+    for (i, name) in variants.into_iter().enumerate() {
+        assert_eq!(
+            t.sign_in(b21_user(&format!("variant-{i}-sub"), name))
+                .await
+                .err()
+                .as_deref(),
+            Some("name_taken"),
+            "{name:?} is a form of a taken name"
+        );
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "nobody is linked");
+
+    let result = t
+        .sign_in(b21_user("anne-sub", "anne"))
+        .await
+        .expect("a name without the umlaut is another name");
+    assert_eq!(result["User"]["Name"], "anne");
+    let result = t
+        .sign_in(b21_user("fiona-sub", "\u{FB01}ona"))
+        .await
+        .expect("a free name");
+    assert_eq!(
+        result["User"]["Name"], "\u{FB01}ona",
+        "the account gets the name as sent"
+    );
+    assert_eq!(
+        t.sign_in(b21_user("fiona2-sub", "FIONA"))
+            .await
+            .err()
+            .as_deref(),
+        Some("name_taken_ask_admin"),
+        "a stored name is folded too; that account has no password"
+    );
+    assert_eq!(t.user_count().await, count + 2);
+}
+
+#[tokio::test]
+async fn b21_password_switch_refuses_group_granted_admins() {
+    let t =
+        b21_on(serde_json::json!({ "AdminGroup": "admins", "AllowPasswordSignIn": false })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.admin_from_group("gus").await);
+    let gus_id = result["User"]["Id"].as_str().unwrap().to_string();
+    let gus = result["AccessToken"].as_str().unwrap().to_string();
+    let uri = format!("/Users/{gus_id}/Password");
+    let body = serde_json::json!({ "NewPw": "pw-gus" });
+    let (status, _) = send(&t.app, request("POST", &uri, Some(&gus), Some(body))).await;
+    assert!(
+        status.is_success(),
+        "the password form still works: {status}"
+    );
+
+    assert_eq!(
+        b21_password_sign_in(&t.app, "gus", "pw-gus").await,
+        (
+            StatusCode::FORBIDDEN,
+            "Password sign-in is turned off for this account.".to_string()
+        ),
+        "rights from the group don't pass the switch"
+    );
+    assert_eq!(b21_reset_pin(&t.app, "gus").await, None, "no reset PIN");
+    let uri = format!("/Auth/Oidc/Accounts/{gus_id}");
+    let (status, account) = send(&t.app, request("GET", &uri, Some(&gus), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(account["CanUnlink"], false, "the password is no way in");
+    let uri = format!("/Auth/Oidc/Accounts/{gus_id}/Link");
+    assert_eq!(
+        send(&t.app, request("DELETE", &uri, Some(&gus), None))
+            .await
+            .0,
+        StatusCode::CONFLICT,
+        "so the link stays"
+    );
+    assert_eq!(
+        b21_password_sign_in(&t.app, "owner", "pw-owner").await.0,
+        StatusCode::OK,
+        "administrators given rights by hand still sign in"
+    );
+
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        b21_password_sign_in(&t.app, "gus", "pw-gus").await.0,
+        StatusCode::OK,
+        "with passwords on, gus's password works"
+    );
+}
+
+#[tokio::test]
+async fn b21_password_switch_stops_reset_pins_for_group_granted_admins() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    for name in ["hal", "ivy"] {
+        let claims = serde_json::json!({ "sub": format!("{name}-sub"), "preferred_username": name, "groups": ["admins"] });
+        t.sign_in(claims).await.unwrap();
+        assert!(t.admin_from_group(name).await);
+    }
+    let hal_pin = b21_reset_pin(&t.app, "hal").await.expect("a PIN for hal");
+    let ivy_pin = b21_reset_pin(&t.app, "ivy").await.expect("a PIN for ivy");
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = serde_json::json!({ "Pin": hal_pin });
+    let req = request("POST", "/Users/ForgotPassword/Pin", None, Some(body));
+    assert_eq!(
+        send(&t.app, req).await.0,
+        StatusCode::FORBIDDEN,
+        "a group-granted admin's PIN resets nothing"
+    );
+    let body =
+        serde_json::json!({ "Pin": ivy_pin, "Username": "ivy", "TempPassword": "b21-temp-pw" });
+    let req = request("POST", "/Users/ResetPassword", None, Some(body));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::FORBIDDEN);
+    for name in ["hal", "ivy"] {
+        let sql = "SELECT password_hash = '' FROM users WHERE name = ?";
+        assert!(
+            b21_true(&t.state, sql, name).await,
+            "{name} still has no password"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b21_resending_the_policy_keeps_the_group_flag() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    let uri = format!("/Users/{}/Policy", result["User"]["Id"].as_str().unwrap());
+    let body = serde_json::json!({ "IsAdministrator": true, "EnableAllFolders": true });
+    let (status, _) = send(&t.app, request("POST", &uri, Some(&t.admin), Some(body))).await;
+    assert!(status.is_success(), "sending the policy back: {status}");
+    assert!(t.is_admin("gus").await);
+    assert!(
+        t.admin_from_group("gus").await,
+        "the same IsAdministrator keeps the rights group-given"
+    );
+
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(
+        !t.is_admin("gus").await,
+        "leaving the group still takes them back"
+    );
+}
+
+// Fix round 2: the re-check of fd5f398 (spec §11, AC44-AC49).
+
+#[tokio::test]
+async fn b21_taken_name_without_a_password_says_ask_an_administrator() {
+    let t = b21_on(serde_json::json!({ "AllowPasswordSignIn": false })).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    add_user(&t.state, "gus", "pw-gus", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_administrator = 1, admin_from_group = 1 WHERE name = ?",
+        "gus",
+    )
+    .await;
+    add_user(&t.state, "nopw", "pw-nopw", false).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET password_hash = '' WHERE name = ?",
+        "nopw",
+    )
+    .await;
+    add_user(&t.state, "dis", "pw-dis", true).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "dis",
+    )
+    .await;
+    add_user(&t.state, "Rex", "pw-rex", false).await;
+    add_user(&t.state, "rex", "pw-rex", true).await;
+    let count = t.user_count().await;
+    // The code for each provider name, with passwords off and then on.
+    let cases = [
+        ("bob", "name_taken_ask_admin", "name_taken"),
+        ("gus", "name_taken_ask_admin", "name_taken"),
+        ("ada", "name_taken", "name_taken"),
+        ("nopw", "name_taken_ask_admin", "name_taken_ask_admin"),
+        ("dis", "name_taken_ask_admin", "name_taken_ask_admin"),
+        ("REX", "name_taken", "name_taken"),
+    ];
+
+    for (name, off, _) in cases {
+        let result = t.sign_in(b21_user(&format!("{name}-sub"), name)).await;
+        assert_eq!(result.err().as_deref(), Some(off), "{name}, passwords off");
+    }
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (name, _, on) in cases {
+        let result = t.sign_in(b21_user(&format!("{name}-sub"), name)).await;
+        assert_eq!(result.err().as_deref(), Some(on), "{name}, passwords on");
+    }
+    assert_eq!(t.user_count().await, count, "nothing created");
+    assert_eq!(t.link_count().await, 0, "nothing linked");
+}
+
+#[tokio::test]
+async fn b21_links_survive_renames() {
+    let t = b21_on(serde_json::json!({})).await;
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    let first = t.sign_in(b21_user("pat-sub", "pat")).await.unwrap();
+    let pat_id = first["User"]["Id"].as_str().unwrap().to_string();
+    let pat = first["AccessToken"].as_str().unwrap().to_string();
+    let rename = |token: &str, name: &str| {
+        let body = serde_json::json!({ "Name": name });
+        request("PUT", &format!("/Users/{pat_id}"), Some(token), Some(body))
+    };
+
+    let (status, _) = send(&t.app, rename(&pat, "patrick")).await;
+    assert_eq!(status, StatusCode::OK, "a linked user renames themselves");
+    let again = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the link signs the renamed user in");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(again["User"]["Name"], "patrick", "the Rustyfin name stays");
+
+    let again = t
+        .sign_in(b21_user("pat-sub", "bob"))
+        .await
+        .expect("a link wins over a provider name that another user has");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(t.link_row("patrick").await.expect("still linked").2, "bob");
+
+    let count = t.user_count().await;
+    let other = t
+        .sign_in(b21_user("new-sub", "pat"))
+        .await
+        .expect("the old name is free again");
+    assert_ne!(other["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(other["User"]["Name"], "pat");
+    assert_eq!(t.user_count().await, count + 1);
+
+    let (status, _) = send(&t.app, rename(&t.admin, "rick")).await;
+    assert_eq!(status, StatusCode::OK, "an administrator renames the user");
+    let again = t
+        .sign_in(b21_user("pat-sub", "pat"))
+        .await
+        .expect("the link still signs in, though pat is taken now");
+    assert_eq!(again["User"]["Id"], first["User"]["Id"]);
+    assert_eq!(again["User"]["Name"], "rick");
+}
+
+#[tokio::test]
+async fn b21_quick_connect_caps_live_requests_per_client() {
+    let state = test_state().await;
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let one = remote_app(state.clone());
+    let mut secrets = Vec::new();
+    for i in 0..5 {
+        let (status, body) = send(&one, initiate()).await;
+        assert_eq!(status, StatusCode::OK, "request {i}");
+        secrets.push(body["Secret"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a sixth live request from one client"
+    );
+    assert_eq!(
+        state.quick_connect.read().await.len(),
+        5,
+        "the refused request is not stored"
+    );
+    let other = g2f_app_from(state.clone(), "192.0.2.11:40000");
+    assert_eq!(
+        send(&other, initiate()).await.0,
+        StatusCode::OK,
+        "another client has its own five"
+    );
+
+    state
+        .quick_connect
+        .write()
+        .await
+        .get_mut(&secrets[0])
+        .expect("the request is stored")
+        .date_added -= chrono::Duration::seconds(301);
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::OK,
+        "an expired request makes room"
+    );
+    assert_eq!(
+        send(&one, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    for i in 1..=5 {
+        let v6 = g2f_app_from(state.clone(), &format!("[2001:db8:1:1::{i}]:40000"));
+        assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "::{i}");
+    }
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:2::99]:40000");
+    assert_eq!(
+        send(&v6, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "one IPv6 /56 is one client"
+    );
+    let v6 = g2f_app_from(state.clone(), "[2001:db8:1:100::1]:40000");
+    assert_eq!(send(&v6, initiate()).await.0, StatusCode::OK, "another /56");
+
+    let local = app(state.clone());
+    for _ in 0..5 {
+        assert_eq!(send(&local, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&local, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "loopback is spared the login limit, not this cap"
+    );
+
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(0, 60);
+    let remote = remote_app(state);
+    for _ in 0..5 {
+        assert_eq!(send(&remote, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&remote, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the cap holds with the login limit off"
+    );
+}
+
+#[tokio::test]
+async fn b21_quick_connect_wrong_codes_count_against_the_login_limit() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    add_user(&state, "alice", "pw-alice", false).await;
+    let local = app(state.clone());
+    let (alice, _) = login(&local, "alice", "pw-alice").await.unwrap();
+    let initiate = || request("POST", "/QuickConnect/Initiate", None, None);
+    let (status, init) = send(&local, initiate()).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = init["Code"].as_str().unwrap().to_string();
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let authorize = |code: &str| {
+        let uri = format!("/QuickConnect/Authorize?code={code}");
+        request("POST", &uri, Some(alice.as_str()), None)
+    };
+
+    let remote = remote_app(state.clone());
+    for _ in 0..4 {
+        assert_eq!(
+            send(&remote, authorize(&code)).await.0,
+            StatusCode::OK,
+            "a right code doesn't count"
+        );
+    }
+    for i in 0..3 {
+        let (status, body) = send(&remote, authorize(wrong)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "miss {i}");
+        assert_eq!(body["Detail"], "Unknown code");
+    }
+    assert_eq!(
+        send(&remote, authorize(wrong)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth miss in a minute"
+    );
+    assert_eq!(
+        send(&remote, authorize(&code)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a limited client tries no more codes"
+    );
+    let body = serde_json::json!({ "Username": "alice", "Pw": "pw-alice" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    assert_eq!(
+        send(&remote, req).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "misses use the sign-in budget"
+    );
+    let other = g2f_app_from(state.clone(), "192.0.2.11:40000");
+    assert_eq!(
+        send(&other, authorize(&code)).await.0,
+        StatusCode::OK,
+        "another client has its own budget"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            send(&local, authorize(wrong)).await.0,
+            StatusCode::NOT_FOUND,
+            "loopback is exempt"
+        );
+    }
+
+    let third = g2f_app_from(state.clone(), "192.0.2.12:40000");
+    for _ in 0..2 {
+        assert_eq!(send(&third, initiate()).await.0, StatusCode::OK);
+    }
+    assert_eq!(
+        send(&third, authorize(wrong)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&third, authorize(wrong)).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "two Initiates and a miss use a budget of 3"
+    );
+    assert_eq!(
+        send(&third, initiate()).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(0, 60);
+    add_user(&state, "alice", "pw-alice", false).await;
+    let (alice, _) = login(&app(state.clone()), "alice", "pw-alice")
+        .await
+        .unwrap();
+    let remote = remote_app(state);
+    let uri = format!("/QuickConnect/Authorize?code={wrong}");
+    for _ in 0..5 {
+        let req = request("POST", &uri, Some(alice.as_str()), None);
+        assert_eq!(
+            send(&remote, req).await.0,
+            StatusCode::NOT_FOUND,
+            "a limit of 0 turns it off"
+        );
+    }
+}
+
+/// The text at the dotted `path` in the web client's `lang` translations, if there is one.
+fn b21_translation(lang: &str, path: &str) -> Option<String> {
+    let file = format!(
+        "{}/../rustyfin-web/src/translations/{lang}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    path.split('.')
+        .try_fold(&json, |value, key| value.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+fn b21_web_explains_taken_names() {
+    let texts = [
+        (
+            "en",
+            "oidc.error.name_taken",
+            "An account with this name already exists. Sign in with your password and link the provider from your profile, or ask an administrator.",
+        ),
+        (
+            "en",
+            "oidc.error.name_taken_ask_admin",
+            "An account with this name already exists. Ask an administrator.",
+        ),
+        (
+            "de",
+            "oidc.error.name_taken",
+            "Ein Konto mit diesem Namen gibt es schon. Bitte mit dem Passwort anmelden und den Anbieter im Profil verknüpfen, oder einen Administrator fragen.",
+        ),
+        (
+            "de",
+            "oidc.error.name_taken_ask_admin",
+            "Ein Konto mit diesem Namen gibt es schon. Bitte einen Administrator fragen.",
+        ),
+    ];
+    for (lang, key, text) in texts {
+        assert_eq!(
+            b21_translation(lang, key).as_deref(),
+            Some(text),
+            "{lang} {key}"
+        );
+    }
+    let gone = ["admin_link_required", "ambiguous_user", "warn_username"];
+    for lang in ["en", "de"] {
+        for key in [
+            "oidc.error.admin_link_required",
+            "oidc.error.ambiguous_user",
+            "oidc.warn_username",
+        ] {
+            assert_eq!(b21_translation(lang, key), None, "{lang} {key} is gone");
+        }
+    }
+    let app_js = std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/app.js",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    for code in ["name_taken", "name_taken_ask_admin"] {
+        assert!(
+            app_js.contains(&format!("['{code}', 'oidc.error.{code}']")),
+            "app.js shows {code}"
+        );
+    }
+    for word in gone {
+        assert!(!app_js.contains(word), "app.js no longer uses {word}");
+    }
+}
+
+#[test]
+fn b21_web_password_switch_names_hand_granted_admins() {
+    let texts = [
+        (
+            "en",
+            "oidc.allow_password",
+            "Allow password sign-in for users other than administrators given rights by hand",
+        ),
+        (
+            "en",
+            "oidc.warn_password_off",
+            "With password sign-in off, only administrators given rights by hand sign in with a password. Other users, including administrators from the admin group, need a link to sign in.",
+        ),
+        (
+            "de",
+            "oidc.allow_password",
+            "Anmeldung mit Passwort für Benutzer erlauben, die keine von Hand ernannten Administratoren sind",
+        ),
+        (
+            "de",
+            "oidc.warn_password_off",
+            "Ist die Anmeldung mit Passwort ausgeschaltet, melden sich nur von Hand ernannte Administratoren mit Passwort an. Alle anderen, auch Administratoren aus der Administratorgruppe, brauchen zur Anmeldung eine Verknüpfung.",
+        ),
+    ];
+    for (lang, key, text) in texts {
+        assert_eq!(
+            b21_translation(lang, key).as_deref(),
+            Some(text),
+            "{lang} {key}"
+        );
+    }
+}
+
+// Fix round 3: the re-check of 15b3e92 (spec §12, AC50-AC53).
+
+fn b21_unlink(id: &str, token: &str) -> Request<Body> {
+    request(
+        "DELETE",
+        &format!("/Auth/Oidc/Accounts/{id}/Link"),
+        Some(token),
+        None,
+    )
+}
+
+/// The answer to an admin-only request: 200 for an administrator, 403 for a user.
+async fn b21_settings_status(app: &axum::Router, token: &str) -> StatusCode {
+    send(
+        app,
+        request("GET", "/Auth/Oidc/Settings", Some(token), None),
+    )
+    .await
+    .0
+}
+
+/// Gives the token's passwordless user a first password, so that they may unlink (AC31).
+async fn b21_first_password(app: &axum::Router, id: &str, token: &str) {
+    let body = serde_json::json!({ "NewPw": "pw-first" });
+    let req = request(
+        "POST",
+        &format!("/Users/{id}/Password"),
+        Some(token),
+        Some(body),
+    );
+    let status = send(app, req).await.0;
+    assert!(status.is_success(), "a first password: {status}");
+}
+
+/// A first sign-in as a member of the admin group "admins": the new user's id and token.
+async fn b21_group_admin(t: &B21, sub: &str, name: &str) -> (String, String) {
+    let claims =
+        serde_json::json!({ "sub": sub, "preferred_username": name, "groups": ["admins"] });
+    let result = t.sign_in(claims).await.expect("a first sign-in");
+    assert!(
+        t.admin_from_group(name).await,
+        "{name}: admin from the group"
+    );
+    (
+        result["User"]["Id"].as_str().unwrap().to_string(),
+        result["AccessToken"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn b21_unlinking_takes_back_group_admin() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+    assert_eq!(b21_settings_status(&t.app, &gus).await, StatusCode::OK);
+    assert_eq!(
+        send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+        StatusCode::NO_CONTENT,
+        "gus's own Unlink"
+    );
+    assert_eq!(t.link_row("gus").await, None);
+    assert!(
+        !t.is_admin("gus").await,
+        "the group's rights go with the link"
+    );
+    assert!(!t.admin_from_group("gus").await, "and so does the flag");
+    assert_eq!(
+        b21_settings_status(&t.app, &gus).await,
+        StatusCode::FORBIDDEN,
+        "at once, in the open session"
+    );
+
+    let (lou_id, lou) = b21_group_admin(&t, "lou-sub", "lou").await;
+    assert_eq!(
+        send(&t.app, b21_unlink(&lou_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT,
+        "an administrator's Remove"
+    );
+    assert!(
+        !t.is_admin("lou").await,
+        "Remove takes the group's rights back too"
+    );
+    assert!(!t.admin_from_group("lou").await);
+    assert_eq!(
+        b21_settings_status(&t.app, &lou).await,
+        StatusCode::FORBIDDEN
+    );
+
+    add_user(&t.state, "ada", "pw-ada", true).await;
+    let (ada, ada_id) = login(&t.app, "ada", "pw-ada").await.unwrap();
+    let claims =
+        serde_json::json!({ "sub": "ada-sub", "preferred_username": "ada", "groups": ["admins"] });
+    t.link(&ada, claims)
+        .await
+        .expect("ada links from the profile");
+    assert!(
+        !t.admin_from_group("ada").await,
+        "ada's rights were given by hand"
+    );
+    assert_eq!(
+        send(&t.app, b21_unlink(&ada_id, &t.admin)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(t.is_admin("ada").await, "rights given by hand stay");
+    assert_eq!(b21_settings_status(&t.app, &ada).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn b21_unlinking_keeps_the_last_admin() {
+    let (log, _guard) = b21_capture();
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+    b21_exec(
+        &t.state,
+        "UPDATE users SET is_disabled = 1 WHERE name = ?",
+        "owner",
+    )
+    .await;
+    let before = log.text().len();
+    assert_eq!(
+        send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(t.link_row("gus").await, None, "the link goes");
+    assert!(
+        t.is_admin("gus").await,
+        "the last enabled admin keeps the rights"
+    );
+    assert!(t.admin_from_group("gus").await, "and the flag");
+    let warned = log.text()[before..]
+        .lines()
+        .any(|line| line.contains("WARN") && line.to_lowercase().contains("admin"));
+    assert!(warned, "a warning says why");
+}
+
+#[tokio::test]
+async fn b21_simultaneous_sign_ins_take_a_name_once() {
+    let t = b21_on(serde_json::json!({})).await;
+    // Sign-ins as "BobN" and "bobN" at the same moment. Both pass the first check whenever both
+    // read `users` before either inserts; then only the check inside the insert's transaction
+    // can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..10 {
+        let count = t.user_count().await;
+        let (upper, lower) = tokio::join!(
+            t.sign_in(b21_user(&format!("upper-{i}-sub"), &format!("Bob{i}"))),
+            t.sign_in(b21_user(&format!("lower-{i}-sub"), &format!("bob{i}")))
+        );
+        let refused: Vec<String> = [upper, lower].into_iter().filter_map(Result::err).collect();
+        if refused.is_empty() {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(refused, ["name_taken_ask_admin"], "pair {i}");
+        assert_eq!(t.user_count().await, count + 1, "pair {i}: one account");
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both sign-ins got an account"
+    );
+    assert_eq!(t.link_count().await, 10, "one link per pair");
+}
+
+#[test]
+fn b21_ipv6_clients_are_keyed_by_their_slash56() {
+    let key = |ip: &str| {
+        rustyfin_api::middleware::resolve_client(
+            ip.parse().unwrap(),
+            &axum::http::HeaderMap::new(),
+            &[],
+        )
+        .limiter_key()
+    };
+    assert_eq!(key("2001:db8:1:2::10"), key("2001:db8:1:2::20"), "one /64");
+    assert_eq!(
+        key("2001:db8:1:2::10"),
+        key("2001:db8:1:3::20"),
+        "two /64s of one /56"
+    );
+    assert_eq!(
+        key("2001:db8:1::1"),
+        key("2001:db8:1:ff:ffff:ffff:ffff:ffff"),
+        "both ends of one /56"
+    );
+    assert_ne!(
+        key("2001:db8:1:2::10"),
+        key("2001:db8:1:100::10"),
+        "another /56"
+    );
+    assert_ne!(
+        key("192.0.2.7"),
+        key("192.0.2.8"),
+        "IPv4 is keyed by address"
+    );
+}
+
+// Fix round 4: the re-check of 7f7caf3 (spec §13, AC55-AC58).
+
+#[tokio::test]
+async fn b21_a_sign_in_cannot_undo_an_unlink() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let (gus_id, gus) = b21_group_admin(&t, "gus-sub", "gus").await;
+    b21_first_password(&t.app, &gus_id, &gus).await;
+
+    // The next ID token has no group claim, so the sign-in asks userinfo after it found the link.
+    // Userinfo answers with the group, but only once gus's Unlink has committed.
+    let (arrived, at_userinfo) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    t.op.with(|st| {
+        st.userinfo = Some(serde_json::json!({
+            "sub": "gus-sub", "preferred_username": "gus", "groups": ["admins"]
+        }));
+        st.userinfo_hold = Some((arrived, released));
+    });
+    let flow = t.start().await;
+    let code =
+        t.op.approve(&flow, b21_user("gus-sub", "gus"), B21Sign::Key(0));
+    let query = flow.callback_query(&code);
+    let ((location, _), ()) = tokio::join!(t.callback(Some(&flow.cookie), &query), async {
+        at_userinfo.await.expect("the sign-in asks userinfo");
+        assert_eq!(
+            send(&t.app, b21_unlink(&gus_id, &gus)).await.0,
+            StatusCode::NO_CONTENT,
+            "gus's Unlink, while the sign-in waits"
+        );
+        release.send(()).unwrap();
+    });
+    assert_eq!(
+        location,
+        b21_login_error("server_error"),
+        "the sign-in whose link went is refused"
+    );
+    assert_eq!(
+        t.complete(Some(&flow.cookie)).await.0,
+        StatusCode::UNAUTHORIZED,
+        "and gets no session"
+    );
+    assert!(!t.is_admin("gus").await, "the group gave no rights back");
+    assert!(!t.admin_from_group("gus").await, "and no flag");
+    assert_eq!(t.link_row("gus").await, None, "and no link");
+
+    let claims =
+        serde_json::json!({ "sub": "gus-sub", "preferred_username": "gus", "groups": ["admins"] });
+    assert_eq!(
+        t.sign_in(claims).await.err().as_deref(),
+        Some("name_taken"),
+        "a new attempt takes the normal path"
+    );
+    assert!(!t.is_admin("gus").await);
+}
+
+/// `POST /Users/AuthenticateByName`: the status and the whole answer.
+async fn b21_password_answer(
+    app: &axum::Router,
+    name: &str,
+    password: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    send(app, req).await
+}
+
+/// `POST /Users/New` as the token's user.
+async fn b21_new_user(
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name, "Password": "pw-new" });
+    send(app, request("POST", "/Users/New", Some(token), Some(body))).await
+}
+
+/// `PUT /Users/{id}`, a rename, as the token's user.
+async fn b21_rename(
+    app: &axum::Router,
+    token: &str,
+    id: &str,
+    name: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Name": name });
+    let req = request("PUT", &format!("/Users/{id}"), Some(token), Some(body));
+    send(app, req).await
+}
+
+#[tokio::test]
+async fn b21_password_sign_in_finds_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ"] {
+        let (status, body) = b21_password_answer(&t.app, name, "pw-alice").await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], "alice", "{name:?} signs in as alice");
+    }
+    let wrong = b21_password_answer(&t.app, "alice", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        b21_password_answer(&t.app, "ALICE", "pw-wrong").await,
+        wrong,
+        "a wrong password in another case"
+    );
+    assert_eq!(
+        b21_password_answer(&t.app, "alice2", "pw-alice").await,
+        wrong,
+        "another name"
+    );
+}
+
+#[tokio::test]
+async fn b21_case_variant_accounts_sign_in_by_exact_name() {
+    let t = b21().await;
+    // Two accounts whose names differ only in case, as older servers may hold.
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    for (name, password) in [("bob", "pw-bob"), ("Bob", "pw-Bob")] {
+        let (status, body) = b21_password_answer(&t.app, name, password).await;
+        assert_eq!(status, StatusCode::OK, "{name:?}");
+        assert_eq!(body["User"]["Name"], name, "{name:?} signs in as itself");
+    }
+    let wrong = b21_password_answer(&t.app, "bob", "pw-wrong").await;
+    assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+    for password in ["pw-bob", "pw-Bob"] {
+        assert_eq!(
+            b21_password_answer(&t.app, "BOB", password).await,
+            wrong,
+            "BOB names neither account"
+        );
+    }
+    assert_eq!(
+        b21_password_answer(&t.app, "Bob", "pw-bob").await,
+        wrong,
+        "Bob is not bob"
+    );
+}
+
+#[tokio::test]
+async fn b21_new_users_refuse_taken_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let exact = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(exact.0, StatusCode::BAD_REQUEST, "{}", exact.1);
+    for name in ["Alice", "ALICE", "ＡＬＩＣＥ", "OWNER"] {
+        assert_eq!(
+            b21_new_user(&t.app, &t.admin, name).await,
+            exact,
+            "{name:?} is taken"
+        );
+    }
+    assert_eq!(t.user_count().await, 2, "no new account");
+    let (status, body) = b21_new_user(&t.app, &t.admin, "alice2").await;
+    assert_eq!(status, StatusCode::OK, "a free name: {body}");
+    assert_eq!(body["Name"], "alice2");
+}
+
+#[tokio::test]
+async fn b21_renames_refuse_other_users_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    let taken = b21_new_user(&t.app, &t.admin, "alice").await;
+    assert_eq!(taken.0, StatusCode::BAD_REQUEST, "{}", taken.1);
+    for name in ["alice", "ALICE", "Alice", "ＡＬＩＣＥ", "Owner"] {
+        assert_eq!(
+            b21_rename(&t.app, &carol, &carol_id, name).await,
+            taken,
+            "{name:?}: carol's own rename"
+        );
+        assert_eq!(
+            b21_rename(&t.app, &t.admin, &carol_id, name).await,
+            taken,
+            "{name:?}: an administrator's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "her own name in another case: {body}"
+    );
+    assert!(user_flags(&t.state, "Carol").await.is_some(), "now Carol");
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, "Carol").await;
+    assert_eq!(status, StatusCode::OK, "her own name unchanged: {body}");
+    let nobody = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        b21_rename(&t.app, &t.admin, &nobody, "nobody").await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn b21_simultaneous_new_users_take_a_name_once() {
+    let t = b21().await;
+    // Users/New as "DanN" and "danN" at the same moment: only a check inside the insert's
+    // transaction can refuse one.
+    let mut doubled = Vec::new();
+    for i in 0..5 {
+        let (upper_name, lower_name) = (format!("Dan{i}"), format!("dan{i}"));
+        let (upper, lower) = tokio::join!(
+            b21_new_user(&t.app, &t.admin, &upper_name),
+            b21_new_user(&t.app, &t.admin, &lower_name)
+        );
+        let mut statuses = [upper.0, lower.0];
+        statuses.sort();
+        if statuses == [StatusCode::OK, StatusCode::OK] {
+            doubled.push(i);
+            continue;
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::BAD_REQUEST],
+            "pair {i}"
+        );
+    }
+    assert_eq!(
+        doubled,
+        Vec::<usize>::new(),
+        "pairs where both got an account"
+    );
+    assert_eq!(
+        t.user_count().await,
+        6,
+        "the owner and one account per pair"
+    );
+}
+
+#[tokio::test]
+async fn b21_password_resets_find_names_in_any_case() {
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let pin = b21_reset_pin(&t.app, "ALICE")
+        .await
+        .expect("a PIN for alice");
+    let body =
+        serde_json::json!({ "Pin": pin, "Username": "Alice", "TempPassword": "b21-temp-pw" });
+    let (status, answer) = send(
+        &t.app,
+        request("POST", "/Users/ResetPassword", None, Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        login(&t.app, "alice", "b21-temp-pw").await.is_some(),
+        "alice's new password"
+    );
+
+    add_user(&t.state, "bob", "pw-bob", false).await;
+    add_user(&t.state, "Bob", "pw-Bob", false).await;
+    assert_eq!(
+        b21_reset_pin(&t.app, "BOB").await,
+        None,
+        "BOB names neither account"
+    );
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_case_variants() {
+    let t = b21().await;
+    for name in ["owner", "OWNER", "Owner"] {
+        assert_eq!(
+            post_startup_user(&t.app, Some(&t.admin), name, "pw-x").await,
+            StatusCode::FORBIDDEN,
+            "{name:?}"
+        );
+    }
+    assert_eq!(t.user_count().await, 1);
+}
+
+/// Names over the limit of 255 UTF-16 code units (AC60): 256 units, 128 surrogate pairs, and 1.8 MB
+/// of U+FDFA, which NFKC grows 18-fold.
+fn b21_over_long_names() -> [String; 3] {
+    [
+        "a".repeat(256),
+        "\u{1F600}".repeat(128),
+        "\u{FDFA}".repeat(600_000),
+    ]
+}
+
+#[tokio::test]
+async fn b21_new_users_refuse_over_long_names() {
+    let t = b21().await;
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
+    }
+    assert_eq!(t.user_count().await, 1, "no new account");
+    // 255 units: bytes don't count, a surrogate pair counts twice.
+    let fits = [
+        "a".repeat(255),
+        "\u{e9}".repeat(255),
+        format!("{}a", "\u{1F600}".repeat(127)),
+    ];
+    for name in fits {
+        let (status, body) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["Name"], name.as_str());
+    }
+}
+
+#[tokio::test]
+async fn b21_renames_refuse_over_long_names() {
+    let t = b21().await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units: own rename");
+        let (status, _) = b21_rename(&t.app, &t.admin, &carol_id, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{units} units: admin's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+    let name = "a".repeat(255);
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(user_flags(&t.state, &name).await.is_some(), "255 units fit");
+}
+
+#[tokio::test]
+async fn b21_startup_user_refuses_an_over_long_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        assert_eq!(
+            post_startup_user(&app, None, &name, "pw").await,
+            StatusCode::BAD_REQUEST,
+            "{units} units"
+        );
+    }
+    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+        .await
+        .unwrap();
+    assert!(users.is_empty(), "no owner");
+    assert_eq!(
+        post_startup_user(&app, None, &"a".repeat(255), "pw").await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn b21_over_long_names_sign_in_only_exactly() {
+    let t = b21().await;
+    // An account an older server let through (AC62): 128 decomposed "é", 256 units.
+    let legacy = "e\u{301}".repeat(128);
+    add_user(&t.state, &legacy, "pw-legacy", false).await;
+    let within = "\u{f6}".repeat(200);
+    add_user(&t.state, &within, "pw-within", false).await;
+    let unknown = b21_password_answer(&t.app, "nobody", "pw-x").await;
+    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = b21_password_answer(&t.app, &legacy, "pw-legacy").await;
+    assert_eq!(status, StatusCode::OK, "the exact over-long name");
+    assert_eq!(body["User"]["Name"], legacy.as_str());
+    let (status, body) = b21_password_answer(&t.app, &"\u{d6}".repeat(200), "pw-within").await;
+    assert_eq!(status, StatusCode::OK, "within the limit, names still fold");
+    assert_eq!(body["User"]["Name"], within.as_str());
+
+    let refused = [
+        (
+            "E\u{301}".repeat(128),
+            "pw-legacy",
+            "an over-long name is not folded",
+        ),
+        (
+            "\u{e9}".repeat(128),
+            "pw-legacy",
+            "an over-long account is not folded",
+        ),
+        (
+            "o\u{308}".repeat(200),
+            "pw-within",
+            "400 units match only exactly",
+        ),
+    ];
+    for (name, password, why) in refused {
+        let (status, body) = b21_password_answer(&t.app, &name, password).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}");
+        assert_eq!(body, unknown.1, "{why}");
+    }
+
+    // ForgotPassword finds over-long names only exactly too (AC61). Ask with the fullwidth spelling
+    // first: an open reset keeps its PIN (`store_reset_pin`), so after the exact request no spelling
+    // could get one, folded or not.
+    assert_eq!(
+        b21_reset_pin(&t.app, &"\u{FF45}\u{301}".repeat(128)).await,
+        None,
+        "no PIN for a folded match"
+    );
+    assert!(b21_reset_pin(&t.app, &legacy).await.is_some(), "exact");
+
+    let huge = "\u{FDFA}".repeat(600_000);
+    let (status, body) = b21_password_answer(&t.app, &huge, "pw-x").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a 1.8 MB name");
+    assert_eq!(body, unknown.1, "a 1.8 MB name");
+    b21_pin_file(&t.app, &huge).await;
+}
+
+#[tokio::test]
+async fn b21_sign_in_refuses_an_over_long_username() {
+    let t = b21_on(serde_json::json!({})).await;
+    let count = t.user_count().await;
+    // The limit applies to the claim after trimming (AC64).
+    let long = "a".repeat(256);
+    for name in [long.clone(), format!(" {long} ")] {
+        let result = t.sign_in(b21_user("long-sub", &name)).await;
+        assert_eq!(result.err().as_deref(), Some("no_username"));
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "no link");
+
+    let fits = "a".repeat(255);
+    let result = t
+        .sign_in(b21_user("long-sub", &format!("  {fits} ")))
+        .await
+        .expect("255 units after trimming sign in");
+    assert_eq!(result["User"]["Name"], fits.as_str());
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_leaves_no_pin_file() {
+    let t = b21().await;
+    let before = b21_pin_file(&t.app, "ＡＬＩＣＥ").await;
+    // Fullwidth, a Kelvin sign and a decomposed spelling; dee's PIN is refused below.
+    let spellings = [
+        ("alice", "ＡＬＩＣＥ"),
+        ("kim", "\u{212A}IM"),
+        ("jos\u{e9}", "JOSE\u{301}"),
+        ("dee", "ＤＥＥ"),
+    ];
+    let mut resets = Vec::new();
+    for (name, spelling) in spellings {
+        add_user(&t.state, name, "pw-old", false).await;
+        let (path, pin) = b21_reset_pin_at(&t.app, spelling).await;
+        let pin = pin.unwrap_or_else(|| panic!("a PIN for {spelling:?}"));
+        resets.push((name, spelling, path, pin));
+    }
+    assert_eq!(
+        resets[0].2, before,
+        "the path doesn't depend on the account"
+    );
+
+    let (_, dee_spelling, dee_path, dee_pin) = resets.pop().unwrap();
+    for (name, spelling, path, pin) in resets {
+        let (status, answer) = b21_redeem_pin(&t.app, &pin).await;
+        assert_eq!(status, StatusCode::OK, "{spelling:?}");
+        assert_eq!(answer["UsersReset"][0], name);
+        let gone = !std::path::Path::new(&path).exists();
+        assert!(gone, "{spelling:?}: the PIN file is gone");
+    }
+
+    // A PIN the switch refuses is spent, and its file goes too.
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = b21_redeem_pin(&t.app, &dee_pin).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "refused");
+    let gone = !std::path::Path::new(&dee_path).exists();
+    assert!(gone, "{dee_spelling:?}: the refused PIN's file is gone");
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_removes_an_older_pin_file() {
+    use sha2::Digest;
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let (path, pin) = b21_reset_pin_at(&t.app, "alice").await;
+    let pin = pin.expect("a PIN for alice");
+    // Before round 5 the file was named after the uppercased name; an older server wrote it so.
+    let hex: String = sha2::Sha256::digest("ALICE".as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = std::path::PathBuf::from(path);
+    let old = path.with_file_name(format!("passwordreset-{hex}.json"));
+    if old != path {
+        std::fs::rename(&path, &old).unwrap();
+    }
+    let (status, _) = b21_redeem_pin(&t.app, &pin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!old.exists(), "the older file is gone");
+    assert!(!path.exists());
+}
+
+#[test]
+fn b21_web_client_follows_a_demotion() {
+    let found = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        println!("b21_web_client_follows_a_demotion: skipped, node is not on PATH");
+        return;
+    }
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let out = std::process::Command::new("node")
+        .arg(format!("{dir}/tests/web/b21_admin_recheck.mjs"))
+        .arg(format!("{dir}/../rustyfin-web/src/api.js"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn b21_dashboard_follows_a_demotion() {
+    let app_js = std::fs::read_to_string(format!(
+        "{}/../rustyfin-web/src/app.js",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    // A top-level function of app.js, from its head to its closing brace.
+    let function = |head: &str| -> String {
+        let start = app_js
+            .find(head)
+            .unwrap_or_else(|| panic!("app.js has {head}"));
+        let rest = &app_js[start..];
+        rest[..rest.find("\n}\n").unwrap()].to_string()
+    };
+    let follow = function("function followAdminLoss() {");
+    for part in [
+        "updateAuthUI()",
+        "toast(t('admin.rights_removed')",
+        "currentPage === 'admin'",
+        "navigate('home')",
+    ] {
+        assert!(follow.contains(part), "followAdminLoss: {part}");
+    }
+    assert!(
+        app_js.contains("\nAPI.onAdminLost = followAdminLoss;\n"),
+        "app.js hands followAdminLoss to the API"
+    );
+    let render = function("async function renderAdmin() {");
+    let recheck = render
+        .find("await API.recheckAdmin()")
+        .expect("renderAdmin re-reads the user");
+    let requests = render.find("Promise.all").expect("renderAdmin's requests");
+    assert!(recheck < requests, "the re-read comes before the requests");
+    assert_eq!(
+        b21_translation("en", "admin.rights_removed").as_deref(),
+        Some("This account no longer has administrator rights.")
+    );
+    assert_eq!(
+        b21_translation("de", "admin.rights_removed").as_deref(),
+        Some("Dieses Konto hat keine Administratorrechte mehr.")
+    );
 }
 
 // ── Environment Tests ──
@@ -3660,6 +10551,1385 @@ async fn test_persons_empty() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── J5: genres, studios, years ──
+
+/// Ids of by-name items: UUIDv5 in the J5 namespace of `"<Type>:<folded name>"`.
+const J5_ACTION: &str = "195d1858-f1fc-5450-9330-73e695447ff1";
+const J5_SCI_FI: &str = "a3577062-d445-5df8-a91e-9f6fdcc7770f";
+const J5_MUSIC_ROCK: &str = "5682964f-dff2-51db-8651-c91285edb0a9";
+const J5_PIXAR: &str = "01aa62ee-902a-5a32-9c32-aca3fdee5582";
+const J5_YEAR_1999: &str = "3b638efc-32dc-5eee-8ba2-c24d7c3bf319";
+const J5_ACAO: &str = "ee352a6b-1d4c-581e-bbbf-ebde19828365";
+const J5_DRAMAS: &str = "46602e53-1af1-504d-823c-c1113b8387da";
+
+/// The keys of a genre, studio or year item without counts, sorted.
+const J5_DTO_KEYS: &[&str] = &[
+    "BackdropImageTags",
+    "ChannelId",
+    "Id",
+    "ImageBlurHashes",
+    "ImageTags",
+    "LocationType",
+    "MediaType",
+    "Name",
+    "ServerId",
+    "Type",
+];
+
+/// The count keys an item gets when the request names item types, sorted.
+const J5_COUNT_KEYS: &[&str] = &[
+    "AlbumCount",
+    "ArtistCount",
+    "ChildCount",
+    "EpisodeCount",
+    "MovieCount",
+    "MusicVideoCount",
+    "ProgramCount",
+    "SeriesCount",
+    "SongCount",
+    "TrailerCount",
+];
+
+/// A server with three libraries:
+/// - J5 Films: the movies Alpha (`Action|Sci-Fi`, 1999, Pixar), Bravo (` action | Animation `,
+///   2009, Pixar), Charlie (no genres, no year) and Delta (`Action & Adventure|Music`, 2009).
+/// - J5 Shows: the series Echo (`Drama|Comedy`, 2011, HBO), its Season 1 (no genres) and the
+///   episode Echo 1 in that season (`Drama`, 2011).
+/// - J5 Music: the album Blue (`Rock|Jazz`) with the songs One (`rock`) and Two (`Música`), all 2017.
+struct J5Server {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    admin: uuid::Uuid,
+    films: uuid::Uuid,
+    music: uuid::Uuid,
+    echo: uuid::Uuid,
+}
+
+impl J5Server {
+    async fn new() -> Self {
+        use rustyfin_model::library::LibraryContentType;
+        let state = test_state().await;
+        let app = app(state.clone());
+        let (token, admin) = admin_session(&state).await;
+        let films = j5_library(&state, "J5 Films", LibraryContentType::Movies).await;
+        let shows = j5_library(&state, "J5 Shows", LibraryContentType::TvShows).await;
+        let music = j5_library(&state, "J5 Music", LibraryContentType::Music).await;
+        let s = &state;
+        let alpha = j5_item(
+            s,
+            films,
+            None,
+            "Alpha",
+            "Movie",
+            "Action|Sci-Fi",
+            Some(1999),
+        )
+        .await;
+        let bravo = j5_item(
+            s,
+            films,
+            None,
+            "Bravo",
+            "Movie",
+            " action | Animation ",
+            Some(2009),
+        )
+        .await;
+        j5_item(s, films, None, "Charlie", "Movie", "", None).await;
+        j5_item(
+            s,
+            films,
+            None,
+            "Delta",
+            "Movie",
+            "Action & Adventure|Music",
+            Some(2009),
+        )
+        .await;
+        let echo = j5_item(s, shows, None, "Echo", "Series", "Drama|Comedy", Some(2011)).await;
+        let season = j5_item(s, shows, Some(echo), "Season 1", "Season", "", None).await;
+        j5_item(
+            s,
+            shows,
+            Some(season),
+            "Echo 1",
+            "Episode",
+            "Drama",
+            Some(2011),
+        )
+        .await;
+        let blue = j5_item(
+            s,
+            music,
+            None,
+            "Blue",
+            "MusicAlbum",
+            "Rock|Jazz",
+            Some(2017),
+        )
+        .await;
+        j5_item(s, music, Some(blue), "One", "Audio", "rock", Some(2017)).await;
+        j5_item(s, music, Some(blue), "Two", "Audio", "Música", Some(2017)).await;
+        for (item, studio) in [(alpha, "Pixar"), (bravo, "Pixar"), (echo, "HBO")] {
+            j5_studio(s, item, studio).await;
+        }
+        J5Server {
+            state,
+            app,
+            token,
+            admin,
+            films,
+            music,
+            echo,
+        }
+    }
+
+    async fn get(&self, uri: &str) -> (StatusCode, serde_json::Value) {
+        send_authed(&self.app, "GET", uri, &self.token, None).await
+    }
+}
+
+/// Adds a library straight to the database, with no folder behind it.
+async fn j5_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![format!("/nonexistent/{name}")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Inserts an item with the column values a scan stores and returns its id.
+async fn j5_item(
+    state: &AppState,
+    library_id: uuid::Uuid,
+    parent_id: Option<uuid::Uuid>,
+    name: &str,
+    media_type: &str,
+    genres: &str,
+    year: Option<i64>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, parent_id, name, media_type, path, genres, production_year) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(parent_id.map(|p| p.to_string()))
+    .bind(name)
+    .bind(media_type)
+    .bind(format!("/nonexistent/j5/{id}"))
+    .bind(genres)
+    .bind(year)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Links an item to a studio, adding the studio if it is new.
+async fn j5_studio(state: &AppState, item_id: uuid::Uuid, studio: &str) {
+    let studio_id = format!("studio-{}", studio.to_lowercase());
+    sqlx::query("INSERT OR IGNORE INTO studios (id, name) VALUES (?, ?)")
+        .bind(&studio_id)
+        .bind(studio)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_studios (item_id, studio_id) VALUES (?, ?)")
+        .bind(item_id.to_string())
+        .bind(&studio_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// The `Items` of a list body.
+fn j5_items(body: &serde_json::Value) -> &Vec<serde_json::Value> {
+    body["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("not a QueryResult: {body}"))
+}
+
+/// The `Name` of each item in a list body, in order.
+fn j5_names(body: &serde_json::Value) -> Vec<String> {
+    j5_items(body)
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The item named `name` in a list body.
+fn j5_named<'a>(body: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    j5_items(body)
+        .iter()
+        .find(|item| item["Name"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {body}"))
+}
+
+/// The `Id` of the item named `name` in a list body.
+fn j5_id(body: &serde_json::Value, name: &str) -> String {
+    j5_named(body, name)["Id"].as_str().unwrap().to_string()
+}
+
+/// The keys of a JSON object, sorted.
+fn j5_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// The keys of an item with its counts, sorted.
+fn j5_keys_with_counts() -> Vec<String> {
+    let mut keys: Vec<String> = J5_DTO_KEYS
+        .iter()
+        .chain(J5_COUNT_KEYS)
+        .map(|k| k.to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// `[ChildCount, MovieCount, SeriesCount, EpisodeCount, AlbumCount, SongCount]` of an item.
+fn j5_counts(item: &serde_json::Value) -> [Option<i64>; 6] {
+    [
+        "ChildCount",
+        "MovieCount",
+        "SeriesCount",
+        "EpisodeCount",
+        "AlbumCount",
+        "SongCount",
+    ]
+    .map(|key| item[key].as_i64())
+}
+
+#[tokio::test]
+async fn j5_genres_are_a_query_result_of_genre_items_with_name_based_ids() {
+    let server = J5Server::new().await;
+    let (status, body) = server.get("/Genres").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        j5_keys(&body),
+        ["Items", "StartIndex", "TotalRecordCount"],
+        "{body}"
+    );
+    let all = [
+        "Action",
+        "Action & Adventure",
+        "Animation",
+        "Comedy",
+        "Drama",
+        "Music",
+        "Sci-Fi",
+    ];
+    assert_eq!(j5_names(&body), all);
+    assert_eq!(body["TotalRecordCount"], 7);
+    assert_eq!(body["StartIndex"], 0);
+    let mut ids = std::collections::HashSet::new();
+    for item in j5_items(&body) {
+        assert_eq!(j5_keys(item), J5_DTO_KEYS, "{item}");
+        assert_eq!(item["Type"], "Genre", "{item}");
+        assert_eq!(item["ServerId"], "test-server-id", "{item}");
+        assert_eq!(item["ChannelId"], serde_json::Value::Null, "{item}");
+        assert_eq!(item["ImageTags"], serde_json::json!({}), "{item}");
+        assert_eq!(item["BackdropImageTags"], serde_json::json!([]), "{item}");
+        assert_eq!(item["ImageBlurHashes"], serde_json::json!({}), "{item}");
+        assert_eq!(item["LocationType"], "FileSystem", "{item}");
+        assert_eq!(item["MediaType"], "Unknown", "{item}");
+        let id: uuid::Uuid = item["Id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(id.get_version_num(), 5, "{item}");
+        ids.insert(id);
+    }
+    assert_eq!(ids.len(), all.len());
+    assert_eq!(j5_id(&body, "Action"), J5_ACTION);
+    assert_eq!(j5_id(&body, "Sci-Fi"), J5_SCI_FI);
+    let (_, again) = server.get("/Genres").await;
+    assert_eq!(again, body);
+}
+
+#[tokio::test]
+async fn j5_genre_lists_honour_parent_types_search_order_and_paging() {
+    let server = J5Server::new().await;
+    let films = server.films;
+    let echo = server.echo;
+    let unknown = uuid::Uuid::new_v4();
+    let movies = [
+        "Action",
+        "Action & Adventure",
+        "Animation",
+        "Music",
+        "Sci-Fi",
+    ];
+    let cases: Vec<(String, Vec<&str>, i64)> = vec![
+        (format!("/Genres?ParentId={films}"), movies.to_vec(), 5),
+        // Items below the series, two levels down; the series itself doesn't count.
+        (format!("/Genres?parentid={echo}"), vec!["Drama"], 1),
+        (format!("/Genres?ParentId={unknown}"), vec![], 0),
+        (
+            "/Genres?IncludeItemTypes=Series".into(),
+            vec!["Comedy", "Drama"],
+            2,
+        ),
+        (
+            "/Genres?includeItemTypes=movie,%20Episode".into(),
+            vec![
+                "Action",
+                "Action & Adventure",
+                "Animation",
+                "Drama",
+                "Music",
+                "Sci-Fi",
+            ],
+            6,
+        ),
+        (
+            "/Genres?ExcludeItemTypes=Movie".into(),
+            vec!["Comedy", "Drama"],
+            2,
+        ),
+        (
+            "/Genres?SearchTerm=ACT".into(),
+            vec!["Action", "Action & Adventure"],
+            2,
+        ),
+        (
+            "/Genres?StartIndex=1&Limit=2".into(),
+            vec!["Action & Adventure", "Animation"],
+            7,
+        ),
+        (
+            "/Genres?SortBy=SortName&SortOrder=Descending&Limit=3".into(),
+            vec!["Sci-Fi", "Music", "Drama"],
+            7,
+        ),
+    ];
+    for (uri, names, total) in cases {
+        let (status, body) = server.get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(j5_names(&body), names, "{uri}");
+        assert_eq!(body["TotalRecordCount"], total, "{uri}");
+    }
+
+    // jellyfin-web's genre tab: item types, so counts, and no total.
+    let uri = format!(
+        "/Genres?SortBy=SortName&SortOrder=Ascending&IncludeItemTypes=Movie&Recursive=true\
+         &EnableTotalRecordCount=false&ParentId={films}&userId={}",
+        server.admin
+    );
+    let (status, body) = server.get(&uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), movies);
+    assert_eq!(body["TotalRecordCount"], 0);
+    let action = j5_named(&body, "Action");
+    assert_eq!(j5_keys(action), j5_keys_with_counts(), "{action}");
+    assert_eq!(j5_counts(action), [2, 2, 0, 0, 0, 0].map(Some));
+    let (_, body) = server.get("/Genres?IncludeItemTypes=Series,Episode").await;
+    assert_eq!(
+        j5_counts(j5_named(&body, "Drama")),
+        [2, 0, 1, 1, 0, 0].map(Some)
+    );
+    assert_eq!(
+        j5_counts(j5_named(&body, "Comedy")),
+        [1, 0, 1, 0, 0, 0].map(Some)
+    );
+
+    // Fields=ItemCounts turns the counts on; the image and DTO options are accepted.
+    let uri = "/Genres?Fields=PrimaryImageAspectRatio,ItemCounts&EnableImages=true&ImageTypeLimit=1\
+               &EnableImageTypes=Primary,Backdrop,Thumb&Recursive=true&EnableUserData=false";
+    let (status, body) = server.get(uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body).len(), 7);
+    assert_eq!(
+        j5_counts(j5_named(&body, "Drama")),
+        [2, 0, 1, 1, 0, 0].map(Some)
+    );
+    let (_, body) = server.get("/Genres?Fields=PrimaryImageAspectRatio").await;
+    assert_eq!(j5_keys(j5_named(&body, "Drama")), J5_DTO_KEYS);
+}
+
+#[tokio::test]
+async fn j5_studio_year_and_music_genre_lists_come_from_their_own_items() {
+    let server = J5Server::new().await;
+    let (status, body) = server.get("/Studios").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["HBO", "Pixar"]);
+    assert_eq!(body["TotalRecordCount"], 2);
+    assert!(
+        j5_items(&body).iter().all(|item| item["Type"] == "Studio"),
+        "{body}"
+    );
+    assert_eq!(j5_id(&body, "Pixar"), J5_PIXAR);
+    let (_, body) = server.get("/Studios?IncludeItemTypes=Movie").await;
+    assert_eq!(j5_names(&body), ["Pixar"]);
+    assert_eq!(
+        j5_counts(j5_named(&body, "Pixar")),
+        [2, 2, 0, 0, 0, 0].map(Some)
+    );
+
+    let (status, body) = server.get("/Years").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["1999", "2009", "2011", "2017"]);
+    assert_eq!(body["TotalRecordCount"], 4);
+    assert!(
+        j5_items(&body).iter().all(|item| item["Type"] == "Year"),
+        "{body}"
+    );
+    assert_eq!(j5_id(&body, "1999"), J5_YEAR_1999);
+    let (_, body) = server.get("/Years?SortOrder=Descending").await;
+    assert_eq!(j5_names(&body), ["2017", "2011", "2009", "1999"]);
+    let (_, body) = server
+        .get(&format!("/Years?ParentId={}", server.films))
+        .await;
+    assert_eq!(j5_names(&body), ["1999", "2009"]);
+
+    let (status, music) = server.get("/MusicGenres").await;
+    assert_eq!(status, StatusCode::OK, "{music}");
+    assert_eq!(j5_names(&music), ["Jazz", "Música", "Rock"]);
+    assert!(
+        j5_items(&music)
+            .iter()
+            .all(|item| item["Type"] == "MusicGenre"),
+        "{music}"
+    );
+    assert_eq!(j5_id(&music, "Rock"), J5_MUSIC_ROCK);
+    let (_, songs) = server.get("/MusicGenres?IncludeItemTypes=Audio").await;
+    assert_eq!(j5_names(&songs), ["Música", "Rock"]);
+    assert_eq!(
+        j5_counts(j5_named(&songs, "Rock")),
+        [1, 0, 0, 0, 0, 1].map(Some)
+    );
+    // A music library as the parent turns /Genres into the music-genre list, as in Jellyfin.
+    let (status, body) = server
+        .get(&format!("/Genres?ParentId={}", server.music))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, music);
+}
+
+#[tokio::test]
+async fn j5_single_routes_return_one_item_or_404() {
+    let server = J5Server::new().await;
+    let cases: [(&str, &str, &str, [i64; 6]); 8] = [
+        (
+            "/Genres/Animation",
+            "Animation",
+            "Genre",
+            [1, 1, 0, 0, 0, 0],
+        ),
+        ("/Genres/ACTION", "Action", "Genre", [2, 2, 0, 0, 0, 0]),
+        ("/Genres/Music", "Music", "Genre", [1, 1, 0, 0, 0, 0]),
+        ("/Genres/Sci-Fi", "Sci-Fi", "Genre", [1, 1, 0, 0, 0, 0]),
+        // jellyfin-web's slug for a name with `&`.
+        (
+            "/Genres/Action%20-%20Adventure",
+            "Action & Adventure",
+            "Genre",
+            [1, 1, 0, 0, 0, 0],
+        ),
+        (
+            "/MusicGenres/rock",
+            "Rock",
+            "MusicGenre",
+            [2, 0, 0, 0, 1, 1],
+        ),
+        ("/Studios/pixar", "Pixar", "Studio", [2, 2, 0, 0, 0, 0]),
+        ("/Years/2009", "2009", "Year", [2, 2, 0, 0, 0, 0]),
+    ];
+    for (uri, name, kind, counts) in cases {
+        let (status, body) = server.get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["Name"], name, "{uri}");
+        assert_eq!(body["Type"], kind, "{uri}");
+        assert_eq!(j5_keys(&body), j5_keys_with_counts(), "{uri}");
+        assert_eq!(j5_counts(&body), counts.map(Some), "{uri}");
+    }
+    let (_, list) = server.get("/Genres").await;
+    for name in ["Action", "Animation", "Sci-Fi"] {
+        let (_, body) = server.get(&format!("/Genres/{name}")).await;
+        assert_eq!(body["Id"], j5_id(&list, name).as_str(), "{name}");
+    }
+    assert_eq!(server.get("/Genres/action").await.1["Id"], J5_ACTION);
+    assert_eq!(server.get("/MusicGenres/Rock").await.1["Id"], J5_MUSIC_ROCK);
+    assert_eq!(server.get("/Studios/Pixar").await.1["Id"], J5_PIXAR);
+    for uri in [
+        "/Genres/Nope",
+        "/Genres/Rock",
+        "/MusicGenres/Drama",
+        "/Studios/Nope",
+        "/Years/1800",
+    ] {
+        let (status, body) = server.get(uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    for uri in ["/Years/abc", "/Years/0", "/Years/-1"] {
+        let (status, body) = server.get(uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+/// The ids of the movies in the database.
+async fn j5_movie_ids(state: &AppState) -> Vec<String> {
+    sqlx::query_scalar("SELECT id FROM media_items WHERE media_type = 'Movie'")
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn j5_genre_ids_survive_a_rescan_that_replaces_the_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "j5 rescan"));
+    let film = root.join("Alpha (2001)");
+    std::fs::create_dir_all(&film).unwrap();
+    std::fs::write(film.join("Alpha (2001).mkv"), b"").unwrap();
+    let nfo = "<movie><title>Alpha</title><year>2001</year>\
+               <genre>Action</genre><genre>Sci-Fi</genre></movie>";
+    std::fs::write(film.join("movie.nfo"), nfo).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "J5 Rescan".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let before = j5_movie_ids(&state).await;
+    assert_eq!(before.len(), 1);
+    let (status, genres) = send_authed(&app, "GET", "/Genres", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{genres}");
+    assert_eq!(j5_names(&genres), ["Action", "Sci-Fi"]);
+    assert_eq!(j5_id(&genres, "Action"), J5_ACTION);
+    assert_eq!(j5_id(&genres, "Sci-Fi"), J5_SCI_FI);
+    let (_, years) = send_authed(&app, "GET", "/Years", &token, None).await;
+    assert_eq!(j5_names(&years), ["2001"]);
+
+    // After a rename the scan removes the movie and adds it again with a new id.
+    std::fs::rename(&film, root.join("Alpha Redux (2001)")).unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let after = j5_movie_ids(&state).await;
+    assert_eq!(after.len(), 1);
+    assert_ne!(after, before, "the rescan kept the old item");
+    let (_, again) = send_authed(&app, "GET", "/Genres", &token, None).await;
+    assert_eq!(again, genres);
+    let (_, again) = send_authed(&app, "GET", "/Years", &token, None).await;
+    assert_eq!(again, years);
+}
+
+#[tokio::test]
+async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Odd", LibraryContentType::Movies).await;
+    let s = &state;
+    j5_item(s, films, None, "Pipes", "Movie", "A||B", None).await;
+    j5_item(
+        s,
+        films,
+        None,
+        "Spaces",
+        "Movie",
+        "  Drama  | |War ",
+        Some(0),
+    )
+    .await;
+    // Rows from before migration 014 keep JSON in both columns.
+    j5_item(
+        s,
+        films,
+        None,
+        "Old",
+        "\"Movie\"",
+        r#"["Western", "Noir"]"#,
+        None,
+    )
+    .await;
+    j5_item(s, films, None, "Empty", "Movie", "[]", Some(-5)).await;
+    j5_item(
+        s,
+        films,
+        None,
+        "Accents",
+        "Movie",
+        "Ação|Comédia|ação",
+        None,
+    )
+    .await;
+    let all = [
+        "A", "Ação", "B", "Comédia", "Drama", "Noir", "War", "Western",
+    ];
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await }
+    };
+
+    let nil = uuid::Uuid::nil();
+    let unknown = uuid::Uuid::new_v4();
+    let cases: Vec<(String, Vec<&str>, i64)> = vec![
+        ("/Genres".into(), all.to_vec(), 8),
+        ("/Genres?IncludeItemTypes=Movie".into(), all.to_vec(), 8),
+        (format!("/Genres?ParentId={nil}"), all.to_vec(), 8),
+        ("/Genres?ParentId=".into(), all.to_vec(), 8),
+        (format!("/Genres?ParentId={unknown}"), vec![], 0),
+        (
+            "/Genres?SearchTerm=%C3%A7".into(),
+            vec!["Ação", "Comédia"],
+            2,
+        ),
+        ("/Genres?SearchTerm=ACAO".into(), vec!["Ação"], 1),
+        ("/Genres?StartIndex=1000".into(), vec![], 8),
+        ("/Genres?Limit=0".into(), vec![], 8),
+        ("/Genres?Limit=1000000".into(), all.to_vec(), 8),
+        ("/Years".into(), vec![], 0),
+    ];
+    for (uri, names, total) in cases {
+        let (status, body) = get(uri.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(j5_names(&body), names, "{uri}");
+        assert_eq!(body["TotalRecordCount"], total, "{uri}");
+    }
+    let (_, body) = get("/Genres?StartIndex=1000".into()).await;
+    assert_eq!(body["StartIndex"], 1000);
+    let (_, body) = get("/Genres".into()).await;
+    assert_eq!(j5_id(&body, "Ação"), J5_ACAO);
+
+    for (uri, name) in [
+        ("/Genres/A%C3%A7%C3%A3o", "Ação"),
+        ("/Genres/Acao", "Ação"),
+        ("/Genres/%20western%20", "Western"),
+        ("/Genres/war", "War"),
+    ] {
+        let (status, body) = get(uri.into()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["Name"], name, "{uri}");
+    }
+    for uri in [
+        "/Genres?ParentId=bogus",
+        "/Genres?StartIndex=-1",
+        "/Genres?Limit=abc",
+        "/Genres?Limit=99999999999999999999999",
+        "/Genres?EnableTotalRecordCount=maybe",
+        "/Genres?userId=nope",
+        "/Studios?ParentId=bogus",
+        "/Years?Limit=-1",
+        "/MusicGenres?StartIndex=x",
+    ] {
+        let (status, body) = get(uri.into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+/// A library with a film ("Drama"), a series ("Crime") and an episode ("Comedy"), and an
+/// administrator's token, for the tests of how the lists read their parameters.
+async fn j5_reader_app() -> (axum::Router, String) {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Reader", LibraryContentType::Movies).await;
+    j5_item(&state, films, None, "Film", "Movie", "Drama", None).await;
+    j5_item(&state, films, None, "Show", "Series", "Crime", None).await;
+    j5_item(&state, films, None, "Pilot", "Episode", "Comedy", None).await;
+    (app(state), token)
+}
+
+/// Checks each case's status, listed names and whether the entries carry counts, all in one
+/// comparison so that a failure shows every case.
+async fn j5_assert_reads(
+    app: &axum::Router,
+    token: &str,
+    cases: &[(&str, StatusCode, &[&str], bool)],
+) {
+    let mut actual = Vec::new();
+    for &(uri, _, _, _) in cases {
+        let (status, body) = send_authed(app, "GET", uri, token, None).await;
+        let (names, counts) = if status == StatusCode::OK {
+            let counts = j5_items(&body)
+                .iter()
+                .any(|item| item.get("ChildCount").is_some());
+            (j5_names(&body), counts)
+        } else {
+            (Vec::new(), false)
+        };
+        actual.push((uri, status, names, counts));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|&(uri, status, names, counts)| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            (uri, status, names, counts)
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn j5_lists_drop_unknown_kinds_media_types_and_sort_orders() {
+    let (app, token) = j5_reader_app().await;
+    let ok = StatusCode::OK;
+    let all: &[&str] = &["Comedy", "Crime", "Drama"];
+    // Jellyfin's binder drops the entries of a typed list that it can't read, so a list of
+    // unknown entries filters nothing and turns no counts on. Known names are read without case.
+    j5_assert_reads(
+        &app,
+        &token,
+        &[
+            ("/Genres?IncludeItemTypes=Foo", ok, all, false),
+            ("/Genres?IncludeItemTypes=Foo,series", ok, &["Crime"], true),
+            (
+                "/Genres?ExcludeItemTypes=Foo,EPISODE",
+                ok,
+                &["Crime", "Drama"],
+                false,
+            ),
+            ("/Genres?MediaTypes=Foo", ok, all, false),
+            (
+                "/Genres?MediaTypes=Foo,video",
+                ok,
+                &["Comedy", "Drama"],
+                false,
+            ),
+            (
+                "/Genres?SortOrder=Foo,Descending",
+                ok,
+                &["Drama", "Crime", "Comedy"],
+                false,
+            ),
+            ("/Genres?SortOrder=Foo", ok, all, false),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_lists_do_not_split_repeated_keys() {
+    let (app, token) = j5_reader_app().await;
+    let ok = StatusCode::OK;
+    let all: &[&str] = &["Comedy", "Crime", "Drama"];
+    // As in Jellyfin's binder, a lone value splits on commas, but a repeated key gives one entry
+    // per value, and an entry with a comma in it names nothing.
+    j5_assert_reads(
+        &app,
+        &token,
+        &[
+            (
+                "/Genres?IncludeItemTypes=Movie,Series",
+                ok,
+                &["Crime", "Drama"],
+                true,
+            ),
+            (
+                "/Genres?IncludeItemTypes=Movie,Series&IncludeItemTypes=Episode",
+                ok,
+                &["Comedy"],
+                true,
+            ),
+            (
+                "/Genres?includeItemTypes=Movie&IncludeItemTypes=Series",
+                ok,
+                &["Crime", "Drama"],
+                true,
+            ),
+            (
+                "/Genres?MediaTypes=Video,Unknown&MediaTypes=Audio",
+                ok,
+                &[],
+                false,
+            ),
+            (
+                "/Genres?Fields=Overview,ItemCounts&Fields=Genres",
+                ok,
+                all,
+                false,
+            ),
+            ("/Genres?Fields=Overview&Fields=itemcounts", ok, all, true),
+            (
+                "/Genres?SortOrder=Ascending,Descending&SortOrder=Descending",
+                ok,
+                &["Drama", "Crime", "Comedy"],
+                false,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_lists_answer_400_for_counts_above_i32_max() {
+    let (app, token) = j5_reader_app().await;
+    let ok = StatusCode::OK;
+    let bad = StatusCode::BAD_REQUEST;
+    // Jellyfin binds StartIndex and Limit to an `int`, so a larger value is a 400.
+    j5_assert_reads(
+        &app,
+        &token,
+        &[
+            (
+                "/Genres?Limit=2147483647",
+                ok,
+                &["Comedy", "Crime", "Drama"],
+                false,
+            ),
+            ("/Genres?StartIndex=2147483647", ok, &[], false),
+            ("/Genres?Limit=2147483648", bad, &[], false),
+            ("/Genres?StartIndex=2147483648", bad, &[], false),
+            ("/Studios?Limit=2147483648", bad, &[], false),
+            ("/Years?StartIndex=2147483648", bad, &[], false),
+            ("/MusicGenres?Limit=2147483648", bad, &[], false),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_names_fold_a_final_sigma_as_jellyfin_does() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Sigma", LibraryContentType::Movies).await;
+    let s = &state;
+    j5_item(s, films, None, "Upper", "Movie", "ΔΡΆΜΑΣ|Μασκαράδα", None).await;
+    j5_item(s, films, None, "Lower", "Movie", "δράμας", None).await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await }
+    };
+
+    // "ΜΑΣ" folds to "μασ", as .NET lowercases it, which "Μασκαράδα" ("μασκαραδα") contains.
+    let (status, body) = get("/Genres?SearchTerm=%CE%9C%CE%91%CE%A3".into()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["ΔΡΆΜΑΣ", "Μασκαράδα"]);
+    assert_eq!(body["TotalRecordCount"], 2);
+    // "ΔΡΆΜΑΣ" and "δράμας" are one entry, "δραμασ", whose id finds both films.
+    let (_, body) = get("/Genres".into()).await;
+    assert_eq!(j5_names(&body), ["ΔΡΆΜΑΣ", "Μασκαράδα"]);
+    assert_eq!(j5_id(&body, "ΔΡΆΜΑΣ"), J5_DRAMAS);
+    let (status, body) = get(format!("/Items?GenreIds={J5_DRAMAS}&Recursive=true")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names = j5_names(&body);
+    names.sort();
+    assert_eq!(names, ["Lower", "Upper"]);
+}
+
+#[tokio::test]
+async fn j5_names_drop_the_characters_jellyfin_deletes() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Deleted", LibraryContentType::Movies).await;
+    let s = &state;
+    j5_item(
+        s,
+        films,
+        None,
+        "Marked",
+        "Movie",
+        "¡Acción!|Rock\u{fffd}",
+        None,
+    )
+    .await;
+    j5_item(s, films, None, "Plain", "Movie", "Acción!|Rock", None).await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await }
+    };
+
+    // U+FFFD, "¡" and "¿" leave names and search terms, as Jellyfin deletes them.
+    for (uri, names) in [
+        ("/Genres", vec!["Acción!", "Rock"]),
+        ("/Genres?SearchTerm=%C2%BFrock", vec!["Rock"]),
+    ] {
+        let (status, body) = get(uri.into()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(j5_names(&body), names, "{uri}");
+        assert_eq!(body["TotalRecordCount"], names.len(), "{uri}");
+    }
+    let (status, body) = get("/Genres/%C2%A1Acci%C3%B3n!".into()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Name"], "Acción!");
+}
+
+#[tokio::test]
+async fn j5_user_id_is_checked_and_does_not_change_the_lists() {
+    let server = J5Server::new().await;
+    let viewer = add_user(&server.state, "j5viewer", "viewer", false).await;
+    let (viewer_token, _) = login(&server.app, "j5viewer", "viewer").await.unwrap();
+    let admin = server.admin;
+    let unknown = uuid::Uuid::new_v4();
+    let cases = [
+        (
+            &server.token,
+            format!("/Genres?userId={admin}"),
+            StatusCode::OK,
+        ),
+        (
+            &server.token,
+            format!("/Studios?UserId={viewer}"),
+            StatusCode::OK,
+        ),
+        (
+            &server.token,
+            format!("/Years?userId={unknown}"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            &viewer_token,
+            format!("/Genres?userId={admin}"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &viewer_token,
+            format!("/MusicGenres?userId={viewer}"),
+            StatusCode::OK,
+        ),
+        (
+            &viewer_token,
+            format!("/Genres/Action?userId={admin}"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &viewer_token,
+            format!("/Genres/Action?userId={viewer}"),
+            StatusCode::OK,
+        ),
+    ];
+    for (token, uri, expected) in cases {
+        let (status, body) = send_authed(&server.app, "GET", &uri, token, None).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (status, theirs) = send_authed(&server.app, "GET", "/Genres", &viewer_token, None).await;
+    assert_eq!(status, StatusCode::OK, "{theirs}");
+    assert_eq!(theirs, server.get("/Genres").await.1);
+}
+
+/// The `Name` and `Id` of each entry in an item's `GenreItems` or `Studios`, checking that each
+/// id is a UUID.
+fn j5_name_ids(entries: &serde_json::Value) -> Vec<(String, String)> {
+    entries
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {entries}"))
+        .iter()
+        .map(|entry| {
+            let id = entry["Id"].as_str().unwrap_or_default().to_string();
+            assert!(uuid::Uuid::parse_str(&id).is_ok(), "not a UUID: {entry}");
+            (entry["Name"].as_str().unwrap_or_default().to_string(), id)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn j5_item_genre_and_studio_ids_are_the_ids_of_the_lists() {
+    let server = J5Server::new().await;
+    let (_, genres) = server.get("/Genres").await;
+    let (_, music_genres) = server.get("/MusicGenres").await;
+    let (_, studios) = server.get("/Studios").await;
+    // Each item keeps its own spelling and takes the id of the entry that lists it.
+    let pairs = |list: &serde_json::Value, names: &[(&str, &str)]| -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|(own, listed)| (own.to_string(), j5_id(list, listed)))
+            .collect()
+    };
+    let alpha_genres = pairs(&genres, &[("Action", "Action"), ("Sci-Fi", "Sci-Fi")]);
+    let alpha_studios = pairs(&studios, &[("Pixar", "Pixar")]);
+    assert_eq!(alpha_genres[0].1, J5_ACTION);
+    assert_eq!(alpha_studios[0].1, J5_PIXAR);
+    let rock = pairs(&music_genres, &[("rock", "Rock")]);
+    assert_eq!(rock[0].1, J5_MUSIC_ROCK);
+
+    let (status, films) = server
+        .get("/Items?IncludeItemTypes=Movie&Recursive=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{films}");
+    let (status, music) = server
+        .get("/Items?IncludeItemTypes=MusicAlbum,Audio&Recursive=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{music}");
+    let listed = [
+        (j5_named(&films, "Alpha"), alpha_genres.clone()),
+        (
+            j5_named(&films, "Bravo"),
+            pairs(&genres, &[("action", "Action"), ("Animation", "Animation")]),
+        ),
+        (
+            j5_named(&music, "Blue"),
+            pairs(&music_genres, &[("Rock", "Rock"), ("Jazz", "Jazz")]),
+        ),
+        (j5_named(&music, "One"), rock.clone()),
+    ];
+    for (item, expected) in listed {
+        assert_eq!(j5_name_ids(&item["GenreItems"]), expected, "{item}");
+    }
+
+    // A single item carries its studios too.
+    let alpha = j5_named(&films, "Alpha")["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let one = j5_named(&music, "One")["Id"].as_str().unwrap().to_string();
+    let single = [
+        (alpha, alpha_genres, alpha_studios),
+        (
+            server.echo.to_string(),
+            pairs(&genres, &[("Drama", "Drama"), ("Comedy", "Comedy")]),
+            pairs(&studios, &[("HBO", "HBO")]),
+        ),
+        (one, rock, Vec::new()),
+    ];
+    for (id, genre_items, studio_items) in single {
+        let uri = format!("/Items/{id}?userId={}", server.admin);
+        let (status, item) = server.get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {item}");
+        assert_eq!(j5_name_ids(&item["GenreItems"]), genre_items, "{item}");
+        assert_eq!(j5_name_ids(&item["Studios"]), studio_items, "{item}");
+    }
+}
+
+/// The names in an `/Items` answer, sorted, after checking that it is a 200 whose total counts them.
+async fn j5_item_names(server: &J5Server, uri: &str) -> Vec<String> {
+    let (status, body) = server.get(uri).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    let mut names = j5_names(&body);
+    assert_eq!(body["TotalRecordCount"], names.len(), "{uri}: {body}");
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn j5_items_filter_by_genre_ids() {
+    let server = J5Server::new().await;
+    let (_, genres) = server.get("/Genres").await;
+    let drama = j5_id(&genres, "Drama");
+    let admin = server.admin;
+    let cases = [
+        // Bravo's " action " is Alpha's "Action"; Delta's "Action & Adventure" is another genre.
+        (
+            format!("/Items?GenreIds={J5_ACTION}&IncludeItemTypes=Movie&Recursive=true"),
+            vec!["Alpha", "Bravo"],
+        ),
+        (
+            format!("/Items?genreIds={J5_ACTION}&includeItemTypes=Movie&recursive=true"),
+            vec!["Alpha", "Bravo"],
+        ),
+        (
+            format!("/Users/{admin}/Items?GenreIds={J5_SCI_FI}&Recursive=true"),
+            vec!["Alpha"],
+        ),
+        // Several ids match any of them.
+        (
+            format!("/Items?GenreIds={J5_ACTION},{drama}&Recursive=true"),
+            vec!["Alpha", "Bravo", "Echo", "Echo 1"],
+        ),
+        (
+            format!("/Items?GenreIds={J5_ACTION},{drama}&IncludeItemTypes=Episode&Recursive=true"),
+            vec!["Echo 1"],
+        ),
+        // A music genre's id finds the album and the song.
+        (
+            format!("/Items?GenreIds={J5_MUSIC_ROCK}&Recursive=true"),
+            vec!["Blue", "One"],
+        ),
+    ];
+    for (uri, expected) in cases {
+        assert_eq!(j5_item_names(&server, &uri).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j5_items_filter_by_studio_ids() {
+    let server = J5Server::new().await;
+    let (_, studios) = server.get("/Studios").await;
+    let hbo = j5_id(&studios, "HBO");
+    let cases = [
+        (
+            format!("/Items?StudioIds={J5_PIXAR}&IncludeItemTypes=Movie&Recursive=true"),
+            vec!["Alpha", "Bravo"],
+        ),
+        (
+            format!("/Items?studioIds={hbo}&Recursive=true"),
+            vec!["Echo"],
+        ),
+        (
+            format!("/Items?StudioIds={J5_PIXAR},{hbo}&Recursive=true"),
+            vec!["Alpha", "Bravo", "Echo"],
+        ),
+        // Genre and studio ids must both match.
+        (
+            format!("/Items?GenreIds={J5_SCI_FI}&StudioIds={J5_PIXAR}&Recursive=true"),
+            vec!["Alpha"],
+        ),
+        (
+            format!("/Items?GenreIds={J5_SCI_FI}&StudioIds={hbo}&Recursive=true"),
+            vec![],
+        ),
+    ];
+    for (uri, expected) in cases {
+        assert_eq!(j5_item_names(&server, &uri).await, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn j5_items_with_unknown_or_bad_ids_answer_as_jellyfin_does() {
+    let server = J5Server::new().await;
+    let unknown = uuid::Uuid::new_v4();
+    let movies = "IncludeItemTypes=Movie&Recursive=true";
+    let all = vec!["Alpha", "Bravo", "Charlie", "Delta"];
+    let cases = [
+        // An id that names nothing matches no item.
+        (format!("/Items?GenreIds={unknown}&{movies}"), vec![]),
+        (format!("/Items?StudioIds={unknown}&{movies}"), vec![]),
+        (
+            format!("/Items?GenreIds={unknown},{J5_ACTION}&{movies}"),
+            vec!["Alpha", "Bravo"],
+        ),
+        // Values that aren't UUIDs are dropped; with none left, nothing is filtered.
+        (format!("/Items?GenreIds=bogus&{movies}"), all.clone()),
+        (format!("/Items?GenreIds=&StudioIds=&{movies}"), all.clone()),
+        (format!("/Items?StudioIds=studio-pixar&{movies}"), all),
+        (
+            format!("/Items?StudioIds=bogus,{J5_PIXAR}&{movies}"),
+            vec!["Alpha", "Bravo"],
+        ),
+    ];
+    for (uri, expected) in cases {
+        assert_eq!(j5_item_names(&server, &uri).await, expected, "{uri}");
+    }
+}
+
+/// A library with one film (genre "Drama", studio "Studio J5"), and an administrator's token and
+/// user id, for the tests of user data on ids that name no item. Also returns the film's id.
+async fn j5_user_data_app() -> (axum::Router, String, uuid::Uuid, uuid::Uuid) {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let (token, user) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 User Data", LibraryContentType::Movies).await;
+    let film = j5_item(&state, films, None, "Film", "Movie", "Drama", None).await;
+    j5_studio(&state, film, "Studio J5").await;
+    (app(state), token, user, film)
+}
+
+/// Sends each request and checks every status in one comparison, so that a failure shows every
+/// case.
+async fn j5_assert_statuses(
+    app: &axum::Router,
+    token: &str,
+    cases: &[(&str, String, Option<&str>, StatusCode)],
+) {
+    let mut actual = Vec::new();
+    for (method, uri, body, _) in cases {
+        let (status, _) = send_authed(app, method, uri, token, *body).await;
+        actual.push((*method, uri.as_str(), status));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(method, uri, _, status)| (*method, uri.as_str(), *status))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn j5_favouriting_a_genre_or_studio_id_answers_404_not_500() {
+    let (app, token, user, _) = j5_user_data_app().await;
+    // The ids that the lists hand out name no media item, so user data on them is a 404, as in
+    // Jellyfin, and not a failed foreign key.
+    let (_, genres) = send_authed(&app, "GET", "/Genres", &token, None).await;
+    let (_, studios) = send_authed(&app, "GET", "/Studios", &token, None).await;
+    let not_found = StatusCode::NOT_FOUND;
+    let mut cases = Vec::new();
+    for id in [j5_id(&genres, "Drama"), j5_id(&studios, "Studio J5")] {
+        cases.push((
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{id}"),
+            None,
+            not_found,
+        ));
+        cases.push((
+            "DELETE",
+            format!("/Users/{user}/FavoriteItems/{id}"),
+            None,
+            not_found,
+        ));
+        cases.push((
+            "DELETE",
+            format!("/UserFavoriteItems/{id}"),
+            None,
+            not_found,
+        ));
+    }
+    j5_assert_statuses(&app, &token, &cases).await;
+}
+
+#[tokio::test]
+async fn j5_played_and_rating_on_an_unknown_id_answer_404() {
+    let (app, token, user, _) = j5_user_data_app().await;
+    let unknown = uuid::Uuid::new_v4();
+    let not_found = StatusCode::NOT_FOUND;
+    let likes = Some(r#"{"Likes":true}"#);
+    j5_assert_statuses(
+        &app,
+        &token,
+        &[
+            (
+                "POST",
+                format!("/Users/{user}/PlayedItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/Users/{user}/PlayedItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/UserPlayedItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "PUT",
+                format!("/Users/{user}/Items/{unknown}/Rating"),
+                likes,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/Users/{user}/Items/{unknown}/Rating"),
+                None,
+                not_found,
+            ),
+            (
+                "POST",
+                format!("/Users/{user}/FavoriteItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/Users/{user}/FavoriteItems/{unknown}"),
+                None,
+                not_found,
+            ),
+            (
+                "DELETE",
+                format!("/UserFavoriteItems/{unknown}"),
+                None,
+                not_found,
+            ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn j5_user_data_on_a_real_item_still_works() {
+    let (app, token, user, film) = j5_user_data_app().await;
+    let (yes, no) = (Some(true), Some(false));
+    let likes = Some(r#"{"Likes":true}"#);
+    // Each step's status and the IsFavorite, Played and Likes it answers with. The routes that
+    // answer `{}` show nothing, so the step after each shows its change.
+    let steps = [
+        (
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            None,
+            [yes, no, None],
+        ),
+        (
+            "DELETE",
+            format!("/UserFavoriteItems/{film}"),
+            None,
+            [None; 3],
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            None,
+            [no, yes, None],
+        ),
+        (
+            "DELETE",
+            format!("/UserPlayedItems/{film}"),
+            None,
+            [None; 3],
+        ),
+        (
+            "PUT",
+            format!("/Users/{user}/Items/{film}/Rating"),
+            likes,
+            [no, no, yes],
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/Items/{film}/Rating"),
+            None,
+            [None; 3],
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            None,
+            [yes, no, None],
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/FavoriteItems/{film}"),
+            None,
+            [no, no, None],
+        ),
+        (
+            "POST",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            None,
+            [no, yes, None],
+        ),
+        (
+            "DELETE",
+            format!("/Users/{user}/PlayedItems/{film}"),
+            None,
+            [no, no, None],
+        ),
+    ];
+    let mut actual = Vec::new();
+    for (method, uri, body, _) in &steps {
+        let (status, data) = send_authed(&app, method, uri, &token, *body).await;
+        let data = ["IsFavorite", "Played", "Likes"].map(|field| data[field].as_bool());
+        actual.push((*method, uri.as_str(), status, data));
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|(method, uri, _, data)| (*method, uri.as_str(), StatusCode::OK, *data))
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 // ── Shows Tests ──
@@ -8211,23 +16481,23 @@ async fn g2f_mapped_proxy_peer_is_trusted() {
 }
 
 #[tokio::test]
-async fn g2f_ipv6_clients_share_a_slash64_budget() {
-    // One host rotating through its /64 must not get a fresh budget per address. 90c99b5 keyed
-    // every full IPv6 address separately.
+async fn g2f_ipv6_clients_share_a_slash56_budget() {
+    // One site rotating through its /56 must not get a fresh budget per address or per /64.
+    // 90c99b5 keyed every full IPv6 address separately, G2f each /64 (B21 round 3: the /56).
     let state = g2f_state("").await;
     let a = g2f_app_from(state.clone(), "[2001:db8:1:2::10]:6116");
-    let b = g2f_app_from(state.clone(), "[2001:db8:1:2::20]:6117");
-    let other = g2f_app_from(state, "[2001:db8:1:3::10]:6118");
+    let b = g2f_app_from(state.clone(), "[2001:db8:1:3::20]:6117");
+    let other = g2f_app_from(state, "[2001:db8:1:100::10]:6118");
     let _ = g2f_limited(&a, 3, &[]).await;
     assert_eq!(
         g2f_limited(&b, 1, &[]).await,
         1,
-        "a second address in the same /64 shares the budget"
+        "another /64 of the same /56 shares the budget"
     );
     assert_eq!(
         g2f_limited(&other, 1, &[]).await,
         0,
-        "a different /64 keeps its own budget"
+        "a different /56 keeps its own budget"
     );
 }
 
@@ -10243,6 +18513,323 @@ async fn g1c_next_up_accepts_both_casings() {
             );
         }
     }
+}
+
+// ── B29: item details per user ──
+// GET /Items/{id} caches only what every user sees and adds the requester's watch data to each
+// answer, so no user gets another's UserData or CompletionPercentage, a change shows on the next
+// request, and a cached answer equals a fresh one, Type included. Item details never reach the L2
+// table. Movies and episodes are built fresh each time.
+
+/// Stores one item of each kind that item details cover, a series with a season and an episode
+/// and an album with a track among them, and returns `(kind, id, runtime ticks)` for each.
+async fn b29_items(state: &AppState) -> Vec<(&'static str, uuid::Uuid, Option<i64>)> {
+    let folder = media_folder(state, "b29");
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "B29".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Mixed,
+        paths: vec![folder.clone()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let id = |n: usize| uuid::Uuid::from_u128(0xb290_0000 + n as u128);
+    // (kind, name, parent, runtime, season number, index number)
+    let rows = [
+        ("Movie", "B29 Movie", None, Some(72_000_000_000), None, None),
+        ("Series", "B29 Series", None, None, None, None),
+        ("Season", "Season 1", Some(id(1)), None, None, Some(1)),
+        (
+            "Episode",
+            "B29 Episode",
+            Some(id(2)),
+            Some(27_000_000_000),
+            Some(1),
+            Some(2),
+        ),
+        ("MusicAlbum", "B29 Album", None, None, None, None),
+        (
+            "Audio",
+            "B29 Track",
+            Some(id(4)),
+            Some(2_400_000_000),
+            None,
+            Some(1),
+        ),
+        ("Genre", "B29 Genre", None, None, None, None),
+        ("Photo", "B29 Photo", None, None, None, None),
+    ];
+    let mut items = Vec::new();
+    for (n, (kind, name, parent, runtime, season, index)) in rows.into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path, \
+             parent_id, runtime_ticks, parent_index_number, index_number, date_created) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id(n).to_string())
+        .bind(lib.id.to_string())
+        .bind(name)
+        .bind(name.to_lowercase())
+        .bind(kind)
+        .bind(format!("{folder}/{n}"))
+        .bind(parent.map(|p: uuid::Uuid| p.to_string()))
+        .bind(runtime)
+        .bind(season)
+        .bind(index)
+        .bind("2024-01-01T00:00:00+00:00")
+        .execute(&state.db)
+        .await
+        .unwrap();
+        items.push((kind, id(n), runtime));
+    }
+    items
+}
+
+/// Sends a request as the token's user and asserts a 2xx answer.
+async fn b29_ok(
+    app: &axum::Router,
+    token: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) {
+    let (status, json) = send(app, request(method, uri, Some(token), body)).await;
+    assert!(status.is_success(), "{method} {uri}: {status} {json}");
+}
+
+/// The user saves a resume point at `ticks` on the item.
+async fn b29_progress(app: &axum::Router, token: &str, item: uuid::Uuid, ticks: i64) {
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": ticks });
+    b29_ok(app, token, "POST", "/Sessions/Playing/Progress", Some(body)).await;
+}
+
+/// The user saves a resume point at `ticks` on the item, then marks it played and favorite.
+async fn b29_watch(app: &axum::Router, token: &str, user_id: &str, item: uuid::Uuid, ticks: i64) {
+    b29_progress(app, token, item, ticks).await;
+    for route in ["PlayedItems", "FavoriteItems"] {
+        let uri = format!("/Users/{user_id}/{route}/{item}");
+        b29_ok(app, token, "POST", &uri, None).await;
+    }
+}
+
+/// `GET /Items/{id}?userId=` as the token's user: asserts a 200 and returns the details.
+async fn b29_details(
+    app: &axum::Router,
+    token: &str,
+    user_id: &str,
+    item: uuid::Uuid,
+) -> serde_json::Value {
+    let uri = format!("/Items/{item}?userId={user_id}");
+    let (status, json) = send(app, request("GET", &uri, Some(token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {json}");
+    json
+}
+
+/// The user's watch data on the item as the database holds it, serialized as `UserData` is.
+async fn b29_stored(state: &AppState, user_id: &str, item: uuid::Uuid) -> serde_json::Value {
+    let user = user_id.parse().unwrap();
+    let data = rustyfin_db::repo_playback::get_user_item_data(&state.db, user, item)
+        .await
+        .unwrap();
+    serde_json::to_value(data).unwrap()
+}
+
+/// `value` as an answer brings it: written as text and read back, since serde_json can read a
+/// float back 1 ulp off.
+fn b29_as_sent(value: serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(&value.to_string()).unwrap()
+}
+
+/// Whether item details of this kind are cached.
+fn b29_cached_kind(kind: &str) -> bool {
+    kind != "Movie" && kind != "Episode"
+}
+
+#[tokio::test]
+async fn b29_each_user_gets_their_own_watch_data_in_item_details() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
+    for (kind, item, runtime) in b29_items(&state).await {
+        // A watched it; B saved a resume point of its own.
+        b29_watch(&app, &a, &a_id, item, 1234).await;
+        b29_progress(&app, &b, item, 5000).await;
+        let first = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&first),
+            Some((true, true, 1234)),
+            "{kind}: A's first request"
+        );
+        // Within the cache's 300 s.
+        let details = b29_details(&app, &b, &b_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 5000)),
+            "{kind}: B gets A's watch data"
+        );
+        assert_eq!(
+            details["UserData"],
+            b29_stored(&state, &b_id, item).await,
+            "{kind}: B's UserData"
+        );
+        assert_eq!(
+            details["CompletionPercentage"],
+            b29_as_sent(serde_json::json!(
+                runtime.map(|r| 5000.0 / r as f64 * 100.0)
+            )),
+            "{kind}: B's CompletionPercentage"
+        );
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            details["UserData"],
+            b29_stored(&state, &a_id, item).await,
+            "{kind}: A's UserData"
+        );
+        assert_eq!(
+            details["CompletionPercentage"],
+            serde_json::json!(runtime.map(|_| 100.0)),
+            "{kind}: A's CompletionPercentage"
+        );
+        if b29_cached_kind(kind) {
+            // The entry A's request made holds nothing of A's.
+            let entry = state.cache.item_details.get(&item.to_string());
+            let entry = serde_json::to_value(entry.expect("cached")).unwrap();
+            assert!(
+                entry["UserData"].is_null() && entry["CompletionPercentage"].is_null(),
+                "{kind}: the cache holds watch data: {} {}",
+                entry["UserData"],
+                entry["CompletionPercentage"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b29_a_change_to_watch_data_shows_on_the_next_request() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, _, _) = g1_owner_and_viewer(&state, &app).await;
+    for (kind, item, _) in b29_items(&state).await {
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 0)),
+            "{kind}: before"
+        );
+        let played = format!("/Users/{a_id}/PlayedItems/{item}");
+        let favorite = format!("/Users/{a_id}/FavoriteItems/{item}");
+        // (change, method, uri, then (Played, IsFavorite, PlaybackPositionTicks))
+        let changes = [
+            ("marked played", "POST", &played, (true, false, 0)),
+            ("favorite", "POST", &favorite, (true, true, 0)),
+            ("marked unplayed", "DELETE", &played, (false, true, 0)),
+            ("not favorite", "DELETE", &favorite, (false, false, 0)),
+        ];
+        for (change, method, uri, expected) in changes {
+            b29_ok(&app, &a, method, uri, None).await;
+            let details = b29_details(&app, &a, &a_id, item).await;
+            assert_eq!(
+                g1c_user_data(&details),
+                Some(expected),
+                "{kind}: after {change}"
+            );
+        }
+        b29_progress(&app, &a, item, 4321).await;
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, false, 4321)),
+            "{kind}: after a resume point"
+        );
+        // Written straight into the database, as an import does.
+        rustyfin_db::repo_playback::set_favorite(&state.db, a_id.parse().unwrap(), item, true)
+            .await
+            .unwrap();
+        let details = b29_details(&app, &a, &a_id, item).await;
+        assert_eq!(
+            g1c_user_data(&details),
+            Some((false, true, 4321)),
+            "{kind}: after a write to the database"
+        );
+        if b29_cached_kind(kind) {
+            assert!(
+                state.cache.item_details.contains_key(&item.to_string()),
+                "{kind}: the details stay cached"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn b29_cached_item_details_equal_fresh_ones() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &app).await;
+    let mut cached = Vec::new();
+    for (kind, item, _) in b29_items(&state).await {
+        b29_watch(&app, &a, &a_id, item, 1234).await;
+        b29_progress(&app, &b, item, 5000).await;
+        let key = item.to_string();
+        state.cache.item_details.invalidate(&key);
+        let a_fresh = b29_details(&app, &a, &a_id, item).await;
+        cached.push((kind, state.cache.item_details.contains_key(&key)));
+        let b_cached = b29_details(&app, &b, &b_id, item).await;
+        let a_cached = b29_details(&app, &a, &a_id, item).await;
+        state.cache.item_details.invalidate(&key);
+        let b_fresh = b29_details(&app, &b, &b_id, item).await;
+        assert_eq!(a_fresh["Type"], kind, "{kind}: Type");
+        assert_eq!(b_fresh["Type"], kind, "{kind}: Type");
+        assert_eq!(a_cached, a_fresh, "{kind}: A's cached answer");
+        assert_eq!(b_cached, b_fresh, "{kind}: B's cached answer");
+    }
+    // Movies and episodes are built fresh each time; the other kinds come from the cache.
+    for (kind, cached) in cached {
+        assert_eq!(cached, b29_cached_kind(kind), "{kind}: cached");
+    }
+}
+
+#[tokio::test]
+async fn b29_item_details_never_reach_the_l2_table() {
+    // The L2 copy on.
+    let state = b27_restarted(&test_state().await).await;
+    let before_restart = app(state.clone());
+    let (a, a_id, b, b_id) = g1_owner_and_viewer(&state, &before_restart).await;
+    let items = b29_items(&state).await;
+    let photo = items.iter().find(|(kind, ..)| *kind == "Photo").unwrap().1;
+    b29_watch(&before_restart, &a, &a_id, photo, 1234).await;
+    let details = b29_details(&before_restart, &a, &a_id, photo).await;
+    // The L2 copy is saved in the background.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_cache WHERE cache_key LIKE 'item:%'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "item details reached the L2 table");
+    // A row that an older build saved, with A's watch data, is not served after a restart.
+    sqlx::query("INSERT INTO api_cache (cache_key, cache_value, expires_at) VALUES (?, ?, ?)")
+        .bind(format!("item:{photo}"))
+        .bind(details.to_string())
+        .bind((chrono::Utc::now() + chrono::TimeDelta::seconds(3600)).to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let restarted = b27_restarted(&state).await;
+    assert!(
+        !restarted
+            .cache
+            .item_details
+            .contains_key(&photo.to_string()),
+        "a restart loaded item details from the L2 table"
+    );
+    let after_restart = app(restarted);
+    let details = b29_details(&after_restart, &b, &b_id, photo).await;
+    assert_eq!(
+        g1c_user_data(&details),
+        Some((false, false, 0)),
+        "B after a restart"
+    );
 }
 
 // ── B17: library scan progress ──
@@ -13342,6 +21929,228 @@ async fn b22_playback_info_lists_external_subtitles() {
     }
 }
 
+// ── B26: re-read old streams ──
+//
+// A scan that reads a file again replaces the item's sources. Item details show the new source
+// and the languages and titles of its streams, though they were cached.
+
+/// (Index, Language, Title) of each stream of a `MediaStreams` array.
+fn b26_labels(streams: &serde_json::Value) -> Vec<(i64, Option<String>, Option<String>)> {
+    streams
+        .as_array()
+        .unwrap_or_else(|| panic!("MediaStreams is not an array: {streams}"))
+        .iter()
+        .map(|stream| {
+            let text = |key: &str| stream[key].as_str().map(str::to_string);
+            (
+                stream["Index"].as_i64().expect("a stream has an Index"),
+                text("Language"),
+                text("Title"),
+            )
+        })
+        .collect()
+}
+
+/// ffmpeg. B26 criteria 4 and 11 for a video: once a scan has read the file again, `GET
+/// /Items/{id}` shows the new source and the languages and titles of its streams, and so does
+/// PlaybackInfo for that source. A video's details never come from the cache, because their
+/// `MediaType` ("Video") does not read back, so this passed before B26 too.
+#[tokio::test]
+async fn b26_item_details_show_the_streams_of_a_reread() {
+    if !g4_have_ffmpeg("b26_item_details_show_the_streams_of_a_reread") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b26-reread");
+    let srt = state.data_dir.join("b26.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,500\nHello\n").unwrap();
+    let file = format!("{folder}/Tracks (2001).mkv");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=64x48:rate=5:duration=2",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=2",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:duration=2",
+        "-i",
+        srt.to_str().unwrap(),
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:a",
+        "-map",
+        "3:s",
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "aac",
+        "-c:s",
+        "srt",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-metadata:s:a:0",
+        "title=Main",
+        "-metadata:s:a:1",
+        "language=spa",
+        "-metadata:s:a:1",
+        "title=Commentary",
+        "-metadata:s:s:0",
+        "language=ita",
+        "-metadata:s:s:0",
+        "title=Signs",
+        &file,
+    ]);
+    let id = g4_insert_item(&state, "Movie", std::path::Path::new(&file)).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    // The streams as the probe before 06fda0d stored them
+    sqlx::query("UPDATE media_streams SET language = NULL, title = NULL")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let uri = format!("/Items/{id}");
+    let (status, old) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{old}");
+    let bare: Vec<(i64, Option<String>, Option<String>)> =
+        (0..4).map(|index| (index, None, None)).collect();
+    assert_eq!(b26_labels(&old["MediaStreams"]), bare);
+
+    // A scan reads the file again
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    let source: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?1")
+        .bind(id.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_ne!(
+        old["MediaSources"][0]["Id"],
+        source.as_str(),
+        "the re-read kept the source id, which tells the cache that its copy is old"
+    );
+    let label = |index: i64, language: &str, title: &str| {
+        (index, Some(language.to_string()), Some(title.to_string()))
+    };
+    let labelled = vec![
+        (0, None, None),
+        label(1, "eng", "Main"),
+        label(2, "spa", "Commentary"),
+        label(3, "ita", "Signs"),
+    ];
+
+    let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(
+        item["MediaSources"][0]["Id"],
+        source.as_str(),
+        "the details show a source that is gone"
+    );
+    assert_eq!(b26_labels(&item["MediaStreams"]), labelled);
+    assert_eq!(
+        b26_labels(&item["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+
+    let uri = format!("/Videos/{id}/PlaybackInfo?MediaSourceId={source}");
+    let (status, info) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"][0]["Id"], source.as_str());
+    assert_eq!(
+        b26_labels(&info["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+}
+
+/// ffmpeg. B26 criterion 11: a music track's details read back from the cache, which
+/// `GET /Items/{id}` filled with the track's old source. Once a scan has read the track again,
+/// the details show the new source and the language and title of its stream, and so does
+/// PlaybackInfo for that source.
+#[tokio::test]
+async fn b26_cached_track_details_show_the_stream_of_a_reread() {
+    if !g4_have_ffmpeg("b26_cached_track_details_show_the_stream_of_a_reread") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b26-track");
+    let file = format!("{folder}/01 Song.ogg");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=duration=1",
+        "-c:a",
+        "flac",
+        "-metadata:s:a:0",
+        "language=ita",
+        "-metadata:s:a:0",
+        "title=Song",
+        &file,
+    ]);
+    let id = g4_insert_item(&state, "Audio", std::path::Path::new(&file)).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    // The stream as the probe before 06fda0d stored it
+    sqlx::query("UPDATE media_streams SET language = NULL, title = NULL")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let uri = format!("/Items/{id}");
+    let (status, old) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{old}");
+    assert_eq!(b26_labels(&old["MediaStreams"]), [(0, None, None)]);
+
+    // A scan reads the track again
+    rustyfin_core::probe::probe_and_save(&state.db, &id, &file)
+        .await
+        .unwrap();
+    let source: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?1")
+        .bind(id.to_string())
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_ne!(old["MediaSources"][0]["Id"], source.as_str());
+    let labelled = [(0, Some("ita".to_string()), Some("Song".to_string()))];
+
+    let (status, item) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert_eq!(
+        item["MediaSources"][0]["Id"],
+        source.as_str(),
+        "the details show a source that is gone"
+    );
+    assert_eq!(b26_labels(&item["MediaStreams"]), labelled);
+    assert_eq!(
+        b26_labels(&item["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+
+    let uri = format!("/Audio/{id}/PlaybackInfo?MediaSourceId={source}");
+    let (status, info) = send(&app, request("GET", &uri, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["MediaSources"][0]["Id"], source.as_str());
+    assert_eq!(
+        b26_labels(&info["MediaSources"][0]["MediaStreams"]),
+        labelled
+    );
+}
+
 // ── B16: media source selection ──
 //
 // A movie with two versions, each a media source on its own file. `MediaSourceId` picks the
@@ -13852,4 +22661,4190 @@ async fn b28_backfilled_dates_show_at_once_in_details_lists_and_latest() {
         chrono::DateTime::from_timestamp(1_000_000_100, 0).unwrap(),
         "{photo_uri} after the run"
     );
+}
+
+// ── B20: Jellyfin import ──
+// Remembered tracks: the playback reports store the reported audio and subtitle stream indexes
+// per user and item, and the video PlaybackInfo offers them as each media source's
+// DefaultAudioStreamIndex and DefaultSubtitleStreamIndex while that stream exists.
+
+/// Video 0, audio 1 (eng) and 2 (ger), subtitles 3 (eng) and 4 (ger).
+fn b20_full_streams() -> serde_json::Value {
+    serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng" },
+        { "Index": 2, "Codec": "ac3", "CodecType": "Audio", "Language": "ger" },
+        { "Index": 3, "Codec": "subrip", "CodecType": "Subtitle", "Language": "eng" },
+        { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle", "Language": "ger" },
+    ])
+}
+
+/// Stores a Matroska source with `streams` for `item` at `file` and returns its id.
+async fn b20_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    file: &std::path::Path,
+    streams: serde_json::Value,
+) -> uuid::Uuid {
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mkv",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap()
+}
+
+/// A movie in folder `name` with one source carrying `streams`; returns its id.
+async fn b20_movie(state: &AppState, name: &str, streams: serde_json::Value) -> uuid::Uuid {
+    let folder = media_folder(state, name);
+    let file = std::path::Path::new(&folder).join(format!("{name}.mkv"));
+    std::fs::write(&file, b"b20").unwrap();
+    let item = g4_insert_item(state, "Movie", &file).await;
+    b20_insert_source(state, item, &file, streams).await;
+    item
+}
+
+/// Sends a playback report to `/Sessions/Playing{route}` and expects success.
+async fn b20_report(app: &axum::Router, token: &str, route: &str, body: serde_json::Value) {
+    let uri = format!("/Sessions/Playing{route}");
+    let (status, _) = send_authed(app, "POST", &uri, token, Some(&body.to_string())).await;
+    assert!(status.is_success(), "{uri}: {status}");
+}
+
+type B20Defaults = (Option<serde_json::Value>, Option<serde_json::Value>);
+
+/// Each media source's stream count with its `DefaultAudioStreamIndex` and
+/// `DefaultSubtitleStreamIndex` from the video PlaybackInfo, `None` where the field is absent.
+async fn b20_track_defaults(
+    app: &axum::Router,
+    token: &str,
+    item: uuid::Uuid,
+) -> Vec<(usize, B20Defaults)> {
+    let uri = format!("/Videos/{item}/PlaybackInfo");
+    let (status, body) = send_authed(app, "GET", &uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["MediaSources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| {
+            let streams = source["MediaStreams"].as_array().unwrap().len();
+            let audio = source.get("DefaultAudioStreamIndex").cloned();
+            let subtitle = source.get("DefaultSubtitleStreamIndex").cloned();
+            (streams, (audio, subtitle))
+        })
+        .collect()
+}
+
+/// The defaults of the item's only media source.
+async fn b20_only_defaults(app: &axum::Router, token: &str, item: uuid::Uuid) -> B20Defaults {
+    let sources = b20_track_defaults(app, token, item).await;
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    sources[0].1.clone()
+}
+
+/// `(Some(audio), Some(subtitle))` as JSON numbers.
+fn b20_both(audio: i64, subtitle: i64) -> B20Defaults {
+    (
+        Some(serde_json::json!(audio)),
+        Some(serde_json::json!(subtitle)),
+    )
+}
+
+/// The stored `(audio_stream_index, subtitle_stream_index)` of `user` for `item`.
+async fn b20_stored_tracks(
+    state: &AppState,
+    user: &str,
+    item: uuid::Uuid,
+) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT audio_stream_index, subtitle_stream_index FROM user_item_data
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user)
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn b20_playback_info_defaults_from_progress_report() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Progress", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(2), Some(4)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+#[tokio::test]
+async fn b20_playback_info_without_choice_omits_defaults() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Nothing", b20_full_streams()).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // A report without track indexes remembers none
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 50 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+}
+
+#[tokio::test]
+async fn b20_start_and_stop_reports_save_tracks() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Start Stop", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 3));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 10_000_000, "AudioStreamIndex": 2,
+        "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Stopped", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+}
+
+#[tokio::test]
+async fn b20_report_without_tracks_keeps_choice() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Keep", b20_full_streams()).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    // Absent and null indexes leave the stored ones alone
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 100 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 200, "AudioStreamIndex": null,
+        "SubtitleStreamIndex": null,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(2, 4));
+
+    // One index changes only that one
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 300, "AudioStreamIndex": 1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 4));
+
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 400 });
+    b20_report(&app, &token, "/Stopped", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, 4));
+}
+
+#[tokio::test]
+async fn b20_subtitle_off_is_remembered() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Off", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": -1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(1), Some(-1)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, b20_both(1, -1));
+
+    // "Off" needs no subtitle stream to exist
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+    ]);
+    let bare = b20_movie(&state, "B20 Off Bare", streams).await;
+    let body = serde_json::json!({ "ItemId": bare, "PositionTicks": 0, "SubtitleStreamIndex": -1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    let defaults = b20_only_defaults(&app, &token, bare).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(-1))));
+}
+
+#[tokio::test]
+async fn b20_stale_track_index_is_ignored() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, user) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Stale", b20_full_streams()).await;
+
+    // Indexes the file doesn't have are stored but not offered
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 7, "SubtitleStreamIndex": 9,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let stored = b20_stored_tracks(&state, &user.to_string(), item).await;
+    assert_eq!(stored, (Some(7), Some(9)));
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // An index naming a stream of the other kind is not offered either
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 3, "SubtitleStreamIndex": 1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &token, item).await, (None, None));
+
+    // Audio -1 names no stream
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": -1, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let defaults = b20_only_defaults(&app, &token, item).await;
+    assert_eq!(defaults, (None, Some(serde_json::json!(4))));
+}
+
+#[tokio::test]
+async fn b20_track_choice_is_per_user() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (owner, _, viewer, _) = g1_owner_and_viewer(&state, &app).await;
+    let item = b20_movie(&state, "B20 Users", b20_full_streams()).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(&app, &owner, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &viewer, item).await, (None, None));
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &viewer, "/Progress", body).await;
+    assert_eq!(b20_only_defaults(&app, &owner, item).await, b20_both(2, 4));
+    assert_eq!(b20_only_defaults(&app, &viewer, item).await, b20_both(1, 3));
+}
+
+#[tokio::test]
+async fn b20_track_defaults_per_media_source() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Versions", b20_full_streams()).await;
+    let folder = media_folder(&state, "B20 Versions");
+    let file = std::path::Path::new(&folder).join("B20 Versions - 720p.mkv");
+    std::fs::write(&file, b"b20").unwrap();
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "aac", "CodecType": "Audio", "Language": "eng" },
+    ]);
+    b20_insert_source(&state, item, &file, streams).await;
+
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1, "SubtitleStreamIndex": 3,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+
+    // Each version offers what it has: the second has no subtitle 3
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    let expected = vec![(2, (Some(serde_json::json!(1)), None)), (5, b20_both(1, 3))];
+    assert_eq!(sources, expected);
+}
+
+/// `b20_full_streams` with `edit` applied to the streams at index 2 (ger audio) and 4 (ger
+/// subtitle).
+fn b20_streams_with(edit: impl Fn(&mut serde_json::Value)) -> serde_json::Value {
+    let mut streams = b20_full_streams();
+    for index in [2, 4] {
+        edit(&mut streams[index]);
+    }
+    streams
+}
+
+/// The defaults of `name`, a movie with `before`, after choosing audio 2 and subtitle 4 and a
+/// rescan that finds `after` in the same file.
+async fn b20_defaults_after_rescan(
+    state: &AppState,
+    app: &axum::Router,
+    token: &str,
+    name: &str,
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> B20Defaults {
+    let item = b20_movie(state, name, before).await;
+    let body = serde_json::json!({
+        "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 2, "SubtitleStreamIndex": 4,
+    });
+    b20_report(app, token, "/Progress", body).await;
+    assert_eq!(
+        b20_only_defaults(app, token, item).await,
+        b20_both(2, 4),
+        "{name}: before the rescan"
+    );
+    rustyfin_db::repo_media_source::delete_media_sources(&state.db, &item)
+        .await
+        .unwrap();
+    let file = std::path::Path::new(&media_folder(state, name)).join(format!("{name}.mkv"));
+    b20_insert_source(state, item, &file, after).await;
+    b20_only_defaults(app, token, item).await
+}
+
+#[tokio::test]
+async fn b20_rescan_offers_only_the_chosen_streams() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let set = |key: &'static str, audio: serde_json::Value, subtitle: serde_json::Value| {
+        b20_streams_with(move |stream| {
+            let kind = stream["CodecType"].as_str().unwrap().to_string();
+            stream[key] = if kind == "Audio" {
+                audio.clone()
+            } else {
+                subtitle.clone()
+            };
+        })
+    };
+    let external = |path: &str| {
+        let mut streams = b20_full_streams();
+        streams[4]["IsExternal"] = serde_json::json!(true);
+        streams[4]["Path"] = serde_json::json!(path);
+        streams
+    };
+    let json = |value: &str| serde_json::json!(value);
+    let kept = b20_both(2, 4);
+    let neither: B20Defaults = (None, None);
+    let cases = [
+        ("Same", b20_full_streams(), b20_full_streams(), kept.clone()),
+        (
+            "Case",
+            b20_full_streams(),
+            b20_streams_with(|stream| {
+                for key in ["Codec", "CodecType", "Language"] {
+                    let upper = stream[key].as_str().unwrap().to_uppercase();
+                    stream[key] = serde_json::json!(upper);
+                }
+            }),
+            kept.clone(),
+        ),
+        (
+            "Codec",
+            b20_full_streams(),
+            set("Codec", json("eac3"), json("ass")),
+            neither.clone(),
+        ),
+        (
+            "Language",
+            b20_full_streams(),
+            set("Language", json("fre"), json("fre")),
+            neither.clone(),
+        ),
+        (
+            "Title",
+            b20_full_streams(),
+            set("Title", json("Commentary"), json("Signs")),
+            neither.clone(),
+        ),
+        (
+            "Default",
+            b20_full_streams(),
+            set(
+                "IsDefault",
+                serde_json::json!(true),
+                serde_json::json!(true),
+            ),
+            neither.clone(),
+        ),
+        (
+            "Forced",
+            b20_full_streams(),
+            set("IsForced", serde_json::json!(true), serde_json::json!(true)),
+            neither.clone(),
+        ),
+        (
+            "External",
+            external("/subs/B20 Ext.ger.srt"),
+            external("/subs/B20 Ext.fre.srt"),
+            (Some(serde_json::json!(2)), None),
+        ),
+        (
+            "External Moved",
+            external("/subs/B20 Ext.ger.srt"),
+            external("/elsewhere/B20 Ext.ger.srt"),
+            kept.clone(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, before, after, expected) in cases {
+        let name = format!("B20 Rescan {case}");
+        let got = b20_defaults_after_rescan(&state, &app, &token, &name, before, after).await;
+        if got != expected {
+            wrong.push(format!("{case}: {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[tokio::test]
+async fn b20_track_choice_names_the_reported_source() {
+    let state = test_state().await;
+    let _dir = G1cDataDir(state.data_dir.to_path_buf());
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let item = b20_movie(&state, "B20 Dub", b20_full_streams()).await;
+    let folder = media_folder(&state, "B20 Dub");
+    let file = std::path::Path::new(&folder).join("B20 Dub - French.mkv");
+    std::fs::write(&file, b"b20").unwrap();
+    let streams = serde_json::json!([
+        { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+        { "Index": 1, "Codec": "ac3", "CodecType": "Audio", "Language": "fre" },
+    ]);
+    let dub = b20_insert_source(&state, item, &file, streams).await;
+
+    // Audio 1 of the French version: the first version's audio 1 is another stream.
+    let body = serde_json::json!({
+        "ItemId": item, "MediaSourceId": dub.simple().to_string(), "PositionTicks": 0,
+        "AudioStreamIndex": 1,
+    });
+    b20_report(&app, &token, "/Progress", body).await;
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    let audio_1 = (Some(serde_json::json!(1)), None);
+    assert_eq!(sources, vec![(2, audio_1.clone()), (5, (None, None))]);
+
+    // Without MediaSourceId, the first version listed that has an audio 1 names it.
+    let body = serde_json::json!({ "ItemId": item, "PositionTicks": 0, "AudioStreamIndex": 1 });
+    b20_report(&app, &token, "/Progress", body).await;
+    let mut sources = b20_track_defaults(&app, &token, item).await;
+    sources.sort_by_key(|(streams, _)| *streams);
+    assert_eq!(sources, vec![(2, (None, None)), (5, audio_1)]);
+}
+
+// Import from Jellyfin: the importer reads a Jellyfin data folder read-only (synthetic databases
+// in both layouts, written by `jellyfin_fixture`), matches users by name and items by path pair or
+// provider id, and its preview reports what an import would do without writing anything.
+
+mod jellyfin_fixture;
+use jellyfin_fixture as jf;
+
+/// A server with an admin, the user "alice", the libraries "Movies" (`media/movies`: Alpha, Beta
+/// with TMDB 222) and "Shows" (`media/tv`: Show with TVDB 333, its Season 1 and S01E01-S01E03),
+/// and the Jellyfin install `source` (`b20_source`), which each test writes where it needs it.
+struct B20World {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    alice: uuid::Uuid,
+    movies: String,
+    tv: String,
+    source: jf::JfSource,
+    /// An empty folder for Jellyfin installs, removed when the test ends.
+    jf_root: std::path::PathBuf,
+}
+
+/// A Rustyfin item row for the B20 import tests.
+#[derive(Default)]
+struct B20Row {
+    media_type: &'static str,
+    name: String,
+    path: String,
+    parent: Option<uuid::Uuid>,
+    parent_index: Option<i32>,
+    index: Option<i32>,
+    tmdb: Option<i64>,
+    tvdb: Option<i64>,
+}
+
+/// Stores `row` in `library` and returns the new item's id.
+async fn b20_insert(state: &AppState, library: uuid::Uuid, row: B20Row) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, media_type, path, parent_id, \
+         parent_index_number, index_number, tmdb_id, tvdb_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library.to_string())
+    .bind(&row.name)
+    .bind(row.media_type)
+    .bind(&row.path)
+    .bind(row.parent.map(|p| p.to_string()))
+    .bind(row.parent_index)
+    .bind(row.index)
+    .bind(row.tmdb)
+    .bind(row.tvdb)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Stores the library `name` of `content_type` on `path` and returns its id.
+async fn b20_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+    path: &str,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![path.to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Stores the user `name` without hashing a password (nobody signs in as them); returns the id.
+async fn b20_plain_user(state: &AppState, name: &str) -> uuid::Uuid {
+    let user = rustyfin_model::user::User {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        password_hash: "unused".to_string(),
+        is_administrator: false,
+        created_at: chrono::Utc::now(),
+        last_login_date: None,
+        configuration: serde_json::json!({}),
+    };
+    rustyfin_db::repo_user::create_user(&state.db, &user)
+        .await
+        .unwrap();
+    user.id
+}
+
+/// Jellyfin's side: "Alice" (admin; Rustyfin has "alice") and "bob" (new); the libraries Movies
+/// (`/data/movies`), Music (`/data/music`, no Rustyfin library) and Shows (`/data/tvshows`);
+/// items matched by path (Alpha, Show, Season 1, S01E01, S01E02), by id (Beta by TMDB, the episode
+/// 1x03 under an old path by its series and numbers) or not at all (Gamma, Song), and a folder,
+/// which is not imported. User data: Alice has Alpha, S01E01, Gamma and a detached row; bob has
+/// Beta and 1x03.
+fn b20_source() -> jf::JfSource {
+    let alice = jf::JfUser::new(1, "Alice", true);
+    let bob = jf::JfUser::new(2, "bob", false);
+    let folder = jf::JfItem::new("Folder", "Movies", Some("/data/movies"));
+    let alpha = jf::JfItem::new(
+        "Movie",
+        "Alpha",
+        Some("/data/movies/Alpha (2001)/Alpha.mkv"),
+    );
+    let beta = jf::JfItem::new("Movie", "Beta", Some("/data/movies/Beta (old)/Beta.avi"))
+        .provider("Tmdb", "222");
+    let gamma = jf::JfItem::new(
+        "Movie",
+        "Gamma",
+        Some("/data/movies/Gamma (2003)/Gamma.mkv"),
+    )
+    .provider("Tmdb", "999");
+    let show =
+        jf::JfItem::new("Series", "Show", Some("/data/tvshows/Show")).provider("Tvdb", "333");
+    let season = jf::JfItem::new("Season", "Season 1", Some("/data/tvshows/Show/Season 01"))
+        .in_series(show.id)
+        .numbers(None, Some(1));
+    let episode = |name: &str, path: &str, number: i32| {
+        jf::JfItem::new("Episode", name, Some(path))
+            .in_season(show.id, season.id)
+            .numbers(Some(1), Some(number))
+    };
+    let e1 = episode(
+        "Show S01E01",
+        "/data/tvshows/Show/Season 01/Show S01E01.mkv",
+        1,
+    );
+    let e2 = episode(
+        "Show S01E02",
+        "/data/tvshows/Show/Season 01/Show S01E02.mkv",
+        2,
+    );
+    let e3 = episode(
+        "Show 1x03",
+        "/data/tvshows/Show/Season 1/Show - 1x03.mkv",
+        3,
+    );
+    let song = jf::JfItem::new("Audio", "Song", Some("/data/music/Song.flac"));
+    let played = |user: &jf::JfUser, item: uuid::Uuid, last: &'static str| jf::JfUserData {
+        user: user.id,
+        item,
+        played: true,
+        play_count: 1,
+        last_played: Some(last),
+        ..Default::default()
+    };
+    let user_data = vec![
+        jf::JfUserData {
+            play_count: 2,
+            favorite: true,
+            rating: Some(7.6),
+            ..played(&alice, alpha.id, "2025-01-02 03:04:05.1234567")
+        },
+        jf::JfUserData {
+            played: false,
+            play_count: 0,
+            position: 6_000_000_000,
+            ..played(&alice, e1.id, "2025-02-01 10:00:00")
+        },
+        played(&alice, gamma.id, "2025-01-05 12:00:00"),
+        played(&alice, jf::DETACHED, "2024-12-01 00:00:00"),
+        jf::JfUserData {
+            rating: Some(9.5),
+            ..played(&bob, beta.id, "2025-03-01 20:00:00")
+        },
+        played(&bob, e3.id, "2025-03-02 21:00:00"),
+    ];
+    let library = |name, collection_type, path| jf::JfLibrary {
+        name,
+        collection_type,
+        paths: vec![path],
+    };
+    jf::JfSource {
+        users: vec![alice, bob],
+        items: vec![folder, alpha, beta, gamma, show, season, e1, e2, e3, song],
+        user_data,
+        streams: Vec::new(),
+        libraries: vec![
+            library("Movies", "movies", "/data/movies"),
+            library("Music", "music", "/data/music"),
+            library("Shows", "tvshows", "/data/tvshows"),
+        ],
+    }
+}
+
+async fn b20_world() -> B20World {
+    use rustyfin_model::library::LibraryContentType as Kind;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let alice = add_user(&state, "alice", "alicepass", false).await;
+    let movies = media_folder(&state, "movies");
+    let tv = media_folder(&state, "tv");
+    let movie_lib = b20_library(&state, "Movies", Kind::Movies, &movies).await;
+    let show_lib = b20_library(&state, "Shows", Kind::TvShows, &tv).await;
+    let row = |media_type: &'static str, name: &str, path: String| B20Row {
+        media_type,
+        name: name.to_string(),
+        path,
+        ..Default::default()
+    };
+    let alpha_path = format!("{movies}/Alpha (2001)/Alpha.mkv");
+    b20_insert(&state, movie_lib, row("Movie", "Alpha", alpha_path)).await;
+    let beta_row = B20Row {
+        tmdb: Some(222),
+        ..row("Movie", "Beta", format!("{movies}/Beta (2002)/Beta.mkv"))
+    };
+    b20_insert(&state, movie_lib, beta_row).await;
+    let show_row = B20Row {
+        tvdb: Some(333),
+        ..row("Series", "Show", format!("{tv}/Show"))
+    };
+    let show = b20_insert(&state, show_lib, show_row).await;
+    let season_row = B20Row {
+        parent: Some(show),
+        index: Some(1),
+        ..row("Season", "Season 1", format!("{tv}/Show/Season 01"))
+    };
+    let season = b20_insert(&state, show_lib, season_row).await;
+    for n in 1..=3 {
+        let name = format!("Show S01E0{n}");
+        let episode = B20Row {
+            parent: Some(season),
+            parent_index: Some(1),
+            index: Some(n),
+            ..row("Episode", &name, format!("{tv}/Show/Season 01/{name}.mkv"))
+        };
+        b20_insert(&state, show_lib, episode).await;
+    }
+    let jf_root =
+        std::env::temp_dir().join(format!("rustyfin_b20_jf_{}", uuid::Uuid::new_v4().simple()));
+    remove_when_test_ends(&jf_root);
+    std::fs::create_dir_all(&jf_root).unwrap();
+    B20World {
+        state,
+        app,
+        token,
+        alice,
+        movies,
+        tv,
+        source: b20_source(),
+        jf_root,
+    }
+}
+
+/// Writes the world's Jellyfin install in `layout` into the folder `name` and returns that folder
+/// (Jellyfin's program data folder, the official image's `/config`).
+async fn b20_install(w: &B20World, name: &str, layout: jf::Layout) -> std::path::PathBuf {
+    let dir = w.jf_root.join(name);
+    w.source.write(&dir, layout).await;
+    dir
+}
+
+/// POSTs `body` to `/JellyfinImport/{route}` as the admin.
+async fn b20_post(
+    w: &B20World,
+    route: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let uri = format!("/JellyfinImport/{route}");
+    send_authed(&w.app, "POST", &uri, &w.token, Some(&body.to_string())).await
+}
+
+/// Previews an import with `body` and expects 200; returns the report.
+async fn b20_preview(w: &B20World, body: serde_json::Value) -> serde_json::Value {
+    let (status, report) = b20_post(w, "Preview", body).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    report
+}
+
+/// A report's item counts: (Total, MatchedByPath, MatchedById, Unmatched).
+fn b20_item_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["Items"][key].as_i64().unwrap_or(-1);
+    (
+        count("Total"),
+        count("MatchedByPath"),
+        count("MatchedById"),
+        count("Unmatched"),
+    )
+}
+
+/// A report's path pairs under `key` as (From, To).
+fn b20_pairs(report: &serde_json::Value, key: &str) -> Vec<(String, String)> {
+    let pairs = report[key].as_array();
+    pairs
+        .unwrap_or_else(|| panic!("no {key}: {report}"))
+        .iter()
+        .map(|p| {
+            (
+                p["From"].as_str().unwrap().into(),
+                p["To"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+/// A report's `UnmatchedSamples` as (Type, Name, Path).
+fn b20_samples(report: &serde_json::Value) -> Vec<(String, String, String)> {
+    let samples = report["Items"]["UnmatchedSamples"].as_array();
+    let text = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    samples
+        .unwrap_or_else(|| panic!("no UnmatchedSamples: {report}"))
+        .iter()
+        .map(|s| (text(&s["Type"]), text(&s["Name"]), text(&s["Path"])))
+        .collect()
+}
+
+/// One entry of a report's `Users`.
+#[derive(Debug, PartialEq)]
+struct B20User {
+    jellyfin_id: uuid::Uuid,
+    name: String,
+    was_admin: bool,
+    action: String,
+    reason: Option<String>,
+    user_id: Option<uuid::Uuid>,
+    code: Option<String>,
+    /// `SuggestedMatch` as (UserId, Name).
+    suggested: Option<(uuid::Uuid, String)>,
+}
+
+fn b20_users(report: &serde_json::Value) -> Vec<B20User> {
+    let id = |v: &serde_json::Value| v.as_str().map(|s| uuid::Uuid::parse_str(s).unwrap());
+    let users = report["Users"].as_array();
+    users
+        .unwrap_or_else(|| panic!("no Users: {report}"))
+        .iter()
+        .map(|u| B20User {
+            jellyfin_id: id(&u["JellyfinId"]).unwrap_or_else(|| panic!("JellyfinId: {u}")),
+            name: u["Name"].as_str().unwrap().to_string(),
+            was_admin: u["WasAdministrator"].as_bool().unwrap(),
+            action: u["Action"].as_str().unwrap().to_string(),
+            reason: u["Reason"].as_str().map(str::to_string),
+            user_id: id(&u["UserId"]),
+            code: u["Code"].as_str().map(str::to_string),
+            suggested: id(&u["SuggestedMatch"]["UserId"]).map(|user| {
+                let name = u["SuggestedMatch"]["Name"].as_str().unwrap();
+                (user, name.to_string())
+            }),
+        })
+        .collect()
+}
+
+/// The report entry expected for the Jellyfin user `name` (no code).
+fn b20_user(
+    w: &B20World,
+    name: &str,
+    action: &str,
+    reason: Option<&str>,
+    user_id: Option<uuid::Uuid>,
+) -> B20User {
+    let jf_user = w.source.user(name);
+    B20User {
+        jellyfin_id: jf_user.id,
+        name: name.to_string(),
+        was_admin: jf_user.admin,
+        action: action.to_string(),
+        reason: reason.map(str::to_string),
+        user_id,
+        code: None,
+        suggested: None,
+    }
+}
+
+/// The report entry expected for the Jellyfin user `name` whose name suggests the Rustyfin
+/// account `account` (id, name): skipped as not confirmed, or matched to it when `confirmed`.
+fn b20_suggested(
+    w: &B20World,
+    name: &str,
+    account: (uuid::Uuid, &str),
+    confirmed: bool,
+) -> B20User {
+    let entry = if confirmed {
+        b20_user(w, name, "Match", None, Some(account.0))
+    } else {
+        b20_user(w, name, "Skip", Some("NotConfirmed"), None)
+    };
+    B20User {
+        suggested: Some((account.0, account.1.to_string())),
+        ..entry
+    }
+}
+
+/// `ConfirmedMatches` pairing each Jellyfin user (by name) with a Rustyfin account id.
+fn b20_confirm(w: &B20World, pairs: &[(&str, uuid::Uuid)]) -> serde_json::Value {
+    let confirm = |(name, user): &(&str, uuid::Uuid)| serde_json::json!({ "JellyfinId": w.source.user(name).id, "UserId": user });
+    pairs.iter().map(confirm).collect()
+}
+
+/// A request for `install` that confirms the world's suggested match, Alice with alice.
+fn b20_body(w: &B20World, install: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "SourcePath": install,
+        "ConfirmedMatches": b20_confirm(w, &[("Alice", w.alice)]),
+    })
+}
+
+/// Row counts of the tables an import may write, then every user and user-data row.
+async fn b20_db_digest(state: &AppState) -> Vec<String> {
+    let mut digest = Vec::new();
+    for table in [
+        "users",
+        "user_item_data",
+        "media_items",
+        "media_sources",
+        "media_streams",
+        "item_images",
+        "people",
+        "item_people",
+        "libraries",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        digest.push(format!("{table} {n}"));
+    }
+    let users: Vec<String> = sqlx::query_scalar(
+        "SELECT id || ' ' || name || ' ' || password_hash || ' ' || is_administrator FROM users \
+         ORDER BY id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT quote(user_id) || quote(item_id) || quote(played) || quote(play_count) || \
+         quote(playback_position_ticks) || quote(last_played_date) || quote(is_favorite) || \
+         quote(user_rating) || quote(likes) || quote(audio_stream_index) || \
+         quote(subtitle_stream_index) FROM user_item_data ORDER BY user_id, item_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    digest.extend(users);
+    digest.extend(rows);
+    digest
+}
+
+#[tokio::test]
+async fn b20_import_preview_is_admin_only() {
+    let w = b20_world().await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = Some(serde_json::json!({ "SourcePath": install }));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Preview", &body, &viewer).await;
+}
+
+#[tokio::test]
+async fn b20_import_preview_rejects_bad_sources() {
+    let w = b20_world().await;
+    let new = b20_install(&w, "new", jf::Layout::New).await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let junk = w.jf_root.join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("jellyfin.db"), b"not a database").unwrap();
+    let missing = w.jf_root.join("missing");
+    let cases = [
+        ("empty", serde_json::json!({ "SourcePath": "" })),
+        (
+            "relative",
+            serde_json::json!({ "SourcePath": "relative/config" }),
+        ),
+        ("missing", serde_json::json!({ "SourcePath": missing })),
+        ("not a database", serde_json::json!({ "SourcePath": junk })),
+        (
+            "Old without library.db",
+            serde_json::json!({ "SourcePath": new, "Layout": "Old" }),
+        ),
+        (
+            "New without BaseItems",
+            serde_json::json!({ "SourcePath": old, "Layout": "New" }),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, answer) = b20_post(&w, "Preview", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+
+    // A missing database names the three places searched, and nothing is created.
+    let body = serde_json::json!({ "SourcePath": missing });
+    let (_, answer) = b20_post(&w, "Preview", body).await;
+    let detail = answer["Detail"].as_str().unwrap_or_default();
+    for place in ["jellyfin.db", "data/jellyfin.db", "data/data/jellyfin.db"] {
+        let path = missing.join(place);
+        assert!(detail.contains(path.to_str().unwrap()), "{place}: {detail}");
+    }
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn b20_import_preview_finds_the_database_in_three_places() {
+    let w = b20_world().await;
+    // linuxserver's image: /config/data/data/jellyfin.db
+    let config = w.jf_root.join("config");
+    w.source.write(&config.join("data"), jf::Layout::New).await;
+    let data = config.join("data").join("data");
+    for source in [config.clone(), config.join("data"), data.clone()] {
+        let report = b20_preview(&w, serde_json::json!({ "SourcePath": source })).await;
+        let shown = source.display();
+        assert_eq!(report["DataPath"], serde_json::json!(data), "{shown}");
+        assert_eq!(b20_item_counts(&report), (9, 5, 2, 2), "{shown}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_preview_reports_without_writing() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let before = b20_db_digest(&w.state).await;
+    let report = b20_preview(&w, b20_body(&w, &install)).await;
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a preview writes nothing"
+    );
+
+    assert_eq!(report["Layout"], "New");
+    assert_eq!(report["DataPath"], serde_json::json!(install.join("data")));
+    let text = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+    let suggested = vec![
+        ("/data/movies".to_string(), w.movies.clone()),
+        ("/data/tvshows".to_string(), w.tv.clone()),
+        ("%MetadataPath%".to_string(), text(install.join("metadata"))),
+        ("%AppDataPath%".to_string(), text(install.join("data"))),
+    ];
+    assert_eq!(b20_pairs(&report, "SuggestedPathMappings"), suggested);
+    assert_eq!(
+        b20_pairs(&report, "PathMappings"),
+        suggested,
+        "absent = suggested"
+    );
+    assert_eq!(
+        report["UnpairedLibraryPaths"],
+        serde_json::json!(["/data/music"])
+    );
+    let users = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        b20_user(&w, "bob", "Create", None, None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+    let gamma = "/data/movies/Gamma (2003)/Gamma.mkv";
+    let samples = vec![("Movie".to_string(), "Gamma".to_string(), gamma.to_string())];
+    assert_eq!(b20_samples(&report), samples);
+}
+
+#[tokio::test]
+async fn b20_import_preview_reads_the_old_layout() {
+    let w = b20_world().await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let report = b20_preview(&w, b20_body(&w, &old)).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+    let users = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        b20_user(&w, "bob", "Create", None, None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    let names: Vec<String> = b20_samples(&report).into_iter().map(|s| s.1).collect();
+    assert_eq!(names, ["Gamma"]);
+
+    // An upgrade renamed library.db to library.db.old
+    let renamed = b20_install(&w, "renamed", jf::Layout::Old).await;
+    let data = renamed.join("data");
+    std::fs::rename(data.join("library.db"), data.join("library.db.old")).unwrap();
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": renamed })).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+
+    // A migrated install reads the new layout unless Old is asked for
+    let migrated = b20_install(&w, "migrated", jf::Layout::New).await;
+    let old_db = migrated.join("data").join("library.db.old");
+    w.source.write_library_db(&old_db).await;
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": migrated })).await;
+    assert_eq!(report["Layout"], "New");
+    let body = serde_json::json!({ "SourcePath": migrated, "Layout": "Old" });
+    let report = b20_preview(&w, body).await;
+    assert_eq!(report["Layout"], "Old");
+    assert_eq!(b20_item_counts(&report), (9, 5, 2, 2));
+}
+
+#[tokio::test]
+async fn b20_import_preview_uses_given_path_pairs() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+
+    // No pairs: only provider ids match (Beta; the show, its season and its episodes)
+    let mut body = b20_body(&w, &install);
+    body["PathMappings"] = serde_json::json!([]);
+    let report = b20_preview(&w, body).await;
+    assert_eq!(
+        b20_pairs(&report, "PathMappings"),
+        Vec::<(String, String)>::new()
+    );
+    assert_eq!(b20_pairs(&report, "SuggestedPathMappings").len(), 4);
+    assert_eq!(b20_item_counts(&report), (9, 0, 6, 3));
+    let names: Vec<String> = b20_samples(&report).into_iter().map(|s| s.1).collect();
+    assert_eq!(names, ["Alpha", "Gamma"]);
+
+    // One pair, with trailing slashes
+    let mut body = b20_body(&w, &install);
+    body["PathMappings"] =
+        serde_json::json!([{ "From": "/data/movies/", "To": format!("{}/", w.movies) }]);
+    let report = b20_preview(&w, body).await;
+    assert_eq!(b20_item_counts(&report), (9, 1, 6, 2));
+}
+
+#[tokio::test]
+async fn b20_import_preview_matches_and_picks_users() {
+    let mut w = b20_world().await;
+    let mut ids = HashMap::new();
+    for name in ["Dave", "DAVE", "Erin", "ERIN"] {
+        ids.insert(name, b20_plain_user(&w.state, name).await);
+    }
+    w.source.users.push(jf::JfUser::new(3, "dave", false));
+    w.source.users.push(jf::JfUser::new(4, "Erin", true));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+
+    // A name match is a suggestion, unconfirmed: the exact-case one wins over ERIN
+    let report = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+    let users = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), false),
+        b20_user(&w, "bob", "Create", None, None),
+        b20_user(&w, "dave", "Skip", Some("Ambiguous"), None),
+        b20_suggested(&w, "Erin", (ids["Erin"], "Erin"), false),
+    ];
+    assert_eq!(b20_users(&report), users);
+
+    // Only picked users count; unknown ids are ignored
+    let bob = w
+        .source
+        .user("bob")
+        .id
+        .hyphenated()
+        .to_string()
+        .to_uppercase();
+    let picks = serde_json::json!([bob, uuid::Uuid::new_v4()]);
+    let body = serde_json::json!({ "SourcePath": install, "UserIds": picks });
+    let report = b20_preview(&w, body).await;
+    let users = vec![
+        b20_user(&w, "Alice", "Skip", Some("NotSelected"), None),
+        b20_user(&w, "bob", "Create", None, None),
+        b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
+        b20_user(&w, "Erin", "Skip", Some("NotSelected"), None),
+    ];
+    assert_eq!(b20_users(&report), users);
+    assert_eq!(b20_samples(&report), Vec::new(), "bob's items all match");
+}
+
+#[tokio::test]
+async fn b20_import_preview_leaves_the_source_and_its_secrets_alone() {
+    let w = b20_world().await;
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let install = b20_install(&w, name, layout).await;
+        let before = jf::listing(&install);
+        let log = jf::LogCapture::start();
+        let body = serde_json::json!({ "SourcePath": install });
+        let (status, answer) = b20_post(&w, "Preview", body).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(jf::listing(&install), before, "{name}: the source changed");
+        assert!(
+            !answer.to_string().contains(jf::CANARY),
+            "{name}: secret in the answer"
+        );
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import");
+        assert!(text.lines().any(info), "{name}: no INFO line in {text}");
+    }
+    let db = w.state.data_dir.join("test.db");
+    let files = [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+    ];
+    assert!(
+        !jf::files_hold_canary(&files),
+        "secret in Rustyfin's database"
+    );
+}
+
+// B20 2b: the import run, its status and the created users' one-time codes.
+
+/// `GET /JellyfinImport/Status` as the admin; expects 200.
+async fn b20_status(w: &B20World) -> serde_json::Value {
+    let uri = "/JellyfinImport/Status";
+    let (status, answer) = send_authed(&w.app, "GET", uri, &w.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer
+}
+
+/// Starts an import run with `body`; expects 202 `{"State":"Running"}`.
+async fn b20_start(w: &B20World, body: serde_json::Value) {
+    let (status, answer) = b20_post(w, "Run", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    assert_eq!(answer, serde_json::json!({ "State": "Running" }));
+}
+
+/// Polls the status until the run no longer runs (two minutes at most) and returns that first
+/// answer, the only one that shows the codes.
+async fn b20_wait(w: &B20World) -> serde_json::Value {
+    for _ in 0..2400 {
+        let answer = b20_status(w).await;
+        if answer["State"] != "Running" {
+            return answer;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the import still runs after two minutes");
+}
+
+/// Runs an import with `body` to its end, expects it to complete and returns the report.
+async fn b20_run(w: &B20World, body: serde_json::Value) -> serde_json::Value {
+    b20_start(w, body).await;
+    let answer = b20_wait(w).await;
+    assert_eq!(answer["State"], "Completed", "{answer}");
+    answer["Result"].clone()
+}
+
+/// Whether `code` has the shape of a one-time code: `XXXX-XXXX-XXXX` in Crockford's base32.
+fn b20_is_code(code: &str) -> bool {
+    let groups: Vec<&str> = code.split('-').collect();
+    let crockford = |c: char| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c);
+    groups.len() == 3
+        && groups
+            .iter()
+            .all(|group| group.len() == 4 && group.chars().all(crockford))
+}
+
+/// Every stored setup code: user id, hash and date.
+async fn b20_code_rows(state: &AppState) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT user_id || ' ' || code_hash || ' ' || created_at FROM user_setup_codes \
+         ORDER BY user_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap()
+}
+
+/// The report entry of the Jellyfin user `name`.
+fn b20_entry(report: &serde_json::Value, name: &str) -> B20User {
+    b20_users(report)
+        .into_iter()
+        .find(|user| user.name == name)
+        .unwrap_or_else(|| panic!("no {name} in {report}"))
+}
+
+async fn b20_user_count(state: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn b20_import_run_and_status_are_admin_only() {
+    let w = b20_world().await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = Some(serde_json::json!({ "SourcePath": install }));
+    g1_assert_admin_only(&w.app, "POST", "/JellyfinImport/Run", &body, &viewer).await;
+    g1_assert_admin_only(&w.app, "GET", "/JellyfinImport/Status", &None, &viewer).await;
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_status_is_idle_before_a_run() {
+    let w = b20_world().await;
+    let idle = serde_json::json!({
+        "State": "Idle",
+        "Stage": null,
+        "Done": 0,
+        "Total": 0,
+        "Result": null,
+        "Error": null,
+    });
+    assert_eq!(b20_status(&w).await, idle);
+}
+
+#[tokio::test]
+async fn b20_import_run_rejects_bad_sources() {
+    let w = b20_world().await;
+    let new = b20_install(&w, "new", jf::Layout::New).await;
+    let old = b20_install(&w, "old", jf::Layout::Old).await;
+    let junk = w.jf_root.join("junk");
+    std::fs::create_dir_all(&junk).unwrap();
+    std::fs::write(junk.join("jellyfin.db"), b"not a database").unwrap();
+    let missing = w.jf_root.join("missing");
+    let before = b20_db_digest(&w.state).await;
+    let cases = [
+        ("empty", serde_json::json!({ "SourcePath": "" })),
+        (
+            "relative",
+            serde_json::json!({ "SourcePath": "relative/config" }),
+        ),
+        ("missing", serde_json::json!({ "SourcePath": missing })),
+        ("not a database", serde_json::json!({ "SourcePath": junk })),
+        (
+            "Old without library.db",
+            serde_json::json!({ "SourcePath": new, "Layout": "Old" }),
+        ),
+        (
+            "New without BaseItems",
+            serde_json::json!({ "SourcePath": old, "Layout": "New" }),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, answer) = b20_post(&w, "Run", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(b20_db_digest(&w.state).await, before, "a refused run wrote");
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn b20_import_run_creates_picked_users_with_codes() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Carol", true));
+    w.source.users.push(jf::JfUser::new(4, "dave", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let picked: Vec<uuid::Uuid> = ["Alice", "bob", "Carol"]
+        .into_iter()
+        .map(|name| w.source.user(name).id)
+        .collect();
+    let users_before = b20_user_count(&w.state).await;
+    let listing = jf::listing(&install);
+    let log = jf::LogCapture::start();
+    let mut body = b20_body(&w, &install);
+    body["UserIds"] = serde_json::json!(picked);
+    let report = b20_run(&w, body).await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(jf::listing(&install), listing, "the source changed");
+
+    // Alice matches alice, confirmed; bob and Carol are created with codes; dave is not picked.
+    let bob = b20_entry(&report, "bob");
+    let carol = b20_entry(&report, "Carol");
+    let (Some(bob_id), Some(bob_code)) = (bob.user_id, bob.code) else {
+        panic!("bob: no UserId or Code in {report}");
+    };
+    let (Some(carol_id), Some(carol_code)) = (carol.user_id, carol.code) else {
+        panic!("Carol: no UserId or Code in {report}");
+    };
+    let created = |name: &str, id: uuid::Uuid, code: &str| B20User {
+        user_id: Some(id),
+        code: Some(code.to_string()),
+        ..b20_user(&w, name, "Create", None, None)
+    };
+    let expected = vec![
+        b20_suggested(&w, "Alice", (w.alice, "alice"), true),
+        created("bob", bob_id, &bob_code),
+        created("Carol", carol_id, &carol_code),
+        b20_user(&w, "dave", "Skip", Some("NotSelected"), None),
+    ];
+    assert_eq!(b20_users(&report), expected);
+    assert!(carol.was_admin, "the report names Jellyfin's admins");
+    assert_ne!(bob_code, carol_code);
+    assert_eq!(
+        b20_user_count(&w.state).await,
+        users_before + 2,
+        "only bob and Carol are created"
+    );
+
+    for (name, id, code) in [("bob", bob_id, &bob_code), ("Carol", carol_id, &carol_code)] {
+        assert!(b20_is_code(code), "{name}: {code}");
+        let (admin, password): (bool, String) = sqlx::query_as(
+            "SELECT is_administrator, password_hash FROM users WHERE id = ? AND name = ?",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .fetch_one(&w.state.db)
+        .await
+        .unwrap();
+        assert!(!admin, "{name}: created as an administrator");
+        assert!(
+            password.starts_with("$argon2"),
+            "{name}: password {password}"
+        );
+        let code_hash: String =
+            sqlx::query_scalar("SELECT code_hash FROM user_setup_codes WHERE user_id = ?")
+                .bind(id.to_string())
+                .fetch_one(&w.state.db)
+                .await
+                .unwrap();
+        let plain = code.replace('-', "");
+        assert!(code_hash.starts_with("$argon2"), "{name}: code hash");
+        assert!(!code_hash.contains(&plain), "{name}: the code is stored");
+        let verified = rustyfin_auth::verify_setup_code(code, &code_hash).await;
+        assert!(verified.unwrap(), "{name}: the hash is not the code's");
+        assert!(
+            login(&w.app, name, code).await.is_none(),
+            "{name}: the code signed in"
+        );
+        assert!(
+            login(&w.app, name, "").await.is_none(),
+            "{name}: no password signed in"
+        );
+        assert!(
+            !text.contains(code.as_str()) && !text.contains(&plain),
+            "{name}: the code is in the log"
+        );
+    }
+
+    let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import run");
+    assert!(text.lines().any(info), "no INFO line in {text}");
+    assert!(!text.contains(jf::CANARY), "secret in the log");
+    assert!(
+        !report.to_string().contains(jf::CANARY),
+        "secret in the report"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_run_creates_one_user_per_name() {
+    // Jellyfin users whose names differ only in case: the one created first matches the other.
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Erin", false));
+    w.source.users.push(jf::JfUser::new(4, "erin", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let erins: Vec<B20User> = b20_users(&report)
+        .into_iter()
+        .filter(|user| user.name.eq_ignore_ascii_case("erin"))
+        .collect();
+    let [first, second] = erins.as_slice() else {
+        panic!("{report}");
+    };
+    let actions = (first.action.as_str(), second.action.as_str());
+    assert_eq!(actions, ("Create", "Match"), "{report}");
+    assert!(first.code.is_some() && second.code.is_none(), "{report}");
+    assert!(first.user_id.is_some(), "{report}");
+    assert_eq!(second.user_id, first.user_id, "{report}");
+    let erin_users: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE lower(name) = 'erin'")
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(erin_users, 1);
+}
+
+#[tokio::test]
+async fn b20_import_run_shows_codes_once() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert!(
+        b20_entry(&report, "bob").code.is_some(),
+        "the first answer has no code"
+    );
+
+    let again = b20_status(&w).await;
+    assert_eq!(again["State"], "Completed", "{again}");
+    let mut expected = report.clone();
+    for user in expected["Users"].as_array_mut().unwrap() {
+        user["Code"] = serde_json::Value::Null;
+    }
+    assert_eq!(again["Result"], expected, "only the codes go");
+}
+
+/// Nothing records an earlier run's pairings: a second run suggests the accounts the first one
+/// created or confirmed, and imports into them only when they're confirmed again. Either way it
+/// creates and writes nothing.
+#[tokio::test]
+async fn b20_import_second_run_creates_nothing() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let first = b20_run(&w, b20_body(&w, &install)).await;
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let digest = b20_db_digest(&w.state).await;
+        let codes = b20_code_rows(&w.state).await;
+        assert_eq!(codes.len(), 1, "{name}: one code, bob's");
+
+        let mut confirmed = serde_json::json!({ "SourcePath": install });
+        confirmed["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let unconfirmed = serde_json::json!({ "SourcePath": install });
+        for (confirm, body) in [(true, confirmed), (false, unconfirmed)] {
+            let again = b20_run(&w, body).await;
+            let users = vec![
+                b20_suggested(&w, "Alice", (w.alice, "alice"), confirm),
+                b20_suggested(&w, "bob", (bob, "bob"), confirm),
+            ];
+            assert_eq!(b20_users(&again), users, "{name} {confirm}");
+            assert_eq!(
+                b20_db_digest(&w.state).await,
+                digest,
+                "{name} {confirm}: the run wrote"
+            );
+            assert_eq!(
+                b20_code_rows(&w.state).await,
+                codes,
+                "{name} {confirm}: the codes changed"
+            );
+        }
+        let alice = login(&w.app, "alice", "alicepass").await;
+        assert!(alice.is_some(), "{name}: alice's password changed");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_conflicts_while_running() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": install });
+    let held = w
+        .state
+        .jellyfin_import
+        .try_start()
+        .expect("an idle job starts");
+    let (status, answer) = b20_post(&w, "Run", body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["Status"], 409, "{answer}");
+    let running = b20_status(&w).await;
+    assert_eq!(running["State"], "Running", "{running}");
+    assert_eq!(running["Stage"], "Reading", "{running}");
+
+    // A run that ends without a result has failed, and the next run starts.
+    drop(held);
+    let failed = b20_status(&w).await;
+    assert_eq!(failed["State"], "Failed", "{failed}");
+    assert!(failed["Error"].is_string(), "{failed}");
+    assert!(failed["Result"].is_null(), "{failed}");
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "bob").action, "Create");
+}
+
+/// Fix round 10 (R2): a non-admin who renames themselves to a Jellyfin user's name gets nothing
+/// from a run that doesn't confirm the pairing. That Jellyfin user is skipped, not created, and the
+/// report names the account as the suggested match. Confirmed by the account's id, the data lands.
+/// At 20c0f3f the name alone put bob's watch data into the account.
+#[tokio::test]
+async fn b20_import_name_match_needs_confirmation() {
+    let w = b20_world().await;
+    let mallory = add_user(&w.state, "mallory", "mallorypass", false).await;
+    let (token, _) = login(&w.app, "mallory", "mallorypass").await.unwrap();
+    let rename = serde_json::json!({ "Name": "bob" }).to_string();
+    let uri = format!("/Users/{mallory}");
+    let (status, answer) = send_authed(&w.app, "PUT", &uri, &token, Some(&rename)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    let users_before = b20_user_count(&w.state).await;
+
+    let mut body = serde_json::json!({ "SourcePath": install });
+    let report = b20_run(&w, body.clone()).await;
+    let expected = b20_suggested(&w, "bob", (mallory, "bob"), false);
+    assert_eq!(b20_entry(&report, "bob"), expected, "{report}");
+    assert_eq!(b20_data(&w.state, mallory, beta).await, None);
+    assert_eq!(b20_data(&w.state, mallory, e3).await, None);
+    assert_eq!(b20_user_count(&w.state).await, users_before, "{report}");
+    assert_eq!(b20_code_rows(&w.state).await, Vec::<String>::new());
+
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("bob", mallory)]);
+    let report = b20_run(&w, body).await;
+    let expected = b20_suggested(&w, "bob", (mallory, "bob"), true);
+    assert_eq!(b20_entry(&report, "bob"), expected, "{report}");
+    assert!(
+        b20_data(&w.state, mallory, beta).await.is_some(),
+        "{report}"
+    );
+    assert!(b20_data(&w.state, mallory, e3).await.is_some(), "{report}");
+}
+
+/// Fix round 10 (R2): a confirmation names the account by id and holds only for the suggested
+/// match. One naming another account is refused, and so is the admin's confirmation once a rename
+/// between Preview and Run gives the name to another account: Alice is skipped with the reason
+/// `ConfirmedOtherAccount`, and neither account gets her data. At 20c0f3f the name alone decided.
+#[tokio::test]
+async fn b20_import_refuses_a_confirmation_of_another_account() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let erin = b20_plain_user(&w.state, "erin").await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let refused = |account: (uuid::Uuid, &str)| B20User {
+        suggested: Some((account.0, account.1.to_string())),
+        ..b20_user(&w, "Alice", "Skip", Some("ConfirmedOtherAccount"), None)
+    };
+
+    let mut body = serde_json::json!({ "SourcePath": install });
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", erin)]);
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), refused((w.alice, "alice")));
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None);
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None);
+
+    let body = b20_body(&w, &install);
+    let preview = b20_preview(&w, body.clone()).await;
+    let confirmed = b20_suggested(&w, "Alice", (w.alice, "alice"), true);
+    assert_eq!(b20_entry(&preview, "Alice"), confirmed);
+    let db = &w.state.db;
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, w.alice, "alice2").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, erin, "alice").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_entry(&report, "Alice"), refused((erin, "alice")));
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, None);
+    assert_eq!(b20_data(&w.state, erin, alpha).await, None);
+}
+
+/// Fix round 10 (R2): users without a match are created as before, whether or not the request
+/// confirms another user's match, and an unconfirmed match is skipped, not created.
+#[tokio::test]
+async fn b20_import_creates_unmatched_users_as_before() {
+    for confirmed in [false, true] {
+        let w = b20_world().await;
+        let install = b20_install(&w, "jf", jf::Layout::New).await;
+        let users_before = b20_user_count(&w.state).await;
+        let body = if confirmed {
+            b20_body(&w, &install)
+        } else {
+            serde_json::json!({ "SourcePath": install })
+        };
+        let alice = || b20_suggested(&w, "Alice", (w.alice, "alice"), confirmed);
+        let preview = b20_preview(&w, body.clone()).await;
+        let bob = b20_user(&w, "bob", "Create", None, None);
+        assert_eq!(b20_users(&preview), [alice(), bob], "{confirmed}");
+
+        let report = b20_run(&w, body).await;
+        let bob = b20_entry(&report, "bob");
+        let (Some(bob_id), Some(code)) = (bob.user_id, bob.code) else {
+            panic!("{confirmed}: bob has no UserId or Code in {report}");
+        };
+        let bob = B20User {
+            user_id: Some(bob_id),
+            code: Some(code),
+            ..b20_user(&w, "bob", "Create", None, None)
+        };
+        assert_eq!(b20_users(&report), [alice(), bob], "{confirmed}");
+        let count = b20_user_count(&w.state).await;
+        assert_eq!(count, users_before + 1, "{confirmed}: only bob is created");
+        let beta = b20_item(&w.state, "Beta").await;
+        assert!(
+            b20_data(&w.state, bob_id, beta).await.is_some(),
+            "{confirmed}"
+        );
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alices = b20_data(&w.state, w.alice, alpha).await;
+        assert_eq!(alices.is_some(), confirmed, "{confirmed}: {report}");
+    }
+}
+
+// B20 2c: watch data and track choices.
+
+/// A `user_item_data` row as the B20 import tests read and write it.
+#[derive(Debug, Default, PartialEq)]
+struct B20Data {
+    played: bool,
+    play_count: i64,
+    position: i64,
+    last_played: Option<chrono::DateTime<chrono::Utc>>,
+    favorite: bool,
+    rating: Option<i64>,
+    likes: Option<bool>,
+    audio: Option<i64>,
+    subtitle: Option<i64>,
+}
+
+type B20DataRow = (
+    bool,
+    i64,
+    i64,
+    Option<String>,
+    bool,
+    Option<i64>,
+    Option<bool>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// The instant `rfc3339`.
+fn b20_at(rfc3339: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let instant =
+        chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap_or_else(|e| panic!("{rfc3339}: {e}"));
+    Some(instant.with_timezone(&chrono::Utc))
+}
+
+/// The id of the Rustyfin item `name`.
+async fn b20_item(state: &AppState, name: &str) -> uuid::Uuid {
+    let id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    uuid::Uuid::parse_str(&id).unwrap()
+}
+
+/// The stored row of `user` for `item`; a stored date must be RFC 3339.
+async fn b20_data(state: &AppState, user: uuid::Uuid, item: uuid::Uuid) -> Option<B20Data> {
+    let row: Option<B20DataRow> = sqlx::query_as(
+        "SELECT played, play_count, playback_position_ticks, last_played_date, is_favorite, \
+         user_rating, likes, audio_stream_index, subtitle_stream_index FROM user_item_data \
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .fetch_optional(&state.db)
+    .await
+    .unwrap();
+    row.map(|r| B20Data {
+        played: r.0,
+        play_count: r.1,
+        position: r.2,
+        last_played: r.3.and_then(|date| b20_at(&date)),
+        favorite: r.4,
+        rating: r.5,
+        likes: r.6,
+        audio: r.7,
+        subtitle: r.8,
+    })
+}
+
+/// Stores `data` as the row of `user` for `item`, its date written with `Z`.
+async fn b20_put_data(state: &AppState, user: uuid::Uuid, item: uuid::Uuid, data: &B20Data) {
+    let date = data
+        .last_played
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
+         playback_position_ticks, last_played_date, is_favorite, user_rating, likes, \
+         audio_stream_index, subtitle_stream_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user.to_string())
+    .bind(item.to_string())
+    .bind(data.played)
+    .bind(data.play_count)
+    .bind(data.position)
+    .bind(date)
+    .bind(data.favorite)
+    .bind(data.rating)
+    .bind(data.likes)
+    .bind(data.audio)
+    .bind(data.subtitle)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// A report's `WatchData` as (Rows, Imported, Unchanged, Unmatched).
+fn b20_watch_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["WatchData"][key].as_i64().unwrap_or(-1);
+    (
+        count("Rows"),
+        count("Imported"),
+        count("Unchanged"),
+        count("Unmatched"),
+    )
+}
+
+/// A report's `Tracks` as (Audio, Subtitle, SubtitleOff, Unmapped).
+fn b20_track_counts(report: &serde_json::Value) -> (i64, i64, i64, i64) {
+    let count = |key: &str| report["Tracks"][key].as_i64().unwrap_or(-1);
+    (
+        count("Audio"),
+        count("Subtitle"),
+        count("SubtitleOff"),
+        count("Unmapped"),
+    )
+}
+
+/// The watch-data part of the INFO lines for `counts` (Rows, Imported, Unchanged, Unmatched).
+fn b20_watch_line(counts: (i64, i64, i64, i64)) -> String {
+    let (rows, imported, unchanged, unmatched) = counts;
+    format!("{rows} watch rows ({imported} imported, {unchanged} unchanged, {unmatched} unmatched)")
+}
+
+#[tokio::test]
+async fn b20_import_preview_counts_watch_data() {
+    // Alice: Alpha and S01E01 match; Gamma and the new layout's detached row don't (the old
+    // layout's detached row has a key no item has, so it is no row). bob: Beta and 1x03 match.
+    for (name, layout, all, alice_only) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2), (4, 2, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1), (3, 2, 0, 1)),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let before = b20_db_digest(&w.state).await;
+        let log = jf::LogCapture::start();
+        let report = b20_preview(&w, b20_body(&w, &install)).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(b20_watch_counts(&report), all, "{name}: {report}");
+        assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
+        let line = b20_watch_line(all);
+        let info = |l: &str| {
+            l.contains("INFO") && l.contains("jellyfin import preview") && l.contains(&line)
+        };
+        assert!(
+            text.lines().any(info),
+            "{name}: no INFO line with {line} in {text}"
+        );
+
+        let alice = w.source.user("Alice").id;
+        let mut body = b20_body(&w, &install);
+        body["UserIds"] = serde_json::json!([alice]);
+        let report = b20_preview(&w, body).await;
+        assert_eq!(
+            b20_watch_counts(&report),
+            alice_only,
+            "{name}: only the picked users' rows: {report}"
+        );
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            before,
+            "{name}: a preview writes nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_writes_watch_data() {
+    for (name, layout, counts) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1)),
+    ] {
+        let mut w = b20_world().await;
+        // Alice likes Alpha; only the new layout has likes.
+        w.source.user_data[0].likes = Some(true);
+        let install = b20_install(&w, name, layout).await;
+        let report = b20_run(&w, b20_body(&w, &install)).await;
+        assert_eq!(b20_watch_counts(&report), counts, "{name}: {report}");
+        assert_eq!(b20_track_counts(&report), (0, 0, 0, 0), "{name}: {report}");
+
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let expected = B20Data {
+            played: true,
+            play_count: 2,
+            last_played: b20_at("2025-01-02T03:04:05.1234567Z"),
+            favorite: true,
+            rating: Some(8),
+            likes: (layout == jf::Layout::New).then_some(true),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, w.alice, alpha).await;
+        assert_eq!(stored, Some(expected), "{name}: Alpha");
+        let e1 = b20_item(&w.state, "Show S01E01").await;
+        let expected = B20Data {
+            position: 6_000_000_000,
+            last_played: b20_at("2025-02-01T10:00:00Z"),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, w.alice, e1).await;
+        assert_eq!(stored, Some(expected), "{name}: S01E01");
+
+        let bob = b20_entry(&report, "bob").user_id.unwrap();
+        let played = |date: &str| B20Data {
+            played: true,
+            play_count: 1,
+            last_played: b20_at(date),
+            ..Default::default()
+        };
+        let beta = b20_item(&w.state, "Beta").await;
+        let expected = B20Data {
+            rating: Some(10),
+            ..played("2025-03-01T20:00:00Z")
+        };
+        let stored = b20_data(&w.state, bob, beta).await;
+        assert_eq!(stored, Some(expected), "{name}: Beta, rated 9.5");
+        let e3 = b20_item(&w.state, "Show S01E03").await;
+        let stored = b20_data(&w.state, bob, e3).await;
+        assert_eq!(stored, Some(played("2025-03-02T21:00:00Z")), "{name}: 1x03");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_data")
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+        assert_eq!(rows, 4, "{name}: only the matched rows are written");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_merges_with_rustyfin_watch_data() {
+    let w = b20_world().await;
+    let bob = b20_plain_user(&w.state, "bob").await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    // Alpha: Rustyfin's row is newer. S01E01: Jellyfin's is. Beta: the same instant, and
+    // already what the import makes of Jellyfin's row.
+    let alpha_row = B20Data {
+        play_count: 5,
+        position: 100,
+        last_played: b20_at("2025-06-01T00:00:00Z"),
+        rating: Some(3),
+        likes: Some(true),
+        audio: Some(7),
+        ..Default::default()
+    };
+    let e1_row = B20Data {
+        play_count: 1,
+        position: 50,
+        last_played: b20_at("2025-01-01T00:00:00Z"),
+        audio: Some(7),
+        ..Default::default()
+    };
+    let beta_row = B20Data {
+        played: true,
+        play_count: 1,
+        last_played: b20_at("2025-03-01T20:00:00Z"),
+        rating: Some(10),
+        ..Default::default()
+    };
+    b20_put_data(&w.state, w.alice, alpha, &alpha_row).await;
+    b20_put_data(&w.state, w.alice, e1, &e1_row).await;
+    b20_put_data(&w.state, bob, beta, &beta_row).await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let mut body = serde_json::json!({ "SourcePath": install });
+    body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+
+    let preview = b20_preview(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&preview), (6, 3, 1, 2), "{preview}");
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_watch_counts(&report), (6, 3, 1, 2), "{report}");
+    assert_eq!(b20_entry(&report, "bob").user_id, Some(bob));
+
+    // Played and favorite if either side; Rustyfin's count, date, position, rating, likes and
+    // track stay on Alpha. S01E01 takes Jellyfin's date and position and keeps its track.
+    let expected = B20Data {
+        played: true,
+        favorite: true,
+        ..alpha_row
+    };
+    assert_eq!(b20_data(&w.state, w.alice, alpha).await, Some(expected));
+    let expected = B20Data {
+        position: 6_000_000_000,
+        last_played: b20_at("2025-02-01T10:00:00Z"),
+        ..e1_row
+    };
+    assert_eq!(b20_data(&w.state, w.alice, e1).await, Some(expected));
+    let beta_date: Option<String> = sqlx::query_scalar(
+        "SELECT last_played_date FROM user_item_data WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(bob.to_string())
+    .bind(beta.to_string())
+    .fetch_one(&w.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        beta_date.as_deref(),
+        Some("2025-03-01T20:00:00Z"),
+        "an unchanged row is not written"
+    );
+    assert!(b20_data(&w.state, bob, e3).await.is_some(), "1x03");
+
+    let digest = b20_db_digest(&w.state).await;
+    let again = b20_run(&w, body).await;
+    assert_eq!(b20_watch_counts(&again), (6, 0, 4, 2), "{again}");
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        digest,
+        "the second run wrote"
+    );
+}
+
+#[tokio::test]
+async fn b20_import_keeps_the_newest_of_several_rows() {
+    // The new layout: a second, older row of Alice's Alpha (another CustomDataKey) with more
+    // plays loses to the newer one.
+    let mut w = b20_world().await;
+    let alice = w.source.user("Alice").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: alice,
+        item: w.source.item("Alpha").id,
+        custom_key: Some("b20-older-key".to_string()),
+        played: true,
+        play_count: 7,
+        position: 1234,
+        last_played: Some("2024-01-01 00:00:00"),
+        ..Default::default()
+    });
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, b20_body(&w, &install)).await;
+    assert_eq!(b20_watch_counts(&report), (6, 4, 0, 2), "{report}");
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let stored = b20_data(&w.state, w.alice, alpha).await.unwrap();
+    assert_eq!((stored.play_count, stored.position), (2, 0));
+    assert_eq!(stored.last_played, b20_at("2025-01-02T03:04:05.1234567Z"));
+}
+
+#[tokio::test]
+async fn b20_import_old_rows_apply_to_each_item_of_their_key() {
+    // The old layout keys rows by UserDataKey: S01E02 shares S01E01's key, so Alice's S01E01
+    // row is S01E02's too.
+    let mut w = b20_world().await;
+    let key = w.source.item("Show S01E01").user_data_key.clone();
+    let e2 = w
+        .source
+        .items
+        .iter_mut()
+        .find(|item| item.name == "Show S01E02");
+    e2.unwrap().user_data_key = key;
+    let install = b20_install(&w, "jf", jf::Layout::Old).await;
+    let report = b20_run(&w, b20_body(&w, &install)).await;
+    assert_eq!(b20_watch_counts(&report), (6, 5, 0, 1), "{report}");
+    let e2 = b20_item(&w.state, "Show S01E02").await;
+    let stored = b20_data(&w.state, w.alice, e2).await.unwrap();
+    assert_eq!(stored.position, 6_000_000_000);
+}
+
+#[tokio::test]
+async fn b20_import_maps_track_choices() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let mut w = b20_world().await;
+        let jf_alpha = w.source.item("Alpha").id;
+        let jf_beta = w.source.item("Beta").id;
+        let jf_e1 = w.source.item("Show S01E01").id;
+        let jf_e3 = w.source.item("Show 1x03").id;
+        let stream = jf::JfStream::new;
+        w.source.streams = vec![
+            stream(jf_alpha, 0, "Video", "h264"),
+            stream(jf_alpha, 1, "Audio", "aac").language("eng"),
+            stream(jf_alpha, 2, "Audio", "ac3").language("ger"),
+            stream(jf_alpha, 3, "Subtitle", "srt").language("eng"),
+            stream(jf_alpha, 4, "Subtitle", "PGSSUB")
+                .language("ger")
+                .flags(false, true),
+            stream(jf_beta, 0, "Video", "mpeg4"),
+            stream(jf_beta, 1, "Audio", "mp3"),
+            stream(jf_e1, 0, "Video", "h264"),
+            stream(jf_e1, 1, "Audio", "aac"),
+            stream(jf_e1, 2, "Audio", "ac3"),
+            stream(jf_e3, 0, "Video", "h264"),
+            stream(jf_e3, 1, "Audio", "aac"),
+        ];
+        // Alice: Alpha's aac and forced PGS subtitles, S01E01's ac3. bob: Beta with subtitles
+        // off and an audio stream Jellyfin doesn't have; 1x03's aac, which has no Rustyfin source.
+        for row in &mut w.source.user_data {
+            let choice = [
+                (jf_alpha, (Some(1), Some(4))),
+                (jf_e1, (Some(2), None)),
+                (jf_beta, (Some(9), Some(-1))),
+                (jf_e3, (Some(1), None)),
+            ]
+            .into_iter()
+            .find(|(item, _)| *item == row.item);
+            if let Some((_, (audio, subtitle))) = choice {
+                row.audio = audio;
+                row.subtitle = subtitle;
+            }
+        }
+
+        // Rustyfin numbers Alpha's streams its own way.
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alpha_file = std::path::PathBuf::from(format!("{}/Alpha (2001)/Alpha.mkv", w.movies));
+        std::fs::create_dir_all(alpha_file.parent().unwrap()).unwrap();
+        std::fs::write(&alpha_file, b"b20").unwrap();
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "hdmv_pgs_subtitle", "CodecType": "Subtitle", "IsForced": true },
+            { "Index": 2, "Codec": "ac3", "CodecType": "Audio" },
+            { "Index": 3, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 4, "Codec": "subrip", "CodecType": "Subtitle" },
+        ]);
+        b20_insert_source(&w.state, alpha, &alpha_file, streams).await;
+        let beta = b20_item(&w.state, "Beta").await;
+        let beta_file = std::path::PathBuf::from(format!("{}/Beta (2002)/Beta.mkv", w.movies));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "mpeg4", "CodecType": "Video" },
+            { "Index": 1, "Codec": "mp3", "CodecType": "Audio" },
+        ]);
+        b20_insert_source(&w.state, beta, &beta_file, streams).await;
+        // S01E01's first source is an older file; the import uses the one at the translated path.
+        let e1 = b20_item(&w.state, "Show S01E01").await;
+        let season = format!("{}/Show/Season 01", w.tv);
+        let old_file = std::path::PathBuf::from(format!("{season}/Show S01E01.old.mkv"));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "ac3", "CodecType": "Audio" },
+        ]);
+        let old_source = b20_insert_source(&w.state, e1, &old_file, streams).await;
+        sqlx::query("UPDATE media_sources SET created_at = '2000-01-01 00:00:00' WHERE id = ?")
+            .bind(old_source.to_string())
+            .execute(&w.state.db)
+            .await
+            .unwrap();
+        let e1_file = std::path::PathBuf::from(format!("{season}/Show S01E01.mkv"));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 2, "Codec": "ac3", "CodecType": "Audio" },
+        ]);
+        b20_insert_source(&w.state, e1, &e1_file, streams).await;
+
+        let install = b20_install(&w, name, layout).await;
+        let body = b20_body(&w, &install);
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body).await;
+        // Audio: Alpha and S01E01. Subtitle: Alpha. Off: Beta. Unmapped: Beta's audio 9 and
+        // 1x03's audio.
+        assert_eq!(b20_track_counts(&report), (2, 1, 1, 2), "{name}: {report}");
+        assert_eq!(
+            b20_track_counts(&preview),
+            (2, 1, 1, 2),
+            "{name}: the preview: {preview}"
+        );
+        let alice = w.alice.to_string();
+        let tracks = b20_stored_tracks(&w.state, &alice, alpha).await;
+        assert_eq!(tracks, (Some(3), Some(1)), "{name}: Alpha");
+        let tracks = b20_stored_tracks(&w.state, &alice, e1).await;
+        assert_eq!(tracks, (Some(2), None), "{name}: S01E01");
+        let bob = b20_entry(&report, "bob").user_id.unwrap().to_string();
+        let tracks = b20_stored_tracks(&w.state, &bob, beta).await;
+        assert_eq!(tracks, (None, Some(-1)), "{name}: Beta");
+        let e3 = b20_item(&w.state, "Show S01E03").await;
+        let tracks = b20_stored_tracks(&w.state, &bob, e3).await;
+        assert_eq!(tracks, (None, None), "{name}: 1x03");
+
+        // Alice's player offers the imported tracks first.
+        let (token, _) = login(&w.app, "alice", "alicepass").await.unwrap();
+        let defaults = b20_only_defaults(&w.app, &token, alpha).await;
+        assert_eq!(defaults, b20_both(3, 1), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_run_leaves_the_source_and_its_secrets_alone() {
+    for (name, layout, counts) in [
+        ("new", jf::Layout::New, (6, 4, 0, 2)),
+        ("old", jf::Layout::Old, (5, 4, 0, 1)),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let before = jf::listing(&install);
+        let log = jf::LogCapture::start();
+        let report = b20_run(&w, b20_body(&w, &install)).await;
+        let status = b20_status(&w).await;
+        let text = log.text();
+        drop(log);
+        assert_eq!(jf::listing(&install), before, "{name}: the source changed");
+        for answer in [&report, &status] {
+            assert!(
+                !answer.to_string().contains(jf::CANARY),
+                "{name}: secret in an answer"
+            );
+        }
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let line = b20_watch_line(counts);
+        let info =
+            |l: &str| l.contains("INFO") && l.contains("jellyfin import run") && l.contains(&line);
+        assert!(
+            text.lines().any(info),
+            "{name}: no INFO line with {line} in {text}"
+        );
+        let db = w.state.data_dir.join("test.db");
+        let files = [
+            db.clone(),
+            db.with_extension("db-wal"),
+            db.with_extension("db-shm"),
+        ];
+        assert!(
+            !jf::files_hold_canary(&files),
+            "{name}: secret in Rustyfin's database"
+        );
+    }
+}
+
+/// Fix 4: a run reads, merges and writes each user's rows in one write transaction, so progress a
+/// client saves while the run works isn't overwritten with the rows the run read before.
+#[tokio::test]
+async fn b20_import_keeps_progress_saved_during_the_run() {
+    use sqlx::ConnectOptions;
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alpha = b20_item(&w.state, "Alpha").await;
+    // A progress report's write, open from before the run starts until the run reads.
+    let mut writer = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(w.state.data_dir.join("test.db"))
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_item_data (user_id, item_id, played, play_count, \
+         playback_position_ticks, last_played_date, is_favorite) \
+         VALUES (?, ?, 0, 0, 7777, '2026-01-01T00:00:00Z', 0)",
+    )
+    .bind(w.alice.to_string())
+    .bind(alpha.to_string())
+    .execute(&mut writer)
+    .await
+    .unwrap();
+    let alice = w.source.user("Alice").id;
+    let body = serde_json::json!({
+        "SourcePath": install,
+        "UserIds": [alice],
+        "ConfirmedMatches": b20_confirm(&w, &[("Alice", w.alice)]),
+        "MetadataMode": "None",
+    });
+    b20_start(&w, body).await;
+    // The job itself, not `/JellyfinImport/Status`: the pool shares its cache, so a request made
+    // while a pool connection waits for the write lock waits with it.
+    let watch_data = Some(rustyfin_core::jellyfin_import::ImportStage::WatchData);
+    let mut stage = None;
+    for _ in 0..1000 {
+        stage = w.state.jellyfin_import.status().stage;
+        if stage == watch_data {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(stage, watch_data, "the run never reached its watch data");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    let answer = b20_wait(&w).await;
+    assert_eq!(answer["State"], "Completed", "{answer}");
+    let row = b20_data(&w.state, w.alice, alpha)
+        .await
+        .expect("alice's Alpha row");
+    assert_eq!(
+        row.position, 7777,
+        "the progress saved during the run was lost"
+    );
+    assert_eq!(row.last_played, b20_at("2026-01-01T00:00:00Z"));
+    assert!(
+        row.played && row.favorite,
+        "Jellyfin's played and favorite merge in"
+    );
+    assert_eq!(row.play_count, 2);
+}
+
+/// Runs `statements` on a WAL-mode copy of `file` made outside the install folder, then puts the
+/// copy and its `-wal` (no checkpoint ran, so the changes are only there) in place of `file`: a
+/// source as a running Jellyfin leaves it.
+async fn b20_change_in_wal(w: &B20World, file: &std::path::Path, statements: &[&'static str]) {
+    use sqlx::{ConnectOptions, Connection};
+    let wal = |db: &std::path::Path| {
+        let mut name = db.as_os_str().to_owned();
+        name.push("-wal");
+        std::path::PathBuf::from(name)
+    };
+    let scratch = w
+        .jf_root
+        .join(format!("wal_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let copy = scratch.join(file.file_name().unwrap());
+    std::fs::copy(file, &copy).unwrap();
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&copy)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA wal_autocheckpoint = 0")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for &statement in statements {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    let frames = std::fs::metadata(wal(&copy)).unwrap().len();
+    assert!(frames > 32, "no frames in {}", wal(&copy).display());
+    std::fs::copy(&copy, file).unwrap();
+    std::fs::copy(wal(&copy), wal(file)).unwrap();
+    conn.close().await.unwrap();
+}
+
+const B20_RENAME_BOB: &str = r#"UPDATE "Users" SET "Username" = 'carol' WHERE "Username" = 'bob'"#;
+const B20_RENAME_GAMMA_NEW: &str =
+    r#"UPDATE "BaseItems" SET "Name" = 'Gamma WAL' WHERE "Name" = 'Gamma'"#;
+const B20_RENAME_GAMMA_OLD: &str =
+    "UPDATE TypedBaseItems SET Name = 'Gamma WAL' WHERE Name = 'Gamma'";
+
+/// Fix 7: a source whose `-wal` holds changes is read with them, and nothing appears or changes
+/// under the source folder (no `-shm` either).
+#[tokio::test]
+async fn b20_import_reads_the_wal_and_leaves_the_source_folder_alone() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let data = install.join("data");
+        match layout {
+            jf::Layout::New => {
+                let changes = [B20_RENAME_BOB, B20_RENAME_GAMMA_NEW];
+                b20_change_in_wal(&w, &data.join("jellyfin.db"), &changes).await;
+            }
+            jf::Layout::Old => {
+                b20_change_in_wal(&w, &data.join("jellyfin.db"), &[B20_RENAME_BOB]).await;
+                let library = data.join("library.db");
+                b20_change_in_wal(&w, &library, &[B20_RENAME_GAMMA_OLD]).await;
+            }
+        }
+        let before = jf::listing(&install);
+        let report = b20_preview(&w, b20_body(&w, &install)).await;
+        assert_eq!(
+            jf::listing(&install),
+            before,
+            "{name}: the preview changed the source folder"
+        );
+        let names: Vec<String> = b20_users(&report).into_iter().map(|u| u.name).collect();
+        assert!(
+            names.iter().any(|n| n == "carol") && !names.iter().any(|n| n == "bob"),
+            "{name}: users {names:?}"
+        );
+        let samples = b20_samples(&report);
+        assert!(
+            samples.iter().any(|(_, item, _)| item == "Gamma WAL"),
+            "{name}: samples {samples:?}"
+        );
+        let alice = w.source.user("Alice").id;
+        let mut body = b20_body(&w, &install);
+        body["UserIds"] = serde_json::json!([alice]);
+        b20_run(&w, body).await;
+        assert_eq!(
+            jf::listing(&install),
+            before,
+            "{name}: the run changed the source folder"
+        );
+    }
+}
+
+/// One state of the flipping writer: Gamma's name (read with the items) and Alpha's tagline (read
+/// with the metadata), changed together.
+const B20_FLIPS_NEW: [&str; 2] = [
+    r#"BEGIN; UPDATE "BaseItems" SET "Name" = 'Gamma' WHERE "Name" = 'Gamma Y';
+       UPDATE "BaseItems" SET "Tagline" = NULL WHERE "Name" = 'Alpha'; COMMIT;"#,
+    r#"BEGIN; UPDATE "BaseItems" SET "Name" = 'Gamma Y' WHERE "Name" = 'Gamma';
+       UPDATE "BaseItems" SET "Tagline" = 'one' WHERE "Name" = 'Alpha'; COMMIT;"#,
+];
+const B20_FLIPS_OLD: [&str; 2] = [
+    "BEGIN; UPDATE TypedBaseItems SET Name = 'Gamma' WHERE Name = 'Gamma Y';
+     UPDATE TypedBaseItems SET Tagline = NULL WHERE Name = 'Alpha'; COMMIT;",
+    "BEGIN; UPDATE TypedBaseItems SET Name = 'Gamma Y' WHERE Name = 'Gamma';
+     UPDATE TypedBaseItems SET Tagline = 'one' WHERE Name = 'Alpha'; COMMIT;",
+];
+
+/// What a FillEmpty preview saw: Gamma's name and the metadata's `Fields` count.
+fn b20_seen(report: &serde_json::Value) -> (String, i64) {
+    let gamma = b20_samples(report)
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .find(|name| name.starts_with("Gamma"))
+        .unwrap_or_else(|| panic!("no Gamma sample: {report}"));
+    (gamma, report["Metadata"]["Fields"].as_i64().unwrap_or(-1))
+}
+
+/// Fix 8: while Jellyfin writes, a preview reads one state of each file: everything it reports
+/// from a file comes from the same commit, or it fails as changing. The writer gets a worker
+/// thread of its own, so it flips while a preview runs, not only when the preview yields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b20_import_reads_one_state_while_jellyfin_writes() {
+    use sqlx::{ConnectOptions, Connection};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for (name, layout, file, flips) in [
+        ("new", jf::Layout::New, "jellyfin.db", B20_FLIPS_NEW),
+        ("old", jf::Layout::Old, "library.db", B20_FLIPS_OLD),
+    ] {
+        let w = b20_world().await;
+        let install = b20_install(&w, name, layout).await;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(install.join("data").join(file))
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let mut body = b20_body(&w, &install);
+        body["MetadataMode"] = serde_json::json!("FillEmpty");
+        let mut states = Vec::new();
+        for flip in flips {
+            let mut conn = options.connect().await.unwrap();
+            sqlx::raw_sql(flip).execute(&mut conn).await.unwrap();
+            conn.close().await.unwrap();
+            states.push(b20_seen(&b20_preview(&w, body.clone()).await));
+        }
+        assert!(
+            states[0].0 != states[1].0 && states[0].1 != states[1].1,
+            "{name}: the two states look alike: {states:?}"
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipped = Arc::new(AtomicUsize::new(0));
+        // No fsync per commit: the writer flips often, as a busy Jellyfin would.
+        let mut conn = options
+            .clone()
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Off)
+            .connect()
+            .await
+            .unwrap();
+        let writer = tokio::spawn({
+            let (stop, flipped) = (stop.clone(), flipped.clone());
+            async move {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    sqlx::raw_sql(flips[n % 2])
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                    n += 1;
+                    flipped.store(n, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                conn.close().await.unwrap();
+            }
+        });
+        let (mut read, mut overlapped) = (0, 0);
+        for attempt in 0..30 {
+            let before = flipped.load(Ordering::Relaxed);
+            let (status, report) = b20_post(&w, "Preview", body.clone()).await;
+            if flipped.load(Ordering::Relaxed) > before {
+                overlapped += 1;
+            }
+            if status == StatusCode::OK {
+                let seen = b20_seen(&report);
+                assert!(
+                    states.contains(&seen),
+                    "{name}: preview {attempt} mixed two states: {seen:?}, states {states:?}"
+                );
+                read += 1;
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {report}");
+                assert!(
+                    report.to_string().contains("kept changing"),
+                    "{name}: {report}"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
+        assert!(read > 0, "{name}: no preview read the source");
+        assert!(
+            overlapped >= 10,
+            "{name}: the writer flipped during only {overlapped} of 30 previews"
+        );
+    }
+}
+
+// B20 3: one-time codes and first sign-in.
+
+type B20Answer = (StatusCode, Option<String>, serde_json::Value);
+
+/// Runs an import that creates bob and returns his id and one-time code.
+async fn b20_pending_bob(w: &B20World) -> (uuid::Uuid, String) {
+    let install = b20_install(w, "jf", jf::Layout::New).await;
+    let report = b20_run(w, serde_json::json!({ "SourcePath": install })).await;
+    let bob = b20_entry(&report, "bob");
+    match (bob.user_id, bob.code) {
+        (Some(id), Some(code)) => (id, code),
+        _ => panic!("the run created no bob with a code"),
+    }
+}
+
+/// Sends `req`; returns the status, the `X-Rustyfin-Setup-Required` header and the JSON body.
+async fn b20_send(app: &axum::Router, req: Request<Body>) -> B20Answer {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let header = resp
+        .headers()
+        .get("X-Rustyfin-Setup-Required")
+        .map(|value| value.to_str().unwrap().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, header, json)
+}
+
+/// `POST /Users/AuthenticateByName` with `name` and `password`.
+async fn b20_sign_in(app: &axum::Router, name: &str, password: &str) -> B20Answer {
+    let body = serde_json::json!({ "Username": name, "Pw": password });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    b20_send(app, req).await
+}
+
+/// `POST /Users/AuthenticateWithSetupCode` with `name`, `code` and the new password.
+async fn b20_redeem(app: &axum::Router, name: &str, code: &str, new_password: &str) -> B20Answer {
+    let body = serde_json::json!({ "Username": name, "Code": code, "NewPw": new_password });
+    let req = request("POST", "/Users/AuthenticateWithSetupCode", None, Some(body));
+    b20_send(app, req).await
+}
+
+/// `POST /JellyfinImport/Users/{user}/SetupCode` as the admin.
+async fn b20_reissue(w: &B20World, user: uuid::Uuid) -> (StatusCode, serde_json::Value) {
+    let uri = format!("/JellyfinImport/Users/{user}/SetupCode");
+    send(&w.app, request("POST", &uri, Some(&w.token), None)).await
+}
+
+/// `GET /JellyfinImport/PendingUsers` as the admin; expects 200 and a JSON array.
+async fn b20_pending(w: &B20World) -> Vec<serde_json::Value> {
+    let uri = "/JellyfinImport/PendingUsers";
+    let (status, answer) = send(&w.app, request("GET", uri, Some(&w.token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer.as_array().expect("PendingUsers is no array").clone()
+}
+
+/// A pending user's entry: its id, name and date.
+fn b20_pending_entry(
+    entry: &serde_json::Value,
+) -> (uuid::Uuid, String, chrono::DateTime<chrono::Utc>) {
+    assert_eq!(entry.as_object().map(|o| o.len()), Some(3), "{entry}");
+    let id = uuid::Uuid::parse_str(entry["UserId"].as_str().unwrap()).unwrap();
+    let name = entry["Name"].as_str().unwrap().to_string();
+    let at = chrono::DateTime::parse_from_rfc3339(entry["CreatedAt"].as_str().unwrap()).unwrap();
+    (id, name, at.with_timezone(&chrono::Utc))
+}
+
+/// How many tokens and sessions `user` has.
+async fn b20_sessions(state: &AppState, user: uuid::Uuid) -> (i64, i64) {
+    let mut counts = Vec::new();
+    for sql in [
+        "SELECT COUNT(*) FROM access_tokens WHERE user_id = ?",
+        "SELECT COUNT(*) FROM sessions WHERE user_id = ?",
+    ] {
+        let n: i64 = sqlx::query_scalar(sql)
+            .bind(user.to_string())
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        counts.push(n);
+    }
+    (counts[0], counts[1])
+}
+
+/// Whether `text` holds `code` in any form a client may send.
+fn b20_holds_code(text: &str, code: &str) -> bool {
+    let bare = code.replace('-', "");
+    [
+        code.to_string(),
+        code.to_lowercase(),
+        bare.clone(),
+        bare.to_lowercase(),
+    ]
+    .iter()
+    .any(|form| text.contains(form.as_str()))
+}
+
+#[tokio::test]
+async fn b20_code_sign_in_asks_for_a_new_password() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let (failed, header, failed_body) = b20_sign_in(&w.app, "bob", "wrong password").await;
+    assert_eq!(failed, StatusCode::UNAUTHORIZED);
+    assert_eq!(header, None, "a wrong password asks for a new password");
+
+    let log = jf::LogCapture::start();
+    let lower = code.to_lowercase();
+    let bare = code.replace('-', "");
+    let spaced = format!(" {} ", code.replace('-', " "));
+    for (form, typed) in [
+        ("as shown", code.as_str()),
+        ("lowercase", lower.as_str()),
+        ("without dashes", bare.as_str()),
+        ("with spaces", spaced.as_str()),
+    ] {
+        let (status, header, body) = b20_sign_in(&w.app, "bob", typed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{form}");
+        assert_eq!(header.as_deref(), Some("true"), "{form}: no setup header");
+        assert_eq!(body, failed_body, "{form}: not a failed sign-in's body");
+    }
+    let text = log.text();
+    drop(log);
+    assert!(!b20_holds_code(&text, &code), "the code is in the log");
+
+    // Only bob's own code asks for a new password, and it gives no session.
+    let other = rustyfin_auth::generate_setup_code();
+    for (case, name, typed) in [
+        ("another code", "bob", other.as_str()),
+        ("unknown user", "nobody", code.as_str()),
+        ("a user without a code", "alice", code.as_str()),
+    ] {
+        let (status, header, body) = b20_sign_in(&w.app, name, typed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(header, None, "{case}: setup header");
+        assert_eq!(body, failed_body, "{case}");
+    }
+    assert_eq!(
+        b20_sessions(&w.state, bob).await,
+        (0, 0),
+        "bob got a session"
+    );
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a sign-in used the code"
+    );
+    assert!(login(&w.app, "alice", "alicepass").await.is_some());
+}
+
+#[tokio::test]
+async fn b20_setup_code_sets_the_password_and_signs_in() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let log = jf::LogCapture::start();
+    let (status, header, answer) =
+        b20_redeem(&w.app, "bob", &code.to_lowercase(), "new pass").await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(header, None);
+    let id = answer["User"]["Id"].as_str().expect("no User.Id");
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap(), bob, "{answer}");
+    assert_eq!(answer["User"]["Name"], "bob", "{answer}");
+    assert!(answer["SessionInfo"]["Id"].is_string(), "{answer}");
+    assert!(answer["ServerId"].is_string(), "{answer}");
+    let token = answer["AccessToken"].as_str().expect("no AccessToken");
+    assert!(
+        !b20_holds_code(&answer.to_string(), &code),
+        "the code is in the answer"
+    );
+    assert!(!b20_holds_code(&text, &code), "the code is in the log");
+    assert!(!text.contains("new pass"), "the password is in the log");
+
+    let (status, me) = send_authed(&w.app, "GET", "/Users/Me", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["Name"], "bob");
+    assert_eq!(b20_sessions(&w.state, bob).await, (1, 1));
+
+    // The new password signs in; the code is used up everywhere.
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "another").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the code worked twice");
+    assert!(login(&w.app, "bob", "another").await.is_none());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+    assert!(b20_pending(&w).await.is_empty(), "bob is still pending");
+}
+
+#[tokio::test]
+async fn b20_setup_code_refuses_bad_requests() {
+    let w = b20_world().await;
+    let (_, code) = b20_pending_bob(&w).await;
+    let (_, _, failed_body) = b20_sign_in(&w.app, "bob", "wrong password").await;
+    let (status, _, answer) = b20_redeem(&w.app, "bob", &code, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "empty NewPw: {answer}");
+
+    let other = rustyfin_auth::generate_setup_code();
+    for (case, name, typed) in [
+        ("another code", "bob", other.as_str()),
+        ("not a code", "bob", "letmein"),
+        ("unknown user", "nobody", code.as_str()),
+        ("a user without a code", "alice", code.as_str()),
+    ] {
+        let (status, header, body) = b20_redeem(&w.app, name, typed, "new pass").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+        assert_eq!(header, None, "{case}");
+        assert_eq!(body, failed_body, "{case}");
+    }
+    assert!(
+        login(&w.app, "alice", "alicepass").await.is_some(),
+        "alice's password changed"
+    );
+    assert!(login(&w.app, "alice", "new pass").await.is_none());
+    assert!(login(&w.app, "bob", "new pass").await.is_none());
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a refusal used the code"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "the code no longer works");
+}
+
+#[tokio::test]
+async fn b20_disabled_pending_user_cannot_use_the_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(bob.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "redeem");
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "a disabled user used the code"
+    );
+    assert_eq!(b20_sessions(&w.state, bob).await, (0, 0));
+}
+
+#[tokio::test]
+async fn b20_setup_code_checks_cost_the_same_for_everyone() {
+    use std::time::{Duration, Instant};
+    // carol is a second pending user, disabled below.
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    assert!(b20_entry(&report, "bob").code.is_some(), "bob has no code");
+    let carol = b20_entry(&report, "carol").user_id.unwrap();
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind(carol.to_string())
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+
+    // bob with a wrong code is the measure: his code hash is verified. Then a user that doesn't
+    // exist, alice (no code), carol (disabled) and bob with a code of the wrong shape.
+    let wrong = "0000-0000-0000";
+    let cases = [
+        ("bob", wrong),
+        ("nobody", wrong),
+        ("alice", wrong),
+        ("carol", wrong),
+        ("bob", "not a code"),
+    ];
+    let device = rustyfin_auth::TokenDevice {
+        device_id: "b20-timing".to_string(),
+        device_name: "test".to_string(),
+        app_name: "test".to_string(),
+        app_version: "1".to_string(),
+    };
+    let mut redeem = [Duration::MAX; 5];
+    let mut pending = [Duration::MAX; 5];
+    let mut errors = Vec::new();
+    // The fastest of two tries, the cases in turn.
+    for _ in 0..2 {
+        for (n, (name, code)) in cases.iter().enumerate() {
+            let start = Instant::now();
+            let result = rustyfin_auth::authenticate_with_setup_code(
+                &w.state.db,
+                name,
+                code,
+                "new pass",
+                &device,
+            )
+            .await;
+            redeem[n] = redeem[n].min(start.elapsed());
+            errors.push((*name, *code, result.err().map(|e| format!("{e:?}"))));
+            let start = Instant::now();
+            let found = rustyfin_auth::setup_code_pending(&w.state.db, name, code)
+                .await
+                .unwrap();
+            pending[n] = pending[n].min(start.elapsed());
+            assert!(!found, "{name} with {code:?} is pending");
+        }
+    }
+    for (check, times) in [
+        ("AuthenticateWithSetupCode", redeem),
+        ("the code check of a sign-in", pending),
+    ] {
+        for (n, (name, code)) in cases.iter().enumerate().skip(1) {
+            assert!(
+                times[n] * 4 >= times[0],
+                "{check}: {name} with {code:?} took {:?}, bob with a wrong code {:?}",
+                times[n],
+                times[0]
+            );
+        }
+    }
+    for (name, code, error) in errors {
+        assert_eq!(
+            error.as_deref(),
+            Some("InvalidCredentials"),
+            "{name} with {code:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_setup_code_sign_in_is_rate_limited() {
+    let mut state = test_state().await;
+    state.rate_limiter = RateLimiter::new(3, 60);
+    let app = remote_app(state);
+    let body = serde_json::json!({ "Username": "nobody", "Code": "AAAA-AAAA-AAAA", "NewPw": "x" });
+    let attempt = || {
+        request(
+            "POST",
+            "/Users/AuthenticateWithSetupCode",
+            None,
+            Some(body.clone()),
+        )
+    };
+    for n in 1..=3 {
+        let status = send(&app, attempt()).await.0;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {n}");
+    }
+    let status = send(&app, attempt()).await.0;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn b20_pending_users_and_reissue_are_admin_only() {
+    let w = b20_world().await;
+    let (bob, _) = b20_pending_bob(&w).await;
+    let codes = b20_code_rows(&w.state).await;
+    add_user(&w.state, "viewer", "viewerpass", false).await;
+    let (viewer, _) = login(&w.app, "viewer", "viewerpass").await.unwrap();
+    let pending = "/JellyfinImport/PendingUsers";
+    g1_assert_admin_only(&w.app, "GET", pending, &None, &viewer).await;
+    let reissue = format!("/JellyfinImport/Users/{bob}/SetupCode");
+    g1_assert_admin_only(&w.app, "POST", &reissue, &None, &viewer).await;
+    assert_eq!(
+        b20_code_rows(&w.state).await,
+        codes,
+        "a refused reissue wrote"
+    );
+}
+
+#[tokio::test]
+async fn b20_pending_users_lists_users_with_a_code() {
+    let mut w = b20_world().await;
+    w.source.users.push(jf::JfUser::new(3, "Carol", false));
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let started = chrono::Utc::now();
+    let report = b20_run(&w, serde_json::json!({ "SourcePath": install })).await;
+    let ended = chrono::Utc::now();
+    let bob = b20_entry(&report, "bob").user_id.unwrap();
+    let carol = b20_entry(&report, "Carol").user_id.unwrap();
+
+    // Sorted by name, case-insensitively; alice (matched) and the admin are not pending.
+    let listed: Vec<_> = b20_pending(&w)
+        .await
+        .iter()
+        .map(b20_pending_entry)
+        .collect();
+    let names: Vec<(uuid::Uuid, &str)> = listed
+        .iter()
+        .map(|(id, name, _)| (*id, name.as_str()))
+        .collect();
+    assert_eq!(names, vec![(bob, "bob"), (carol, "Carol")]);
+    for (_, name, at) in &listed {
+        let window = started - chrono::Duration::seconds(1)..=ended + chrono::Duration::seconds(1);
+        assert!(window.contains(at), "{name}: CreatedAt {at}");
+    }
+}
+
+#[tokio::test]
+async fn b20_reissue_replaces_the_code() {
+    let w = b20_world().await;
+    let (bob, old) = b20_pending_bob(&w).await;
+    let before = b20_pending_entry(&b20_pending(&w).await[0]);
+    let log = jf::LogCapture::start();
+    let (status, answer) = b20_reissue(&w, bob).await;
+    let text = log.text();
+    drop(log);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        answer.as_object().map(|o| o.len()),
+        Some(3),
+        "not UserId, Name and Code"
+    );
+    let id = uuid::Uuid::parse_str(answer["UserId"].as_str().unwrap()).unwrap();
+    assert_eq!(id, bob);
+    assert_eq!(answer["Name"], "bob");
+    let new = answer["Code"].as_str().expect("no Code").to_string();
+    assert!(b20_is_code(&new), "not a code");
+    assert_ne!(new, old);
+    assert!(!b20_holds_code(&text, &new), "the code is in the log");
+    let info = |l: &str| l.contains("INFO") && l.contains("jellyfin import: new setup code");
+    assert!(text.lines().any(info), "no INFO line");
+
+    let hash: String =
+        sqlx::query_scalar("SELECT code_hash FROM user_setup_codes WHERE user_id = ?")
+            .bind(bob.to_string())
+            .fetch_one(&w.state.db)
+            .await
+            .unwrap();
+    assert!(!b20_holds_code(&hash, &new), "the code is stored");
+    let verified = rustyfin_auth::verify_setup_code(&new, &hash).await.unwrap();
+    assert!(verified, "the hash is not the new code's");
+    assert!(
+        !b20_holds_code(&b20_status(&w).await.to_string(), &new),
+        "in the status"
+    );
+    let after = b20_pending_entry(&b20_pending(&w).await[0]);
+    assert_eq!((after.0, &after.1), (before.0, &before.1));
+    assert!(after.2 >= before.2, "CreatedAt went back");
+
+    // The old code is dead; the new one asks for a new password and redeems.
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &old).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "old code"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &old, "new pass").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the old code redeemed");
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &new).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(header.as_deref(), Some("true"), "new code");
+    let (status, _, _) = b20_redeem(&w.app, "bob", &new, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "the new code");
+}
+
+#[tokio::test]
+async fn b20_reissue_refuses_users_without_a_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let (status, answer) = b20_reissue(&w, uuid::Uuid::new_v4()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown user: {answer}");
+    let (status, answer) = b20_reissue(&w, w.alice).await;
+    assert_eq!(status, StatusCode::CONFLICT, "alice: {answer}");
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, answer) = b20_reissue(&w, bob).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "bob after his sign-in: {answer}"
+    );
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "a refused reissue wrote"
+    );
+    assert!(b20_pending(&w).await.is_empty());
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(login(&w.app, "alice", "alicepass").await.is_some());
+}
+
+#[tokio::test]
+async fn b20_setting_a_password_ends_the_code() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    let uri = format!("/Users/{bob}/Password");
+    let body = serde_json::json!({ "CurrentPw": "", "NewPw": "set by admin" });
+    let (status, answer) = send(&w.app, request("POST", &uri, Some(&w.token), Some(body))).await;
+    assert!(status.is_success(), "{status} {answer}");
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+    assert!(b20_pending(&w).await.is_empty(), "bob is still pending");
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+    let (status, _, _) = b20_redeem(&w.app, "bob", &code, "mine").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "redeem");
+    let (status, _) = b20_reissue(&w, bob).await;
+    assert_eq!(status, StatusCode::CONFLICT, "reissue");
+    assert!(login(&w.app, "bob", "set by admin").await.is_some());
+}
+
+// B21 merge round 7: the password switch and name matching for setup codes (X1, X2).
+
+/// Turns password sign-in on or off as the B20 world's admin.
+async fn b21_x1_allow_passwords(w: &B20World, allow: bool) {
+    let body = serde_json::json!({ "AllowPasswordSignIn": allow });
+    let req = request("POST", "/Auth/Oidc/Settings", Some(&w.token), Some(body));
+    let (status, answer) = send(&w.app, req).await;
+    assert_eq!(status, StatusCode::OK, "saving: {answer}");
+    assert_eq!(answer["AllowPasswordSignIn"], allow, "{answer}");
+}
+
+#[tokio::test]
+async fn b21_x1_setup_code_obeys_the_password_switch() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+    b21_x1_allow_passwords(&w, false).await;
+
+    // A wrong code is checked first and gets a wrong password's answer.
+    let other = rustyfin_auth::generate_setup_code();
+    let (status, header, _) = b20_redeem(&w.app, "bob", &other, "new pass").await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "wrong code"
+    );
+
+    // The right code is refused like a password, gives no token and stays unused.
+    let (status, header, answer) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(header, None);
+    assert_eq!(
+        answer["Detail"], "Password sign-in is turned off for this account.",
+        "{answer}"
+    );
+    assert!(answer.get("AccessToken").is_none(), "a token: {answer}");
+    assert_eq!(
+        b20_sessions(&w.state, bob).await,
+        (0, 0),
+        "bob got a session"
+    );
+    assert_eq!(
+        b20_code_rows(&w.state).await.len(),
+        1,
+        "the code was used up"
+    );
+    let pending = b20_pending(&w).await;
+    let bob_pending = pending.iter().any(|e| b20_pending_entry(e).0 == bob);
+    assert!(bob_pending, "bob is no longer pending: {pending:?}");
+    assert!(login(&w.app, "bob", "new pass").await.is_none());
+
+    // A sign-in with the code doesn't send bob to the setup-code form.
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header),
+        (StatusCode::UNAUTHORIZED, None),
+        "sign-in"
+    );
+
+    // Once password sign-in is back on, the same code works.
+    b21_x1_allow_passwords(&w, true).await;
+    let (status, header, _) = b20_sign_in(&w.app, "bob", &code).await;
+    assert_eq!(
+        (status, header.as_deref()),
+        (StatusCode::UNAUTHORIZED, Some("true")),
+        "sign-in after the switch"
+    );
+    let (status, _, answer) = b20_redeem(&w.app, "bob", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["AccessToken"].is_string(), "{answer}");
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+}
+
+#[tokio::test]
+async fn b21_x2_setup_code_finds_names_in_any_case() {
+    let w = b20_world().await;
+    let (bob, code) = b20_pending_bob(&w).await;
+
+    // The code typed as a password under another case of the name asks for a new password.
+    let (status, header, _) = b20_sign_in(&w.app, "Bob", &code).await;
+    assert_eq!(
+        (status, header.as_deref()),
+        (StatusCode::UNAUTHORIZED, Some("true")),
+        "sign-in as Bob"
+    );
+
+    // The code signs in as the stored "bob".
+    let (status, _, answer) = b20_redeem(&w.app, "BOB", &code, "new pass").await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let id = answer["User"]["Id"].as_str().expect("no User.Id");
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap(), bob, "{answer}");
+    assert_eq!(answer["User"]["Name"], "bob", "{answer}");
+    assert!(login(&w.app, "bob", "new pass").await.is_some());
+    assert!(
+        b20_code_rows(&w.state).await.is_empty(),
+        "the code row stays"
+    );
+}
+
+// B20 5: metadata for matched items.
+
+/// Replaces the world's Jellyfin item `name` with `edit` of it.
+fn b20_edit(w: &mut B20World, name: &str, edit: impl FnOnce(jf::JfItem) -> jf::JfItem) {
+    let at = w.source.items.iter().position(|i| i.name == name);
+    let at = at.unwrap_or_else(|| panic!("no Jellyfin item {name}"));
+    w.source.items[at] = edit(w.source.items[at].clone());
+}
+
+/// The metadata world's install, Rustyfin's item ids (taken before an import renames anything)
+/// and the bytes of the usable Jellyfin images.
+struct B20Meta {
+    install: std::path::PathBuf,
+    alpha: uuid::Uuid,
+    beta: uuid::Uuid,
+    show: uuid::Uuid,
+    e1: uuid::Uuid,
+    e3: uuid::Uuid,
+    poster: Vec<u8>,
+    backdrop: Vec<u8>,
+    logo: Vec<u8>,
+    show_poster: Vec<u8>,
+    ann: Vec<u8>,
+}
+
+/// The B20 world with Jellyfin metadata, installed into the folder `name` in `layout`.
+///
+/// Jellyfin's Alpha, renamed "Alpha: Jellyfin Cut", has every field, TMDB and IMDb ids, four
+/// credits (Ann twice) and ten image rows: a poster; a missing backdrop before a usable one, so
+/// indexes have no gap; a logo beside the media; a Box (ignored); and five unusable rows: a `..`
+/// path to a JPEG, a URL, a text file, a symlink to a JPEG outside the metadata folder, and the
+/// database through `%AppDataPath%`. Beta has some fields, an IMDb id and a credit; Rustyfin's
+/// Beta already has an overview, genres and a rating. The Show has an overview, a studio, a
+/// creator and a poster; Rustyfin's Show already has a person and a local poster. S01E01 has an
+/// overview and a date. Jellyfin's Ann (with a portrait) and Dan (whose portrait file is missing)
+/// are Person items.
+async fn b20_meta_world(name: &str, layout: jf::Layout) -> (B20World, B20Meta) {
+    let mut w = b20_world().await;
+    let dir = "/config/metadata/library/a1/alpha";
+    b20_edit(&mut w, "Alpha", |i| {
+        let mut alpha = i
+            .provider("Tmdb", "111")
+            .provider("Imdb", "tt0000111")
+            .meta(jf::JfMeta {
+                forced_sort_name: Some("Alpha, The"),
+                original_title: Some("Alfa"),
+                overview: Some("Jellyfin overview of Alpha."),
+                tagline: Some("First of all."),
+                official_rating: Some("PG-13"),
+                community_rating: Some(7.5),
+                critic_rating: Some(88.0),
+                premiere_date: Some("2001-05-04 00:00:00"),
+                production_year: Some(2001),
+                genres: Some("Drama| Comedy |Drama"),
+                studios: Some("Acme Pictures|Big Studio"),
+                tags: Some("favourite"),
+                ..Default::default()
+            })
+            .credit("Ann Actor", Some("Actor"), "Hero", Some(1))
+            .credit("Dan Director", Some("Director"), "", Some(0))
+            .credit("Ann Actor", Some("Actor"), "Cameo", Some(2))
+            .credit("Nora Nobody", None, "", None)
+            .image(
+                &format!("{dir}/poster.jpg"),
+                0,
+                (1000, 1500),
+                Some("LEHV*nWB|yk8"),
+            )
+            .image(&format!("{dir}/backdrop1.jpg"), 2, (1920, 1080), None)
+            .image(
+                "%MetadataPath%/library/a1/alpha/backdrop.png",
+                2,
+                (1920, 1080),
+                None,
+            )
+            .image("/data/movies/Alpha (2001)/logo.png", 4, (0, 0), None)
+            .image(&format!("{dir}/box.jpg"), 7, (100, 100), None)
+            .image("/config/metadata/../outside.jpg", 5, (100, 100), None)
+            .image("https://image.example/banner.jpg", 3, (100, 100), None)
+            .image(&format!("{dir}/notimage.jpg"), 1, (100, 100), None)
+            .image(&format!("{dir}/disc.jpg"), 6, (100, 100), None)
+            .image("%AppDataPath%/jellyfin.db", 8, (100, 100), None);
+        alpha.name = "Alpha: Jellyfin Cut".to_string();
+        alpha
+    });
+    b20_edit(&mut w, "Beta", |i| {
+        i.provider("Imdb", "tt0000222")
+            .meta(jf::JfMeta {
+                overview: Some("Jellyfin overview of Beta."),
+                community_rating: Some(6.0),
+                production_year: Some(2002),
+                genres: Some("Thriller"),
+                ..Default::default()
+            })
+            .credit("Bea Star", Some("Actor"), "Lead", Some(0))
+    });
+    b20_edit(&mut w, "Show", |i| {
+        i.meta(jf::JfMeta {
+            overview: Some("A show."),
+            studios: Some("Acme TV"),
+            ..Default::default()
+        })
+        .credit("Sam Showrunner", Some("Creator"), "", Some(0))
+        .image(
+            "%MetadataPath%/library/b2/show/poster.jpg",
+            0,
+            (680, 1000),
+            None,
+        )
+    });
+    b20_edit(&mut w, "Show S01E01", |i| {
+        i.meta(jf::JfMeta {
+            overview: Some("Pilot."),
+            premiere_date: Some("2025-01-10 00:00:00"),
+            ..Default::default()
+        })
+    });
+    let ann_dir = "%MetadataPath%/People/A/Ann Actor";
+    let ann = jf::JfItem::new("Person", "Ann Actor", Some(ann_dir)).image(
+        &format!("{ann_dir}/folder.jpg"),
+        0,
+        (300, 450),
+        Some("LKO2?U%2Tw=w"),
+    );
+    let dan = jf::JfItem::new("Person", "Dan Director", None).image(
+        "/config/metadata/People/D/Dan Director/folder.jpg",
+        0,
+        (300, 450),
+        None,
+    );
+    w.source.items.extend([ann, dan]);
+    let install = b20_install(&w, name, layout).await;
+
+    let library = install.join("metadata/library");
+    let alpha_dir = library.join("a1/alpha");
+    let poster = jf::write_image(&alpha_dir.join("poster.jpg"), jf::JPEG_HEAD, "alpha poster");
+    let backdrop = jf::write_image(&alpha_dir.join("backdrop.png"), jf::PNG_HEAD, "backdrop");
+    jf::write_image(&alpha_dir.join("box.jpg"), jf::JPEG_HEAD, "alpha box");
+    std::fs::write(alpha_dir.join("notimage.jpg"), "not an image").unwrap();
+    jf::write_image(&install.join("outside.jpg"), jf::JPEG_HEAD, "outside");
+    let escaped = w.jf_root.join("escaped.jpg");
+    jf::write_image(&escaped, jf::JPEG_HEAD, "escaped");
+    std::os::unix::fs::symlink(&escaped, alpha_dir.join("disc.jpg")).unwrap();
+    let logo_path = format!("{}/Alpha (2001)/logo.png", w.movies);
+    let logo = jf::write_image(std::path::Path::new(&logo_path), jf::PNG_HEAD, "alpha logo");
+    let show_poster = jf::write_image(&library.join("b2/show/poster.jpg"), jf::JPEG_HEAD, "show");
+    let ann_file = install.join("metadata/People/A/Ann Actor/folder.jpg");
+    let ann_bytes = jf::write_image(&ann_file, jf::JPEG_HEAD, "ann portrait");
+
+    let alpha = b20_item(&w.state, "Alpha").await;
+    let beta = b20_item(&w.state, "Beta").await;
+    let show = b20_item(&w.state, "Show").await;
+    let e1 = b20_item(&w.state, "Show S01E01").await;
+    let e3 = b20_item(&w.state, "Show S01E03").await;
+    sqlx::query(
+        "UPDATE media_items SET overview = 'Rustyfin overview', genres = 'Action', \
+         official_rating = 'R' WHERE id = ?",
+    )
+    .bind(beta.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_images (item_id, image_type, image_index, path, provider) \
+         VALUES (?, 'Primary', 0, '/nowhere/show.jpg', 'local')",
+    )
+    .bind(show.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO people (id, name, type) VALUES ('old-actor', 'Old Actor', 'Actor')")
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO item_people (item_id, person_id, type) VALUES (?, 'old-actor', 'Actor')",
+    )
+    .bind(show.to_string())
+    .execute(&w.state.db)
+    .await
+    .unwrap();
+    let meta = B20Meta {
+        install,
+        alpha,
+        beta,
+        show,
+        e1,
+        e3,
+        poster,
+        backdrop,
+        logo,
+        show_poster,
+        ann: ann_bytes,
+    };
+    (w, meta)
+}
+
+/// A report's metadata counts: [Items, Fields, People, Images, ImagesMissing, Locked].
+fn b20_meta_counts(report: &serde_json::Value) -> [i64; 6] {
+    [
+        "Items",
+        "Fields",
+        "People",
+        "Images",
+        "ImagesMissing",
+        "Locked",
+    ]
+    .map(|key| report["Metadata"][key].as_i64().unwrap_or(-1))
+}
+
+/// The metadata of `item`: its fields, its extras and its studios (names sorted, joined by `|`).
+async fn b20_fields(state: &AppState, item: uuid::Uuid) -> serde_json::Value {
+    let text: String = sqlx::query_scalar(
+        "SELECT json_object('name', m.name, 'sort_name', m.sort_name, 'overview', m.overview, \
+         'tagline', m.tagline, 'official_rating', m.official_rating, \
+         'community_rating', m.community_rating, 'premiere_date', m.premiere_date, \
+         'end_date', m.end_date, 'production_year', m.production_year, 'genres', m.genres, \
+         'tags', m.tags, 'tmdb_id', m.tmdb_id, 'tvdb_id', m.tvdb_id, \
+         'original_title', x.original_title, 'critic_rating', x.critic_rating, \
+         'imdb_id', x.imdb_id, 'studios', (SELECT group_concat(name, '|') FROM \
+         (SELECT s.name FROM item_studios i JOIN studios s ON s.id = i.studio_id \
+         WHERE i.item_id = m.id ORDER BY s.name))) \
+         FROM media_items m LEFT JOIN item_metadata_extras x ON x.item_id = m.id WHERE m.id = ?",
+    )
+    .bind(item.to_string())
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// What `b20_fields` gives for an item named `name` with no metadata, with `changes` applied.
+fn b20_expect(name: &str, changes: serde_json::Value) -> serde_json::Value {
+    let mut fields = serde_json::json!({
+        "name": name,
+        "sort_name": null,
+        "overview": null,
+        "tagline": null,
+        "official_rating": null,
+        "community_rating": null,
+        "premiere_date": null,
+        "end_date": null,
+        "production_year": null,
+        "genres": "[]",
+        "tags": "",
+        "tmdb_id": null,
+        "tvdb_id": null,
+        "original_title": null,
+        "critic_rating": null,
+        "imdb_id": null,
+        "studios": null,
+    });
+    for (key, value) in changes.as_object().unwrap() {
+        assert!(fields.get(key).is_some(), "no field {key}");
+        fields[key] = value.clone();
+    }
+    fields
+}
+
+/// Alpha's fields after an import of the metadata world, where Rustyfin names it `name`.
+fn b20_alpha_fields(name: &str) -> serde_json::Value {
+    let changes = serde_json::json!({
+        "sort_name": "alpha, the",
+        "overview": "Jellyfin overview of Alpha.",
+        "tagline": "First of all.",
+        "official_rating": "PG-13",
+        "community_rating": 7.5,
+        "premiere_date": "2001-05-04T00:00:00+00:00",
+        "production_year": 2001,
+        "genres": "Drama|Comedy",
+        "tags": "favourite",
+        "tmdb_id": 111,
+        "original_title": "Alfa",
+        "critic_rating": 88.0,
+        "imdb_id": "tt0000111",
+        "studios": "Acme Pictures|Big Studio",
+    });
+    b20_expect(name, changes)
+}
+
+/// The Show's fields after an import of the metadata world.
+fn b20_show_fields() -> serde_json::Value {
+    let changes =
+        serde_json::json!({ "overview": "A show.", "tvdb_id": 333, "studios": "Acme TV" });
+    b20_expect("Show", changes)
+}
+
+/// S01E01's fields after an import of the metadata world.
+fn b20_e1_fields() -> serde_json::Value {
+    let changes = serde_json::json!({
+        "overview": "Pilot.",
+        "premiere_date": "2025-01-10T00:00:00+00:00",
+    });
+    b20_expect("Show S01E01", changes)
+}
+
+/// Beta's fields after an import of the metadata world, with the overview and genres given.
+fn b20_beta_fields(overview: &str, genres: &str) -> serde_json::Value {
+    let changes = serde_json::json!({
+        "overview": overview,
+        "official_rating": "R",
+        "genres": genres,
+        "community_rating": 6.0,
+        "production_year": 2002,
+        "tmdb_id": 222,
+        "imdb_id": "tt0000222",
+    });
+    b20_expect("Beta", changes)
+}
+
+/// `GET /Items/{id}` as the admin; expects 200.
+async fn b20_get_item(w: &B20World, id: uuid::Uuid) -> serde_json::Value {
+    let uri = format!("/Items/{id}");
+    let (status, item) = send_authed(&w.app, "GET", &uri, &w.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    item
+}
+
+/// A person of an item answer: (Name, Type, Role, PrimaryImageTag).
+type B20Person = (String, String, Option<String>, Option<String>);
+
+fn b20_person(name: &str, kind: &str, role: Option<&str>, tag: Option<&str>) -> B20Person {
+    let text = |s: Option<&str>| s.map(str::to_string);
+    (name.to_string(), kind.to_string(), text(role), text(tag))
+}
+
+/// The `People` of an item answer, in order.
+fn b20_people(item: &serde_json::Value) -> Vec<B20Person> {
+    let text = |p: &serde_json::Value, key: &str| p[key].as_str().map(str::to_string);
+    let people = item["People"].as_array().cloned().unwrap_or_default();
+    people
+        .iter()
+        .map(|p| {
+            (
+                text(p, "Name").unwrap_or_default(),
+                text(p, "Type").unwrap_or_default(),
+                text(p, "Role"),
+                text(p, "PrimaryImageTag"),
+            )
+        })
+        .collect()
+}
+
+/// Alpha's people after an import of the metadata world: in Jellyfin's list order, Ann once (her
+/// first credit), Nora without a kind, and only Ann with a portrait.
+fn b20_alpha_people() -> Vec<B20Person> {
+    vec![
+        b20_person("Dan Director", "Director", None, None),
+        b20_person("Ann Actor", "Actor", Some("Hero"), Some("Primary_0")),
+        b20_person("Nora Nobody", "Unknown", None, None),
+    ]
+}
+
+/// The id of the Rustyfin person `name`.
+async fn b20_person_id(state: &AppState, name: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM people WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// An image row: (type, index, path, provider, width, height, blurhash).
+type B20Image = (
+    String,
+    i64,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// The image rows of the item `id` (`person`: of the person `id`), by type and index.
+async fn b20_images(state: &AppState, id: &str, person: bool) -> Vec<B20Image> {
+    let sql = if person {
+        "SELECT image_type, image_index, path, provider, width, height, blurhash \
+         FROM person_images WHERE person_id = ? ORDER BY image_type, image_index"
+    } else {
+        "SELECT image_type, image_index, path, provider, width, height, blurhash \
+         FROM item_images WHERE item_id = ? ORDER BY image_type, image_index"
+    };
+    sqlx::query_as(sql)
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+/// Image rows without their path and provider: (type, index, width, height, blurhash).
+/// An image row without its path and provider: type, index, width, height, blurhash.
+type B20ImageShape<'a> = (&'a str, i64, Option<i64>, Option<i64>, Option<&'a str>);
+
+fn b20_image_shapes(rows: &[B20Image]) -> Vec<B20ImageShape<'_>> {
+    rows.iter()
+        .map(|(kind, index, _, _, width, height, hash)| {
+            (kind.as_str(), *index, *width, *height, hash.as_deref())
+        })
+        .collect()
+}
+
+/// Rustyfin's own poster of the Show in the metadata world.
+fn b20_local_poster() -> B20Image {
+    let path = "/nowhere/show.jpg".to_string();
+    (
+        "Primary".to_string(),
+        0,
+        path,
+        "local".to_string(),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Checks that `row` is an imported copy `<data_dir>/images/<folder>/jf-<Type>-<index>-<16 hex>.<ext>`
+/// and returns the copy's bytes.
+fn b20_copy(state: &AppState, folder: &str, row: &B20Image, ext: &str) -> Vec<u8> {
+    let (kind, index, path, provider, ..) = row;
+    assert_eq!(provider, "jellyfin", "{row:?}");
+    let path = std::path::Path::new(path);
+    let parent = state.data_dir.join("images").join(folder);
+    assert_eq!(path.parent(), Some(parent.as_path()), "{row:?}");
+    let file = path.file_name().unwrap().to_str().unwrap();
+    let hex = file
+        .strip_prefix(&format!("jf-{kind}-{index}-"))
+        .and_then(|rest| rest.strip_suffix(&format!(".{ext}")));
+    let lower_hex = |h: &str| h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    assert!(
+        hex.is_some_and(|h| h.len() == 16 && lower_hex(h)),
+        "copy name {file}"
+    );
+    std::fs::read(path).unwrap()
+}
+
+/// GETs `uri` as the admin; returns the status and the body.
+async fn b20_get_bytes(w: &B20World, uri: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {}", w.token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = w.app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+/// The regular files under `dir`, recursively, sorted; none when `dir` doesn't exist.
+fn b20_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The rows of the tables the metadata import writes, as JSON arrays, sorted per table.
+async fn b20_meta_rows(state: &AppState) -> Vec<String> {
+    let image = "image_type, image_index, path, provider, width, height, blurhash";
+    let tables = [
+        ("item_images", format!("item_id, {image}")),
+        ("people", "id, name, type".to_string()),
+        (
+            "item_people",
+            "item_id, person_id, type, role, sort_order".to_string(),
+        ),
+        ("studios", "id, name".to_string()),
+        ("item_studios", "item_id, studio_id".to_string()),
+        (
+            "item_metadata_extras",
+            "item_id, original_title, critic_rating, imdb_id, lock_data, locked_fields".to_string(),
+        ),
+        ("person_images", format!("person_id, {image}")),
+    ];
+    let mut rows = Vec::new();
+    for (table, columns) in tables {
+        let sql = format!("SELECT json_array({columns}) FROM {table} ORDER BY 1");
+        let found: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        rows.push(format!("{table}: {}", found.join(" ")));
+    }
+    rows
+}
+
+/// The fields of every item, then `b20_meta_rows`.
+async fn b20_meta_digest(state: &AppState) -> Vec<String> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM media_items ORDER BY id")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    let mut digest = Vec::new();
+    for id in ids {
+        let id = uuid::Uuid::parse_str(&id).unwrap();
+        digest.push(b20_fields(state, id).await.to_string());
+    }
+    digest.extend(b20_meta_rows(state).await);
+    digest
+}
+
+#[tokio::test]
+async fn b20_import_metadata_fills_empty_fields() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, m) = b20_meta_world(name, layout).await;
+        let before = jf::listing(&m.install);
+        let body = serde_json::json!({ "SourcePath": m.install });
+        let log = jf::LogCapture::start();
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body.clone()).await;
+        let status = b20_status(&w).await;
+        let text = log.text();
+        drop(log);
+        let counts = [4, 21, 4, 4, 7, 0];
+        assert_eq!(
+            b20_meta_counts(&preview),
+            counts,
+            "{name}: preview {preview}"
+        );
+        assert_eq!(b20_meta_counts(&report), counts, "{name}: {report}");
+        assert_eq!(report["Metadata"]["Mode"], "FillEmpty", "{name}");
+
+        assert_eq!(
+            b20_fields(&w.state, m.alpha).await,
+            b20_alpha_fields("Alpha"),
+            "{name}: Alpha"
+        );
+        assert_eq!(
+            b20_fields(&w.state, m.beta).await,
+            b20_beta_fields("Rustyfin overview", "Action"),
+            "{name}: Beta keeps its own"
+        );
+        let show_fields = b20_fields(&w.state, m.show).await;
+        assert_eq!(show_fields, b20_show_fields(), "{name}: Show");
+        assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields(), "{name}");
+        assert_eq!(
+            b20_fields(&w.state, m.e3).await,
+            b20_expect("Show S01E03", serde_json::json!({})),
+            "{name}: a name is never empty"
+        );
+
+        let alpha = b20_get_item(&w, m.alpha).await;
+        assert_eq!(b20_people(&alpha), b20_alpha_people(), "{name}");
+        assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
+        assert_eq!(alpha["CriticRating"], 88.0, "{name}");
+        assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
+        assert_eq!(alpha["ProviderIds"]["imdb"], "tt0000111", "{name}");
+        assert_eq!(alpha["LockData"], false, "{name}");
+        assert_eq!(alpha["LockedFields"], serde_json::json!([]), "{name}");
+        let beta = b20_get_item(&w, m.beta).await;
+        let bea = b20_person("Bea Star", "Actor", Some("Lead"), None);
+        assert_eq!(b20_people(&beta), vec![bea], "{name}");
+        let show = b20_get_item(&w, m.show).await;
+        let old = b20_person("Old Actor", "Actor", None, None);
+        assert_eq!(
+            b20_people(&show),
+            vec![old],
+            "{name}: the Show keeps its people"
+        );
+        assert_eq!(
+            b20_images(&w.state, &m.show.to_string(), false).await,
+            vec![b20_local_poster()],
+            "{name}: the Show keeps its poster"
+        );
+
+        for answer in [&preview, &report, &status] {
+            assert!(
+                !answer.to_string().contains(jf::CANARY),
+                "{name}: secret in an answer"
+            );
+        }
+        assert!(!text.contains(jf::CANARY), "{name}: secret in the log");
+        let db = w.state.data_dir.join("test.db");
+        let mut files = vec![
+            db.clone(),
+            db.with_extension("db-wal"),
+            db.with_extension("db-shm"),
+        ];
+        files.extend(b20_files(&w.state.data_dir.join("images")));
+        assert!(
+            !jf::files_hold_canary(&files),
+            "{name}: secret in Rustyfin's files"
+        );
+        assert_eq!(
+            jf::listing(&m.install),
+            before,
+            "{name}: the source changed"
+        );
+
+        let digest = b20_meta_digest(&w.state).await;
+        let again = b20_run(&w, body).await;
+        assert_eq!(
+            b20_meta_counts(&again)[..4],
+            [0, 0, 0, 0],
+            "{name}: {again}"
+        );
+        assert_eq!(
+            b20_meta_digest(&w.state).await,
+            digest,
+            "{name}: the second run wrote"
+        );
+    }
+}
+
+/// Fix round 9 (re-check 8, N1): a run that writes metadata clears the cached item details and
+/// search answers. The Show's details, read before the run, show the imported overview right after
+/// it; at 60efa3f the cached copy without it was served for up to 300 s. Movie and episode details
+/// are never cached, so a Series shows it.
+#[tokio::test]
+async fn b20_import_metadata_clears_cached_details() {
+    let (w, m) = b20_meta_world("cached", jf::Layout::New).await;
+    let before = b20_get_item(&w, m.show).await;
+    assert_ne!(before["Overview"], "A show.", "{before}");
+    b20_run(&w, serde_json::json!({ "SourcePath": m.install })).await;
+    let after = b20_get_item(&w, m.show).await;
+    assert_eq!(after["Overview"], "A show.", "{after}");
+}
+
+#[tokio::test]
+async fn b20_import_metadata_copies_images() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, m) = b20_meta_world(name, layout).await;
+        let report = b20_run(&w, serde_json::json!({ "SourcePath": m.install })).await;
+        assert_eq!(b20_meta_counts(&report)[3..5], [4, 7], "{name}: {report}");
+        let alpha = m.alpha.to_string();
+        let rows = b20_images(&w.state, &alpha, false).await;
+        let shapes = vec![
+            ("Backdrop", 0, Some(1920), Some(1080), None),
+            ("Logo", 0, None, None, None),
+            ("Primary", 0, Some(1000), Some(1500), Some("LEHV*nWB|yk8")),
+        ];
+        assert_eq!(b20_image_shapes(&rows), shapes, "{name}: Alpha's rows");
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[0], "png"),
+            m.backdrop,
+            "{name}"
+        );
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[1], "png"),
+            m.logo,
+            "{name}"
+        );
+        assert_eq!(
+            b20_copy(&w.state, &alpha, &rows[2], "jpg"),
+            m.poster,
+            "{name}"
+        );
+
+        let ann = b20_person_id(&w.state, "Ann Actor").await;
+        let rows = b20_images(&w.state, &ann, true).await;
+        let shapes = vec![("Primary", 0, Some(300), Some(450), Some("LKO2?U%2Tw=w"))];
+        assert_eq!(b20_image_shapes(&rows), shapes, "{name}: Ann's rows");
+        let folder = format!("people/{ann}");
+        assert_eq!(
+            b20_copy(&w.state, &folder, &rows[0], "jpg"),
+            m.ann,
+            "{name}"
+        );
+        let dan = b20_person_id(&w.state, "Dan Director").await;
+        assert!(
+            b20_images(&w.state, &dan, true).await.is_empty(),
+            "{name}: Dan's portrait is missing"
+        );
+        let copies = b20_files(&w.state.data_dir.join("images"));
+        assert_eq!(copies.len(), 4, "{name}: {copies:?}");
+
+        for (uri, bytes) in [
+            (format!("/Items/{alpha}/Images/Primary"), &m.poster),
+            (format!("/Items/{alpha}/Images/Backdrop/0"), &m.backdrop),
+            (format!("/Items/{ann}/Images/Primary"), &m.ann),
+        ] {
+            let (status, body) = b20_get_bytes(&w, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {uri}");
+            assert_eq!(&body, bytes, "{name}: {uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_replaces_with_jellyfins() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body.clone()).await;
+    assert_eq!(b20_meta_counts(&report), [5, 25, 5, 5, 7, 0], "{report}");
+    assert_eq!(report["Metadata"]["Mode"], "Replace");
+    assert_eq!(
+        b20_fields(&w.state, m.alpha).await,
+        b20_alpha_fields("Alpha: Jellyfin Cut")
+    );
+    assert_eq!(
+        b20_fields(&w.state, m.beta).await,
+        b20_beta_fields("Jellyfin overview of Beta.", "Thriller"),
+        "Jellyfin has no rating for Beta, so its R stays"
+    );
+    assert_eq!(b20_fields(&w.state, m.show).await, b20_show_fields());
+    assert_eq!(b20_fields(&w.state, m.e1).await, b20_e1_fields());
+    let e3 = serde_json::json!({ "sort_name": "show 1x03" });
+    assert_eq!(
+        b20_fields(&w.state, m.e3).await,
+        b20_expect("Show 1x03", e3),
+        "the sort name follows a new name"
+    );
+
+    let alpha = b20_get_item(&w, m.alpha).await;
+    assert_eq!(b20_people(&alpha), b20_alpha_people());
+    let show = b20_get_item(&w, m.show).await;
+    let sam = b20_person("Sam Showrunner", "Creator", None, None);
+    assert_eq!(
+        b20_people(&show),
+        vec![sam],
+        "Jellyfin's people replace the Show's"
+    );
+    let show = m.show.to_string();
+    let rows = b20_images(&w.state, &show, false).await;
+    let shapes = vec![("Primary", 0, Some(680), Some(1000), None)];
+    assert_eq!(
+        b20_image_shapes(&rows),
+        shapes,
+        "Jellyfin's poster replaces the Show's"
+    );
+    assert_eq!(b20_copy(&w.state, &show, &rows[0], "jpg"), m.show_poster);
+    let images = w.state.data_dir.join("images");
+    assert_eq!(b20_files(&images).len(), 5);
+
+    let digest = b20_meta_digest(&w.state).await;
+    let again = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&again)[..4], [0, 0, 0, 0], "{again}");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        digest,
+        "the second run wrote"
+    );
+    assert_eq!(b20_files(&images).len(), 5, "the second run copied");
+}
+
+#[tokio::test]
+async fn b20_import_metadata_skips_locked_items_and_fields() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    for (item, lock_data, locked_fields) in [(m.show, 1, ""), (m.beta, 0, "Overview|Genres|Cast")] {
+        sqlx::query(
+            "INSERT INTO item_metadata_extras (item_id, lock_data, locked_fields) VALUES (?, ?, ?)",
+        )
+        .bind(item.to_string())
+        .bind(lock_data)
+        .bind(locked_fields)
+        .execute(&w.state.db)
+        .await
+        .unwrap();
+    }
+    let show_fields = b20_fields(&w.state, m.show).await;
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&report), [4, 21, 3, 4, 7, 1], "{report}");
+
+    assert_eq!(
+        b20_fields(&w.state, m.beta).await,
+        b20_beta_fields("Rustyfin overview", "Action"),
+        "Beta's locked fields changed"
+    );
+    let beta = b20_get_item(&w, m.beta).await;
+    assert!(b20_people(&beta).is_empty(), "Beta's cast is locked");
+    assert_eq!(beta["LockData"], false);
+    let locked = serde_json::json!(["Overview", "Genres", "Cast"]);
+    assert_eq!(beta["LockedFields"], locked);
+
+    assert_eq!(
+        b20_fields(&w.state, m.show).await,
+        show_fields,
+        "the locked Show changed"
+    );
+    let show = b20_get_item(&w, m.show).await;
+    let old = b20_person("Old Actor", "Actor", None, None);
+    assert_eq!(b20_people(&show), vec![old]);
+    assert_eq!(show["LockData"], true);
+    assert_eq!(show["LockedFields"], serde_json::json!([]));
+    assert_eq!(
+        b20_images(&w.state, &m.show.to_string(), false).await,
+        vec![b20_local_poster()]
+    );
+    let created: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM people WHERE name IN ('Sam Showrunner', 'Bea Star')",
+    )
+    .fetch_one(&w.state.db)
+    .await
+    .unwrap();
+    assert_eq!(created, 0, "people of locked casts were created");
+    assert_eq!(
+        b20_fields(&w.state, m.alpha).await,
+        b20_alpha_fields("Alpha: Jellyfin Cut")
+    );
+}
+
+#[tokio::test]
+async fn b20_import_metadata_preview_and_mode_none_write_nothing() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let before = b20_db_digest(&w.state).await;
+    let meta = b20_meta_digest(&w.state).await;
+    let fill = b20_preview(&w, serde_json::json!({ "SourcePath": m.install })).await;
+    assert_eq!(b20_meta_counts(&fill), [4, 21, 4, 4, 7, 0], "{fill}");
+    assert_eq!(fill["Metadata"]["Mode"], "FillEmpty");
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let replace = b20_preview(&w, body).await;
+    assert_eq!(b20_meta_counts(&replace), [5, 25, 5, 5, 7, 0], "{replace}");
+    assert_eq!(replace["Metadata"]["Mode"], "Replace");
+    let pair = (
+        "/config/metadata".to_string(),
+        m.install.join("metadata").display().to_string(),
+    );
+    let pairs = b20_pairs(&fill, "SuggestedPathMappings");
+    assert_eq!(pairs.last(), Some(&pair), "{pairs:?}");
+    assert_eq!(b20_db_digest(&w.state).await, before, "the preview wrote");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "the preview wrote metadata"
+    );
+    let images = w.state.data_dir.join("images");
+    assert!(!images.exists(), "the preview copied images");
+
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "None" });
+    let none = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&none), [0; 6], "{none}");
+    assert_eq!(none["Metadata"]["Mode"], "None");
+    assert_eq!(
+        b20_meta_digest(&w.state).await,
+        meta,
+        "mode None wrote metadata"
+    );
+    assert!(!images.exists(), "mode None copied images");
+}
+
+/// What a rescan must keep after a Replace import of the metadata world: Alpha's fields, the
+/// imported fields of the others (a rescan may give Beta and the Show the sort name they lack)
+/// and the metadata rows.
+async fn b20_imported(state: &AppState, m: &B20Meta) -> Vec<String> {
+    let picks: [(uuid::Uuid, &[&str]); 4] = [
+        (
+            m.beta,
+            &[
+                "overview",
+                "community_rating",
+                "production_year",
+                "genres",
+                "imdb_id",
+            ],
+        ),
+        (m.show, &["overview", "studios"]),
+        (m.e1, &["overview", "premiere_date"]),
+        (m.e3, &["name", "sort_name"]),
+    ];
+    let mut kept = vec![b20_fields(state, m.alpha).await.to_string()];
+    for (item, keys) in picks {
+        let fields = b20_fields(state, item).await;
+        kept.extend(keys.iter().map(|k| format!("{item} {k} {}", fields[*k])));
+    }
+    kept.extend(b20_meta_rows(state).await);
+    kept
+}
+
+#[tokio::test]
+async fn b20_import_metadata_survives_a_rescan() {
+    let (w, m) = b20_meta_world("jf", jf::Layout::New).await;
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM media_items WHERE media_type IN ('Movie', 'Episode')")
+            .fetch_all(&w.state.db)
+            .await
+            .unwrap();
+    assert_eq!(paths.len(), 5);
+    for path in &paths {
+        let path = std::path::Path::new(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    let body = serde_json::json!({ "SourcePath": m.install, "MetadataMode": "Replace" });
+    let report = b20_run(&w, body).await;
+    assert_eq!(b20_meta_counts(&report), [5, 25, 5, 5, 7, 0], "{report}");
+    let imported = b20_imported(&w.state, &m).await;
+
+    let libraries = rustyfin_db::repo_library::get_all_libraries(&w.state.db)
+        .await
+        .unwrap();
+    assert_eq!(libraries.len(), 2);
+    for library in &libraries {
+        rustyfin_core::scanner::scan_library(&w.state.db, library)
+            .await
+            .unwrap();
+    }
+    rustyfin_core::scanner::wait_for_idle().await;
+    assert_eq!(
+        b20_imported(&w.state, &m).await,
+        imported,
+        "the rescan lost imported data"
+    );
+}
+
+/// The B20 world with a stale Jellyfin entry of Alpha, installed into the folder `name` in
+/// `layout`. Jellyfin's Alpha gets TMDB 111 and an overview; "Alpha (stale)", listed before it, is
+/// a Movie at an old path in Alpha's folder with TMDB 111, its own overview and bob's played row.
+/// Rustyfin's Alpha has no TMDB id, so only an id the import writes can match the stale entry.
+/// `edit` gets the world and the stale entry's id before the install.
+async fn b20_stale_world_with(
+    name: &str,
+    layout: jf::Layout,
+    edit: impl FnOnce(&mut B20World, uuid::Uuid),
+) -> (B20World, std::path::PathBuf) {
+    let mut w = b20_world().await;
+    b20_edit(&mut w, "Alpha", |i| {
+        i.provider("Tmdb", "111").meta(jf::JfMeta {
+            overview: Some("Jellyfin overview of Alpha."),
+            ..Default::default()
+        })
+    });
+    let stale = jf::JfItem::new(
+        "Movie",
+        "Alpha (stale)",
+        Some("/data/movies/Alpha (2001)/Alpha.old.avi"),
+    )
+    .provider("Tmdb", "111")
+    .meta(jf::JfMeta {
+        overview: Some("Stale overview."),
+        ..Default::default()
+    });
+    let bob = w.source.user("bob").id;
+    w.source.user_data.push(jf::JfUserData {
+        user: bob,
+        item: stale.id,
+        played: true,
+        play_count: 1,
+        last_played: Some("2025-04-01 08:00:00"),
+        ..Default::default()
+    });
+    let stale_id = stale.id;
+    let at = w.source.items.iter().position(|i| i.name == "Alpha");
+    w.source.items.insert(at.unwrap(), stale);
+    edit(&mut w, stale_id);
+    let install = b20_install(&w, name, layout).await;
+    (w, install)
+}
+
+/// The stale world, as installed.
+async fn b20_stale_world(name: &str, layout: jf::Layout) -> (B20World, std::path::PathBuf) {
+    b20_stale_world_with(name, layout, |_, _| {}).await
+}
+
+#[tokio::test]
+async fn b20_import_maps_tracks_only_at_the_jellyfin_path() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        // bob chose the stale file's aac and German subtitles; Rustyfin's Alpha has streams of
+        // the same kinds and codecs, but at its own path, not the stale entry's.
+        let (w, install) = b20_stale_world_with(name, layout, |w, stale| {
+            let stream = jf::JfStream::new;
+            w.source.streams.extend([
+                stream(stale, 0, "Video", "h264"),
+                stream(stale, 1, "Audio", "aac"),
+                stream(stale, 2, "Subtitle", "srt").language("ger"),
+            ]);
+            let bob = w.source.user("bob").id;
+            let mut rows = w.source.user_data.iter_mut();
+            let row = rows
+                .find(|row| row.user == bob && row.item == stale)
+                .unwrap();
+            row.audio = Some(1);
+            row.subtitle = Some(2);
+        })
+        .await;
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let alpha_file = std::path::PathBuf::from(format!("{}/Alpha (2001)/Alpha.mkv", w.movies));
+        let streams = serde_json::json!([
+            { "Index": 0, "Codec": "h264", "CodecType": "Video" },
+            { "Index": 1, "Codec": "aac", "CodecType": "Audio" },
+            { "Index": 2, "Codec": "subrip", "CodecType": "Subtitle" },
+        ]);
+        b20_insert_source(&w.state, alpha, &alpha_file, streams).await;
+
+        let body = serde_json::json!({ "SourcePath": install });
+        let preview = b20_preview(&w, body.clone()).await;
+        let report = b20_run(&w, body).await;
+        for report in [&preview, &report] {
+            assert_eq!(b20_track_counts(report), (0, 0, 0, 2), "{name}: {report}");
+        }
+        let bob = b20_entry(&report, "bob").user_id.unwrap().to_string();
+        let tracks = b20_stored_tracks(&w.state, &bob, alpha).await;
+        assert_eq!(tracks, (None, None), "{name}: choices of another file");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_ids_count_for_matching() {
+    // The watch counts of the first run and of the second.
+    for (name, layout, first_watch, second_watch) in [
+        ("new", jf::Layout::New, (7, 5, 0, 2), (7, 0, 5, 2)),
+        ("old", jf::Layout::Old, (6, 5, 0, 1), (6, 0, 5, 1)),
+    ] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let mut body = b20_body(&w, &install);
+        let preview = b20_preview(&w, body.clone()).await;
+        let first = b20_run(&w, body.clone()).await;
+        for report in [&preview, &first] {
+            assert_eq!(b20_item_counts(report), (10, 5, 3, 2), "{name}: {report}");
+            assert_eq!(b20_watch_counts(report), first_watch, "{name}: {report}");
+            assert_eq!(
+                b20_meta_counts(report),
+                [1, 2, 0, 0, 0, 0],
+                "{name}: {report}"
+            );
+        }
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(fields["tmdb_id"], 111, "{name}: {fields}");
+        assert_eq!(
+            fields["overview"], "Jellyfin overview of Alpha.",
+            "{name}: the path match is the source"
+        );
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let expected = B20Data {
+            played: true,
+            play_count: 1,
+            last_played: b20_at("2025-04-01T08:00:00Z"),
+            ..Default::default()
+        };
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(
+            stored,
+            Some(expected),
+            "{name}: bob's row of the stale entry"
+        );
+
+        let rows = b20_db_digest(&w.state).await;
+        let meta = b20_meta_digest(&w.state).await;
+        body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 3, 2), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
+        assert_eq!(b20_meta_counts(&second), [0; 6], "{name}: {second}");
+        assert_eq!(b20_db_digest(&w.state).await, rows, "{name}: second run");
+        assert_eq!(b20_meta_digest(&w.state).await, meta, "{name}: second run");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_none_matches_on_stored_ids() {
+    // The watch counts of the first run and of the second.
+    for (name, layout, first_watch, second_watch) in [
+        ("new", jf::Layout::New, (7, 4, 0, 3), (7, 0, 4, 3)),
+        ("old", jf::Layout::Old, (6, 4, 0, 2), (6, 0, 4, 2)),
+    ] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let mut body = b20_body(&w, &install);
+        body["MetadataMode"] = serde_json::json!("None");
+        let first = b20_run(&w, body.clone()).await;
+        assert_eq!(b20_item_counts(&first), (10, 5, 2, 3), "{name}: {first}");
+        assert_eq!(b20_watch_counts(&first), first_watch, "{name}: {first}");
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(
+            fields["tmdb_id"],
+            serde_json::Value::Null,
+            "{name}: {fields}"
+        );
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(stored, None, "{name}: the stale entry matched");
+        body["ConfirmedMatches"] = b20_confirm(&w, &[("Alice", w.alice), ("bob", bob)]);
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second), second_watch, "{name}: {second}");
+    }
+}
+
+#[tokio::test]
+async fn b20_import_metadata_replace_keeps_rustyfins_ids() {
+    for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {
+        let (w, install) = b20_stale_world(name, layout).await;
+        let alpha = b20_item(&w.state, "Alpha").await;
+        let show = b20_item(&w.state, "Show").await;
+        // Rustyfin's own ids, which differ from Jellyfin's (TMDB 111 for Alpha, TVDB 333).
+        for (sql, id) in [
+            ("UPDATE media_items SET tmdb_id = 555 WHERE id = ?", alpha),
+            ("UPDATE media_items SET tvdb_id = 444 WHERE id = ?", show),
+        ] {
+            sqlx::query(sql)
+                .bind(id.to_string())
+                .execute(&w.state.db)
+                .await
+                .unwrap();
+        }
+        // Filling keeps Rustyfin's TMDB id, so the stale entry stays unmatched.
+        let fill = b20_preview(&w, serde_json::json!({ "SourcePath": install })).await;
+        assert_eq!(b20_item_counts(&fill), (10, 5, 2, 3), "{name}: {fill}");
+
+        // Replacing keeps them too: the ids decide what matches.
+        let body = serde_json::json!({ "SourcePath": install, "MetadataMode": "Replace" });
+        let preview = b20_preview(&w, body.clone()).await;
+        let first = b20_run(&w, body.clone()).await;
+        for report in [&preview, &first] {
+            assert_eq!(b20_item_counts(report), (10, 5, 2, 3), "{name}: {report}");
+        }
+        let fields = b20_fields(&w.state, alpha).await;
+        assert_eq!(fields["tmdb_id"], 555, "{name}: {fields}");
+        assert_eq!(
+            fields["name"], "Alpha",
+            "{name}: the stale entry renamed Alpha"
+        );
+        assert_eq!(
+            fields["overview"], "Jellyfin overview of Alpha.",
+            "{name}: Replace still replaces the other fields"
+        );
+        let fields = b20_fields(&w.state, show).await;
+        assert_eq!(fields["tvdb_id"], 444, "{name}: {fields}");
+        let bob = b20_entry(&first, "bob").user_id.unwrap();
+        let stored = b20_data(&w.state, bob, alpha).await;
+        assert_eq!(stored, None, "{name}: the stale entry's row was imported");
+
+        let rows = b20_db_digest(&w.state).await;
+        let meta = b20_meta_digest(&w.state).await;
+        let second = b20_run(&w, body).await;
+        assert_eq!(b20_item_counts(&second), (10, 5, 2, 3), "{name}: {second}");
+        assert_eq!(b20_watch_counts(&second).1, 0, "{name}: {second}");
+        assert_eq!(b20_meta_counts(&second), [0; 6], "{name}: {second}");
+        assert_eq!(
+            b20_db_digest(&w.state).await,
+            rows,
+            "{name}: the second run changed rows"
+        );
+        assert_eq!(
+            b20_meta_digest(&w.state).await,
+            meta,
+            "{name}: the second run changed metadata"
+        );
+    }
 }

@@ -86,9 +86,14 @@ async fn serve_image(
     let image_type = ImageType::from_str(image_type_str)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
 
-    let img = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("image not found".into()))?;
+    let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
+    // Imported people keep their images in `person_images`; try those before giving up.
+    let img = match found {
+        Some(img) => img,
+        None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+    };
 
     // A stored size spares the header read, but counts only when both sides are known.
     let stored_size = match (img.width, img.height) {

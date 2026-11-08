@@ -319,12 +319,12 @@ function navigate(page, data) {
     const pages = {
         home: renderHome,
         favorites: renderFavorites,
-        login: renderLogin,
+        login: () => renderLogin(data),
         library: () => renderLibrary(data),
         detail: () => renderDetail(data),
         search: () => renderSearch(data),
         person: () => renderPerson(data),
-        settings: renderSettings,
+        settings: () => renderSettings(data),
         admin: renderAdmin
     };
 
@@ -383,6 +383,12 @@ const clickActions = {
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'dir-open': el => navigateDirectoryPicker(el.dataset.path),
     'remove-path': el => removeSelectedPath(Number(el.dataset.index)),
+    'oidc-sign-in': () => startOidcSignIn(),
+    'oidc-link': () => startOidcLink(),
+    'oidc-unlink': el => unlinkOidc(el.dataset.id),
+    'oidc-remove-link': el => removeOidcLinkAsAdmin(el),
+    'oidc-copy-callback': () => copyOidcCallbackUrl(),
+    'oidc-save-settings': () => saveOidcAdminSettings(),
 };
 document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');
@@ -1551,13 +1557,21 @@ async function renderSearch(term) {
     term = decodeURIComponent(term || '').trim();
     if ($('search-input')) $('search-input').value = term;
     const page = $('page-search');
+    const showNoResults = () => {
+        page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+    };
+    // A blank term never reaches the server: /Search/Hints answers 400 to it.
+    if (!term) {
+        showNoResults();
+        return;
+    }
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
         const data = await API.search(term, 50);
         const hints = data.SearchHints || data.search_hints || [];
         if (!hints.length) {
-            page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+            showNoResults();
             return;
         }
         const items = hints.map(h => ({
@@ -2325,8 +2339,144 @@ async function togglePlayed(id, current) {
     }
 }
 
+// --- OpenID Connect: helpers for the sign-in page and the profile ---
+// The redirect codes of the OIDC flows, each mapped to its translation key. A code not listed here gets the
+// generic message; the code itself never reaches t().
+const OIDC_ERROR_KEYS = new Map([
+    ['cancelled', 'oidc.error.cancelled'],
+    ['state_mismatch', 'oidc.error.state_mismatch'],
+    ['expired', 'oidc.error.expired'],
+    ['disabled', 'oidc.error.disabled'],
+    ['provider_error', 'oidc.error.provider_error'],
+    ['invalid_token', 'oidc.error.invalid_token'],
+    ['no_username', 'oidc.error.no_username'],
+    ['not_allowed', 'oidc.error.not_allowed'],
+    ['name_taken', 'oidc.error.name_taken'],
+    ['name_taken_ask_admin', 'oidc.error.name_taken_ask_admin'],
+    ['already_linked', 'oidc.error.already_linked'],
+    ['account_disabled', 'oidc.error.account_disabled'],
+    ['server_error', 'oidc.error.server_error'],
+]);
+
+// The code of an 'oidc-error/<code>' route, or null for any other route.
+function oidcErrorCode(data) {
+    const match = /^oidc-error\/(.*)$/.exec(data || '');
+    return match ? match[1] : null;
+}
+
+function oidcErrorText(code) {
+    return t(OIDC_ERROR_KEYS.get(code) || 'oidc.error.unknown');
+}
+
+// Sends the browser to the provider. Only http(s) links are followed; anything else is an error.
+function goToOidcProvider(url) {
+    if (!/^https?:\/\//i.test(url || '')) throw new Error(t('oidc.error.provider_error'));
+    window.location.href = url;
+}
+
+function showLoginError(message) {
+    $('login-error').textContent = message;
+    show('login-error');
+}
+
+// Adds the provider button below the sign-in form when OIDC is on. A failed Info call counts as off.
+async function loadOidcSignIn() {
+    const info = await API.oidcInfo().catch(() => null);
+    const box = $('oidc-sign-in');
+    if (!info?.Enabled || !box) return;
+    const label = (info.ButtonLabel || '').trim() || t('oidc.sign_in_default');
+    box.innerHTML = `<button type="button" class="jf-btn-ghost w-full !py-3 !font-semibold text-sm mt-4" data-action="oidc-sign-in">${escapeHtml(label)}</button>`;
+}
+
+async function startOidcSignIn() {
+    try {
+        const { AuthorizationUrl } = await API.oidcStart();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        showLoginError(err.message);
+    }
+}
+
+// The flow is single-use, so the browser's return to #login/oidc is completed once per page load.
+let oidcCompleteStarted = false;
+
+async function completeOidcSignIn() {
+    if (oidcCompleteStarted) return;
+    oidcCompleteStarted = true;
+    const completed = await API.oidcComplete().then(() => true, () => false);
+    if (!completed) {
+        showLoginError(t('oidc.complete_failed'));
+        history.replaceState(null, '', '#login');
+        return;
+    }
+    await finishSignIn();
+}
+
+// Starts linking the signed-in account. The provider's callback returns to #settings.
+async function startOidcLink() {
+    try {
+        const { AuthorizationUrl } = await API.oidcLink();
+        goToOidcProvider(AuthorizationUrl);
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+async function unlinkOidc(userId) {
+    if (!confirm(t('oidc.unlink_confirm'))) return;
+    try {
+        await API.oidcUnlink(userId);
+        toast(t('oidc.unlinked'));
+        renderSettings();
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+}
+
+// The profile gets the result of a link as #settings/oidc-linked or #settings/oidc-error/<code>. It is toasted
+// once, then the hash is cleared so that a reload does not repeat it.
+function showOidcLinkResult(data) {
+    const code = oidcErrorCode(data);
+    if (code !== null) toast(oidcErrorText(code), 'error');
+    else if (data === 'oidc-linked') toast(t('oidc.linked'));
+    else return;
+    history.replaceState(null, '', '#settings');
+}
+
+// The profile's "Single sign-on" card. Not linked: a link button, when OIDC is on. Linked: the provider login
+// and Unlink, which is disabled with the reason when the server says CanUnlink is false.
+function oidcCardHtml(enabled, account) {
+    let body;
+    if (account?.Linked) {
+        const linkedAt = account.LinkedAt ? new Date(account.LinkedAt).toLocaleString() : '—';
+        const canUnlink = Boolean(account.CanUnlink);
+        const reason = account.HasPassword ? t('oidc.unlink_password_off') : t('oidc.unlink_needs_password');
+        const linkedAs = t('oidc.linked_as', { name: account.ProviderUsername || '', date: linkedAt });
+        body = `
+            <p class="text-sm text-white/80">${escapeHtml(linkedAs)}</p>
+            <div class="flex flex-wrap items-center gap-3 mt-4">
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs${canUnlink ? '' : ' !cursor-not-allowed !opacity-50 disabled:pointer-events-none'}" data-action="oidc-unlink" data-id="${escapeHtml(account.UserId)}"${canUnlink ? '' : ' disabled'}>${t('oidc.unlink')}</button>
+                ${canUnlink ? '' : `<span class="text-xs text-white/40">${escapeHtml(reason)}</span>`}
+            </div>`;
+    } else {
+        body = `
+            <p class="text-sm text-white/60">${t('oidc.not_linked')}</p>
+            ${enabled ? `<button type="button" class="jf-btn-primary !py-2 !px-4 text-xs mt-4" data-action="oidc-link">${t('oidc.link')}</button>` : ''}`;
+    }
+    return `
+        <div class="jf-settings-card">
+            <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-[#38bdf8]"></span>
+                ${t('oidc.account_title')}
+            </h3>
+            ${body}
+        </div>`;
+}
+
 // --- Login Page Renderer ---
-function renderLogin() {
+let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
+function renderLogin(data) {
+    pendingSetup = null;
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
@@ -2349,24 +2499,87 @@ function renderLogin() {
                 </button>
                 <div id="login-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
             </form>
+            <div id="oidc-sign-in"></div>
         </div>
     </div>`);
+    loadOidcSignIn();
+    const oidcError = oidcErrorCode(data);
+    if (data === 'oidc') completeOidcSignIn();
+    else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
+}
+
+// The steps after any sign-in: password, setup code or OpenID Connect.
+async function finishSignIn() {
+    updateAuthUI();
+    // Replace a socket or retry left from an earlier session, so the new token is used now
+    stopScanProgressWebSocket();
+    initScanProgressWebSocket();
+    await loadSidebar();
+    navigate('home');
+    toast(t('login.welcome_back', { name: API.userName }));
 }
 
 async function handleLogin(e) {
     e.preventDefault();
+    const username = $('login-user').value;
+    const password = $('login-pass').value;
     try {
-        await API.login($('login-user').value, $('login-pass').value);
-        updateAuthUI();
-        // Replace a socket or retry left from an earlier session, so the new token is used now
-        stopScanProgressWebSocket();
-        initScanProgressWebSocket();
-        await loadSidebar();
-        navigate('home');
-        toast(t('login.welcome_back', { name: API.userName }));
+        await API.login(username, password);
     } catch (err) {
-        $('login-error').textContent = err.message;
-        show('login-error');
+        if (err.setupRequired) {
+            renderSetupPassword(username, password);
+            return;
+        }
+        showLoginError(err.status === 403 ? t('oidc.password_sign_in_off') : err.message);
+        return;
+    }
+    await finishSignIn();
+}
+
+// Shown when a sign-in answers "setup required" for an imported user. The code is kept in memory only.
+function renderSetupPassword(username, code) {
+    pendingSetup = { username, code };
+    html('page-login', `
+    <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
+        <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
+            <div class="text-center mb-8">
+                <img src="/web/assets/logo.png" alt="Rustyfin" class="w-20 h-20 mx-auto rounded-2xl shadow-xl mb-3 p-1 bg-white/5 border border-white/10">
+                <h2 class="text-2xl font-black text-white tracking-tight">${t('jellyfin_import.setup_title')}</h2>
+                <p class="text-white/40 text-xs mt-1">${t('jellyfin_import.setup_text', { name: escapeHtml(username) })}</p>
+            </div>
+            <form id="setup-form" onsubmit="handleSetupPassword(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.new_password')}</label>
+                    <input type="password" id="setup-pass" class="jf-input w-full" autocomplete="new-password" autofocus>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.confirm_password')}</label>
+                    <input type="password" id="setup-pass2" class="jf-input w-full" autocomplete="new-password">
+                </div>
+                <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg mt-2">
+                    ${t('jellyfin_import.setup_submit')}
+                </button>
+                <div id="setup-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+                <button type="button" id="setup-back" class="w-full text-xs text-white/50 hover:text-white transition py-2" onclick="pendingSetup = null; renderLogin()">${t('jellyfin_import.back')}</button>
+            </form>
+        </div>
+    </div>`);
+}
+
+async function handleSetupPassword(e) {
+    e.preventDefault();
+    const pw = $('setup-pass').value;
+    const pw2 = $('setup-pass2').value;
+    const fail = message => { $('setup-error').textContent = message; show('setup-error'); };
+    if (!pw) return fail(t('jellyfin_import.password_required'));
+    if (pw !== pw2) return fail(t('jellyfin_import.password_mismatch'));
+    if (!pendingSetup) { renderLogin(); return; }
+    try {
+        await API.loginWithSetupCode(pendingSetup.username, pendingSetup.code, pw);
+        pendingSetup = null;
+        await finishSignIn();
+    } catch (err) {
+        fail(err.status === 401 ? t('jellyfin_import.code_invalid') : err.message);
     }
 }
 
@@ -2393,7 +2606,7 @@ async function authorizeQuickConnect() {
         return;
     }
     try {
-        await API.post('/QuickConnect/Authorize', { Code: code });
+        await API.post('/QuickConnect/Authorize?code=' + encodeURIComponent(code));
         toast(t('quick_connect.authorized'));
         $('qc-modal')?.close();
     } catch (e) {
@@ -2402,14 +2615,17 @@ async function authorizeQuickConnect() {
 }
 
 // --- Settings Page Renderer ---
-async function renderSettings() {
+async function renderSettings(data) {
+    showOidcLinkResult(data);
     const page = $('page-settings');
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
-        const [me, config] = await Promise.all([
+        const [me, config, ssoInfo, ssoAccount] = await Promise.all([
             API.getMe().catch(() => ({})),
-            API.getConfig().catch(() => null)
+            API.getConfig().catch(() => null),
+            API.oidcInfo().catch(() => null),
+            API.oidcAccount(API.userId).catch(() => null)
         ]);
 
         const name = me.Name || me.name || API.userName || '';
@@ -2459,6 +2675,10 @@ async function renderSettings() {
             </div>`;
         }
 
+        // Without the account (its request failed) the current password stays required.
+        const hasPassword = ssoAccount?.HasPassword ?? true;
+        const ssoHtml = (ssoInfo?.Enabled || ssoAccount?.Linked) ? oidcCardHtml(Boolean(ssoInfo?.Enabled), ssoAccount) : '';
+
         page.innerHTML = `
         <div class="max-w-3xl mx-auto jf-page">
             <h1 class="text-2xl lg:text-3xl font-extrabold text-white mb-6">${t('settings.title')}</h1>
@@ -2496,13 +2716,16 @@ async function renderSettings() {
                     ${t('settings.change_password')}
                 </h3>
                 <form id="change-password-form" class="space-y-3">
-                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" required>
+                    <input type="password" id="pw-current" class="jf-input w-full" placeholder="${escapeHtml(t('settings.current_password'))}" ${hasPassword ? 'required' : ''}>
+                    ${hasPassword ? '' : `<p class="text-xs text-white/40">${t('oidc.no_current_password')}</p>`}
                     <input type="password" id="pw-new" class="jf-input w-full" placeholder="${escapeHtml(t('settings.new_password'))}" required>
                     <input type="password" id="pw-confirm" class="jf-input w-full" placeholder="${escapeHtml(t('settings.confirm_new_password'))}" required>
                     <button type="submit" class="jf-btn-primary text-xs">${t('settings.save_password')}</button>
                     <span id="pw-msg" class="text-xs ml-3 hidden"></span>
                 </form>
             </div>
+
+            ${ssoHtml}
 
             ${serverCfgHtml}
         </div>`;
@@ -2557,6 +2780,9 @@ async function handleSaveConfig(e) {
 }
 
 // --- Admin Dashboard Renderer ---
+// AccountStatus.UserId has hyphens and a user's Id may not, so account ids are compared without case and hyphens.
+function oidcAccountKey(id) { return String(id).toLowerCase().replace(/-/g, ''); }
+
 async function renderAdmin() {
     const page = $('page-admin');
     if (!API.isAdmin) {
@@ -2566,19 +2792,22 @@ async function renderAdmin() {
 
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
+    if (!(await API.recheckAdmin())) return;
     try {
         let libsError = null;
-        const [users, libs, tasks, plugins, info, sessions] = await Promise.all([
+        const [users, libs, tasks, plugins, info, sessions, accounts] = await Promise.all([
             API.getUsers().catch(() => []),
             API.getLibraries().catch(err => { libsError = err; return []; }),
             API.getTasks().catch(() => []),
             API.getPlugins().catch(() => []),
             API.getFullInfo().catch(() => ({})),
-            API.getSessions().catch(() => [])
+            API.getSessions().catch(() => []),
+            API.oidcAccounts().catch(() => [])
         ]);
+        const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2650,19 +2879,26 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('oidc.provider_column'))}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-white/5">
-                            ${users.map(u => `
+                            ${users.map(u => {
+                                const name = u.Name || u.name;
+                                const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
+                                const account = accountById.get(oidcAccountKey(u.Id || u.id));
+                                return `
                             <tr>
-                                <td class="py-3 font-bold text-white">${escapeHtml(u.Name || u.name)}</td>
-                                <td class="py-3">${(u.Policy?.IsAdministrator || u.policy?.is_administrator) ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${t('admin.role_admin')}</span>` : `<span class="text-white/40">${t('admin.role_user')}</span>`}</td>
+                                <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
+                                <td class="py-3">${isAdmin ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_admin'))}</span>${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span>` : ''}` : `<span class="text-white/40">${escapeHtml(t('admin.role_user'))}</span>`}</td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
+                                <td class="py-3 text-white/60">${account?.Linked ? `${escapeHtml(account.ProviderUsername || '—')} <button type="button" class="ml-2 text-[#00a4dc] hover:text-[#38bdf8] font-semibold" data-action="oidc-remove-link" data-id="${escapeHtml(account.UserId)}" data-name="${escapeHtml(name)}">${escapeHtml(t('oidc.remove_link'))}</button>` : '<span class="text-white/40">—</span>'}</td>
                                 <td class="py-3 text-right">
                                     <button class="text-red-400 hover:text-red-300 font-semibold" data-action="delete-user" data-id="${escapeHtml(u.Id || u.id)}">${t('common.delete')}</button>
                                 </td>
-                            </tr>`).join('')}
+                            </tr>`;
+                            }).join('')}
                         </tbody>
                     </table>
                 </div>
@@ -2773,6 +3009,11 @@ async function renderAdmin() {
                     <p class="text-[10px] text-white/20 mt-2">${t('admin.live_log_hint')}</p>
                 </div>
             </div>
+
+            <!-- Tab 7: Sign-in (OpenID Connect settings, filled by loadOidcAdminTab) -->
+            <div id="admin-signin" class="hidden jf-settings-card"></div>
+
+            ${jiPanelHtml()}
         </div>`;
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
@@ -2785,13 +3026,642 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
 
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
+    if (tabId === 'admin-signin') loadOidcAdminTab();
+    if (tabId === 'admin-import') loadJellyfinImport();
+}
+
+// An administrator removes another user's provider link. The users tab is shown again after the page is rendered.
+async function removeOidcLinkAsAdmin(el) {
+    if (!confirm(t('oidc.remove_link_confirm', { name: el.dataset.name }))) return;
+    try {
+        await API.oidcUnlink(el.dataset.id);
+    } catch (err) {
+        toast(err.message, 'error');
+        return;
+    }
+    toast(t('oidc.unlinked'));
+    await renderAdmin();
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
+}
+
+// --- OpenID Connect settings (admin "Sign-in" tab) ---
+
+async function loadOidcAdminTab() {
+    let settings;
+    try {
+        settings = await API.oidcSettings();
+    } catch {
+        const box = $('admin-signin');
+        if (box) box.innerHTML = `<p class="text-xs text-red-400">${escapeHtml(t('oidc.load_failed'))}</p>`;
+        return;
+    }
+    renderOidcAdminSettings(settings);
+}
+
+// Renders the form from an OidcSettings object. The client secret field is always empty: a saved secret shows only in the placeholder.
+function renderOidcAdminSettings(s) {
+    const box = $('admin-signin');
+    if (!box) return;
+    const label = (id, key) => `<label for="${id}" class="block text-xs font-semibold text-white/70 mb-1.5">${escapeHtml(t(key))}</label>`;
+    const hint = key => `<p class="text-xs text-white/40 mt-1">${escapeHtml(t(key))}</p>`;
+    const warn = key => `<p class="text-xs text-amber-300/80 mt-1">${escapeHtml(t(key))}</p>`;
+    const check = (id, key, checked = false) => `
+            <div class="flex items-center gap-3">
+                <input type="checkbox" id="${id}" class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"${checked ? ' checked' : ''}>
+                <label for="${id}" class="text-sm text-white/70">${escapeHtml(t(key))}</label>
+            </div>`;
+    const callbackRow = s.CallbackUrl
+        ? `<div class="flex gap-2">
+                <input id="oidc-callback-url" class="jf-input w-full" value="${escapeHtml(s.CallbackUrl)}" readonly>
+                <button type="button" class="jf-btn-ghost !py-2 !px-4 text-xs whitespace-nowrap" data-action="oidc-copy-callback">${escapeHtml(t('oidc.copy'))}</button>
+            </div>`
+        : hint('oidc.callback_after_save');
+
+    box.innerHTML = `
+        <h3 class="font-bold text-white text-base mb-4">${escapeHtml(t('oidc.settings_title'))}</h3>
+        <div class="space-y-4 max-w-2xl">
+            ${check('oidc-enabled', 'oidc.enabled', s.Enabled)}
+            <div>
+                ${label('oidc-issuer-url', 'oidc.issuer_url')}
+                <input id="oidc-issuer-url" type="text" class="jf-input w-full" value="${escapeHtml(s.IssuerUrl)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-id', 'oidc.client_id')}
+                <input id="oidc-client-id" type="text" class="jf-input w-full" value="${escapeHtml(s.ClientId)}" spellcheck="false" autocomplete="off">
+            </div>
+            <div>
+                ${label('oidc-client-secret', 'oidc.client_secret')}
+                <input id="oidc-client-secret" type="password" class="jf-input w-full" autocomplete="new-password" placeholder="${escapeHtml(t(s.HasClientSecret ? 'oidc.secret_saved_placeholder' : 'oidc.secret_none_placeholder'))}">
+                ${s.HasClientSecret ? `<div class="mt-2">${check('oidc-remove-secret', 'oidc.remove_secret')}</div>` : ''}
+            </div>
+            <div>
+                ${label('oidc-scopes', 'oidc.scopes')}
+                <input id="oidc-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.Scopes)}" spellcheck="false" autocomplete="off">
+                ${hint('oidc.scopes_hint')}
+                <div class="mt-3">
+                    ${label('oidc-effective-scopes', 'oidc.effective_scopes')}
+                    <input id="oidc-effective-scopes" type="text" class="jf-input w-full" value="${escapeHtml(s.EffectiveScopes)}" readonly>
+                </div>
+            </div>
+            <div>
+                ${label('oidc-button-label', 'oidc.button_label')}
+                <input id="oidc-button-label" type="text" class="jf-input w-full" value="${escapeHtml(s.ButtonLabel)}" placeholder="${escapeHtml(t('oidc.sign_in_default'))}">
+            </div>
+            <div>
+                ${label('oidc-username-claim', 'oidc.username_claim')}
+                <input id="oidc-username-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.UsernameClaim)}">
+            </div>
+            <div>
+                ${label('oidc-group-claim', 'oidc.group_claim')}
+                <input id="oidc-group-claim" type="text" class="jf-input w-full" value="${escapeHtml(s.GroupClaim)}">
+            </div>
+            <div>
+                ${label('oidc-allowed-group', 'oidc.allowed_group')}
+                <input id="oidc-allowed-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AllowedGroup)}">
+                ${hint('oidc.allowed_group_hint')}
+            </div>
+            <div>
+                ${label('oidc-admin-group', 'oidc.admin_group')}
+                <input id="oidc-admin-group" type="text" class="jf-input w-full" value="${escapeHtml(s.AdminGroup)}">
+                ${hint('oidc.admin_group_hint')}
+                ${warn('oidc.warn_groups')}
+            </div>
+            <div>
+                ${label('oidc-public-url', 'oidc.public_url')}
+                <input id="oidc-public-url" type="text" class="jf-input w-full" value="${escapeHtml(s.PublicUrl || location.origin)}">
+            </div>
+            <div>
+                ${label('oidc-callback-url', 'oidc.callback_url')}
+                ${callbackRow}
+            </div>
+            <div>
+                ${check('oidc-allow-password', 'oidc.allow_password', s.AllowPasswordSignIn)}
+                ${warn('oidc.warn_password_off')}
+            </div>
+            <div id="oidc-settings-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+            <div class="flex justify-end">
+                <button type="button" class="jf-btn-primary text-xs" data-action="oidc-save-settings">${escapeHtml(t('oidc.save'))}</button>
+            </div>
+        </div>`;
+}
+
+// Copies the callback URL. navigator.clipboard is missing on plain-http LAN addresses, so the field is selected for execCommand.
+async function copyOidcCallbackUrl() {
+    const input = $('oidc-callback-url');
+    if (!input) return;
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+        copied = await navigator.clipboard.writeText(input.value).then(() => true, () => false);
+    }
+    if (!copied) {
+        input.select();
+        copied = document.execCommand('copy');
+    }
+    if (copied) toast(t('oidc.copied'));
+    else toast(t('oidc.copy_failed'), 'error');
+}
+
+// The form stays as typed when the server refuses the save: the error text goes into the card, not over the form.
+async function saveOidcAdminSettings() {
+    const text = id => $(id).value;
+    const body = {
+        Enabled: $('oidc-enabled').checked,
+        IssuerUrl: text('oidc-issuer-url'),
+        ClientId: text('oidc-client-id'),
+        Scopes: text('oidc-scopes'),
+        ButtonLabel: text('oidc-button-label'),
+        UsernameClaim: text('oidc-username-claim'),
+        GroupClaim: text('oidc-group-claim'),
+        AllowedGroup: text('oidc-allowed-group'),
+        AdminGroup: text('oidc-admin-group'),
+        PublicUrl: text('oidc-public-url'),
+        AllowPasswordSignIn: $('oidc-allow-password').checked,
+    };
+    const secret = text('oidc-client-secret');
+    if ($('oidc-remove-secret')?.checked) body.ClientSecret = '';
+    else if (secret) body.ClientSecret = secret;
+
+    hide('oidc-settings-error');
+    let saved;
+    try {
+        saved = await API.saveOidcSettings(body);
+    } catch (err) {
+        $('oidc-settings-error').textContent = err.message;
+        show('oidc-settings-error');
+        return;
+    }
+    toast(t('oidc.settings_saved'));
+    renderOidcAdminSettings(saved);
+}
+
+// --- Jellyfin import (B20) ---
+// Admin tab: imports users, watch data and track choices from a Jellyfin data folder.
+let jiPreviewed = false; // a preview is on screen; from then on the request carries the pairs and the checked users
+let jiRunning = false;   // the last status read said Running
+let jiTimer = null;      // the one status poll loop
+const jiChoice = new Map();     // JellyfinId -> checked; kept across previews of the same folder and layout
+const jiConfirm = new Map();    // JellyfinId -> UserId of a ticked suggested match; kept like jiChoice
+let jiPendingNames = new Map(); // UserId -> Name of the pending users (names stay out of onclick attributes)
+const jiShownCodes = new Map(); // UserId -> { name, code } of a new code shown in the pending list
+const jiLayoutKeys = { New: 'jellyfin_import.layout_new', Old: 'jellyfin_import.layout_old' };
+const jiMetadataModeKeys = { FillEmpty: 'jellyfin_import.metadata_fill_empty', Replace: 'jellyfin_import.metadata_replace', None: 'jellyfin_import.metadata_none' };
+const jiStageKeys = {
+    Reading: 'jellyfin_import.stage_reading',
+    Matching: 'jellyfin_import.stage_matching',
+    Users: 'jellyfin_import.stage_users',
+    WatchData: 'jellyfin_import.stage_watch_data',
+    Metadata: 'jellyfin_import.stage_metadata'
+};
+const jiActionKeys = {
+    Match: 'jellyfin_import.action_match',
+    Create: 'jellyfin_import.action_create',
+    Skip: 'jellyfin_import.action_skip'
+};
+const jiReasonKeys = {
+    Ambiguous: 'jellyfin_import.reason_ambiguous',
+    NotSelected: 'jellyfin_import.reason_not_selected',
+    NotConfirmed: 'jellyfin_import.reason_not_confirmed',
+    ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other'
+};
+
+function jiPanelHtml() {
+    return `
+    <div id="admin-import" class="hidden space-y-6">
+        <div class="jf-settings-card">
+            <h3 class="font-bold text-white text-base mb-2">${t('jellyfin_import.title')}</h3>
+            <p class="text-xs text-white/60 mb-3">${t('jellyfin_import.help_intro')}</p>
+            <p class="text-xs text-white/60 mb-2">${t('jellyfin_import.help_mount')}</p>
+            <pre class="text-[11px] font-mono bg-black/50 border border-white/10 rounded-lg p-3 text-white/80 overflow-x-auto">-v /path/to/jellyfin/config:/import/jellyfin:ro</pre>
+            <p class="text-xs text-white/60 mt-3">${t('jellyfin_import.help_path')}</p>
+            <div class="grid gap-4 sm:grid-cols-2 mt-5">
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.folder')}</span>
+                    <input type="text" id="ji-source" class="jf-input w-full" placeholder="/import/jellyfin" oninput="jiForget()">
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.layout')}</span>
+                    <select id="ji-layout" class="jf-input w-full" onchange="jiForget()">
+                        <option value="Auto">${t('jellyfin_import.layout_auto')}</option>
+                        <option value="New">${t('jellyfin_import.layout_new')}</option>
+                        <option value="Old">${t('jellyfin_import.layout_old')}</option>
+                    </select>
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.metadata')}</span>
+                    <select id="ji-metadata" class="jf-input w-full">
+                        <option value="FillEmpty">${t('jellyfin_import.metadata_fill_empty')}</option>
+                        <option value="Replace">${t('jellyfin_import.metadata_replace')}</option>
+                        <option value="None">${t('jellyfin_import.metadata_none')}</option>
+                    </select>
+                    <span class="block text-xs text-white/50 mt-1.5">${t('jellyfin_import.metadata_help')}</span>
+                </label>
+            </div>
+            <button id="ji-preview-btn" class="jf-btn-primary !py-2 !px-4 text-sm mt-5" onclick="jiPreview()">${t('jellyfin_import.preview')}</button>
+        </div>
+
+        <div id="ji-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+
+        <div id="ji-preview" class="hidden jf-settings-card space-y-5">
+            <p id="ji-found" class="text-xs text-white/70"></p>
+            <div>
+                <h4 class="font-semibold text-white text-sm">${t('jellyfin_import.pairs_title')}</h4>
+                <p class="text-xs text-white/50 mb-3">${t('jellyfin_import.pairs_help')}</p>
+                <div id="ji-pairs" class="space-y-2"></div>
+                <button id="ji-add-pair" class="jf-btn-ghost !py-1.5 !px-3 text-xs mt-3" onclick="jiAddPair()">${t('jellyfin_import.add_pair')}</button>
+                <div id="ji-unpaired" class="mt-3 space-y-1"></div>
+            </div>
+            <div>
+                <h4 class="font-semibold text-white text-sm mb-2">${t('jellyfin_import.users_title')}</h4>
+                <div id="ji-users" class="space-y-2"></div>
+            </div>
+            <div id="ji-counts" class="space-y-1 text-xs text-white/70"></div>
+            <div id="ji-samples" class="space-y-1"></div>
+            <button id="ji-run-btn" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiRun()">${t('jellyfin_import.run')}</button>
+        </div>
+
+        <div id="ji-progress" class="hidden jf-settings-card space-y-3">
+            <p id="ji-progress-text" class="text-sm text-white"></p>
+            <div id="ji-progress-detail">
+                <div class="h-2 rounded-full bg-white/10 overflow-hidden"><div id="ji-bar" class="h-2 bg-[#00a4dc]" style="width: 0%"></div></div>
+                <p id="ji-progress-count" class="text-xs text-white/50 mt-2"></p>
+            </div>
+        </div>
+
+        <div id="ji-result" class="hidden jf-settings-card space-y-4">
+            <p id="ji-result-text" class="text-sm font-semibold text-white"></p>
+            <div id="ji-result-report" class="space-y-2 text-xs text-white/70"></div>
+            <div id="ji-codes-box" class="hidden rounded-xl border border-amber-400/40 bg-amber-500/10 p-4 space-y-3">
+                <h4 class="font-bold text-amber-300 text-sm">${t('jellyfin_import.codes_title')}</h4>
+                <p class="text-xs font-semibold text-amber-200">${t('jellyfin_import.codes_warning')}</p>
+                <table id="ji-codes" class="w-full text-sm"></table>
+                <button id="ji-copy-codes" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiCopyCodes()">${t('jellyfin_import.copy_codes')}</button>
+            </div>
+            <p id="ji-former-admins" class="hidden text-xs text-amber-300"></p>
+        </div>
+
+        <div id="ji-pending" class="jf-settings-card">
+            <h4 class="font-semibold text-white text-sm">${t('jellyfin_import.pending_title')}</h4>
+            <p class="text-xs text-white/50 mb-3">${t('jellyfin_import.pending_help')}</p>
+            <div id="ji-pending-list"></div>
+        </div>
+    </div>`;
+}
+
+function jiPairRowHtml(from, to) {
+    return `
+    <div class="ji-pair flex items-center gap-2">
+        <input type="text" class="ji-from jf-input flex-1 font-mono text-xs" placeholder="${escapeHtml(t('jellyfin_import.pair_from'))}" value="${escapeHtml(from)}">
+        <span class="text-white/40 text-xs">→</span>
+        <input type="text" class="ji-to jf-input flex-1 font-mono text-xs" placeholder="${escapeHtml(t('jellyfin_import.pair_to'))}" value="${escapeHtml(to)}">
+        <button type="button" class="ji-pair-remove jf-btn-ghost !py-1 !px-2 text-xs" title="${escapeHtml(t('jellyfin_import.remove_pair'))}" onclick="this.closest('.ji-pair').remove()">×</button>
+    </div>`;
+}
+
+function jiAddPair() {
+    $('ji-pairs').insertAdjacentHTML('beforeend', jiPairRowHtml('', ''));
+}
+
+// The pairs with both sides filled, trimmed.
+function jiPairs() {
+    return [...document.querySelectorAll('#ji-pairs .ji-pair')]
+        .map(row => ({ From: row.querySelector('.ji-from').value.trim(), To: row.querySelector('.ji-to').value.trim() }))
+        .filter(p => p.From && p.To);
+}
+
+// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs, checked users and ticked matches.
+function jiRequest() {
+    const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value, MetadataMode: $('ji-metadata').value };
+    if (jiPreviewed) {
+        req.PathMappings = jiPairs();
+        req.UserIds = [...document.querySelectorAll('#ji-users .ji-user:checked:not(:disabled)')].map(el => el.value);
+        req.ConfirmedMatches = [...document.querySelectorAll('#ji-users .ji-confirm:checked')]
+            .map(el => ({ JellyfinId: el.value, UserId: el.dataset.userId }));
+    }
+    return req;
+}
+
+function jiBusy(busy) {
+    ['ji-preview-btn', 'ji-run-btn'].forEach(id => { const b = $(id); if (b) b.disabled = busy; });
+}
+
+function jiShowError(message) {
+    $('ji-error').textContent = message;
+    show('ji-error');
+}
+
+// A changed folder or layout forgets the preview, its pairs and the checkbox choices.
+function jiForget() {
+    jiPreviewed = false;
+    jiChoice.clear();
+    jiConfirm.clear();
+    $('ji-pairs').innerHTML = '';
+    $('ji-users').innerHTML = '';
+    hide('ji-preview');
+}
+
+function jiSetChoice(el) {
+    jiChoice.set(el.value, el.checked);
+}
+
+function jiSetConfirm(el) {
+    if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
+    else jiConfirm.delete(el.value);
+}
+
+async function jiPreview() {
+    const btn = $('ji-preview-btn');
+    btn.disabled = true;
+    btn.textContent = t('jellyfin_import.previewing');
+    hide('ji-error');
+    try {
+        jiRenderPreview(await API.jellyfinImportPreview(jiRequest()));
+    } catch (err) {
+        jiShowError(err.message);
+    } finally {
+        btn.disabled = jiRunning;
+        btn.textContent = t('jellyfin_import.preview');
+    }
+}
+
+function jiRenderPreview(r) {
+    jiPreviewed = true;
+    $('ji-found').innerHTML = t('jellyfin_import.found', { layout: t(jiLayoutKeys[r.Layout]), path: escapeHtml(r.DataPath) });
+    $('ji-pairs').innerHTML = (r.PathMappings || []).map(m => jiPairRowHtml(m.From, m.To)).join('');
+    $('ji-unpaired').innerHTML = jiUnpairedHtml(r);
+    $('ji-users').innerHTML = jiUsersHtml(r.Users || []);
+    $('ji-counts').innerHTML = jiCountsHtml(r);
+    $('ji-samples').innerHTML = jiSamplesHtml(r);
+    show('ji-preview');
+}
+
+function jiUsersHtml(users) {
+    return users.map(u => {
+        const ambiguous = u.Reason === 'Ambiguous';
+        const checked = !ambiguous && (jiChoice.has(u.JellyfinId) ? jiChoice.get(u.JellyfinId) : true);
+        return `
+        <div>
+            <label class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
+                <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
+                <span class="font-semibold">${escapeHtml(u.Name)}</span>
+                ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
+                <span class="text-xs text-white/50">${jiActionText(u)}</span>
+            </label>${jiConfirmHtml(u)}
+        </div>`;
+    }).join('');
+}
+
+// A name match goes into the existing account only when its box is ticked. It starts unticked, and
+// stays ticked only while the suggestion names the same account. Account names are escaped.
+function jiConfirmHtml(u) {
+    const s = u.SuggestedMatch;
+    if (!s) return '';
+    const checked = jiConfirm.get(u.JellyfinId) === s.UserId;
+    return `
+            <label class="flex items-center gap-2 ml-7 mt-1 text-xs text-white/70">
+                <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''}>
+                <span>${t('jellyfin_import.confirm_match', { name: escapeHtml(s.Name) })}</span>
+            </label>`;
+}
+
+// "Action", or "Action: reason" when there is a reason. The translations are static text.
+function jiActionText(u) {
+    const action = t(jiActionKeys[u.Action]);
+    return u.Reason ? `${action}: ${t(jiReasonKeys[u.Reason])}` : action;
+}
+
+// Counts are numbers and are not escaped: escapeHtml(0) would be ''.
+function jiCountsHtml(r) {
+    const { Items: i, WatchData: w, Tracks: k, Metadata: m } = r;
+    let metadata = '';
+    if (m && m.Mode === 'None') {
+        metadata = `<p>${t('jellyfin_import.metadata_summary_none')}</p>`;
+    } else if (m) {
+        metadata = `<p>${t('jellyfin_import.metadata_summary', { mode: t(jiMetadataModeKeys[m.Mode]), items: m.Items, fields: m.Fields, people: m.People, images: m.Images, missing: m.ImagesMissing, locked: m.Locked })}</p>`;
+    }
+    return `
+        <p>${t('jellyfin_import.items_summary', { total: i.Total, by_path: i.MatchedByPath, by_id: i.MatchedById, unmatched: i.Unmatched })}</p>
+        <p>${t('jellyfin_import.watch_summary', { rows: w.Rows, imported: w.Imported, unchanged: w.Unchanged, unmatched: w.Unmatched })}</p>
+        <p>${t('jellyfin_import.tracks_summary', { audio: k.Audio, subtitle: k.Subtitle, off: k.SubtitleOff, unmapped: k.Unmapped })}</p>${metadata}`;
+}
+
+function jiUnpairedHtml(r) {
+    const paths = r.UnpairedLibraryPaths || [];
+    if (!paths.length) return '';
+    return `
+        <p class="text-xs text-amber-300">${t('jellyfin_import.unpaired')}</p>
+        <ul class="font-mono text-[11px] text-white/60 space-y-0.5">${paths.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`;
+}
+
+function jiSamplesHtml(r) {
+    const samples = r.Items.UnmatchedSamples || [];
+    if (!samples.length) return '';
+    return `
+        <p class="text-xs font-semibold text-white/70 mt-2">${t('jellyfin_import.samples_title')}</p>
+        <ul class="text-xs text-white/60 space-y-0.5">${samples.map(s => `<li>${escapeHtml(s.Type)} · ${escapeHtml(s.Name)} · <span class="font-mono text-[11px]">${escapeHtml(s.Path)}</span></li>`).join('')}</ul>`;
+}
+
+function jiUserActionsHtml(users) {
+    if (!users.length) return '';
+    return `
+        <p class="font-semibold text-white/80">${t('jellyfin_import.users_title')}</p>
+        <ul class="space-y-0.5">${users.map(u => `<li><span class="text-white">${escapeHtml(u.Name)}</span>${u.WasAdministrator ? ` <span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''} · ${jiActionText(u)}</li>`).join('')}</ul>`;
+}
+
+async function jiRun() {
+    const req = jiRequest();
+    jiBusy(true);
+    hide('ji-error');
+    try {
+        await API.jellyfinImportRun(req);
+    } catch (err) {
+        jiShowError(err.message);
+        jiBusy(false);
+        return;
+    }
+    jiRunning = true;
+    jiShowProgress({ Stage: null, Done: 0, Total: 0 });
+    jiPoll();
+}
+
+// Running: the stage, or "starting" before the first one; a bar and a count when the total is known.
+function jiShowProgress(st) {
+    show('ji-progress');
+    hide('ji-result');
+    $('ji-progress-text').innerHTML = st.Stage
+        ? t('jellyfin_import.running', { stage: t(jiStageKeys[st.Stage]) })
+        : t('jellyfin_import.starting');
+    if (st.Total > 0) {
+        $('ji-bar').style.width = `${Math.min(100, Math.round(100 * st.Done / st.Total))}%`;
+        $('ji-progress-count').innerHTML = t('jellyfin_import.progress', { done: st.Done, total: st.Total });
+        show('ji-progress-detail');
+    } else {
+        hide('ji-progress-detail');
+    }
+}
+
+// Completed: the report and the new users' codes (the first read after completion carries them). Failed: the error.
+function jiShowResult(st) {
+    hide('ji-progress');
+    if (st.State === 'Failed') {
+        show('ji-result');
+        $('ji-result-text').innerHTML = t('jellyfin_import.failed', { error: escapeHtml(st.Error) });
+        $('ji-result-report').innerHTML = '';
+        hide('ji-codes-box');
+        hide('ji-former-admins');
+        return;
+    }
+    if (st.State !== 'Completed' || !st.Result) {
+        hide('ji-result');
+        return;
+    }
+    const r = st.Result;
+    const users = r.Users || [];
+    show('ji-result');
+    $('ji-result-text').innerHTML = t('jellyfin_import.done');
+    $('ji-result-report').innerHTML = jiCountsHtml(r) + jiUnpairedHtml(r) + jiSamplesHtml(r) + jiUserActionsHtml(users);
+    const coded = users.filter(u => u.Code);
+    $('ji-codes').innerHTML = coded.map(u => `
+        <tr><td class="py-1 pr-4 text-white">${escapeHtml(u.Name)}</td><td class="ji-code py-1 font-mono select-all text-amber-200">${escapeHtml(u.Code)}</td></tr>`).join('');
+    if (coded.length) show('ji-codes-box');
+    else hide('ji-codes-box');
+    const admins = users.filter(u => u.Action === 'Create' && u.WasAdministrator);
+    $('ji-former-admins').innerHTML = t('jellyfin_import.former_admins', { names: admins.map(u => escapeHtml(u.Name)).join(', ') });
+    if (admins.length) show('ji-former-admins');
+    else hide('ji-former-admins');
+}
+
+// One loop: read the status and show it; while it runs, the next read follows in one second.
+async function jiPoll() {
+    clearTimeout(jiTimer);
+    jiTimer = null;
+    if (!$('admin-import')) return; // the panel left the page
+    let st;
+    try {
+        st = await API.jellyfinImportStatus();
+    } catch (err) {
+        jiShowError(err.message);
+        if (jiRunning) jiSchedule();
+        return;
+    }
+    hide('ji-error');
+    const wasRunning = jiRunning;
+    jiRunning = st.State === 'Running';
+    if (jiRunning) {
+        jiBusy(true);
+        jiShowProgress(st);
+        jiSchedule();
+        return;
+    }
+    jiBusy(false);
+    jiShowResult(st);
+    if (wasRunning) jiLoadPending();
+}
+
+function jiSchedule() {
+    clearTimeout(jiTimer);
+    jiTimer = $('admin-import') ? setTimeout(jiPoll, 1000) : null;
+}
+
+async function jiLoadPending() {
+    try {
+        jiRenderPending(await API.jellyfinImportPendingUsers());
+    } catch (err) {
+        jiShowError(err.message);
+    }
+}
+
+function jiRenderPending(users) {
+    const list = $('ji-pending-list');
+    if (!list) return;
+    jiPendingNames = new Map(users.map(u => [u.UserId, u.Name]));
+    for (const id of [...jiShownCodes.keys()]) {
+        if (!jiPendingNames.has(id)) jiShownCodes.delete(id);
+    }
+    list.innerHTML = users.length
+        ? users.map(u => jiPendingRowHtml(u)).join('')
+        : `<p class="text-xs text-white/50">${t('jellyfin_import.pending_none')}</p>`;
+}
+
+function jiPendingRowHtml(u) {
+    const shown = jiShownCodes.get(u.UserId);
+    const action = shown
+        ? jiCodeLineHtml(shown.name, shown.code)
+        : `<button class="jf-btn-ghost !py-1.5 !px-3 text-xs ji-new-code" data-user-id="${escapeHtml(u.UserId)}" onclick="jiNewCode(this)">${t('jellyfin_import.new_code')}</button>`;
+    return `
+        <div class="ji-pending-row flex flex-wrap items-center justify-between gap-3 py-3 border-b border-white/5">
+            <div>
+                <p class="text-sm font-semibold text-white">${escapeHtml(u.Name)}</p>
+                <p class="text-xs text-white/40">${t('jellyfin_import.pending_since', { date: escapeHtml(new Date(u.CreatedAt).toLocaleString()) })}</p>
+            </div>
+            <div class="ji-row-action">${action}</div>
+        </div>`;
+}
+
+function jiCodeLineHtml(name, code) {
+    return `
+        <p class="text-xs text-amber-300">${t('jellyfin_import.new_code_shown', { name: escapeHtml(name) })}</p>
+        <div class="ji-code font-mono text-sm text-amber-200 select-all">${escapeHtml(code)}</div>`;
+}
+
+async function jiNewCode(btn) {
+    const id = btn.dataset.userId;
+    const name = jiPendingNames.get(id) || '';
+    if (!confirm(t('jellyfin_import.new_code_confirm', { name }))) return;
+    try {
+        const res = await API.jellyfinImportNewCode(id);
+        const shownName = res.Name || name;
+        jiShownCodes.set(id, { name: shownName, code: res.Code });
+        const cell = btn.closest('.ji-row-action');
+        if (cell) cell.innerHTML = jiCodeLineHtml(shownName, res.Code);
+    } catch (err) {
+        toast(err.message, 'error');
+        if (err.status === 409) {
+            jiShownCodes.delete(id);
+            jiLoadPending();
+        }
+    }
+}
+
+async function jiCopyCodes() {
+    const table = $('ji-codes');
+    if (window.isSecureContext && navigator.clipboard) {
+        try {
+            const text = [...table.rows].map(row => `${row.cells[0].textContent}\t${row.cells[1].textContent}`).join('\n');
+            await navigator.clipboard.writeText(text);
+            toast(t('jellyfin_import.copied'));
+            return;
+        } catch (err) {
+            // Not allowed here: fall through and select the codes.
+        }
+    }
+    window.getSelection().selectAllChildren(table);
+    toast(t('jellyfin_import.copy_manually'));
+}
+
+// Opening the tab reloads the pending users. The status is read once per rendered panel, so
+// switching tabs never re-renders a result or drops a code on screen.
+async function loadJellyfinImport() {
+    const panel = $('admin-import');
+    if (!panel) return;
+    const first = !panel.dataset.loaded;
+    panel.dataset.loaded = '1';
+    if (first) {
+        // A new panel has no preview on screen, so the old pairs, choices and codes go.
+        jiPreviewed = false;
+        jiChoice.clear();
+        jiConfirm.clear();
+        jiShownCodes.clear();
+    }
+    jiLoadPending();
+    if (first) await jiPoll();
 }
 
 // --- Scheduled Tasks UI ---
@@ -3457,6 +4327,14 @@ function updateAuthUI() {
         hide('sidebar');
     }
 }
+
+// Reacts to lost administrator rights: hides the admin UI, says so, and leaves the Dashboard.
+function followAdminLoss() {
+    updateAuthUI();
+    toast(t('admin.rights_removed'), 'error');
+    if (currentPage === 'admin') navigate('home');
+}
+API.onAdminLost = followAdminLoss;
 
 // --- Live Log Functions ---
 let liveLogInitialized = false;

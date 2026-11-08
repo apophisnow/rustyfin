@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
-use rustyfin_model::user::{User, UserPreferences};
+use rustyfin_model::user::{NameMatch, User, UserPreferences, name_too_long};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-pub async fn create_user(pool: &SqlitePool, user: &User) -> Result<(), sqlx::Error> {
+/// Writes a user row. The executor is a pool, or a transaction the caller holds.
+pub async fn create_user<'e, E>(executor: E, user: &User) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let id = user.id.to_string();
     let created = user.created_at.to_rfc3339();
     let is_admin = user.is_administrator as i32;
@@ -18,10 +22,28 @@ pub async fn create_user(pool: &SqlitePool, user: &User) -> Result<(), sqlx::Err
     .bind(is_admin)
     .bind(&created)
     .bind(&config)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
+}
+
+/// Writes a new user unless a user's name matches the new one (`NameMatch`, AC56, AC62). The check
+/// and the insert run in one IMMEDIATE transaction, so two callers cannot both take a name.
+/// Returns false when the name is taken.
+pub async fn create_user_unless_taken(pool: &SqlitePool, user: &User) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users")
+        .fetch_all(&mut *tx)
+        .await?;
+    let matcher = NameMatch::new(&user.name);
+    if names.iter().any(|name| matcher.matches(name)) {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    create_user(&mut *tx, user).await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn get_user_by_name(pool: &SqlitePool, name: &str) -> Result<Option<User>, sqlx::Error> {
@@ -31,6 +53,31 @@ pub async fn get_user_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Us
         .await?;
 
     Ok(row.map(Into::into))
+}
+
+/// The account a sign-in or password reset names (AC57, AC61): the user whose name is exactly
+/// `name`, else the one user whose name matches it (`NameMatch`). A name over the limit matches
+/// only exactly, so it reads no other users. Several matches with no exact one give None.
+pub async fn find_user_for_sign_in(
+    pool: &SqlitePool,
+    name: &str,
+) -> Result<Option<User>, sqlx::Error> {
+    if let Some(user) = get_user_by_name(pool, name).await? {
+        return Ok(Some(user));
+    }
+    if name_too_long(name) {
+        return Ok(None);
+    }
+    let matcher = NameMatch::new(name);
+    let mut matches: Vec<User> = get_all_users(pool)
+        .await?
+        .into_iter()
+        .filter(|user| matcher.matches(&user.name))
+        .collect();
+    if matches.len() == 1 {
+        return Ok(matches.pop());
+    }
+    Ok(None)
 }
 
 pub async fn get_user_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<User>, sqlx::Error> {
@@ -203,30 +250,99 @@ pub async fn delete_user(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
     Ok(result.rows_affected() > 0)
 }
 
+/// Sets a user's password hash and returns whether the user exists. A password write also ends the
+/// user's one-time setup code, in the same transaction (B20 3.6).
 pub async fn update_password(
     pool: &SqlitePool,
     id: Uuid,
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
+    let id = id.to_string();
+    let mut tx = pool.begin().await?;
     let result = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(password_hash)
-        .bind(id.to_string())
-        .execute(pool)
+        .bind(&id)
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+    let updated = result.rows_affected() > 0;
+    if updated {
+        sqlx::query("DELETE FROM user_setup_codes WHERE user_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(updated)
 }
 
+/// Sets the administrator flag by hand. A hand change clears the flag the admin group set (AC19);
+/// sending the current value keeps it (AC42).
 pub async fn update_policy(
     pool: &SqlitePool,
     id: Uuid,
     is_administrator: bool,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE users SET is_administrator = ? WHERE id = ?")
-        .bind(is_administrator as i32)
-        .bind(id.to_string())
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE users SET admin_from_group = \
+         CASE WHEN is_administrator = ?1 THEN admin_from_group ELSE 0 END, \
+         is_administrator = ?1 WHERE id = ?2",
+    )
+    .bind(is_administrator as i32)
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Makes the user an administrator through the admin group (AC17). The flag records that the group
+/// gave the rights. An existing administrator is left as it is, flag and all.
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn grant_group_admin<'e, E>(executor: E, id: Uuid) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "UPDATE users SET is_administrator = 1, admin_from_group = 1 \
+         WHERE id = ? AND is_administrator = 0",
+    )
+    .bind(id.to_string())
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Takes back the administrator rights the admin group gave the user (AC18). They stay when the user
+/// is the owner, or when no other enabled administrator would be left. Returns whether they went.
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn revoke_group_admin<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let done = sqlx::query(
+        "UPDATE users SET is_administrator = 0, admin_from_group = 0 \
+         WHERE id = ?1 AND admin_from_group = 1 AND is_owner = 0 \
+         AND EXISTS (SELECT 1 FROM users AS other \
+         WHERE other.is_administrator = 1 AND other.is_disabled = 0 AND other.id <> ?1)",
+    )
+    .bind(id.to_string())
+    .execute(executor)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Whether the admin group gave the user its administrator rights (AC17).
+/// The executor is a pool, or a transaction the caller holds.
+pub async fn admin_from_group<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let flagged: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ? AND admin_from_group = 1)",
+    )
+    .bind(id.to_string())
+    .fetch_one(executor)
+    .await?;
+    Ok(flagged)
 }
 
 pub async fn update_configuration(
@@ -283,17 +399,49 @@ impl From<UserRow> for User {
     }
 }
 
-pub async fn update_user_name(
+/// Outcome of `rename_user_unless_taken`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renamed {
+    /// The user has the new name.
+    Done,
+    /// Another user's name matches the new name. Nothing changed.
+    Taken,
+    /// No user has this id. Nothing changed.
+    NotFound,
+}
+
+/// Gives a user a new name unless another user's name matches it (`NameMatch`, AC56, AC62). The
+/// user's own name never counts, so a user may change its case. The check and the update run in one
+/// IMMEDIATE transaction.
+pub async fn rename_user_unless_taken(
     pool: &SqlitePool,
     id: Uuid,
     name: &str,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE users SET name = ? WHERE id = ?")
-        .bind(name)
-        .bind(id.to_string())
-        .execute(pool)
+) -> Result<Renamed, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM users")
+        .fetch_all(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+    let own_id = id.to_string();
+    if !rows.iter().any(|(row_id, _)| *row_id == own_id) {
+        tx.rollback().await?;
+        return Ok(Renamed::NotFound);
+    }
+    let matcher = NameMatch::new(name);
+    if rows
+        .iter()
+        .any(|(row_id, row_name)| *row_id != own_id && matcher.matches(row_name))
+    {
+        tx.rollback().await?;
+        return Ok(Renamed::Taken);
+    }
+    sqlx::query("UPDATE users SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(&own_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Renamed::Done)
 }
 
 pub async fn update_display_preference(
