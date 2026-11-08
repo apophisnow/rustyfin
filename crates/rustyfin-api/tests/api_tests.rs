@@ -11275,6 +11275,70 @@ async fn b25_universal_transcodes_10bit_mkv_to_8bit_h264() {
     }
 }
 
+#[tokio::test]
+async fn b25_universal_sends_deep_h264_mp4_to_an_8bit_transcode() {
+    if !g4_have_ffmpeg("b25_universal_sends_deep_h264_mp4_to_an_8bit_transcode") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    // Hi10P H.264 with its bit depth stored and without it, and 8-bit High 4:2:2
+    let mut items = Vec::new();
+    for (name, pix_fmt, depth) in [
+        ("B25 Hi10 MP4", "yuv420p10le", Some(10)),
+        ("B25 Hi10 MP4 Unstored", "yuv420p10le", None),
+        ("B25 422 MP4", "yuv422p", Some(8)),
+    ] {
+        let folder = std::path::PathBuf::from(media_folder(&state, name));
+        let file = folder.join(format!("{name}.mp4"));
+        b25_make_clip(&file, "libx264", pix_fmt);
+        let id = g4_insert_item(&state, "Movie", &file).await;
+        rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        if depth.is_none() {
+            b25_forget_bit_depth(&state, id).await;
+        }
+        assert_eq!(b25_bit_depth(&state, id).await, depth, "{name}");
+        items.push((name, id));
+    }
+    let probe_file = state.data_dir.join("b25-segment.ts");
+    let app = app(state);
+
+    // The web client states no profile or bit depth: the MP4 is not sent as it is but
+    // transcoded, from the start and from a resume point, to 8-bit 4:2:0 High
+    for (name, id) in &items {
+        for extra in ["", "&StartTimeTicks=10000000"] {
+            let (body, video) = b25_web_client_gets(&app, *id, &token, extra, &probe_file).await;
+            let source = &body["MediaSources"][0];
+            assert_eq!(source["SupportsDirectPlay"], false, "{name} {extra}");
+            assert_eq!(source["SupportsDirectStream"], false, "{name} {extra}");
+            assert_eq!(video, "High|yuv420p", "{name} {extra}");
+        }
+    }
+
+    // A client that states it takes 10-bit H.264 gets the 10-bit file as it is
+    for (name, id) in &items[..2] {
+        for extra in [
+            "&MaxVideoBitDepth=10",
+            "&h264-profile=high,main,baseline,constrainedbaseline,high10",
+        ] {
+            let (body, video) = b25_web_client_gets(&app, *id, &token, extra, &probe_file).await;
+            assert_eq!(
+                body["MediaSources"][0]["SupportsDirectPlay"], true,
+                "{name} {extra}"
+            );
+            let url = body["Url"].as_str().unwrap_or_default();
+            assert!(
+                url.starts_with(&format!("/Videos/{id}/stream?")) && url.contains("Static=true"),
+                "{name} {extra}: {url}"
+            );
+            assert_eq!(video, "", "{name} {extra}");
+        }
+    }
+}
+
 // ── B22: player tracks ──
 //
 // Subtitles reach the player as WebVTT through Jellyfin's
