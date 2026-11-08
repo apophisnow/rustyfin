@@ -425,12 +425,90 @@ type CreditDbRow = (
     Option<i64>,
     Option<i64>,
 );
+/// A credit link, `PeopleBaseItemMap`: ItemId, PeopleId, Role, ListOrder, SortOrder.
+type CreditLinkDbRow = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+/// A person, `Peoples`: Id, Name, PersonType.
+type PersonDbRow = (Option<Vec<u8>>, Option<String>, Option<String>);
 /// The metadata rows of one layout: items, image rows (new layout only), and credits.
 type MetadataRows = (Vec<MetaDbRow>, Vec<ImageDbRow>, Vec<CreditDbRow>);
 
+/// The tables `read_snapshot` reads from `jellyfin.db`, each checked by `check_tables` (B20 round
+/// 2, finding 3).
+const JELLYFIN_TABLES: &[&str] = &[
+    "Users",
+    "Permissions",
+    "BaseItems",
+    "BaseItemProviders",
+    "UserData",
+    "MediaStreamInfos",
+    "BaseItemImageInfos",
+    "PeopleBaseItemMap",
+    "Peoples",
+];
+/// The tables `read_old_layout` reads from `library.db`, each checked by `check_tables` (B20 round
+/// 2, finding 3).
+const LIBRARY_TABLES: &[&str] = &["TypedBaseItems", "UserDatas", "mediastreams", "People"];
+
+/// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
+/// with generated columns can make a query run without end or make values of any size. A name the
+/// file doesn't have is skipped; its query reports that, as before. `file` is the source's path,
+/// never a copy's.
+async fn check_tables(
+    conn: &mut SqliteConnection,
+    file: &Path,
+    names: &[&str],
+) -> Result<(), ImportError> {
+    for name in names {
+        let kind: Option<(String,)> = sqlx::query_as(
+            "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1 \
+             COLLATE NOCASE",
+        )
+        .bind(*name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
+        let Some((kind,)) = kind else {
+            continue;
+        };
+        if kind != "table" {
+            let shown = match kind.as_str() {
+                "view" => "view",
+                "virtual" => "virtual table",
+                "shadow" => "shadow table",
+                other => other,
+            };
+            return Err(ImportError::BadSource(format!(
+                "{}: {name} is a {shown}, not a plain table",
+                file.display()
+            )));
+        }
+        let (generated,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_xinfo(?1, 'main') WHERE hidden IN (2, 3)",
+        )
+        .bind(*name)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
+        if generated > 0 {
+            return Err(ImportError::BadSource(format!(
+                "{}: {name} has generated columns",
+                file.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reads the source's users and importable items (spec 2.2, 2.3). The new layout comes from
 /// `jellyfin.db`; the old one from `library.db`, else `library.db.old`. Users always come from
-/// `jellyfin.db`. A database too big for memory is copied into `data_dir` while it is read.
+/// `jellyfin.db`. A database too big for memory is copied into `data_dir` while it is read. The
+/// tables it reads are checked to be plain tables before any query runs.
 pub async fn read_snapshot(
     location: &SourceLocation,
     choice: LayoutChoice,
@@ -438,6 +516,7 @@ pub async fn read_snapshot(
 ) -> Result<Snapshot, ImportError> {
     let file = location.data_path.join(JELLYFIN_DB);
     let mut conn = open_snapshot(&file, data_dir).await?;
+    check_tables(&mut conn, &file, JELLYFIN_TABLES).await?;
     let db = read_jellyfin_db(&mut conn, choice)
         .await
         .map_err(|e| unreadable(&file, &e))?;
@@ -623,7 +702,8 @@ async fn read_new_layout(conn: &mut SqliteConnection) -> Result<ItemRows, sqlx::
 
 /// The old layout's items, user-data rows, streams and metadata rows, all from one snapshot of
 /// `library.db` (else `library.db.old`). A row reaches every importable item that has its `key`
-/// (`UserDataKey`). `data_dir` is where a copy goes when the file is too big for memory.
+/// (`UserDataKey`). `data_dir` is where a copy goes when the file is too big for memory. Its
+/// tables are checked to be plain tables before any query runs.
 async fn read_old_layout(
     data_path: &Path,
     users: &[JfUser],
@@ -631,6 +711,7 @@ async fn read_old_layout(
 ) -> Result<(ItemRows, MetadataRows), ImportError> {
     let file = library_file(data_path)?;
     let mut conn = open_snapshot(&file, data_dir).await?;
+    check_tables(&mut conn, &file, LIBRARY_TABLES).await?;
     let (item_rows, data_rows, stream_rows) = read_library_db(&mut conn)
         .await
         .map_err(|e| unreadable(&file, &e))?;
@@ -768,7 +849,9 @@ pub fn parse_old_images(text: &str) -> Vec<JfImage> {
         .collect()
 }
 
-/// The new layout's metadata rows: items, image rows and credits (spec 5.4, 5.7, 5.8).
+/// The new layout's metadata rows: items, image rows and credits (spec 5.4, 5.7, 5.8). Credits are
+/// two plain scans joined here on the person's id, so a repeated id can't multiply them: the first
+/// `Peoples` row of an id wins, and a link to no known person gives no credit.
 async fn read_new_metadata(conn: &mut SqliteConnection) -> Result<MetadataRows, sqlx::Error> {
     let items: Vec<MetaDbRow> = sqlx::query_as(
         "SELECT Id AS id, Type AS type_name, Name AS name, ForcedSortName AS forced_sort_name, \
@@ -786,12 +869,36 @@ async fn read_new_metadata(conn: &mut SqliteConnection) -> Result<MetadataRows, 
     )
     .fetch_all(&mut *conn)
     .await?;
-    let credits: Vec<CreditDbRow> = sqlx::query_as(
-        "SELECT m.ItemId, p.Name, p.PersonType, m.Role, m.ListOrder, m.SortOrder FROM \
-         PeopleBaseItemMap m JOIN Peoples p ON p.Id = m.PeopleId ORDER BY m.rowid",
+    let links: Vec<CreditLinkDbRow> = sqlx::query_as(
+        "SELECT ItemId, PeopleId, Role, ListOrder, SortOrder FROM PeopleBaseItemMap \
+         ORDER BY rowid",
     )
     .fetch_all(&mut *conn)
     .await?;
+    let person_rows: Vec<PersonDbRow> =
+        sqlx::query_as("SELECT Id, Name, PersonType FROM Peoples ORDER BY rowid")
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut people: HashMap<Vec<u8>, (Option<String>, Option<String>)> = HashMap::new();
+    for (id, name, person_type) in person_rows {
+        if let Some(id) = id {
+            people.entry(id).or_insert((name, person_type));
+        }
+    }
+    let credits: Vec<CreditDbRow> = links
+        .into_iter()
+        .filter_map(|(item, person, role, list_order, sort_order)| {
+            let (name, person_type) = people.get(&person?)?;
+            Some((
+                item,
+                name.clone(),
+                person_type.clone(),
+                role,
+                list_order,
+                sort_order,
+            ))
+        })
+        .collect();
     Ok((items, images, credits))
 }
 

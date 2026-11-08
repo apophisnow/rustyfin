@@ -15,11 +15,11 @@ use super::plan::{UserMatch, match_user_name};
 use super::source::{
     IN_MEMORY_LIMIT, JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob,
     guid_from_text, locate, open_snapshot, open_snapshot_with, parse_jellyfin_date,
-    parse_old_images, parse_provider_ids, reads_in_memory,
+    parse_old_images, parse_provider_ids, read_snapshot, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
-    ImportError, ImportReport, ItemReport, Layout, TrackReport, UserAction, UserRow,
+    ImportError, ImportReport, ItemReport, Layout, LayoutChoice, TrackReport, UserAction, UserRow,
     WatchDataReport,
 };
 
@@ -1696,6 +1696,251 @@ async fn b20_snapshot_copies_a_big_source_to_the_data_folder() {
             "limit {limit}: the copy outlived its connection"
         );
     }
+}
+
+// Fix round 2, 3: the reader reads the stored rows of plain tables only. A view, a virtual table or a
+// generated column in place of a table it reads is a bad source, found before any row is read: a
+// recursive view never ends, and a view or a generated column can make values of any size. Credits
+// come from two plain scans, so a repeated person id can't multiply them.
+
+/// The user tables of `jellyfin.db`, with the columns the reader reads.
+const USERS_DDL: &str = "\
+    CREATE TABLE Users (Id TEXT NOT NULL PRIMARY KEY, InternalId INTEGER NOT NULL, \
+        Username TEXT NOT NULL); \
+    CREATE TABLE Permissions (Id INTEGER PRIMARY KEY, UserId TEXT, Kind INTEGER NOT NULL, \
+        Value INTEGER NOT NULL);";
+
+/// The new layout's library tables in `jellyfin.db`, with the columns the reader reads. Unlike
+/// Jellyfin's, `Peoples` may repeat an id and `PeopleBaseItemMap` may lack a person.
+const NEW_LIBRARY_DDL: &str = "\
+    CREATE TABLE BaseItems (Id TEXT NOT NULL PRIMARY KEY, Type TEXT NOT NULL, Name TEXT, Path TEXT, \
+        ParentId TEXT, SeriesId TEXT, SeasonId TEXT, IndexNumber INTEGER, \
+        ParentIndexNumber INTEGER, ForcedSortName TEXT, OriginalTitle TEXT, Overview TEXT, \
+        Tagline TEXT, OfficialRating TEXT, CommunityRating REAL, CriticRating REAL, \
+        PremiereDate TEXT, EndDate TEXT, ProductionYear INTEGER, Genres TEXT, Studios TEXT, \
+        Tags TEXT); \
+    CREATE TABLE BaseItemProviders (ItemId TEXT NOT NULL, ProviderId TEXT NOT NULL, \
+        ProviderValue TEXT NOT NULL); \
+    CREATE TABLE UserData (ItemId TEXT NOT NULL, UserId TEXT NOT NULL, Played INTEGER NOT NULL, \
+        PlayCount INTEGER NOT NULL, PlaybackPositionTicks INTEGER NOT NULL, LastPlayedDate TEXT, \
+        IsFavorite INTEGER NOT NULL, Rating REAL, Likes INTEGER, AudioStreamIndex INTEGER, \
+        SubtitleStreamIndex INTEGER); \
+    CREATE TABLE MediaStreamInfos (ItemId TEXT NOT NULL, StreamIndex INTEGER NOT NULL, \
+        StreamType INTEGER NOT NULL, Codec TEXT, Language TEXT, Title TEXT, \
+        IsExternal INTEGER NOT NULL, Path TEXT, IsDefault INTEGER NOT NULL, \
+        IsForced INTEGER NOT NULL); \
+    CREATE TABLE BaseItemImageInfos (Id TEXT, Path TEXT NOT NULL, ImageType INTEGER NOT NULL, \
+        Width INTEGER NOT NULL, Height INTEGER NOT NULL, Blurhash BLOB, ItemId TEXT NOT NULL); \
+    CREATE TABLE Peoples (Id TEXT, Name TEXT NOT NULL, PersonType TEXT); \
+    CREATE TABLE PeopleBaseItemMap (SortOrder INTEGER, ListOrder INTEGER, Role TEXT, \
+        ItemId TEXT NOT NULL, PeopleId TEXT);";
+
+/// The old layout's `library.db`, with the columns the reader reads.
+const OLD_LIBRARY_DDL: &str = "\
+    CREATE TABLE TypedBaseItems (guid GUID PRIMARY KEY NOT NULL, type TEXT NOT NULL, Path TEXT, \
+        ParentId GUID, Name TEXT, IndexNumber INT, ParentIndexNumber INT, UserDataKey TEXT, \
+        SeasonId GUID, SeriesId GUID, ProviderIds TEXT, ForcedSortName TEXT, OriginalTitle TEXT, \
+        Overview TEXT, Tagline TEXT, OfficialRating TEXT, CommunityRating FLOAT, \
+        CriticRating FLOAT, PremiereDate DATETIME, EndDate DATETIME, ProductionYear INT, \
+        Genres TEXT, Studios TEXT, Tags TEXT, Images TEXT); \
+    CREATE TABLE UserDatas (key TEXT NOT NULL, userId INT NOT NULL, rating FLOAT, \
+        played BIT NOT NULL, playCount INT NOT NULL, isFavorite BIT NOT NULL, \
+        playbackPositionTicks BIGINT NOT NULL, lastPlayedDate DATETIME, AudioStreamIndex INT, \
+        SubtitleStreamIndex INT); \
+    CREATE TABLE mediastreams (ItemId GUID, StreamIndex INT, StreamType TEXT, Codec TEXT, \
+        Language TEXT, Title TEXT, IsExternal BIT, Path TEXT, IsDefault BIT, IsForced BIT); \
+    CREATE TABLE People (ItemId GUID, Name TEXT NOT NULL, Role TEXT, PersonType TEXT, \
+        SortOrder INT, ListOrder INT);";
+
+/// One movie with one credit, for `NEW_LIBRARY_DDL`.
+const ONE_CREDIT: &str = "\
+    INSERT INTO BaseItems (Id, Type, Name, Path) VALUES ('00000000-0000-0000-0000-0000000000F1', \
+        'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', '/media/film.mkv'); \
+    INSERT INTO Peoples (Id, Name, PersonType) VALUES ('p1', 'Ann', 'Actor'); \
+    INSERT INTO PeopleBaseItemMap (ItemId, PeopleId, Role, ListOrder, SortOrder) \
+        VALUES ('00000000-0000-0000-0000-0000000000F1', 'p1', 'Lead', 0, 0);";
+
+/// A new SQLite file at `file`, made by running `scripts` in turn.
+async fn write_db(file: &Path, scripts: &[&'static str]) {
+    use sqlx::{ConnectOptions, Connection};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(file)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    for script in scripts {
+        sqlx::raw_sql(*script)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+    }
+    conn.close().await.unwrap();
+}
+
+/// What `read_snapshot` gives for the source folder `dir` (layout Auto), or None while it is still
+/// busy after 5 s. Like `snapshot_within_5s`, it runs on its own thread and runtime.
+fn read_within_5s(dir: &Path) -> Option<Result<(), ImportError>> {
+    let dir = dir.to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let data = TempDir::new();
+        let read = locate(&dir).and_then(|location| {
+            runtime
+                .block_on(read_snapshot(&location, LayoutChoice::Auto, &data.0))
+                .map(drop)
+        });
+        let _ = sender.send(read);
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .ok()
+}
+
+#[tokio::test]
+async fn b20_snapshot_reads_only_tables() {
+    // Endless views: one that makes a row now and then, the review's, and one that makes none.
+    const ENDLESS_USERS: &str = "DROP TABLE Users; CREATE VIEW Users AS WITH RECURSIVE c(x) AS \
+        (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT randomblob(16) AS Id, 'u' AS Username, \
+        x AS InternalId FROM c WHERE x % 1000000 = 0";
+    const REVIEW_USERS: &str = "DROP TABLE Users; CREATE VIEW Users AS WITH RECURSIVE c(x) AS \
+        (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x,'u',x FROM c";
+    const ENDLESS_PEOPLES: &str = "DROP TABLE Peoples; CREATE VIEW Peoples AS WITH RECURSIVE \
+        c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT 'p1' AS Id, 'n' AS Name, \
+        NULL AS PersonType FROM c WHERE x < 0";
+    const VIRTUAL_COLUMN: &str = "DROP TABLE Users; CREATE TABLE Users (Id TEXT, \
+        InternalId INTEGER, Username TEXT GENERATED ALWAYS AS ('u' || InternalId) VIRTUAL)";
+    const STORED_COLUMN: &str = "DROP TABLE Peoples; CREATE TABLE Peoples (Id TEXT, Name TEXT, \
+        PersonType TEXT GENERATED ALWAYS AS ('Actor') STORED)";
+    const VIRTUAL_TABLE: &str =
+        "DROP TABLE Peoples; CREATE VIRTUAL TABLE Peoples USING fts5(Id, Name, PersonType)";
+    const ENDLESS_USER_DATAS: &str = "DROP TABLE UserDatas; CREATE VIEW UserDatas AS WITH \
+        RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT 'k' AS key, \
+        1 AS userId, 0 AS played, 0 AS playCount, 0 AS playbackPositionTicks, \
+        NULL AS lastPlayedDate, 0 AS isFavorite, NULL AS rating, NULL AS AudioStreamIndex, \
+        NULL AS SubtitleStreamIndex FROM c WHERE x < 0";
+    let tmp = TempDir::new();
+    let mut cases = Vec::new();
+    for (case, change, want) in [
+        (
+            "endless view",
+            ENDLESS_USERS,
+            "Users is a view, not a plain table",
+        ),
+        (
+            "review view",
+            REVIEW_USERS,
+            "Users is a view, not a plain table",
+        ),
+        (
+            "view in place of a later table",
+            ENDLESS_PEOPLES,
+            "Peoples is a view, not a plain table",
+        ),
+        (
+            "virtual generated column",
+            VIRTUAL_COLUMN,
+            "Users has generated columns",
+        ),
+        (
+            "stored generated column",
+            STORED_COLUMN,
+            "Peoples has generated columns",
+        ),
+        (
+            "virtual table",
+            VIRTUAL_TABLE,
+            "Peoples is a virtual table, not a plain table",
+        ),
+    ] {
+        let dir = tmp.0.join(case.replace(' ', "_"));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_db(
+            &dir.join("jellyfin.db"),
+            &[USERS_DDL, NEW_LIBRARY_DDL, ONE_CREDIT, change],
+        )
+        .await;
+        cases.push((case, dir, "jellyfin.db", want));
+    }
+    // The old layout's tables are checked in `library.db`.
+    let old = tmp.0.join("old_layout");
+    std::fs::create_dir_all(&old).unwrap();
+    write_db(&old.join("jellyfin.db"), &[USERS_DDL]).await;
+    write_db(
+        &old.join("library.db"),
+        &[OLD_LIBRARY_DDL, ENDLESS_USER_DATAS],
+    )
+    .await;
+    cases.push((
+        "endless view in library.db",
+        old,
+        "library.db",
+        "UserDatas is a view, not a plain table",
+    ));
+
+    let mut wrong = Vec::new();
+    for (case, dir, file, want) in &cases {
+        match read_within_5s(dir) {
+            Some(Err(ImportError::BadSource(text)))
+                if text.contains(file) && text.contains(want) => {}
+            None => wrong.push(format!("{case}: read_snapshot still busy after 5 s")),
+            Some(other) => wrong.push(format!(
+                "{case}: {other:?}, want a BadSource naming {file} that says \"{want}\""
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[tokio::test]
+async fn b20_credits_take_the_first_person_of_an_id() {
+    // Ann's id is repeated, one credit has no person and one an unknown person.
+    const CREDITS: &str = "\
+        INSERT INTO BaseItems (Id, Type, Name, Path) VALUES \
+            ('00000000-0000-0000-0000-0000000000F1', \
+            'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', '/media/film.mkv'); \
+        INSERT INTO Peoples (Id, Name, PersonType) VALUES ('p1', 'Ann', 'Actor'), \
+            ('p2', 'Bob', 'Director'), ('p1', 'Ann again', 'Actor'), \
+            ('p1', 'Ann once more', 'GuestStar'); \
+        INSERT INTO PeopleBaseItemMap (ItemId, PeopleId, Role, ListOrder, SortOrder) VALUES \
+            ('00000000-0000-0000-0000-0000000000F1', 'p1', 'Lead', 0, 0), \
+            ('00000000-0000-0000-0000-0000000000F1', 'p2', NULL, 1, 1), \
+            ('00000000-0000-0000-0000-0000000000F1', NULL, 'Nobody', 2, 2), \
+            ('00000000-0000-0000-0000-0000000000F1', 'p9', 'Unknown', 3, 3);";
+    let tmp = TempDir::new();
+    write_db(
+        &tmp.0.join("jellyfin.db"),
+        &[USERS_DDL, NEW_LIBRARY_DDL, CREDITS],
+    )
+    .await;
+    let data = TempDir::new();
+    let location = locate(&tmp.0).unwrap();
+    let snapshot = read_snapshot(&location, LayoutChoice::Auto, &data.0)
+        .await
+        .unwrap();
+    let credits: Vec<_> = snapshot.metadata.credits[&Uuid::from_u128(0xF1)]
+        .iter()
+        .map(|credit| {
+            (
+                credit.name.as_str(),
+                credit.kind.as_deref(),
+                credit.role.as_deref(),
+                credit.list_order,
+                credit.sort_order,
+            )
+        })
+        .collect();
+    assert_eq!(
+        credits,
+        [
+            ("Ann", Some("Actor"), Some("Lead"), Some(0), Some(0)),
+            ("Bob", Some("Director"), None, Some(1), Some(1)),
+        ]
+    );
 }
 
 /// Writes a JPEG of `len` bytes to `path`: the signature, then `fill`.
