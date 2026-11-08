@@ -189,6 +189,12 @@ async fn update_configuration(
         .set_delay(std::time::Duration::from_secs(u64::from(
             config.library_monitor_delay,
         )));
+    state
+        .task_scheduler
+        .watcher()
+        .set_poll_interval(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_poll_interval.max(1),
+        )));
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -562,6 +568,12 @@ async fn update_configuration_by_key(
         .changes()
         .set_delay(std::time::Duration::from_secs(u64::from(
             config.library_monitor_delay,
+        )));
+    state
+        .task_scheduler
+        .watcher()
+        .set_poll_interval(std::time::Duration::from_secs(u64::from(
+            config.library_monitor_poll_interval.max(1),
         )));
     drop(config);
 

@@ -188,6 +188,7 @@ async fn create_library(
     if let Some(options) = &req.library_options {
         rustyfin_db::repo_library::set_library_options(&state.db, lib.id, options).await?;
     }
+    state.task_scheduler.watcher().libraries_changed();
     Ok(Json(lib))
 }
 
@@ -197,6 +198,7 @@ async fn remove_library(
 ) -> Result<Json<Value>, ApiError> {
     rustyfin_db::repo_library::delete_library(&state.db, id).await?;
     state.cache.invalidate_library_lists();
+    state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -492,6 +494,7 @@ async fn update_library_options(
     Json(options): Json<LibraryOptions>,
 ) -> Result<Json<Value>, ApiError> {
     rustyfin_db::repo_library::set_library_options(&state.db, id, &options).await?;
+    state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -531,6 +534,7 @@ async fn remove_library_paths(
     rustyfin_db::repo_library::update_library_paths(&state.db, lib_id, &new_paths)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.task_scheduler.watcher().libraries_changed();
 
     Ok(Json(json!({})))
 }
