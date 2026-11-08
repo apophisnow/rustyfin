@@ -471,8 +471,6 @@ pub(super) const JELLYFIN_TABLES: &[&str] = &[
 pub(super) const LIBRARY_TABLES: &[&str] =
     &["TypedBaseItems", "UserDatas", "mediastreams", "People"];
 
-/// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
-/// with generated columns can make a query run without end or make values of any size. It also
 /// Renders a `quick_check` result line for an error message: each control character becomes
 /// `\uXXXX` and the result is cut to 200 bytes on a char boundary, with `…` marking a cut. Keeps a
 /// crafted database from writing megabytes of control bytes, or ANSI escapes, into the log.
@@ -500,6 +498,8 @@ pub(super) fn clip_check_line(line: &str) -> String {
     out
 }
 
+/// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
+/// with generated columns can make a query run without end or make values of any size. It also
 /// refuses a damaged table, found with SQLite's `quick_check` before any row is read; the first row
 /// is enough and is all it reads. A name the file doesn't have is skipped; its query reports that,
 /// as before. `file` is the source's path, never a copy's.
