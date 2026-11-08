@@ -606,9 +606,9 @@ async fn scan_tv_library(
     let existing_seasons: HashMap<String, Uuid> =
         rustyfin_db::repo_media::get_library_items_by_type(pool, library.id, "Season", &filter)
             .await?;
-    // The episode files of each season, by season id: the id of its series, the season's name, then its
+    // The episode files of each season, by season id: the id of its series, the season's number, then its
     // files in walk order. The episodes are reconciled once every path has been walked.
-    let mut episode_files: BTreeMap<Uuid, (Uuid, String, Vec<PathBuf>)> = BTreeMap::new();
+    let mut episode_files: BTreeMap<Uuid, (Uuid, Option<i32>, Vec<PathBuf>)> = BTreeMap::new();
 
     // Every file that the walks returned, every folder they could not list, and every symlink
     // loop they skipped. The removal at the end of the scan needs all three.
@@ -734,6 +734,7 @@ async fn scan_tv_library(
 
             // Ensure season item exists — use pre-loaded HashMap first, then create new
             let season_path = format!("{}/{}", series_dir, season_name);
+            let season_number = parse_season_number(&season_name, &series_name);
             let season_id = if let Some(id) = season_map.get(&season_path) {
                 *id
             } else if let Some(id) =
@@ -743,11 +744,10 @@ async fn scan_tv_library(
                 id
             } else {
                 let id = Uuid::new_v4();
-                let season_index = parse_season_number(&season_name);
                 let season_item = MediaItem {
                     id,
                     name: season_name.clone(),
-                    sort_name: Some(format!("season {:04}", season_index.unwrap_or(1))),
+                    sort_name: Some(season_sort_name(season_number)),
                     overview: None,
                     media_type: MediaType::Season,
                     path: season_path.clone(),
@@ -760,7 +760,7 @@ async fn scan_tv_library(
                     date_created: date_added(Path::new(&season_path)).await,
                     premiere_date: None,
                     runtime_ticks: None,
-                    index_number: season_index,
+                    index_number: season_number,
                     parent_index_number: None,
                     media_sources: Vec::new(),
                     ..MediaItem::default_dto_fields()
@@ -772,7 +772,7 @@ async fn scan_tv_library(
 
             episode_files
                 .entry(season_id)
-                .or_insert_with(|| (series_id, season_name, Vec::new()))
+                .or_insert_with(|| (series_id, season_number, Vec::new()))
                 .2
                 .push(file_path_buf);
         }
@@ -815,12 +815,25 @@ async fn scan_tv_library(
         }
     }
 
+    // A season stored under an older rule gets the number that its folder gives now.
+    let season_numbers: Vec<(Uuid, Option<i32>)> = episode_files
+        .iter()
+        .map(|(&season_id, &(_, season_number, _))| (season_id, season_number))
+        .collect();
+    let settled = scan_sync::settle_season_numbers(pool, library.id, &season_numbers).await?;
+    if settled > 0 {
+        tracing::info!(
+            "TV library '{}': set the number of {} stored seasons",
+            library.name,
+            settled
+        );
+    }
+
     // Group the files of each season into episodes, then reconcile the episodes with the items.
     // The numbers of an episode come from its primary file, the first of its versions.
     let mut episode_groups: Vec<scan_sync::EpisodeGroup> = Vec::new();
-    for (&season_id, (series_id, season_name, season_files)) in &episode_files {
-        for versions in naming::group_episode_files(season_files, parse_season_number(season_name))
-        {
+    for (&season_id, &(series_id, season_number, ref season_files)) in &episode_files {
+        for versions in naming::group_episode_files(season_files, season_number) {
             let stem = versions[0]
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -829,10 +842,9 @@ async fn scan_tv_library(
             episode_groups.push(scan_sync::EpisodeGroup {
                 files: versions,
                 season_id,
-                series_id: *series_id,
+                series_id,
                 index_number: parsed.map(|n| n.episode),
-                parent_index_number: parse_season_number(season_name)
-                    .or_else(|| parsed.and_then(|n| n.season)),
+                parent_index_number: season_number.or_else(|| parsed.and_then(|n| n.season)),
             });
         }
     }
@@ -1697,7 +1709,9 @@ async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBu
     (result, unreadable, Vec::new())
 }
 
-fn parse_season_number(name: &str) -> Option<i32> {
+/// The number of the season folder called `name` in the series folder called `series_folder`: the number
+/// after `Season `, `S` or `Staffel `, or 0 for a specials folder (`naming::is_specials_folder`).
+fn parse_season_number(name: &str, series_folder: &str) -> Option<i32> {
     let lower = name.to_lowercase();
     // "Season 02", "Season 2", "S02", "Staffel 2"
     for prefix in &["season ", "s", "staffel "] {
@@ -1707,5 +1721,10 @@ fn parse_season_number(name: &str) -> Option<i32> {
             return Some(n);
         }
     }
-    None
+    naming::is_specials_folder(name, series_folder).then_some(0)
+}
+
+/// The sort name that the scan gives a season numbered `number`.
+pub(crate) fn season_sort_name(number: Option<i32>) -> String {
+    format!("season {:04}", number.unwrap_or(1))
 }

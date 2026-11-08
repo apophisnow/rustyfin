@@ -396,6 +396,27 @@ fn is_ci_at(bytes: &[u8], at: usize, c: u8) -> bool {
     bytes.get(at).is_some_and(|b| b.eq_ignore_ascii_case(&c))
 }
 
+/// Whether the season folder called `name`, in the series folder called `series_folder`, holds the specials
+/// (season 0), as Jellyfin 12.4 reads it (`SeasonPathParser.cs:81-94`). Spaces, `.`, `_`, `-`, `[` and `]` are
+/// removed from both names (`SeasonPathParser.cs:18`), then every occurrence of the series folder's name, in any
+/// case. What is left must be `specials` or `extras`, in any case. So `Specials`, `SPECIALS`, `[Specials]`,
+/// `Show - Specials` and `Show Extras` hold the specials of `Show`, and `Specials 2` doesn't.
+pub fn is_specials_folder(name: &str, series_folder: &str) -> bool {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !matches!(c, ' ' | '.' | '_' | '-' | '[' | ']'))
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut rest = clean(name);
+    let series = clean(series_folder);
+    // Jellyfin throws on an empty series name; nothing is removed here.
+    if !series.is_empty() {
+        rest = rest.replace(&series, "");
+    }
+    rest == "specials" || rest == "extras"
+}
+
 /// A title and year read from a movie file name, as Jellyfin's `CleanDateTime` and `CleanString` leave them
 /// (`NamingOptions.cs:146-160`).
 #[derive(Debug, Clone, PartialEq, Eq)]

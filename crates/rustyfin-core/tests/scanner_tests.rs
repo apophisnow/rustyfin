@@ -6439,3 +6439,138 @@ async fn b32_rescans_read_e_dot_episode_numbers() {
     assert_eq!(item_at(&fx.pool, &lib, E02).await, episode);
     assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
 }
+
+/// (path, number, sort name) of each season of the library, sorted by path.
+async fn b32_seasons(
+    pool: &SqlitePool,
+    lib: &Library,
+) -> Vec<(String, Option<i32>, Option<String>)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT path, index_number, sort_name FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|(path, number, sort_name)| (rel(&root, &path), number, sort_name))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The season numbers of the library's episodes, sorted by path.
+async fn b32_episode_seasons(pool: &SqlitePool, lib: &Library) -> Vec<Option<i64>> {
+    let rows = episodes(pool, lib).await;
+    rows.into_iter().map(|(_, _, season, _)| season).collect()
+}
+
+#[tokio::test]
+async fn b32_specials_folders_are_season_0() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [
+        "Alpha/Specials/Alpha.ep01.mkv",
+        "Bravo/SPECIALS/Bravo.ep01.mkv",
+        "Charlie/[Specials]/Charlie.ep01.mkv",
+        "Delta/Delta - Specials/Delta.ep01.mkv",
+        "Echo/Echo Extras/Echo.ep01.mkv",
+        "Foxtrot/Specials 2/Foxtrot.ep01.mkv",
+    ] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    let special = |path: &str| (path.to_string(), Some(0), Some("season 0000".to_string()));
+    assert_eq!(
+        b32_seasons(&fx.pool, &lib).await,
+        [
+            special("Alpha/Specials"),
+            special("Bravo/SPECIALS"),
+            special("Charlie/[Specials]"),
+            special("Delta/Delta - Specials"),
+            special("Echo/Echo Extras"),
+            (
+                "Foxtrot/Specials 2".to_string(),
+                None,
+                Some("season 0001".to_string())
+            ),
+        ]
+    );
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(0), Some(0), Some(0), Some(0), None]
+    );
+}
+
+#[tokio::test]
+async fn b32_rescans_make_stored_specials_folders_season_0() {
+    const ALPHA: &str = "Alpha/Specials/Alpha.ep01.mkv";
+    const BRAVO: &str = "Bravo/Specials/Bravo.ep01.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&lib), ALPHA);
+    touch(&root_of(&lib), BRAVO);
+    scan(&fx.pool, &lib).await;
+    let alpha = item_at(&fx.pool, &lib, "Alpha/Specials").await;
+    let bravo = item_at(&fx.pool, &lib, "Bravo/Specials").await;
+    let episode = item_at(&fx.pool, &lib, ALPHA).await;
+    // 3afba21 stored them with no number. Bravo's sort name is not one that the scan made.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number = NULL, sort_name = 'season 0001' WHERE id = ?1",
+        &[&alpha.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET index_number = NULL, sort_name = 'bravo specials' WHERE id = ?1",
+        &[&bravo.to_string()],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET parent_index_number = NULL WHERE media_type = 'Episode'",
+        &[],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, episode, &marks).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, alpha, &favorite).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_seasons(&fx.pool, &lib).await,
+        [
+            (
+                "Alpha/Specials".to_string(),
+                Some(0),
+                Some("season 0000".to_string())
+            ),
+            (
+                "Bravo/Specials".to_string(),
+                Some(0),
+                Some("bravo specials".to_string())
+            ),
+        ]
+    );
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(0)]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, "Alpha/Specials").await, alpha);
+    assert_eq!(item_at(&fx.pool, &lib, "Bravo/Specials").await, bravo);
+    assert_eq!(item_at(&fx.pool, &lib, ALPHA).await, episode);
+    assert_eq!(marks_of(&fx.pool, &user, episode).await, Some(marks));
+    assert_eq!(marks_of(&fx.pool, &user, alpha).await, Some(favorite));
+}

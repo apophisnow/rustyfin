@@ -1,6 +1,6 @@
 //! `naming::parse_episode` (R1-13) on the file name stems of the G9 spec, §6.3.
 
-use rustyfin_core::naming::{EpisodeNumbers, parse_episode};
+use rustyfin_core::naming::{EpisodeNumbers, is_specials_folder, parse_episode};
 
 #[test]
 fn parse_episode_table() {
@@ -91,4 +91,37 @@ fn b32_parse_episode_e_dot() {
         Some((Some(1), 2)),
         "S01E02 comes first"
     );
+}
+
+#[test]
+fn b32_specials_folders() {
+    // Jellyfin's specials aliases (SeasonPathParser.cs:81-94): the folder name without ` ._-[]` and without the
+    // series folder's name, in any case, is `specials` or `extras`.
+    let table: &[(&str, &str, bool)] = &[
+        ("Specials", "Show", true),
+        ("SPECIALS", "Show", true),
+        ("specials", "Show", true),
+        ("[Specials]", "Show", true),
+        ("Show - Specials", "Show", true),
+        ("Show.Specials", "Show", true),
+        ("show_specials", "Show", true),
+        ("The Show Specials", "The Show", true),
+        ("Show (2010) Specials", "Show (2010)", true),
+        ("Extras", "Show", true),
+        ("Show Extras", "Show", true),
+        ("Specials", "", true),
+        ("Specials 2", "Show", false),
+        ("Special", "Show", false),
+        ("Season Specials", "Show", false),
+        ("Showcase Specials", "Show", false),
+        ("Specials (2010)", "Show", false),
+        ("Season 1", "Show", false),
+    ];
+    for &(name, series, want) in table {
+        assert_eq!(
+            is_specials_folder(name, series),
+            want,
+            "{name:?} in {series:?}"
+        );
+    }
 }

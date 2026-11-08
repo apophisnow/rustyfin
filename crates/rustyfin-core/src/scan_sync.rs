@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::naming::{self, VersionGroup, is_ignored_dir, is_ignored_file};
 use crate::probe::ProbeStep;
-use crate::scanner::parse_year;
+use crate::scanner::{parse_year, season_sort_name};
 
 /// Deletes the item `id` and the rows that refer to it, in one transaction.
 ///
@@ -737,6 +737,68 @@ pub async fn reconcile_episode_groups(
         })
         .collect();
     reconcile_groups(pool, library_id, "Episode", scope, &wanted, gone).await
+}
+
+/// Gives each season of `seasons`, (id, number), the number that the scan read from its folder, where the stored
+/// one differs: a `Specials` folder stored with no number before it was read as season 0, say. A sort name that
+/// the scan made from the stored number is made again from the new one; any other is kept. Only the seasons
+/// that differ are written, in one transaction. Returns how many changed.
+pub async fn settle_season_numbers(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    seasons: &[(Uuid, Option<i32>)],
+) -> Result<u64, sqlx::Error> {
+    let stored: Vec<(String, Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT id, index_number, sort_name FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let stored: HashMap<String, (Option<i32>, Option<String>)> = stored
+        .into_iter()
+        .map(|(id, number, sort_name)| (id, (number, sort_name)))
+        .collect();
+
+    let mut changes = Vec::new();
+    for &(id, number) in seasons {
+        let id = id.to_string();
+        let Some((old_number, old_sort_name)) = stored.get(&id) else {
+            continue;
+        };
+        if *old_number == number {
+            continue;
+        }
+        let sort_name = if old_sort_name.as_deref() == Some(&season_sort_name(*old_number)) {
+            Some(season_sort_name(number))
+        } else {
+            old_sort_name.clone()
+        };
+        changes.push((id, number, sort_name, *old_number, old_sort_name.as_deref()));
+    }
+    if changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed = 0;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (id, number, sort_name, old_number, old_sort_name) in changes {
+        // A season that another writer changed since it was read is left to the next scan.
+        changed += sqlx::query(
+            "UPDATE media_items SET index_number = ?1, sort_name = ?2
+             WHERE id = ?3 AND index_number IS ?4 AND sort_name IS ?5",
+        )
+        .bind(number)
+        .bind(sort_name)
+        .bind(id)
+        .bind(old_number)
+        .bind(old_sort_name)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
 }
 
 /// Settles the groups of one media type in the library. The outcomes are in the order of `groups`.
