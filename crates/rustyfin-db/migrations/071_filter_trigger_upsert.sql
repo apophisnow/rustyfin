@@ -81,3 +81,8 @@ BEGIN
     WHERE rating = OLD.official_rating
       AND NOT EXISTS (SELECT 1 FROM media_items WHERE official_rating = OLD.official_rating);
 END;
+
+-- Each save with INSERT OR REPLACE gave the item a new rowid, and the search entry for its old name,
+-- overview and genres stayed at the old rowid. Rebuilding the search index from media_items once
+-- drops those entries.
+INSERT INTO media_items_fts(media_items_fts) VALUES('rebuild');
