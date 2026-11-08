@@ -93,6 +93,12 @@ async fn with_64_open_files() {
             && !logs.contains("max_user_instances"),
         "the warning names the open file limit: {logs}"
     );
+    // A raised ulimit, LimitNOFILE= or --ulimit reaches only a new process, and a SIGHUP tries
+    // again only when a limit changed, so the advice names the restart and the live way.
+    assert!(
+        logs.contains("restart Rustyfin") && logs.contains("prlimit --pid"),
+        "the warning says to restart Rustyfin, or to raise the limit live with prlimit --pid: {logs}"
+    );
 }
 
 /// An empty temporary folder, removed when dropped.
