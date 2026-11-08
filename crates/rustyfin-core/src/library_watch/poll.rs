@@ -164,6 +164,13 @@ impl FolderPoller {
                     folder.settling = true;
                 }
             } else if let Some(folder) = self.folders.get_mut(&path) {
+                // A copy tool can put the folder's time back after making a subfolder, so the
+                // names are compared here too.
+                new.extend(
+                    subs.difference(&folder.subfolders)
+                        .map(|name| path.join(name)),
+                );
+                folder.subfolders = subs;
                 if files != folder.files {
                     folder.files = files; // still moving; checked again at the next poll
                 } else {
