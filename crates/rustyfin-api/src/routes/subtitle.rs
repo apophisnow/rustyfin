@@ -438,6 +438,7 @@ async fn download_remote_subtitle(
 mod tests {
     use super::*;
     use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
+    use std::path::Path;
 
     /// A folder under the temp dir with empty files, removed when dropped.
     struct Folder(PathBuf);
@@ -573,5 +574,58 @@ mod tests {
         // No subtitle files: nothing
         let bare = Folder::with(&["Film.mkv"]);
         assert!(external_streams(&source(&bare, json!([]))).is_empty());
+    }
+
+    #[test]
+    fn test_subtitle_demuxer_follows_the_extension() {
+        assert_eq!(subtitle_demuxer(Path::new("film.srt")), Some("srt"));
+        assert_eq!(subtitle_demuxer(Path::new("film.ASS")), Some("ass"));
+        assert_eq!(subtitle_demuxer(Path::new("film.ssa")), Some("ass"));
+        assert_eq!(subtitle_demuxer(Path::new("film.vtt")), Some("webvtt"));
+        assert_eq!(subtitle_demuxer(Path::new("film.txt")), None);
+    }
+
+    #[test]
+    fn test_vtt_args_force_the_external_format() {
+        let args: Vec<String> = vtt_args(Path::new("/media/film.srt"), "0:s:0", Some("srt"), false)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        let input = args.iter().position(|arg| arg == "-i").unwrap();
+        let before = &args[..input];
+        assert!(before.windows(2).any(|p| p[0] == "-f" && p[1] == "srt"));
+        assert!(
+            before
+                .windows(2)
+                .any(|p| p[0] == "-protocol_whitelist" && p[1] == "file")
+        );
+        assert_eq!(args[input + 1], "/media/film.srt");
+        assert_eq!(args[input + 2..], ["-map", "0:s:0", "-f", "webvtt", "-"]);
+    }
+
+    #[test]
+    fn test_vtt_args_let_ffmpeg_probe_an_embedded_stream() {
+        let args: Vec<String> = vtt_args(Path::new("/media/film.mkv"), "0:3", None, false)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        let input = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(!args[..input].iter().any(|arg| arg == "-f"));
+        assert_eq!(args[input + 2..], ["-map", "0:3", "-f", "webvtt", "-"]);
+    }
+
+    #[test]
+    fn test_vtt_args_read_cp1252() {
+        let args: Vec<String> = vtt_args(Path::new("/media/film.srt"), "0:s:0", Some("srt"), true)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        let input = args.iter().position(|arg| arg == "-i").unwrap();
+        let before = &args[..input];
+        assert!(
+            before
+                .windows(2)
+                .any(|p| p[0] == "-sub_charenc" && p[1] == "CP1252")
+        );
     }
 }
