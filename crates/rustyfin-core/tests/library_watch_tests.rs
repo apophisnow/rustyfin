@@ -346,6 +346,45 @@ fn a_growing_file_is_reported_again_once_it_holds_still() {
 }
 
 #[test]
+fn a_folder_made_while_its_parent_settles_is_reported_though_the_parent_time_is_put_back() {
+    // Fix round 1, item 4: a copy tool that keeps times can put a folder's time back after making
+    // a subfolder in it. While the folder settles, its subfolders are compared too.
+    let tree = Tree::new();
+    let show = tree.at("Show (2001)");
+    std::fs::create_dir_all(&show).unwrap();
+    let mut poller = FolderPoller::new(tree.root(), None);
+    assert!(poller.poll().is_empty());
+
+    tick();
+    write(&show.join("Show (2001) S01E01.mkv"), 1000);
+    assert_eq!(poller.poll(), vec![show.clone()], "the new file");
+    assert_eq!(poller.settling(), 1, "the folder settles");
+
+    let listed = std::fs::metadata(&show).unwrap().modified().unwrap();
+    tick();
+    let season = show.join("Season 02");
+    std::fs::create_dir(&season).unwrap();
+    std::fs::File::open(&show)
+        .unwrap()
+        .set_modified(listed)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&show).unwrap().modified().unwrap(),
+        listed,
+        "the folder's time is put back"
+    );
+    write(&season.join("Show (2001) S02E01.mkv"), 1000);
+
+    let mut reported = poller.poll();
+    tick();
+    reported.extend(poller.poll());
+    assert!(
+        reported.contains(&season),
+        "the new folder is reported: {reported:?}"
+    );
+}
+
+#[test]
 fn a_copy_that_ended_before_the_next_poll_is_reported_once() {
     let tree = Tree::new();
     std::fs::create_dir_all(tree.at("Heat (1995)")).unwrap();
