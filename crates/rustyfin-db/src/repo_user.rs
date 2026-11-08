@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rustyfin_model::user::{User, UserPreferences, names_match};
+use rustyfin_model::user::{NameMatch, User, UserPreferences, name_too_long};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -28,7 +28,7 @@ where
     Ok(())
 }
 
-/// Writes a new user unless a user's name matches the new one (`names_match`, AC56). The check
+/// Writes a new user unless a user's name matches the new one (`NameMatch`, AC56, AC62). The check
 /// and the insert run in one IMMEDIATE transaction, so two callers cannot both take a name.
 /// Returns false when the name is taken.
 pub async fn create_user_unless_taken(pool: &SqlitePool, user: &User) -> Result<bool, sqlx::Error> {
@@ -36,7 +36,8 @@ pub async fn create_user_unless_taken(pool: &SqlitePool, user: &User) -> Result<
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM users")
         .fetch_all(&mut *tx)
         .await?;
-    if names.iter().any(|name| names_match(name, &user.name)) {
+    let matcher = NameMatch::new(&user.name);
+    if names.iter().any(|name| matcher.matches(name)) {
         tx.rollback().await?;
         return Ok(false);
     }
@@ -54,9 +55,9 @@ pub async fn get_user_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Us
     Ok(row.map(Into::into))
 }
 
-/// The account a sign-in or password reset names (AC57): the user whose name is exactly `name`,
-/// else the one user whose name matches it (`names_match`). Several matches with no exact one
-/// give None.
+/// The account a sign-in or password reset names (AC57, AC61): the user whose name is exactly
+/// `name`, else the one user whose name matches it (`NameMatch`). A name over the limit matches
+/// only exactly, so it reads no other users. Several matches with no exact one give None.
 pub async fn find_user_for_sign_in(
     pool: &SqlitePool,
     name: &str,
@@ -64,10 +65,14 @@ pub async fn find_user_for_sign_in(
     if let Some(user) = get_user_by_name(pool, name).await? {
         return Ok(Some(user));
     }
+    if name_too_long(name) {
+        return Ok(None);
+    }
+    let matcher = NameMatch::new(name);
     let mut matches: Vec<User> = get_all_users(pool)
         .await?
         .into_iter()
-        .filter(|user| names_match(&user.name, name))
+        .filter(|user| matcher.matches(&user.name))
         .collect();
     if matches.len() == 1 {
         return Ok(matches.pop());
@@ -393,8 +398,8 @@ pub enum Renamed {
     NotFound,
 }
 
-/// Gives a user a new name unless another user's name matches it (`names_match`, AC56). The user's
-/// own name never counts, so a user may change its case. The check and the update run in one
+/// Gives a user a new name unless another user's name matches it (`NameMatch`, AC56, AC62). The
+/// user's own name never counts, so a user may change its case. The check and the update run in one
 /// IMMEDIATE transaction.
 pub async fn rename_user_unless_taken(
     pool: &SqlitePool,
@@ -410,9 +415,10 @@ pub async fn rename_user_unless_taken(
         tx.rollback().await?;
         return Ok(Renamed::NotFound);
     }
+    let matcher = NameMatch::new(name);
     if rows
         .iter()
-        .any(|(row_id, row_name)| *row_id != own_id && names_match(row_name, name))
+        .any(|(row_id, row_name)| *row_id != own_id && matcher.matches(row_name))
     {
         tx.rollback().await?;
         return Ok(Renamed::Taken);

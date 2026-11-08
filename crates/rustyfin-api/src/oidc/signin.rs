@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use super::flow::{Flow, FlowKind};
 use super::{
-    OidcState, Provider, callback_url, claim_username, in_group, names_match, password_allowed,
+    NameMatch, OidcState, Provider, callback_url, claim_username, in_group, name_too_long,
+    password_allowed,
 };
 
 /// How a sign-in ended without a user: the code the browser is sent, or a database failure.
@@ -212,9 +213,9 @@ pub(crate) async fn sign_in(
 }
 
 /// The account a sign-in is for (AC44): the user the identity is linked to; else, when no user has
-/// the name (it matches in any case and compatibility form, `names_match`), a new user. A taken
-/// name is refused (`name_taken`, or `name_taken_ask_admin` when no matching account can sign in
-/// with a password), and the person links from the profile.
+/// the name (it matches in any case and compatibility form, `NameMatch`), a new user. A claim over
+/// the limit is refused (AC64). A taken name is refused (`name_taken`, or `name_taken_ask_admin`
+/// when no matching account can sign in with a password), and the person links from the profile.
 async fn sign_in_account(
     pool: &SqlitePool,
     config: &OidcConfig,
@@ -231,8 +232,12 @@ async fn sign_in_account(
 
     let username = claim_username(claims, &config.username_claim)
         .ok_or(SignInError::Refused("no_username"))?;
+    if name_too_long(&username) {
+        return Err(SignInError::Refused("no_username"));
+    }
     let now = Utc::now();
-    let same_name = users_named(pool, &username).await?;
+    let matcher = NameMatch::new(&username);
+    let same_name = users_named(pool, &matcher).await?;
     if same_name.is_empty() {
         let user = User {
             id: Uuid::new_v4(),
@@ -250,26 +255,26 @@ async fn sign_in_account(
             subject,
             &username,
             now,
-            |name: &str| names_match(name, &username),
+            |name: &str| matcher.matches(name),
         )
         .await?;
         if created {
             return Ok(user.id);
         }
         // The name was taken between the first look and the insert (AC52): nothing was written.
-        let matching = users_named(pool, &username).await?;
+        let matching = users_named(pool, &matcher).await?;
         return refuse_taken(pool, config, &matching).await;
     }
     // A taken name is refused whole (AC44): nothing is created, linked or granted here.
     refuse_taken(pool, config, &same_name).await
 }
 
-/// The users whose name matches `username` (`names_match`), disabled ones included.
-async fn users_named(pool: &SqlitePool, username: &str) -> Result<Vec<User>, sqlx::Error> {
+/// The users whose name matches the entered name (`NameMatch`), disabled ones included.
+async fn users_named(pool: &SqlitePool, matcher: &NameMatch<'_>) -> Result<Vec<User>, sqlx::Error> {
     Ok(repo_user::get_all_users(pool)
         .await?
         .into_iter()
-        .filter(|user| names_match(&user.name, username))
+        .filter(|user| matcher.matches(&user.name))
         .collect())
 }
 

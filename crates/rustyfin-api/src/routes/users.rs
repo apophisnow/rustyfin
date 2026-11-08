@@ -8,7 +8,7 @@ use rustyfin_model::user::{
     ChangePasswordRequest, CreateUserRequest, EasyPasswordRequest, ForgotPasswordPinRequest,
     ForgotPasswordRequest, ForgotPasswordResult, PublicUserDto, ResetPasswordRequest,
     UpdatePolicyRequest, UpdateUserNameRequest, UserAccessSchedule, UserDto, UserImageInfo,
-    UserPreferences, UserSecurityInfo,
+    UserPreferences, UserSecurityInfo, name_too_long,
 };
 use sqlx::SqlitePool;
 use std::net::SocketAddr;
@@ -117,6 +117,9 @@ async fn create_user(
 
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
+    }
+    if name_too_long(&req.name) {
+        return Err(ApiError::BadRequest("name is too long".into()));
     }
 
     let hash = rustyfin_auth::hash_password(&req.password)
@@ -476,6 +479,9 @@ async fn update_user_name(
     }
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
+    }
+    if name_too_long(&req.name) {
+        return Err(ApiError::BadRequest("name is too long".into()));
     }
     match rustyfin_db::repo_user::rename_user_unless_taken(&state.db, id, &req.name).await? {
         rustyfin_db::repo_user::Renamed::Done => Ok(Json(serde_json::json!({}))),

@@ -8,7 +8,7 @@ use flow::FlowStore;
 use openidconnect::core::{CoreJsonWebKeySet, CoreProviderMetadata};
 use rustyfin_model::oidc::{OidcConfig, OidcSettings};
 use rustyfin_model::user::User;
-pub use rustyfin_model::user::{name_key, names_match};
+pub use rustyfin_model::user::{NameMatch, name_key, name_too_long, names_match};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;

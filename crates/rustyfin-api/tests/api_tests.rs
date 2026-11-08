@@ -6446,7 +6446,6 @@ fn b21_over_long_names() -> [String; 3] {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 5 fix 1"]
 async fn b21_new_users_refuse_over_long_names() {
     let t = b21().await;
     for name in b21_over_long_names() {
@@ -6469,7 +6468,6 @@ async fn b21_new_users_refuse_over_long_names() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 5 fix 1"]
 async fn b21_renames_refuse_over_long_names() {
     let t = b21().await;
     let carol_id = add_user(&t.state, "carol", "pw-carol", false)
@@ -6495,7 +6493,6 @@ async fn b21_renames_refuse_over_long_names() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 5 fix 1"]
 async fn b21_startup_user_refuses_an_over_long_name() {
     let state = test_state().await;
     let app = app(state.clone());
@@ -6518,7 +6515,6 @@ async fn b21_startup_user_refuses_an_over_long_name() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 5 fix 1"]
 async fn b21_over_long_names_sign_in_only_exactly() {
     let t = b21().await;
     // An account an older server let through (AC62): 128 decomposed "é", 256 units.
@@ -6576,7 +6572,6 @@ async fn b21_over_long_names_sign_in_only_exactly() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 5 fix 1"]
 async fn b21_sign_in_refuses_an_over_long_username() {
     let t = b21_on(serde_json::json!({})).await;
     let count = t.user_count().await;
