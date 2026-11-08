@@ -8,8 +8,9 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::PoisonError;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
@@ -73,6 +74,8 @@ struct Tree {
     /// The fallback that ends the kernel watching, once a walk or an event meets it. The walks stop
     /// then, and the events after it only report their paths.
     fallback: Option<Fallback>,
+    /// Set once the monitor's task is gone, and a walk under way then stops at the next folder.
+    stopped: Arc<AtomicBool>,
     /// The mount table, read by the first check of the walk under way. None between walks.
     mounts: Option<String>,
     /// The canonical paths of the symlinked folders checked so far, local or not. Forgetting a
@@ -109,6 +112,16 @@ enum Fallback {
     Failed(String),
 }
 
+/// Sets its flag when it is dropped. `watch` holds one for as long as it runs, so an abort, which
+/// drops the future of `watch`, stops a walk under way at its next folder.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Watches the library path of the monitor `key` until the monitor has to poll it instead, and
 /// returns the reason, which the poller logs. Returns None when the monitor is no longer listed,
 /// or when its task failed, which is logged. The next reload then replaces the monitor.
@@ -132,7 +145,11 @@ pub(super) async fn watch(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let setup = off_runtime(move || setup(&setup_root, &data_dir, limit, walk_hook)).await;
+    // Set when this future is dropped, as an abort does: the setup walk then stops at its next
+    // folder, and off_runtime drops what it made.
+    let stopped = Arc::new(AtomicBool::new(false));
+    let _stop_walks = StopOnDrop(Arc::clone(&stopped));
+    let setup = off_runtime(move || setup(&setup_root, &data_dir, limit, walk_hook, stopped)).await;
     let (inotify, mut tree, took) = match setup {
         Ok(Ok(setup)) => setup,
         Ok(Err(fallback)) => return Some(fallback_reason(inner, &root, fallback)),
@@ -255,6 +272,7 @@ fn setup(
     data_dir: &Path,
     limit: Option<usize>,
     walk_hook: Option<PollHook>,
+    stopped: Arc<AtomicBool>,
 ) -> Result<(Inotify, Tree, Duration), Fallback> {
     let started = std::time::Instant::now();
     let inotify = Inotify::init().map_err(|err| {
@@ -287,6 +305,7 @@ fn setup(
         limit,
         walk_hook,
         fallback: None,
+        stopped,
         mounts: None,
         link_targets: BTreeSet::new(),
     };
@@ -524,10 +543,10 @@ impl Tree {
     }
 
     /// Watches the new folders under `dir`, of device `dev`, in name order. The walk stops at a
-    /// fallback.
+    /// fallback, or once the monitor's task is gone.
     fn walk_children(&mut self, dir: &Path, dev: u64) {
         for name in subfolders(dir) {
-            if self.fallback.is_some() {
+            if self.fallback.is_some() || self.stopped.load(Ordering::Relaxed) {
                 return;
             }
             self.watch_new(&dir.join(name), dev);
@@ -537,9 +556,10 @@ impl Tree {
     /// Watches `dir`, a folder that appeared in a folder of device `parent_dev`, and the folders
     /// under it. Returns whether `dir` is watched now. It is not when it is gone, when it is the
     /// data dir or watched under another name, or when its watch fails. A watch limit or a folder
-    /// that is not local sets the fallback instead, and then nothing more is watched.
+    /// that is not local sets the fallback instead, and then nothing more is watched. Nothing is
+    /// watched either once the monitor's task is gone.
     fn watch_new(&mut self, dir: &Path, parent_dev: u64) -> bool {
-        if self.fallback.is_some() {
+        if self.fallback.is_some() || self.stopped.load(Ordering::Relaxed) {
             return false;
         }
         let Some(id) = folder_id(dir) else {
@@ -661,10 +681,10 @@ impl Tree {
     }
 
     /// Goes down through the watched folders under `dir`, of device `dev`, and watches the new
-    /// ones. The walk stops at a fallback.
+    /// ones. The walk stops at a fallback, or once the monitor's task is gone.
     fn overflow_dir(&mut self, dir: &Path, dev: u64) {
         for name in subfolders(dir) {
-            if self.fallback.is_some() {
+            if self.fallback.is_some() || self.stopped.load(Ordering::Relaxed) {
                 return;
             }
             let child = dir.join(name);

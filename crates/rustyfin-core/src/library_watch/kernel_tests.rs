@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use sqlx::SqlitePool;
@@ -63,7 +64,14 @@ async fn with_64_open_files() {
             Err(err) => break err,
         }
     };
-    let fallback = setup(&root.0, &root.0.join("data"), None, None).err();
+    let fallback = setup(
+        &root.0,
+        &root.0.join("data"),
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .err();
     drop(open);
     assert_eq!(full.raw_os_error(), Some(EMFILE), "{full}");
     let fallback = fallback.expect("no inotify instance without a free file");
