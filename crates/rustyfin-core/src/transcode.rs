@@ -1664,6 +1664,73 @@ exec sleep 30
         mgr.stop_all().await;
     }
 
+    /// The playback id of a start of `/in.mkv` with `profile` on a play session, from device "d"
+    async fn start_profile(
+        mgr: &TranscodeManager,
+        item: Uuid,
+        profile: &TranscodeProfile,
+        play_session_id: &str,
+    ) -> Uuid {
+        let (_, playback_id) = mgr
+            .start_transcode(item, "/in.mkv", profile, play_session_id, "d")
+            .await
+            .unwrap();
+        playback_id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_another_profile_replaces_the_session() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        let a = TranscodeProfile {
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        let b = TranscodeProfile {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        let c = TranscodeProfile {
+            start_time_ticks: 600_000_000,
+            ..a.clone()
+        };
+        let id1 = start_profile(&mgr, item, &a, "p").await;
+        // The same profile reuses the transcode
+        assert_eq!(start_profile(&mgr, item, &a, "p").await, id1);
+        // Other tracks replace it: the client of the play session has moved on from the old one
+        let id2 = start_profile(&mgr, item, &b, "p").await;
+        assert_ne!(id2, id1, "other tracks must not reuse the old transcode");
+        assert_eq!(mgr.sessions.len(), 1);
+        // Another start replaces it too
+        let id3 = start_profile(&mgr, item, &c, "p").await;
+        assert_ne!(id3, id2, "another start must not reuse the old transcode");
+        assert_eq!(mgr.sessions.len(), 1);
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_other_profiles_on_two_play_sessions_keep_both() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        let a = TranscodeProfile {
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        let b = TranscodeProfile {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        let on_p = start_profile(&mgr, item, &a, "p").await;
+        let on_q = start_profile(&mgr, item, &b, "q").await;
+        assert_ne!(on_p, on_q);
+        assert_eq!(mgr.sessions.len(), 2);
+
+        mgr.stop_all().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_stop_by_device_and_keyless() {
