@@ -498,8 +498,34 @@ pub(super) fn clip_check_line(line: &str) -> String {
     out
 }
 
-/// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
-/// with generated columns can make a query run without end or make values of any size. It also
+/// What `name` is in the file's main schema: "table", "view" or "virtual table", or None when the
+/// file has no table or view by that name. It is read from `sqlite_schema` alone, which costs SQLite
+/// only the schema parse. `pragma_table_list` would first compile every view in the file, named or
+/// not, and a crafted view can make that compile take minutes and gigabytes where no guard can stop
+/// it (B20 re-check 6, H2). Loading the schema checks each row's type against its SQL, so a view
+/// can't pass as a table. A virtual table is a table row with no root page, made by `CREATE VIRTUAL
+/// TABLE`; one whose stored SQL hides that is connected through its module by the checks that
+/// follow, as `pragma_table_list` already did (re-check 6, D2). Shadow tables need no kind of their
+/// own: their names hold an underscore, and none of the tables the import reads has one.
+async fn table_kind(
+    conn: &mut SqliteConnection,
+    file: &Path,
+    name: &str,
+) -> Result<Option<String>, ImportError> {
+    let kind: Option<(String,)> = sqlx::query_as(
+        "SELECT CASE WHEN type = 'view' THEN 'view' \
+         WHEN rootpage = 0 OR sql LIKE 'CREATE VIRTUAL%' THEN 'virtual table' ELSE 'table' END \
+         FROM main.sqlite_schema WHERE name = ?1 COLLATE NOCASE AND type IN ('table', 'view')",
+    )
+    .bind(name)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| unreadable(file, &e))?;
+    Ok(kind.map(|(kind,)| kind))
+}
+
+/// Refuses a source whose named tables are not plain: a view, a virtual table or a table with
+/// generated columns can make a query run without end or make values of any size. It also
 /// refuses a damaged table, found with SQLite's `quick_check` before any row is read; the first row
 /// is enough and is all it reads. A name the file doesn't have is skipped; its query reports that,
 /// as before. `file` is the source's path, never a copy's.
@@ -515,26 +541,12 @@ async fn check_tables(
         .await
         .map_err(|e| unreadable(file, &e))?;
     for name in names {
-        let kind: Option<(String,)> = sqlx::query_as(
-            "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1 \
-             COLLATE NOCASE",
-        )
-        .bind(*name)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| unreadable(file, &e))?;
-        let Some((kind,)) = kind else {
+        let Some(kind) = table_kind(&mut *conn, file, name).await? else {
             continue;
         };
         if kind != "table" {
-            let shown = match kind.as_str() {
-                "view" => "view",
-                "virtual" => "virtual table",
-                "shadow" => "shadow table",
-                other => other,
-            };
             return Err(ImportError::BadSource(format!(
-                "{}: {name} is a {shown}, not a plain table",
+                "{}: {name} is a {kind}, not a plain table",
                 file.display()
             )));
         }
@@ -1580,15 +1592,9 @@ async fn read_roots(
         .map_err(|e| unreadable(file, &e))?;
     let mut roots = Vec::new();
     for &table in tables {
-        let kind: Option<(String,)> = sqlx::query_as(
-            "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1 \
-             COLLATE NOCASE",
-        )
-        .bind(table)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| unreadable(file, &e))?;
-        if !kind.is_some_and(|(kind,)| kind == "table") {
+        // `table_kind` reads `sqlite_schema`, so no view is compiled before the guards (B20
+        // re-check 6, H2).
+        if table_kind(&mut *conn, file, table).await?.as_deref() != Some("table") {
             continue;
         }
         // Refuse a generated column before the `EXPLAIN` compiles its expression (see above); the

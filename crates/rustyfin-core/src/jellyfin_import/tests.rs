@@ -3611,3 +3611,76 @@ async fn b20_read_roots_refuses_a_generated_column_chain_before_the_explain() {
         "the in-memory path (u64::MAX), then the copy path (0)"
     );
 }
+
+// Fix round 7 (re-check 6, H2): at 76680f2 `read_roots` and `check_tables` found each named table's
+// kind in `pragma_table_list`, which first prepares `SELECT * FROM "<view>"` for every view in the
+// file, named or not. That prepare expands the view and generates its code at compile time, where
+// the progress guard never fires, so neither the F4 budget nor the R4 cancel can stop it, and it runs
+// before either guard. Here an unnamed view filters an unnamed table through a 1,000-value IN list
+// and each level above it joins the one below to itself, so resolving the top view copies the list
+// 1,024 times. The fix reads the kind from `sqlite_schema`, which costs only the schema parse, so no
+// view is resolved: both paths open and read `Users` within 5 s. On 76680f2 both are still busy after
+// 5 s (seen under `timeout`+`prlimit`): that is the red. Ten levels cost the parent tens of seconds
+// and about 120 MiB a connection (measured with Python's SQLite 3.46.1), so even a red run stays
+// small without a prlimit; each level more would triple the time and double the memory.
+#[tokio::test]
+async fn b20_snapshot_never_resolves_an_unnamed_view() {
+    use sqlx::{ConnectOptions, Connection};
+    use std::time::Duration;
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let db = tmp.0.join("jellyfin.db");
+    let alice = "INSERT INTO Users VALUES ('u1', 1, 'alice')";
+    write_db(&db, &[USERS_DDL, alice]).await;
+    // Each level doubles the copies of `v0` the view expander makes: 2^DEPTH in all.
+    const DEPTH: usize = 10;
+    let list: Vec<String> = (0..1000).map(|n| n.to_string()).collect();
+    let mut views = format!(
+        "CREATE TABLE x (c0 INTEGER); CREATE VIEW v0 AS SELECT c0 FROM x WHERE c0 IN ({});",
+        list.join(", ")
+    );
+    for j in 1..=DEPTH {
+        let prev = j - 1;
+        views.push_str(&format!(
+            " CREATE VIEW v{j} AS SELECT a.c0 FROM v{prev} a, v{prev} b;"
+        ));
+    }
+    {
+        // Creating a view doesn't resolve it, so building the fixture is quick.
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(views))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let mut texts = Vec::new();
+    for limit in [u64::MAX, 0] {
+        let read = async {
+            let mut snapshot =
+                open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX))
+                    .await?;
+            let (name,): (String,) = sqlx::query_as("SELECT Username FROM Users")
+                .fetch_one(&mut *snapshot)
+                .await
+                .unwrap();
+            Ok::<_, ImportError>(name)
+        };
+        texts.push(
+            match tokio::time::timeout(Duration::from_secs(5), read).await {
+                Err(_) => "still busy after 5 s".to_string(),
+                Ok(Ok(name)) => format!("read {name}"),
+                Ok(Err(ImportError::BadSource(text))) => text,
+                Ok(Err(other)) => format!("{other:?}"),
+            },
+        );
+    }
+    assert_eq!(
+        texts,
+        ["read alice", "read alice"],
+        "the in-memory path (u64::MAX), then the copy path (0)"
+    );
+}
