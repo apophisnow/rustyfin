@@ -602,6 +602,7 @@ mod tests {
     use super::*;
     use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, SystemTime};
 
     /// A folder under the temp dir with empty files, removed when dropped.
@@ -842,5 +843,142 @@ mod tests {
         assert!(!Path::new(&folder.path("v1-src-0.vtt")).exists());
         assert!(Path::new(&folder.path("v1-src-1.vtt")).exists());
         assert!(Path::new(&folder.path("v1-src-2.vtt")).exists());
+    }
+
+    #[tokio::test]
+    async fn test_read_capped_keeps_input_at_the_cap() {
+        assert_eq!(
+            read_capped(&b"abcd"[..], 4).await.unwrap(),
+            Some(b"abcd".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_capped_refuses_input_over_the_cap() {
+        assert_eq!(read_capped(&b"abcde"[..], 4).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_run_capped_returns_the_output() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf abc; printf oops >&2; exit 3"]);
+        let RunEnd::Exited {
+            status,
+            stdout,
+            stderr,
+        } = run_capped(&mut command, 1000, Duration::from_secs(10))
+            .await
+            .unwrap()
+        else {
+            panic!("the child did not exit");
+        };
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(stdout, b"abc".to_vec());
+        assert_eq!(stderr, "oops");
+    }
+
+    #[tokio::test]
+    async fn test_run_capped_stops_at_the_cap() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "head -c 100000 /dev/zero; exec sleep 30"]);
+        let started = std::time::Instant::now();
+        let end = run_capped(&mut command, 1000, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert!(matches!(end, RunEnd::TooLarge));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn test_run_capped_stops_at_the_time_limit() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = std::time::Instant::now();
+        let end = run_capped(&mut command, 1000, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(matches!(end, RunEnd::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_run_capped_drains_a_long_stderr() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "head -c 300000 /dev/zero >&2; printf ok"]);
+        let RunEnd::Exited { stdout, .. } = run_capped(&mut command, 10, Duration::from_secs(10))
+            .await
+            .unwrap()
+        else {
+            panic!("the child did not exit");
+        };
+        assert_eq!(stdout, b"ok".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_vtt_jobs_run_at_most_their_permits() {
+        let jobs = VttJobs::new(2);
+        let (running, peak, runs) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let work = (0..6).map(|n| {
+            let file = PathBuf::from(format!("/cache/{n}.vtt"));
+            let (jobs, running, peak, runs) = (&jobs, &running, &peak, &runs);
+            async move {
+                jobs.run(&file, async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    runs.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+            }
+        });
+        futures_util::future::join_all(work).await;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(runs.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn test_vtt_jobs_run_one_job_per_file() {
+        let jobs = VttJobs::new(4);
+        let file = PathBuf::from("/cache/one.vtt");
+        let (running, peak, runs) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let work = (0..3).map(|_| {
+            let (jobs, file, running, peak, runs) = (&jobs, &file, &running, &peak, &runs);
+            async move {
+                jobs.run(file, async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    runs.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+            }
+        });
+        futures_util::future::join_all(work).await;
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        assert!(jobs.files.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_vtt_jobs_forget_a_dropped_wait() {
+        let jobs = VttJobs::new(1);
+        let file = PathBuf::from("/cache/x.vtt");
+        // B waits for the file that A holds, and is dropped while it waits
+        let (_, waited) = tokio::join!(
+            jobs.run(&file, tokio::time::sleep(Duration::from_millis(200))),
+            tokio::time::timeout(Duration::from_millis(50), jobs.run(&file, async {})),
+        );
+        assert!(waited.is_err());
+        assert!(jobs.files.lock().unwrap().is_empty());
     }
 }

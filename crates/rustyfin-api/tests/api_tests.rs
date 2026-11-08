@@ -11026,6 +11026,33 @@ async fn b22_subtitle_vtt_cache_keeps_one_file_per_stream() {
 }
 
 #[tokio::test]
+async fn b22_subtitle_vtt_refuses_a_huge_file() {
+    if !g4_have_ffmpeg("b22_subtitle_vtt_refuses_a_huge_file") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (id, msid, _) = b22_film(&state, "b22-huge").await;
+    // The English file, external index 0, grows past 32 MiB as a sparse file
+    let eng = std::path::PathBuf::from(media_folder(&state, "b22-huge")).join("B22 Film.eng.srt");
+    std::fs::File::create(&eng)
+        .unwrap()
+        .set_len(33 << 20)
+        .unwrap();
+    let app = app(state);
+
+    // The WebVTT of stream 3 and the file itself are both too large
+    let vtt_uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    let (vtt, _, _) = b22_get(&app, &vtt_uri, &token).await;
+    let (file, _, _) = b22_get(&app, &format!("/Videos/{id}/Subtitles/0/Stream"), &token).await;
+    assert_eq!(
+        (vtt, file),
+        (StatusCode::PAYLOAD_TOO_LARGE, StatusCode::PAYLOAD_TOO_LARGE)
+    );
+}
+
+#[tokio::test]
 async fn b22_report_bodies_carry_track_indexes() {
     use rustyfin_model::playback::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
 
