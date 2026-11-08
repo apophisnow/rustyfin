@@ -246,7 +246,8 @@ mod tests {
 
     #[tokio::test]
     async fn b33_a_9d9cfb2_db_applies_070_and_keeps_its_items() {
-        // Master 9d9cfb2 ships 001-035 and 061. Its episodes get an empty end at the next start.
+        // Master 9d9cfb2 ships 001-035 and 061. At the next start its episodes get an empty end,
+        // and its items the FileSystem location type that a scan corrects for seasons with no folder.
         let dir = temp_dir();
         let master = dir.join("9d9cfb2.db");
         let pool = plain_pool(&master).await;
@@ -273,13 +274,13 @@ mod tests {
                 .await
                 .unwrap();
         assert!(applied.contains(&70), "070 is applied: {applied:?}");
-        let episode: (Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT index_number, index_number_end FROM media_items WHERE id = 'ep'",
+        let episode: (Option<i64>, Option<i64>, String) = sqlx::query_as(
+            "SELECT index_number, index_number_end, location_type FROM media_items WHERE id = 'ep'",
         )
         .fetch_one(&upgraded)
         .await
         .unwrap();
-        assert_eq!(episode, (Some(3), None));
+        assert_eq!(episode, (Some(3), None, "FileSystem".to_string()));
         let fresh = init_db(dir.join("fresh.db").to_str().unwrap())
             .await
             .unwrap();

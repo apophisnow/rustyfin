@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 use chrono::{DateTime, FixedOffset, Utc};
 use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
+use rustyfin_model::media::LocationType;
 use rustyfin_model::metadata::ExternalMetadata;
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -799,6 +800,55 @@ pub async fn settle_season_numbers(
         .bind(id)
         .bind(old_number)
         .bind(old_sort_name)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Gives each season of `seasons`, (id, location type), the location type that the scan found for it, where
+/// the stored one differs: a season with no folder of its own, made for the episode files in its series'
+/// folder, is Virtual and gives no Path, as in Jellyfin; one with a folder is FileSystem. A season keeps the
+/// path that the scan finds it by, so it keeps its id. Only the seasons that differ are written, in one
+/// transaction. Returns how many changed.
+pub async fn settle_season_folders(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    seasons: &[(Uuid, LocationType)],
+) -> Result<u64, sqlx::Error> {
+    let stored: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, location_type FROM media_items
+         WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let stored: HashMap<String, String> = stored.into_iter().collect();
+
+    let changes: Vec<(String, &str, &str)> = seasons
+        .iter()
+        .filter_map(|&(id, location)| {
+            let id = id.to_string();
+            let old = stored.get(&id)?.as_str();
+            (old != location.as_str()).then_some((id, location.as_str(), old))
+        })
+        .collect();
+    if changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed = 0;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (id, location, old) in changes {
+        // A season that another writer changed since it was read is left to the next scan.
+        changed += sqlx::query(
+            "UPDATE media_items SET location_type = ?1 WHERE id = ?2 AND location_type = ?3",
+        )
+        .bind(location)
+        .bind(id)
+        .bind(old)
         .execute(&mut *tx)
         .await?
         .rows_affected();

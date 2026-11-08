@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rustyfin_db::repo_media::PathScope;
 use rustyfin_model::library::{Library, LibraryContentType};
-use rustyfin_model::media::{MediaItem, MediaType};
+use rustyfin_model::media::{LocationType, MediaItem, MediaType};
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -781,6 +781,7 @@ async fn scan_tv_library(
                     index_number: season_number,
                     parent_index_number: None,
                     media_sources: Vec::new(),
+                    location_type: season_location(&season_path),
                     ..MediaItem::default_dto_fields()
                 };
                 new_items.push(season_item);
@@ -852,6 +853,24 @@ async fn scan_tv_library(
     if settled > 0 {
         tracing::info!(
             "TV library '{}': set the number of {} stored seasons",
+            library.name,
+            settled
+        );
+    }
+    // A season stored under an older rule loses the Path of a folder that it doesn't have, and a season whose
+    // folder has appeared since gets its Path.
+    let season_folders: Vec<(Uuid, LocationType)> = series_folders
+        .values()
+        .flat_map(|walk| {
+            walk.seasons
+                .iter()
+                .map(|(&id, (name, _))| (id, season_location(&format!("{}/{}", walk.dir, name))))
+        })
+        .collect();
+    let settled = scan_sync::settle_season_folders(pool, library.id, &season_folders).await?;
+    if settled > 0 {
+        tracing::info!(
+            "TV library '{}': set whether {} stored seasons have a folder",
             library.name,
             settled
         );
@@ -1775,6 +1794,17 @@ async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBu
     }
     result.sort();
     (result, unreadable, Vec::new())
+}
+
+/// The location type of the season stored at `path`: Virtual where that folder doesn't exist, as for a season
+/// made for the episode files in its series' folder, and FileSystem where it does. Jellyfin 12.4 gives such a
+/// season no Path (`Resolvers/TV/SeasonResolver.cs:63`), which makes it Virtual (`Entities/BaseItem.cs:348-365`).
+fn season_location(path: &str) -> LocationType {
+    if Path::new(path).is_dir() {
+        LocationType::FileSystem
+    } else {
+        LocationType::Virtual
+    }
 }
 
 /// The number of the season folder called `name` in the series folder called `series_folder`: the number

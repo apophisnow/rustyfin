@@ -6960,3 +6960,120 @@ async fn b33_rescans_give_stored_episodes_their_last_episode() {
     assert_eq!(marks_of(&fx.pool, &user, double).await, Some(marks));
     assert_eq!(marks_of(&fx.pool, &user, single).await, Some(favorite));
 }
+
+// B32 (e): a season with no folder has no Path
+
+/// The LocationType and the Path that items give for the item at `rel`.
+async fn b32_location(
+    pool: &SqlitePool,
+    lib: &Library,
+    rel: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let id = item_at(pool, lib, rel).await;
+    let item = rustyfin_db::repo_media::get_item_by_id(pool, id)
+        .await
+        .unwrap()
+        .expect("the item is stored");
+    let json = serde_json::to_value(&item).unwrap();
+    (json["LocationType"].clone(), json["Path"].clone())
+}
+
+/// What items give for a season with a folder at `rel`.
+fn b32_folder(lib: &Library, rel: &str) -> (serde_json::Value, serde_json::Value) {
+    let folder = root_of(lib).join(rel);
+    (
+        serde_json::json!("FileSystem"),
+        serde_json::json!(folder.to_str().unwrap()),
+    )
+}
+
+/// What items give for a season with no folder.
+fn b32_virtual() -> (serde_json::Value, serde_json::Value) {
+    (serde_json::json!("Virtual"), serde_json::Value::Null)
+}
+
+const B32_LOOSE: &str = "Lima Series/Lima Series - S01E01.mkv";
+/// The path that the season of `B32_LOOSE` is stored and found by, though it has no folder.
+const B32_LOOSE_SEASON: &str = "Lima Series/Season 1";
+
+#[tokio::test]
+async fn b32_seasons_with_no_folder_have_no_path() {
+    // A loose file of a season that has a folder joins that season, as Dekalog's does.
+    const IN_FOLDER: &str = "Mike Series/Season 1/Mike Series - S01E01.mkv";
+    const JOINS: &str = "Mike Series/Mike Series - S01E02.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [B32_LOOSE, JOINS, IN_FOLDER] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_location(&fx.pool, &lib, B32_LOOSE_SEASON).await,
+        b32_virtual()
+    );
+    assert_eq!(
+        b32_location(&fx.pool, &lib, "Mike Series/Season 1").await,
+        b32_folder(&lib, "Mike Series/Season 1")
+    );
+    let seasons: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE library_id = ?1 AND media_type = 'Season'",
+    )
+    .bind(lib.id.to_string())
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(seasons, 2);
+}
+
+#[tokio::test]
+async fn b32_rescans_settle_whether_a_season_has_a_folder() {
+    const MOVED: &str = "Lima Series/Season 1/Lima Series - S01E01.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, B32_LOOSE);
+    scan(&fx.pool, &lib).await;
+    let season = item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await;
+    let episode = item_at(&fx.pool, &lib, B32_LOOSE).await;
+    // 9d9cfb2 gave each season the made-up path, so 070 leaves its seasons FileSystem.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET location_type = 'FileSystem'",
+        &[],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let favorite = Marks {
+        favorite: true,
+        ..Marks::default()
+    };
+    insert_marks(&fx.pool, &user, season, &favorite).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_location(&fx.pool, &lib, B32_LOOSE_SEASON).await,
+        b32_virtual()
+    );
+    assert_eq!(item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await, season);
+    assert_eq!(
+        marks_of(&fx.pool, &user, season).await,
+        Some(favorite.clone())
+    );
+
+    // The episode moves into a folder for its season.
+    std::fs::create_dir(root.join(B32_LOOSE_SEASON)).unwrap();
+    std::fs::rename(root.join(B32_LOOSE), root.join(MOVED)).unwrap();
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(
+        b32_location(&fx.pool, &lib, B32_LOOSE_SEASON).await,
+        b32_folder(&lib, B32_LOOSE_SEASON)
+    );
+    assert_eq!(item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await, season);
+    assert_eq!(item_at(&fx.pool, &lib, MOVED).await, episode);
+    assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
+}

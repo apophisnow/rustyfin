@@ -734,7 +734,11 @@ impl Serialize for MediaItem {
         s.serialize_field("Type", self.media_type.item_kind())?;
         s.serialize_field("MediaType", self.media_type.media_kind())?;
         s.serialize_field("IsFolder", &self.media_type.is_folder())?;
-        s.serialize_field("Path", &self.path)?;
+        // A season with no folder has no Path in Jellyfin 12.4 (`Resolvers/TV/SeasonResolver.cs:63`,
+        // `TV/SeriesMetadataService.cs:456-463`), which makes it Virtual (`Entities/BaseItem.cs:348-365`).
+        // Such a season is stored with a made-up path that the scan finds it by.
+        let path = (self.location_type != LocationType::Virtual).then_some(&self.path);
+        s.serialize_field("Path", &path)?;
         s.serialize_field("ParentId", &self.parent_id)?;
         s.serialize_field("LibraryId", &self.library_id)?;
         s.serialize_field("ProductionYear", &self.production_year)?;
@@ -1115,5 +1119,27 @@ mod tests {
         cached.as_object_mut().unwrap().remove("IndexNumberEnd");
         let read: MediaItem = serde_json::from_value(cached).unwrap();
         assert_eq!(read.index_number_end, None);
+    }
+
+    // ── A season with no folder ──
+
+    #[test]
+    fn b32_a_virtual_season_gives_no_path() {
+        let made_up = MediaItem {
+            media_type: MediaType::Season,
+            path: "/tv/One Night (2023)/Season 1".to_string(),
+            location_type: LocationType::Virtual,
+            ..MediaItem::default_dto_fields()
+        };
+        let json = serde_json::to_value(&made_up).unwrap();
+        assert_eq!(json["LocationType"], "Virtual");
+        assert_eq!(json["Path"], serde_json::Value::Null);
+        let folder = MediaItem {
+            location_type: LocationType::FileSystem,
+            ..made_up
+        };
+        let json = serde_json::to_value(&folder).unwrap();
+        assert_eq!(json["LocationType"], "FileSystem");
+        assert_eq!(json["Path"], "/tv/One Night (2023)/Season 1");
     }
 }
