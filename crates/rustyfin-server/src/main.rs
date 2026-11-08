@@ -152,6 +152,12 @@ async fn main() {
         Err(e) => tracing::warn!("could not check for default admin passwords: {}", e),
     }
 
+    // Makes the setup-code dummy hash now, so the first setup-code check after a start
+    // is not slower.
+    if let Err(e) = rustyfin_auth::prepare_setup_code_checks().await {
+        tracing::warn!("could not prepare setup-code checks: {e}");
+    }
+
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     let transcode_manager = rustyfin_core::transcode::TranscodeManager::new(&data_dir);
@@ -176,7 +182,8 @@ async fn main() {
     plugin_manager.load_all().await;
 
     // Rate limiter: default 10 requests per 60 seconds per resolved client IP, for the login
-    // endpoints only (AuthenticateByName, ForgotPassword, ForgotPassword/Pin, ResetPassword).
+    // endpoints only (AuthenticateByName, AuthenticateWithSetupCode, ForgotPassword,
+    // ForgotPassword/Pin, ResetPassword).
     // Configurable via env; 0 disables.
     let rate_max: usize = std::env::var("RUSTYFIN_RATE_LIMIT")
         .ok()
@@ -230,6 +237,8 @@ async fn main() {
         image_cache,
         http_client,
         tmdb,
+        oidc: rustyfin_api::oidc::OidcState::new(),
+        jellyfin_import: Default::default(),
     };
 
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
@@ -312,7 +321,7 @@ async fn main() {
     let app = build_router(state)
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(request_span));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -528,6 +537,17 @@ fn load_or_create_server_id(data_dir: &std::path::Path) -> String {
     id
 }
 
+/// The span of one request: the method, the path without the query string, and the HTTP version.
+/// Query strings carry `api_key` tokens and the OIDC callback's `code` and `state` (AC43).
+fn request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        uri = %request.uri().path(),
+        version = ?request.version(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,3 +582,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+mod request_log_tests;

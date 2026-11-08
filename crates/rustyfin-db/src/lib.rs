@@ -2,10 +2,12 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 pub mod repo_activity;
+pub mod repo_by_name;
 pub mod repo_chapter;
 pub mod repo_collection;
 pub mod repo_device;
 pub mod repo_image;
+pub mod repo_jellyfin_import;
 pub mod repo_library;
 pub mod repo_live_tv;
 pub mod repo_media;
@@ -13,12 +15,14 @@ pub mod repo_media_segment;
 pub mod repo_media_source;
 pub mod repo_misc;
 pub mod repo_notification;
+pub mod repo_oidc;
 pub mod repo_package;
 pub mod repo_person;
 pub mod repo_playback;
 pub mod repo_playlist;
 pub mod repo_search;
 pub mod repo_session;
+pub mod repo_setup_code;
 pub mod repo_sync_play;
 pub mod repo_token;
 pub mod repo_trickplay;
@@ -245,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b33_a_9d9cfb2_db_applies_070_and_keeps_its_items() {
+    async fn b33_a_9d9cfb2_db_applies_072_and_keeps_its_items() {
         // Master 9d9cfb2 ships 001-035 and 061. At the next start its episodes get an empty end,
         // and its items the FileSystem location type that a scan corrects for seasons with no folder.
         let dir = temp_dir();
@@ -273,7 +277,7 @@ mod tests {
                 .fetch_all(&upgraded)
                 .await
                 .unwrap();
-        assert!(applied.contains(&70), "070 is applied: {applied:?}");
+        assert!(applied.contains(&72), "072 is applied: {applied:?}");
         let episode: (Option<i64>, Option<i64>, String) = sqlx::query_as(
             "SELECT index_number, index_number_end, location_type FROM media_items WHERE id = 'ep'",
         )
@@ -333,6 +337,61 @@ mod tests {
         );
         upgraded.close().await;
         fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rowids of the search index entries that match `query`.
+    async fn search_entries(pool: &SqlitePool, query: &str) -> Vec<i64> {
+        sqlx::query_scalar(
+            "SELECT rowid FROM media_items_fts WHERE media_items_fts MATCH ?1 ORDER BY rowid",
+        )
+        .bind(query)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn b31_071_drops_search_entries_left_at_old_rowids() {
+        // Before 071 a metadata refresh saved an item with INSERT OR REPLACE. The item came back
+        // under a new rowid, and the search entry for its old name stayed at the old rowid. 071
+        // rebuilds the search index from media_items once.
+        let dir = temp_dir();
+        let old = dir.join("old.db");
+        let pool = plain_pool(&old).await;
+        subset(70).run(&pool).await.unwrap();
+        for statement in [
+            "INSERT INTO libraries (id, name, content_type) VALUES ('lib', 'Film', 'movies')",
+            "INSERT INTO media_items (id, library_id, name, media_type, path) \
+             VALUES ('item', 'lib', 'Old Title', 'Movie', '/media/movies/item.mkv')",
+            "INSERT OR REPLACE INTO media_items (id, library_id, name, media_type, path) \
+             VALUES ('item', 'lib', 'New Title', 'Movie', '/media/movies/item.mkv')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            search_entries(&pool, "old*").await.len(),
+            1,
+            "the old save left an entry for the old name"
+        );
+        pool.close().await;
+
+        let upgraded = init_db(old.to_str().unwrap()).await.unwrap();
+        let rowid: i64 = sqlx::query_scalar("SELECT rowid FROM media_items WHERE id = 'item'")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+        assert_eq!(
+            search_entries(&upgraded, "old*").await,
+            Vec::<i64>::new(),
+            "no entry for the old name is left"
+        );
+        assert_eq!(
+            search_entries(&upgraded, "new*").await,
+            [rowid],
+            "the new name has one entry, at the item's rowid"
+        );
+        upgraded.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

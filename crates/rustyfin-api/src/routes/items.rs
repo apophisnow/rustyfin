@@ -52,6 +52,22 @@ async fn populate_media_source_single(
     Ok(())
 }
 
+/// Sets a user's watch data on an item, with its CompletionPercentage if the runtime is known.
+fn apply_user_data(item: &mut MediaItem, user_data: rustyfin_model::playback::UserItemDataDto) {
+    if let Some(runtime) = item.runtime_ticks
+        && runtime > 0
+    {
+        let pos = user_data.playback_position_ticks.max(0) as f64;
+        let run = runtime as f64;
+        if user_data.played {
+            item.completion_percentage = Some(100.0);
+        } else {
+            item.completion_percentage = Some((pos / run * 100.0).min(100.0));
+        }
+    }
+    item.user_data = Some(user_data);
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -93,6 +109,26 @@ async fn enrich_item(
         provider_ids.set("tvdb".to_string(), tvdb.to_string());
     }
     item.provider_ids = provider_ids;
+
+    // Jellyfin import: metadata columns that live outside media_items
+    if let Ok(Some(extras)) = rustyfin_db::repo_jellyfin_import::item_extras(pool, item.id).await {
+        if let Some(title) = extras.original_title {
+            item.original_title = Some(title);
+        }
+        if let Some(rating) = extras.critic_rating {
+            item.critic_rating = Some(rating);
+        }
+        if let Some(imdb) = extras.imdb_id {
+            item.provider_ids.set("imdb".to_string(), imdb);
+        }
+        item.lock_data = extras.lock_data;
+        item.locked_fields = extras
+            .locked_fields
+            .split('|')
+            .filter(|field| !field.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
 
     // ExternalUrls from provider_ids
     let mut external_urls = Vec::new();
@@ -229,18 +265,7 @@ async fn enrich_item(
 
     // CompletionPercentage from user_item_data
     if let Ok(user_data) = user_data_result {
-        item.user_data = Some(user_data.clone());
-        if let Some(runtime) = item.runtime_ticks
-            && runtime > 0
-        {
-            let pos = user_data.playback_position_ticks.max(0) as f64;
-            let run = runtime as f64;
-            if user_data.played {
-                item.completion_percentage = Some(100.0);
-            } else {
-                item.completion_percentage = Some((pos / run * 100.0).min(100.0));
-            }
-        }
+        apply_user_data(item, user_data);
     }
 
     // Media source count and streams
@@ -374,12 +399,15 @@ async fn enrich_item(
         if let Ok(artists) = &people_result {
             item.artists = artists
                 .iter()
-                .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
-                    id: pid.clone(),
-                    name: name.clone(),
-                    role: role.clone(),
-                    person_type: Some("Artist".to_string()),
-                })
+                .map(
+                    |(pid, name, role, _, has_image)| rustyfin_model::media::PersonInfo {
+                        id: pid.clone(),
+                        name: name.clone(),
+                        role: role.clone(),
+                        person_type: Some("Artist".to_string()),
+                        primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                    },
+                )
                 .collect();
             item.album_artists = item.artists.clone();
             // Also populate People for audio items
@@ -394,32 +422,27 @@ async fn enrich_item(
     {
         item.people = people_rows
             .iter()
-            .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
-                id: pid.clone(),
-                name: name.clone(),
-                role: role.clone(),
-                person_type: role
-                    .as_deref()
-                    .map(|r| {
-                        if r == "Actor" || r == "Actress" {
-                            "Actor".to_string()
-                        } else {
-                            "Creator".to_string()
-                        }
-                    })
-                    .or_else(|| Some("Actor".to_string())),
-            })
+            .map(
+                |(pid, name, role, kind, has_image)| rustyfin_model::media::PersonInfo {
+                    id: pid.clone(),
+                    name: name.clone(),
+                    role: role.clone(),
+                    person_type: Some(kind.clone()),
+                    primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                },
+            )
             .collect();
     }
 
-    // --- Studios from item_studios table ---
+    // --- Studios from item_studios table, with the ids that /Studios lists ---
     if item.studios.is_empty()
         && let Ok(studio_rows) = studios_result
     {
+        let studio = rustyfin_db::repo_by_name::ByNameKind::Studio;
         item.studios = studio_rows
             .into_iter()
-            .map(|(sid, sname)| rustyfin_model::media::StudioInfo {
-                id: sid,
+            .map(|(_, sname)| rustyfin_model::media::StudioInfo {
+                id: rustyfin_db::repo_by_name::by_name_id(studio, &sname).to_string(),
                 name: sname,
             })
             .collect();
@@ -580,12 +603,13 @@ async fn enrich_item(
         }
     }
 
-    // --- GenreItems from genres ---
+    // --- GenreItems from genres, with the ids that /Genres or /MusicGenres lists ---
     if item.genre_items.is_empty() && !item.genres.is_empty() {
+        let kind = rustyfin_db::repo_by_name::genre_kind_of(item.media_type);
         for genre in &item.genres {
             item.genre_items.push(rustyfin_model::media::GenreItem {
                 name: genre.clone(),
-                id: genre.to_lowercase().replace(' ', "-"),
+                id: rustyfin_db::repo_by_name::by_name_id(kind, genre).to_string(),
             });
         }
     }
@@ -685,25 +709,28 @@ async fn enrich_items(
     };
 
     // Batch query 8: People for all items
-    let people_map: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = {
-        let mut map: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+    let people_map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> = {
+        let mut map: std::collections::HashMap<String, Vec<rustyfin_db::repo_media::PersonRow>> =
             std::collections::HashMap::new();
         for chunk_ids in item_ids.chunks(100) {
             let placeholders: Vec<String> =
                 (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
             let query = format!(
-                "SELECT ip.item_id, p.id, p.name, ip.role FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({})",
+                "SELECT ip.item_id, p.id, p.name, ip.role, ip.type, EXISTS(SELECT 1 FROM person_images pi WHERE pi.person_id = p.id AND pi.image_type = 'Primary' AND pi.image_index = 0) FROM item_people ip JOIN people p ON p.id = ip.person_id WHERE ip.item_id IN ({}) ORDER BY ip.item_id, ip.sort_order IS NULL, ip.sort_order, ip.rowid",
                 placeholders.join(",")
             );
-            let mut query_builder = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-                sqlx::AssertSqlSafe(query.clone()),
-            );
+            let mut query_builder = sqlx::query_as::<
+                _,
+                (String, String, String, Option<String>, String, bool),
+            >(sqlx::AssertSqlSafe(query.clone()));
             for id in chunk_ids {
                 query_builder = query_builder.bind(id.to_string());
             }
             if let Ok(rows) = query_builder.fetch_all(pool).await {
-                for (item_id, pid, pname, role) in rows {
-                    map.entry(item_id).or_default().push((pid, pname, role));
+                for (item_id, pid, pname, role, kind, has_image) in rows {
+                    map.entry(item_id)
+                        .or_default()
+                        .push((pid, pname, role, kind, has_image));
                 }
             }
         }
@@ -1139,12 +1166,13 @@ async fn enrich_items(
             }
         }
 
-        // --- GenreItems from genres ---
+        // --- GenreItems from genres, with the ids that /Genres or /MusicGenres lists ---
         if item.genre_items.is_empty() && !item.genres.is_empty() {
+            let kind = rustyfin_db::repo_by_name::genre_kind_of(item.media_type);
             for genre in &item.genres {
                 item.genre_items.push(rustyfin_model::media::GenreItem {
                     name: genre.clone(),
-                    id: genre.to_lowercase().replace(' ', "-"),
+                    id: rustyfin_db::repo_by_name::by_name_id(kind, genre).to_string(),
                 });
             }
         }
@@ -1155,21 +1183,15 @@ async fn enrich_items(
         {
             item.people = people_rows
                 .iter()
-                .map(|(pid, name, role)| rustyfin_model::media::PersonInfo {
-                    id: pid.clone(),
-                    name: name.clone(),
-                    role: role.clone(),
-                    person_type: role
-                        .as_deref()
-                        .map(|r| {
-                            if r == "Actor" || r == "Actress" {
-                                "Actor".to_string()
-                            } else {
-                                "Creator".to_string()
-                            }
-                        })
-                        .or_else(|| Some("Actor".to_string())),
-                })
+                .map(
+                    |(pid, name, role, kind, has_image)| rustyfin_model::media::PersonInfo {
+                        id: pid.clone(),
+                        name: name.clone(),
+                        role: role.clone(),
+                        person_type: Some(kind.clone()),
+                        primary_image_tag: has_image.then(|| "Primary_0".to_string()),
+                    },
+                )
                 .collect();
             // For audio items, also populate artists
             if item.media_type == rustyfin_model::media::MediaType::Audio {
@@ -1576,6 +1598,16 @@ impl ItemsQuery {
     }
 }
 
+/// The UUIDs in a comma-separated id list. A value that isn't a UUID is dropped, as Jellyfin's
+/// comma-delimited binder drops it (`CommaDelimitedCollectionModelBinder.cs:65-73`).
+fn parse_ids(value: Option<&str>) -> Vec<Uuid> {
+    value
+        .into_iter()
+        .flat_map(|ids| ids.split(','))
+        .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+        .collect()
+}
+
 async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
@@ -1628,6 +1660,14 @@ async fn get_items(
         media_types
     };
 
+    // GenreIds and StudioIds keep the items with one of those genres and one of those studios.
+    let item_ids = rustyfin_db::repo_by_name::item_ids_with(
+        &state.db_ro,
+        &parse_ids(query.genre_ids()),
+        &parse_ids(query.studio_ids()),
+    )
+    .await?;
+
     let (items, total) = rustyfin_db::repo_media::get_items_filtered(
         &state.db_ro,
         query.parent_id(),
@@ -1656,6 +1696,7 @@ async fn get_items(
         query.date_created(),
         runtime_parts,
         Some(claims.sub),
+        item_ids.as_deref(),
     )
     .await?;
 
@@ -1705,43 +1746,57 @@ async fn get_item(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<MediaItem>, ApiError> {
     let id_str = id.to_string();
-    // Check cache first
-    if let Some(cached) = state.cache.item_details.get(&id_str)
-        && let Ok(item) = serde_json::from_value(cached.clone())
+    // The details every user sees; the requester's watch data is added below. A scan that reads
+    // a file again replaces the item's sources, with new ids, so a cached copy is served only
+    // while its source ids are still the stored ones.
+    let cached = match state.cache.item_details.get(&id_str) {
+        Some(cached) => {
+            let mut cached_ids: Vec<String> =
+                cached.media_sources.iter().map(|s| s.id.clone()).collect();
+            cached_ids.sort();
+            let stored =
+                rustyfin_db::repo_media_source::get_media_source_ids(&state.db_ro, &id).await;
+            stored.is_ok_and(|ids| ids == cached_ids).then_some(cached)
+        }
+        None => None,
+    };
+    let mut item = match cached {
+        Some(cached) => cached,
+        None => {
+            let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+                .await?
+                .ok_or(ApiError::NotFound("item not found".into()))?;
+            let _ = populate_media_source_single(&state.db_ro, &mut item).await;
+            // Enrich with all response fields, without any user's watch data
+            let config = state.config.read().await;
+            let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+            enrich_item(
+                &state.db_ro,
+                &state.server_id,
+                None,
+                &mut item,
+                &state.http_client,
+                tmdb.as_ref(),
+                &state.data_dir,
+            )
+            .await;
+            drop(config);
+            // Movies and episodes are not cached: their sources, streams, chapters and
+            // trickplay change on rescans, re-probes and extraction, and none of those
+            // clear this cache.
+            if !matches!(
+                item.media_type,
+                rustyfin_model::media::MediaType::Movie | rustyfin_model::media::MediaType::Episode
+            ) {
+                state.cache.item_details.insert(id_str, item.clone());
+            }
+            item
+        }
+    };
+    if let Ok(user_data) =
+        rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id).await
     {
-        return Ok(Json(item));
-    }
-    let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or(ApiError::NotFound("item not found".into()))?;
-    let _ = populate_media_source_single(&state.db_ro, &mut item).await;
-    // Enrich with all response fields
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
-    enrich_item(
-        &state.db_ro,
-        &state.server_id,
-        Some(claims.sub),
-        &mut item,
-        &state.http_client,
-        tmdb.as_ref(),
-        &state.data_dir,
-    )
-    .await;
-    drop(config);
-    // Cache the result
-    if let Ok(json) = serde_json::to_value(&item) {
-        state
-            .cache
-            .item_details
-            .insert(id_str.clone(), json.clone());
-        // Persist to L2 cache for survival across restarts (fire-and-forget)
-        let cache = state.cache.clone();
-        let item_id = id_str.clone();
-        let item_json = json.clone();
-        tokio::spawn(async move {
-            cache.save_item_to_l2(&item_id, &item_json).await;
-        });
+        apply_user_data(&mut item, user_data);
     }
     Ok(Json(item))
 }
