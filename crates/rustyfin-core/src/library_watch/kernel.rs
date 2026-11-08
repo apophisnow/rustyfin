@@ -656,3 +656,7 @@ fn subfolders(dir: &Path) -> BTreeSet<OsString> {
         .map(|entry| entry.file_name())
         .collect()
 }
+
+#[cfg(test)]
+#[path = "kernel_tests.rs"]
+mod tests;
