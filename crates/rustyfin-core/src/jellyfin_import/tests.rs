@@ -15,7 +15,7 @@ use super::plan::{UserMatch, match_user_name};
 use super::source::{
     IN_MEMORY_LIMIT, JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob,
     guid_from_text, locate, open_snapshot, open_snapshot_with, parse_jellyfin_date,
-    parse_old_images, parse_provider_ids, read_snapshot, reads_in_memory,
+    parse_old_images, parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -2168,5 +2168,59 @@ async fn b20_old_watch_data_is_at_most_items_and_rows() {
         (200, 200, 200, true),
         "200 rows of one user on 200 items, each from its first row; 30 users on 30 items \
          refused, not {many_users:?}"
+    );
+}
+
+// Fix round 3, 4: a `.mblink` holds one path, so one over 64 KiB, such as a link to a film, is a bad
+// source and is never read whole.
+
+#[cfg(unix)]
+#[test]
+fn b20_mblinks_are_at_most_64_kib() {
+    // Each case is a program data folder of its own, as a bad source ends the read.
+    const CASES: [&str; 4] = ["at_limit", "over_limit", "to_a_film", "not_utf8"];
+    let tmp = TempDir::new();
+    let link_in = |case: &str| tmp.0.join(case).join("root/default/Films/films.mblink");
+    for case in CASES {
+        std::fs::create_dir_all(link_in(case).parent().unwrap()).unwrap();
+    }
+    let path_of = |len: usize| format!("/media/{}", "a".repeat(len - "/media/".len()));
+    std::fs::write(link_in("at_limit"), path_of(64 << 10)).unwrap();
+    std::fs::write(link_in("over_limit"), path_of((64 << 10) + 1)).unwrap();
+    // A sparse 8 MiB film, linked in as a `.mblink`.
+    let film = tmp.0.join("film.mkv");
+    std::fs::File::create(&film)
+        .unwrap()
+        .set_len(8 << 20)
+        .unwrap();
+    std::os::unix::fs::symlink(&film, link_in("to_a_film")).unwrap();
+    std::fs::write(link_in("not_utf8"), b"/media/\xff").unwrap();
+    let outcomes: Vec<String> = CASES
+        .into_iter()
+        .map(|case| match read_library_folders(&tmp.0.join(case)) {
+            Ok(folders) => {
+                let bytes: usize = folders
+                    .iter()
+                    .flat_map(|folder| &folder.mblinks)
+                    .map(String::len)
+                    .sum();
+                format!("read {bytes} bytes")
+            }
+            Err(ImportError::BadSource(text))
+                if text.contains(&link_in(case).display().to_string()) =>
+            {
+                "bad source naming the file".to_string()
+            }
+            Err(other) => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            "read 65536 bytes",
+            "bad source naming the file",
+            "bad source naming the file",
+            "bad source naming the file",
+        ]
     );
 }

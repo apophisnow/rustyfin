@@ -1785,8 +1785,13 @@ fn file_name_text(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The most bytes a `.mblink` may hold. A `.mblink` holds one path, and the cap keeps a link to a
+/// big file, such as a film, from being read whole.
+const MBLINK_LIMIT: u64 = 64 << 10;
+
 /// The Jellyfin library folders under `P/root/default`, sorted by name (spec 2.8). A missing
-/// folder gives none; a folder that can't be read is a 400 naming it.
+/// folder gives none; a folder that can't be read is a 400 naming it. A `.mblink` over 64 KiB is
+/// a 400 naming it.
 pub fn read_library_folders(program_data: &Path) -> Result<Vec<LibraryFolder>, ImportError> {
     let root = program_data.join("root").join("default");
     if !root.is_dir() {
@@ -1805,8 +1810,18 @@ pub fn read_library_folders(program_data: &Path) -> Result<Vec<LibraryFolder>, I
             }
             let file_name = file_name_text(&file);
             if file_name.ends_with(".mblink") {
-                let text =
-                    std::fs::read_to_string(&file).map_err(|e| unreadable_path(&file, &e))?;
+                let Some(handle) = open_regular(&file)? else {
+                    continue;
+                };
+                let Some(bytes) = read_up_to(&file, handle, MBLINK_LIMIT)? else {
+                    return Err(ImportError::BadSource(format!(
+                        "{} is longer than 64 KiB; a .mblink holds one path",
+                        file.display()
+                    )));
+                };
+                let text = String::from_utf8(bytes).map_err(|e| {
+                    unreadable_path(&file, &std::io::Error::new(ErrorKind::InvalidData, e))
+                })?;
                 let link = text.trim();
                 if !link.is_empty() {
                     mblinks.push(link.to_string());
