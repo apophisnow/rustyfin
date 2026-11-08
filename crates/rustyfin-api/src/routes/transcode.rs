@@ -392,6 +392,9 @@ async fn hls_master_playlist(
             )
                 .into_response());
         }
+        Err(TranscodeError::Stopped) => {
+            return Err(ApiError::NotFound("The play session was stopped".into()));
+        }
         Err(TranscodeError::FfmpegFailed(msg)) => {
             return Err(ApiError::Internal(format!("Transcode failed: {msg}")));
         }

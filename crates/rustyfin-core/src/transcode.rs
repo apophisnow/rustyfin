@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -147,6 +147,9 @@ pub struct TranscodeManager {
     ffmpeg: PathBuf,         // "ffmpeg"; unit tests point it at a fake script
     playlist_wait: Duration, // 30 s; unit tests shorten it
     start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The PlaySessionIds stopped lately (in ASCII lower case) and when each was stopped
+    stopped: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    stop_memory: Duration, // 60 s; unit tests shorten it
 }
 
 impl TranscodeManager {
@@ -157,6 +160,8 @@ impl TranscodeManager {
             ffmpeg: PathBuf::from("ffmpeg"),
             playlist_wait: Duration::from_secs(30),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            stopped: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stop_memory: Duration::from_secs(60),
         }
     }
 
@@ -183,6 +188,7 @@ impl TranscodeManager {
     /// the same input file, the same play session (else device) and the same profile. Returns the
     /// playlist path and the playback id once ffmpeg has written the playlist. Fails when ffmpeg
     /// exits first, or when no playlist appears within `playlist_wait`; ffmpeg then keeps running.
+    /// A play session stopped less than `stop_memory` ago fails at once with `Stopped`.
     pub async fn start_transcode(
         &self,
         item_id: Uuid,
@@ -193,6 +199,9 @@ impl TranscodeManager {
     ) -> Result<(PathBuf, Uuid), TranscodeError> {
         let playback_id = {
             let _lock = self.start_lock.lock().await;
+            if !play_session_id.is_empty() && self.recently_stopped(play_session_id) {
+                return Err(TranscodeError::Stopped);
+            }
             match self.find_session(item_id, input_path, play_session_id, device_id) {
                 Some(id) if !self.same_profile(id, profile) => {
                     // Other tracks, another start or other limits: the transcode is replaced
@@ -392,13 +401,23 @@ impl TranscodeManager {
     /// Stop the transcodes that a stop request names and delete their files. Names are the
     /// PlaySessionId, else the DeviceId (whatever the session's PlaySessionId), else, with no
     /// names, the unnamed sessions. `item_id` restricts the stop to one item; without an item
-    /// and without names nothing stops. Returns how many sessions were stopped.
+    /// and without names nothing stops. Returns how many sessions were stopped. A stop by
+    /// PlaySessionId also refuses that play session's starts for `stop_memory`.
     pub async fn stop_play_session(
         &self,
         item_id: Option<Uuid>,
         play_session_id: &str,
         device_id: &str,
     ) -> usize {
+        // Under the start lock, a start either sees the stop or has its new session collected
+        let start_lock = match play_session_id {
+            "" => None,
+            id => {
+                let guard = self.start_lock.lock().await;
+                self.remember_stop(id);
+                Some(guard)
+            }
+        };
         let matching: Vec<Uuid> = self
             .sessions
             .iter()
@@ -416,6 +435,7 @@ impl TranscodeManager {
             })
             .map(|e| *e.key())
             .collect();
+        drop(start_lock);
 
         let mut stopped = 0;
         for id in matching {
@@ -424,6 +444,22 @@ impl TranscodeManager {
             }
         }
         stopped
+    }
+
+    /// Record a stop by PlaySessionId, and forget the stops older than `stop_memory`
+    fn remember_stop(&self, play_session_id: &str) {
+        let mut stopped = self.stopped.lock().unwrap();
+        stopped.retain(|_, at| at.elapsed() < self.stop_memory);
+        stopped.insert(play_session_id.to_ascii_lowercase(), Instant::now());
+    }
+
+    /// Whether a play session was stopped less than `stop_memory` ago
+    fn recently_stopped(&self, play_session_id: &str) -> bool {
+        self.stopped
+            .lock()
+            .unwrap()
+            .get(&play_session_id.to_ascii_lowercase())
+            .is_some_and(|at| at.elapsed() < self.stop_memory)
     }
 
     /// Stop all running transcodes.
@@ -963,6 +999,9 @@ pub enum TranscodeError {
 
     #[error("ffmpeg has not written a playlist yet")]
     PlaylistTimeout,
+
+    #[error("the play session was stopped")]
+    Stopped,
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,7 +1832,10 @@ exec sleep 30
         start(&mgr, item, "p", "").await.unwrap();
         assert_eq!(mgr.stop_play_session(None, "p", "").await, 1);
         // A request still on its way when the player closed must not start a transcode
-        assert!(start(&mgr, item, "p", "").await.is_err());
+        assert!(matches!(
+            start(&mgr, item, "p", "").await,
+            Err(TranscodeError::Stopped)
+        ));
         assert_eq!(mgr.sessions.len(), 0);
         // Another play session still plays
         start(&mgr, item, "q", "").await.unwrap();
@@ -1809,7 +1851,10 @@ exec sleep 30
         // The player closed before its first request arrived; the stop ignores case, as a
         // start's lookup does
         assert_eq!(mgr.stop_play_session(None, "P", "").await, 0);
-        assert!(start(&mgr, item, "p", "").await.is_err());
+        assert!(matches!(
+            start(&mgr, item, "p", "").await,
+            Err(TranscodeError::Stopped)
+        ));
         assert_eq!(mgr.sessions.len(), 0);
     }
 
@@ -1822,6 +1867,20 @@ exec sleep 30
         assert_eq!(mgr.stop_play_session(None, "", "d").await, 1);
         // A client without a PlaySessionId can play again at once
         start(&mgr, item, "", "d").await.unwrap();
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stop_is_forgotten_after_a_while() {
+        let (_dir, mut mgr) = fake_manager("good", Duration::from_secs(5));
+        mgr.stop_memory = Duration::from_millis(200);
+        let item = Uuid::new_v4();
+        start(&mgr, item, "p", "").await.unwrap();
+        assert_eq!(mgr.stop_play_session(None, "p", "").await, 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        start(&mgr, item, "p", "").await.unwrap();
 
         mgr.stop_all().await;
     }
