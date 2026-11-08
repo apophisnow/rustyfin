@@ -197,12 +197,14 @@ pub async fn render_image(
         return read_image_bytes(source_path, http_client).await;
     };
 
-    let cache_path = cache_dir.join(cached_copy_name(source_path, stamp, width, height));
+    let name = cached_copy_name(source_path, stamp, width, height);
+    let cache_path = cache_dir.join(&name);
 
-    // Return cached version if exists
-    if cache_path.exists()
-        && let Ok(bytes) = fs::read(&cache_path).await
+    // Return the cached copy if it is whole; an empty or cut-short one is made again
+    if let Ok(bytes) = fs::read(&cache_path).await
+        && is_whole_jpeg(&bytes)
     {
+        mark_copy_used(cache_path).await;
         return Ok(bytes);
     }
 
@@ -233,11 +235,59 @@ pub async fn render_image(
         .map_err(|e| format!("failed to encode image: {}", e))?;
     let bytes = buf.into_inner();
 
-    // Cache
-    let _ = fs::create_dir_all(cache_dir).await;
-    let _ = fs::write(&cache_path, &bytes).await;
+    // Cache the copy. A failure is logged, and the bytes are served all the same.
+    if let Err(e) = write_copy(cache_dir, &name, &bytes).await {
+        tracing::warn!("failed to cache image copy {}: {}", cache_path.display(), e);
+    }
 
     Ok(bytes)
+}
+
+/// Whether a disk copy is whole: at least 4 bytes, from the JPEG start marker to the end marker.
+fn is_whole_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes.starts_with(&[0xFF, 0xD8]) && bytes.ends_with(&[0xFF, 0xD9])
+}
+
+/// A file last modified longer ago than this is stale: a disk copy this old is marked as used when
+/// it is hit, and a temporary file this old was left behind by a write that did not finish.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// How long ago a file was last modified; `None` when that is unknown or in the future.
+fn file_age(meta: &std::fs::Metadata) -> Option<std::time::Duration> {
+    meta.modified().ok()?.elapsed().ok()
+}
+
+/// Marks a disk copy as used, for the cap's oldest-first trim: a copy stale by `STALE_AFTER` gets
+/// the time now. Errors are ignored, as the copy is served either way.
+async fn mark_copy_used(path: std::path::PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let stale = std::fs::metadata(&path)
+            .ok()
+            .and_then(|meta| file_age(&meta))
+            .is_some_and(|age| age > STALE_AFTER);
+        if stale {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+        }
+    })
+    .await;
+}
+
+/// Writes a disk copy under a temporary name, then renames it into place, so a reader never sees a
+/// part-written copy. The temporary file is removed when the write or the rename fails.
+async fn write_copy(cache_dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    fs::create_dir_all(cache_dir).await?;
+    let temp = cache_dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let written = match fs::write(&temp, bytes).await {
+        Ok(()) => fs::rename(&temp, cache_dir.join(name)).await,
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        let _ = fs::remove_file(&temp).await;
+    }
+    written
 }
 
 /// Serve an image with optional resizing, using a cache directory.
@@ -327,6 +377,124 @@ pub async fn compute_blurhash(
     // Use 4x4 components for a short hash
     let hash = blurhash::encode(4, 4, width as u32, height as u32, pixels.as_slice()).ok()?;
     Some(hash)
+}
+
+/// The most the disk copies of images may total; `sweep_image_cache` trims them to this.
+pub const IMAGE_CACHE_MAX_BYTES: u64 = 1 << 30;
+
+/// What `sweep_image_cache` removed, and what it kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SweepReport {
+    /// The number of files removed.
+    pub removed: usize,
+    /// The total length of the files removed, in bytes.
+    pub freed_bytes: u64,
+    /// The total length of the disk copies kept, in bytes. Temporary files count in neither total.
+    pub kept_bytes: u64,
+}
+
+/// Sweeps the folder of disk copies of images at `dir`. Only its top-level regular files are looked
+/// at: a file whose name is not a copy's is removed, and so is a temporary file (`.*.tmp`) last
+/// modified more than an hour ago. Symlinks and folders are left alone, and so is a fresh temporary
+/// file. Then the copies are removed, least recently modified first, until they total no more than
+/// `max_bytes`. A missing `dir` sweeps nothing.
+pub fn sweep_image_cache(dir: &Path, max_bytes: u64) -> std::io::Result<SweepReport> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SweepReport::default()),
+        Err(e) => return Err(e),
+    };
+    let mut report = SweepReport::default();
+    // The copies kept so far, as (last modified, path, length)
+    let mut copies = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(file_type) = present(entry.file_type())? else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(meta) = present(entry.metadata())? else {
+            continue;
+        };
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        if is_temp_name(name) {
+            if file_age(&meta).is_some_and(|age| age > STALE_AFTER) {
+                remove_counted(&path, meta.len(), &mut report)?;
+            }
+        } else if is_copy_name(name) {
+            copies.push((meta.modified()?, path, meta.len()));
+        } else {
+            remove_counted(&path, meta.len(), &mut report)?;
+        }
+    }
+
+    // Trim the copies to the cap, the least recently modified first
+    copies.sort_by_key(|copy| copy.0);
+    report.kept_bytes = copies.iter().map(|copy| copy.2).sum();
+    for (_, path, len) in copies {
+        if report.kept_bytes <= max_bytes {
+            break;
+        }
+        remove_counted(&path, len, &mut report)?;
+        report.kept_bytes -= len;
+    }
+    Ok(report)
+}
+
+/// A result for a file that may have vanished meanwhile: `None` when it is not found.
+fn present<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes a file and counts it in `report`. A file that is already gone is skipped, not counted.
+fn remove_counted(path: &Path, len: u64, report: &mut SweepReport) -> std::io::Result<()> {
+    if present(std::fs::remove_file(path))?.is_some() {
+        report.removed += 1;
+        report.freed_bytes += len;
+    }
+    Ok(())
+}
+
+/// Whether a file name is a temporary file's: it starts with `.` and ends with `.tmp`.
+fn is_temp_name(name: &[u8]) -> bool {
+    name.starts_with(b".") && name.ends_with(b".tmp")
+}
+
+/// Whether a file name is a disk copy's, `{hash}_{stamp}_{width}x{height}.jpg`, which matches
+/// `^[0-9a-f]{64}_[0-9a-f]{16}_[0-9]+x[0-9]+\.jpg$`.
+fn is_copy_name(name: &[u8]) -> bool {
+    let Some(stem) = name.strip_suffix(b".jpg") else {
+        return false;
+    };
+    let mut parts = stem.split(|&b| b == b'_');
+    let (Some(hash), Some(stamp), Some(size), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let mut dims = size.split(|&b| b == b'x');
+    let (Some(width), Some(height), None) = (dims.next(), dims.next(), dims.next()) else {
+        return false;
+    };
+    is_hex(hash, 64) && is_hex(stamp, 16) && is_decimal(width) && is_decimal(height)
+}
+
+/// Whether `part` is exactly `len` lower-case hex digits.
+fn is_hex(part: &[u8], len: usize) -> bool {
+    part.len() == len && part.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `part` is one or more decimal digits.
+fn is_decimal(part: &[u8]) -> bool {
+    !part.is_empty() && part.iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -669,5 +837,158 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(b30_names(&cache_dir), expected);
+    }
+
+    /// Writes `len` bytes to `dir/name`, last modified `age` ago.
+    fn b30_file(dir: &Path, name: &str, len: usize, age: std::time::Duration) {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    const B30_MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+    const B30_HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    #[tokio::test]
+    async fn b30_p4_an_empty_or_cut_short_copy_is_made_again() {
+        let (root, _remove) = b30_root();
+        let poster = root.join("media").join("poster.jpg");
+        write_poster(&poster, [255, 0, 0]);
+        let path = poster.to_str().unwrap();
+        let cache_dir = root.join("cache");
+        let copy = Rendition::Copy {
+            width: 8,
+            height: 12,
+        };
+        let first = render_image(path, Some(7), copy, &cache_dir, None)
+            .await
+            .unwrap();
+        let file = cache_dir.join(cached_copy_name(path, Some(7), 8, 12));
+        assert_eq!(std::fs::read(&file).unwrap(), first);
+
+        for cut in [first.len() / 2, 0] {
+            std::fs::write(&file, &first[..cut]).unwrap();
+            let again = render_image(path, Some(7), copy, &cache_dir, None).await;
+            assert_eq!(
+                again.unwrap(),
+                first,
+                "a copy cut to {cut} bytes was served"
+            );
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                first,
+                "a copy cut to {cut} bytes was not made again"
+            );
+        }
+
+        // A hit marks the copy as used, for the cap's oldest-first trim.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * B30_HOUR)
+            .unwrap();
+        let again = render_image(path, Some(7), copy, &cache_dir, None).await;
+        assert_eq!(again.unwrap(), first);
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(
+            modified > std::time::SystemTime::now() - 10 * B30_MINUTE,
+            "a hit left the copy's time as it was"
+        );
+        // Copies are written under a temporary name and renamed, so none is left over.
+        assert_eq!(
+            b30_names(&cache_dir),
+            [cached_copy_name(path, Some(7), 8, 12)]
+        );
+    }
+
+    #[test]
+    fn b30_r5_sweep_removes_old_names_and_stale_temp_files() {
+        let (root, _remove) = b30_root();
+        let dir = root.join("images");
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let (hash, stamp) = ("a".repeat(64), "0".repeat(16));
+        let current = format!("{hash}_{stamp}_300x450.jpg");
+        let other = format!("{}_ffffffffffffffff_8x12.jpg", "0123456789abcdef".repeat(4));
+        let fresh_temp = format!(".{current}.{}.tmp", uuid::Uuid::new_v4().simple());
+        let stale_temp = format!(".{other}.{}.tmp", uuid::Uuid::new_v4().simple());
+        for name in [&current, &other, &fresh_temp] {
+            b30_file(&dir, name, 10, B30_MINUTE);
+        }
+        b30_file(&dir, &stale_temp, 10, 2 * B30_HOUR);
+        b30_file(&dir.join("folder"), "notes.txt", 10, B30_MINUTE);
+        let old_names = [
+            // djb2's names, before B27
+            "12345678901234567890_poster_300x0.jpg".to_string(),
+            // B27's names, without a stamp
+            format!("{hash}_300x450.jpg"),
+            // and other names no version writes
+            format!("{}_{stamp}_300x450.jpg", "A".repeat(64)),
+            format!("{}_{stamp}_300x450.jpg", "a".repeat(63)),
+            format!("{hash}_{}_300x450.jpg", "0".repeat(15)),
+            format!("{hash}_{stamp}_300x450.jpeg"),
+            format!("{hash}_{stamp}_300x.jpg"),
+            format!("{hash}_{stamp}_x450.jpg"),
+            format!("{hash}_{stamp}_300x450.jpg.part"),
+            "notes.txt".to_string(),
+        ];
+        for name in &old_names {
+            b30_file(&dir, name, 10, B30_MINUTE);
+        }
+
+        let report = sweep_image_cache(&dir, IMAGE_CACHE_MAX_BYTES).unwrap();
+        let removed = old_names.len() + 1;
+        assert_eq!(
+            (report.removed, report.freed_bytes, report.kept_bytes),
+            (removed, 10 * removed as u64, 20)
+        );
+        let mut kept = vec![current, other, fresh_temp, "folder".to_string()];
+        kept.sort();
+        assert_eq!(b30_names(&dir), kept);
+        assert!(dir.join("folder").join("notes.txt").exists());
+    }
+
+    #[test]
+    fn b30_r5_sweep_trims_the_least_recently_used_copies_to_the_cap() {
+        let (root, _remove) = b30_root();
+        let dir = root.join("images");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = |side: u32| format!("{}_{}_{side}x{side}.jpg", "b".repeat(64), "0".repeat(16));
+        b30_file(&dir, &name(1), 1000, 3 * B30_HOUR);
+        b30_file(&dir, &name(2), 1000, 2 * B30_HOUR);
+        b30_file(&dir, &name(3), 1000, B30_HOUR);
+        // A copy being written counts toward no cap.
+        let fresh_temp = format!(".{}.{}.tmp", name(4), uuid::Uuid::new_v4().simple());
+        b30_file(&dir, &fresh_temp, 5000, B30_MINUTE);
+
+        let report = sweep_image_cache(&dir, 2500).unwrap();
+        assert_eq!(
+            (report.removed, report.freed_bytes, report.kept_bytes),
+            (1, 1000, 2000)
+        );
+        let mut kept = vec![name(2), name(3), fresh_temp];
+        kept.sort();
+        assert_eq!(b30_names(&dir), kept);
+        // At the cap, nothing more goes.
+        let report = sweep_image_cache(&dir, 2000).unwrap();
+        assert_eq!(
+            (report.removed, report.freed_bytes, report.kept_bytes),
+            (0, 0, 2000)
+        );
+    }
+
+    #[test]
+    fn b30_r5_sweep_of_a_missing_folder_is_ok() {
+        let (root, _remove) = b30_root();
+        let report = sweep_image_cache(&root.join("images"), 0).unwrap();
+        assert_eq!(
+            (report.removed, report.freed_bytes, report.kept_bytes),
+            (0, 0, 0)
+        );
     }
 }
