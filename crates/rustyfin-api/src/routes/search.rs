@@ -76,6 +76,33 @@ fn default_search_limit() -> i64 {
     100
 }
 
+/// The key of a `/Search` answer. It holds every input `full_search` applies: the term exactly as
+/// sent, the parsed item types as a set (sorted, deduplicated `item_kind()` names), the start index
+/// and the limit. `full_search` applies no other `FullSearchQuery` field (`IsFavorite`, `IsPlayed`,
+/// ... are ignored) and nothing that depends on the user, so a filter that does needs the user in
+/// this key. The `search2:` tag keeps rows that the L2 table saved under the old format from ever
+/// matching, and the free-text term comes last so that no term can make one key look like another.
+fn full_search_cache_key(
+    term: &str,
+    item_types: &[MediaType],
+    start_index: usize,
+    limit: usize,
+) -> String {
+    let mut kinds: Vec<&str> = item_types.iter().map(|t| t.item_kind()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let kinds = kinds.join(",");
+    format!("search2:{kinds}:{start_index}:{limit}:{term}")
+}
+
+/// The key of a `/Search/Hints` answer. Its only inputs are the term exactly as sent and the limit,
+/// since `SearchQuery` has no other fields. The `hints2:` tag keeps rows that the L2 table saved
+/// under the old format from ever matching, and the free-text term comes last so that no term can
+/// make one key look like another.
+fn search_hints_cache_key(term: &str, limit: i64) -> String {
+    format!("hints2:{limit}:{term}")
+}
+
 async fn search_hints(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -89,7 +116,7 @@ async fn search_hints(
     }
 
     // Check cache first
-    let cache_key = format!("hints:{}:{}", term.to_lowercase(), query.limit);
+    let cache_key = search_hints_cache_key(&term, query.limit);
     if let Some(cached) = state.cache.search_results.get(&cache_key)
         && let Ok(result) = serde_json::from_value(cached.clone())
     {
@@ -135,17 +162,23 @@ async fn full_search(
     let start_index = query.start_index.unwrap_or(0) as usize;
     let limit = query.limit as usize;
 
-    // Parse include_item_types
+    // Parse include_item_types: names match without ASCII case and with spaces trimmed, as
+    // Jellyfin's binder does; unknown names are skipped.
     let item_types: Vec<MediaType> = if let Some(ref types) = query.include_item_types {
         types
             .split(',')
-            .filter_map(|t| match t.trim() {
-                "Movie" => Some(MediaType::Movie),
-                "Series" => Some(MediaType::Series),
-                "Episode" => Some(MediaType::Episode),
-                "Audio" => Some(MediaType::Audio),
-                "Photo" => Some(MediaType::Photo),
-                _ => None,
+            .filter_map(|t| {
+                let t = t.trim();
+                [
+                    ("Movie", MediaType::Movie),
+                    ("Series", MediaType::Series),
+                    ("Episode", MediaType::Episode),
+                    ("Audio", MediaType::Audio),
+                    ("Photo", MediaType::Photo),
+                ]
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(t))
+                .map(|(_, kind)| kind)
             })
             .collect()
     } else {
@@ -158,13 +191,7 @@ async fn full_search(
     };
 
     // Check cache first
-    let cache_key = format!(
-        "search:{}:{}:{}:{}",
-        term.to_lowercase(),
-        item_types.len(),
-        start_index,
-        limit
-    );
+    let cache_key = full_search_cache_key(&term, &item_types, start_index, limit);
     if let Some(cached) = state.cache.search_results.get(&cache_key)
         && let Ok(result) = serde_json::from_value(cached.clone())
     {
