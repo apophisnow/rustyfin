@@ -3376,3 +3376,121 @@ async fn b20_unreadable_text_is_clipped() {
         "the in-memory path, then the copy path"
     );
 }
+
+/// Rewrites `table`'s root in the SQLite file `file` (which has no `-wal`) into the head of a
+/// single-child interior chain `levels` pages deep, appended to the file: the root and the first
+/// `levels - 1` appended pages become interior pages carrying only a right-most pointer to the next,
+/// and the last appended page a leaf. The walk reaches a depth past `MAX_TREE_DEPTH` and refuses the
+/// tree; a `quick_check` would instead recurse the chain past a cursor's `BTCURSOR_MAX_DEPTH`.
+/// `levels` must exceed `MAX_TREE_DEPTH` and the table's own tree must be shallower.
+async fn deepen_tree(file: &Path, table: &str, levels: u32) {
+    use sqlx::{ConnectOptions, Connection};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(file)
+        .connect()
+        .await
+        .unwrap();
+    let (root,): (i64,) = sqlx::query_as("SELECT rootpage FROM sqlite_schema WHERE name = ?1")
+        .bind(table)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    assert!(
+        !file.with_extension("db-wal").exists(),
+        "{}",
+        file.display()
+    );
+    let mut bytes = std::fs::read(file).unwrap();
+    // The header holds the page size at offset 16 (1 means 65536) and the size in pages at 28.
+    let size = match u16::from_be_bytes([bytes[16], bytes[17]]) {
+        1 => 65536,
+        s => usize::from(s),
+    };
+    let count = u32::try_from(bytes.len() / size).unwrap();
+    let root = u32::try_from(root).unwrap();
+    let start = |page: u32| (page as usize - 1) * size;
+    // Append `levels` pages and chain root -> count+1 -> ... -> count+levels (a leaf). A table root
+    // is never page 1, so every page's b-tree header sits at offset 0.
+    bytes.resize(bytes.len() + levels as usize * size, 0);
+    let chain: Vec<u32> = std::iter::once(root)
+        .chain(count + 1..=count + levels)
+        .collect();
+    for pair in chain.windows(2) {
+        let (page, next) = (pair[0], pair[1]);
+        let slot = &mut bytes[start(page)..start(page) + size];
+        slot.fill(0);
+        slot[0] = 0x05; // interior table page, zero cells
+        slot[8..12].copy_from_slice(&next.to_be_bytes()); // right-most pointer
+    }
+    let leaf = start(count + levels);
+    bytes[leaf..leaf + size].fill(0);
+    bytes[leaf] = 0x0D; // leaf table page
+    bytes[28..32].copy_from_slice(&(count + levels).to_be_bytes());
+    std::fs::write(file, bytes).unwrap();
+}
+
+// Fix round 5, T (re-check 4, point 4 (a)): the depth walk is wired into `open_snapshot` on both
+// paths. A single-child chain 23 pages deep under `Permissions` passes `read_roots`' EXPLAIN (which
+// compiles the check without reading the tree) and is refused by `check_tree_depth` at its depth
+// limit — "<file>: Permissions is damaged" with no ": <line>" suffix. With the walk removed,
+// `check_tables`' `quick_check` would recurse the chain and add a suffix, or fail to read it, so the
+// text would differ: that is the red. 23 levels are far below a stack overflow, so a regression
+// fails the assertion without crashing the test.
+#[tokio::test]
+async fn b20_snapshot_refuses_a_deep_tree() {
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let db = tmp.0.join("jellyfin.db");
+    write_db(&db, &[USERS_DDL]).await;
+    deepen_tree(&db, "Permissions", 23).await;
+    let expected = format!("{}: Permissions is damaged", db.display());
+    let mut texts = Vec::new();
+    for limit in [u64::MAX, 0] {
+        let open =
+            open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX)).await;
+        texts.push(match open.map(drop) {
+            Ok(()) => "read".to_string(),
+            Err(ImportError::BadSource(text)) => text,
+            Err(other) => format!("{other:?}"),
+        });
+    }
+    assert_eq!(
+        texts,
+        [expected.clone(), expected],
+        "the in-memory path (u64::MAX), then the copy path (0)"
+    );
+}
+
+// Fix round 5, T (re-check 4, point 4 (b)): the progress handler is wired into `open_snapshot` on
+// both paths. A 6x20 shared-page schema DAG (`spinning_schema`) makes the schema load re-walk its
+// leaf for about 90 s; the handler `guard_connection` installs before `read_roots` spends the budget
+// and interrupts the load (SQLITE_INTERRUPT -> "its schema is damaged") well within 5 s. With the
+// handler removed, the load spins past the timeout: that is the red.
+#[tokio::test]
+async fn b20_snapshot_refuses_a_spinning_schema() {
+    use std::time::Duration;
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let file = tmp.0.join("jellyfin.db");
+    spinning_schema(&file, 6, 20, 10);
+    let expected = format!("{}: its schema is damaged", file.display());
+    let mut texts = Vec::new();
+    for limit in [u64::MAX, 0] {
+        let open =
+            open_snapshot_with_free(&file, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX));
+        texts.push(
+            match tokio::time::timeout(Duration::from_secs(5), open).await {
+                Err(_) => "still spinning after 5 s".to_string(),
+                Ok(open) => match open.map(drop) {
+                    Ok(()) => "read".to_string(),
+                    Err(ImportError::BadSource(text)) => text,
+                    Err(other) => format!("{other:?}"),
+                },
+            },
+        );
+    }
+    assert_eq!(
+        texts,
+        [expected.clone(), expected],
+        "the in-memory path (u64::MAX), then the copy path (0)"
+    );
+}
