@@ -10940,6 +10940,40 @@ async fn b22_subtitle_vtt_refuses_bad_requests() {
 }
 
 #[tokio::test]
+async fn b22_subtitle_vtt_strips_ass_blocks() {
+    if !g4_have_ffmpeg("b22_subtitle_vtt_strips_ass_blocks") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (id, msid, file) = b22_film(&state, "b22-ass").await;
+
+    // A minimal script: `{=2}` is an override block that ffmpeg keeps as text, `{note}` a comment
+    let script = "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 240\n\n\
+        [V4+ Styles]\n\
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+        BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+        BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+        Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,\
+        0,1,2,0,2,10,10,10,1\n\n\
+        [Events]\n\
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+        Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{=2}Doom\n\
+        Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\i1}Plain{\\i0} {note}text\n";
+    let ass_file = file.parent().unwrap().join("B22 Film.jpn.ass");
+    std::fs::write(ass_file, script).unwrap();
+    let app = app(state);
+
+    // The external files follow the embedded stream 2 in name order: eng 3, ger 4, jpn 5
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/5/Stream.vtt");
+    let (status, _, body) = b22_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Doom") && body.contains("Plain"), "{body}");
+    assert!(!body.contains('{'), "{body}");
+}
+
+#[tokio::test]
 async fn b22_report_bodies_carry_track_indexes() {
     use rustyfin_model::playback::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
 

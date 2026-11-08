@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
     OpenSubtitlesConfig, discover_external_subtitles, download_subtitle, is_image_subtitle,
-    shift_vtt, srt_to_vtt,
+    shift_vtt, srt_to_vtt, strip_ass_blocks,
 };
 use rustyfin_model::media_source::{MediaSourceResponse, MediaStream};
 
@@ -291,6 +291,11 @@ async fn subtitle_vtt(
         Err(_) => {
             let cp1252 = stream.is_external && is_cp1252(&input).await;
             let text = ffmpeg_vtt(&input, &map, cp1252).await?;
+            // ffmpeg keeps the ASS override and comment blocks as text; no ASS renderer shows them
+            let ass = stream.codec.as_deref().is_some_and(|codec| {
+                codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
+            });
+            let text = if ass { strip_ass_blocks(&text) } else { text };
             if let Err(e) = write_cache(&cache_dir, &cache_file, &text).await {
                 tracing::warn!("Cannot cache the subtitle at {}: {e}", cache_file.display());
             }

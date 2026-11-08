@@ -183,6 +183,63 @@ pub fn shift_vtt(vtt: &str, start_ticks: i64) -> String {
     out
 }
 
+/// Takes the ASS override and comment blocks out of a WebVTT text, as no ASS renderer shows them.
+/// In a cue, each `{` ... `}` run on a text line after the timing line is cut out; a `{` with no
+/// `}` after it stays. A text line left empty or only whitespace is removed, and a cue left with no
+/// text line is dropped. The header, the NOTE, STYLE and REGION blocks, the cue identifiers and the
+/// timings stay as they are. Blocks are joined by one blank line and the text ends with a newline.
+pub fn strip_ass_blocks(vtt: &str) -> String {
+    let mut out = String::with_capacity(vtt.len());
+    for block in vtt_blocks(vtt) {
+        let Some(lines) = strip_block(&block) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The lines of a block with the brace runs cut from its text, or None for a cue left with no text.
+/// A block with no " --> " in its first two lines is kept as it is.
+fn strip_block(block: &[&str]) -> Option<Vec<String>> {
+    let Some(at) = block.iter().take(2).position(|line| line.contains(" --> ")) else {
+        return Some(block.iter().map(|line| line.to_string()).collect());
+    };
+    let text: Vec<String> = block[at + 1..]
+        .iter()
+        .copied()
+        .map(remove_brace_runs)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if text.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = block[..=at].iter().map(|line| line.to_string()).collect();
+    lines.extend(text);
+    Some(lines)
+}
+
+/// The text with each `{` ... `}` run on it cut out. A `{` with no `}` after it stays.
+fn remove_brace_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        let Some(len) = rest[open..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        rest = &rest[open + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The blocks of a WebVTT text: runs of lines between blank lines, without their line endings.
 fn vtt_blocks(vtt: &str) -> Vec<Vec<&str>> {
     let mut blocks = Vec::new();
@@ -621,6 +678,60 @@ mod tests {
         assert_eq!(
             shift_vtt(vtt, 36_000_000_000),
             "WEBVTT\n\n99:00:00.000 --> 99:00:01.000\nLong\n"
+        );
+    }
+
+    // ── strip_ass_blocks ──
+
+    #[test]
+    fn test_strip_ass_blocks_cuts_each_brace_run() {
+        let vtt = "WEBVTT\n\n\
+                   00:01.000 --> 00:02.000\n{=2}Doom\n\n\
+                   00:03.000 --> 00:04.000\n{*\\c&H0000FF&}Red\n\n\
+                   00:05.000 --> 00:06.000\nHello {note} world\n";
+        assert_eq!(
+            strip_ass_blocks(vtt),
+            "WEBVTT\n\n\
+             00:01.000 --> 00:02.000\nDoom\n\n\
+             00:03.000 --> 00:04.000\nRed\n\n\
+             00:05.000 --> 00:06.000\nHello  world\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_ass_blocks_keeps_a_brace_with_no_close() {
+        let vtt = "WEBVTT\n\n00:01.000 --> 00:02.000\na { b\n";
+        assert_eq!(strip_ass_blocks(vtt), vtt);
+    }
+
+    #[test]
+    fn test_strip_ass_blocks_drops_a_cue_left_with_no_text() {
+        let vtt = "WEBVTT\n\n\
+                   00:01.000 --> 00:02.000\nOne\n\n\
+                   00:02.000 --> 00:03.000\n{=5}\n\n\
+                   00:03.000 --> 00:04.000\n{=5}\nTwo\n\n\
+                   00:04.000 --> 00:05.000\nThree\n";
+        assert_eq!(
+            strip_ass_blocks(vtt),
+            "WEBVTT\n\n\
+             00:01.000 --> 00:02.000\nOne\n\n\
+             00:03.000 --> 00:04.000\nTwo\n\n\
+             00:04.000 --> 00:05.000\nThree\n"
+        );
+    }
+
+    #[test]
+    fn test_strip_ass_blocks_keeps_the_header_notes_ids_and_timings() {
+        let vtt = "WEBVTT\r\nKind: captions\r\n\r\n\
+                   STYLE\r\n::cue { color: red }\r\n\r\n\
+                   NOTE {kept} by hand\r\n\r\n\
+                   intro\r\n00:04.000 --> 00:06.000 line:90%\r\n{=2}Doom\r\n";
+        assert_eq!(
+            strip_ass_blocks(vtt),
+            "WEBVTT\nKind: captions\n\n\
+             STYLE\n::cue { color: red }\n\n\
+             NOTE {kept} by hand\n\n\
+             intro\n00:04.000 --> 00:06.000 line:90%\nDoom\n"
         );
     }
 }
