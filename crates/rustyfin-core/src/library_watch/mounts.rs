@@ -59,19 +59,30 @@ pub enum MountChange {
     Unmounted,
 }
 
+/// A mount in the mount table, keyed by its mount id, its `major:minor` and its unescaped mount
+/// point. See `mount_keys`.
+pub(super) type MountKey = (String, String, PathBuf);
+
 /// The mounts that appeared and went away between two readings of the mount table, with their
 /// mount points: sorted by mount point, then `Mounted` before `Unmounted`, without duplicates. A
 /// mount is keyed by its id, `major:minor` and mount point, so a change of its options alone is
 /// no change.
 pub fn mount_changes(before: &str, after: &str) -> Vec<(PathBuf, MountChange)> {
-    let before = mount_keys(before);
-    let after = mount_keys(after);
+    changes_between(&mount_keys(before), &mount_keys(after))
+}
+
+/// The mounts that appeared and went away between two sets of mount keys, with their mount
+/// points: sorted by mount point, then `Mounted` before `Unmounted`, without duplicates.
+pub(super) fn changes_between(
+    before: &HashSet<MountKey>,
+    after: &HashSet<MountKey>,
+) -> Vec<(PathBuf, MountChange)> {
     let mut changes: Vec<(PathBuf, MountChange)> = after
-        .difference(&before)
+        .difference(before)
         .map(|(_, _, point)| (point.clone(), MountChange::Mounted))
         .chain(
             before
-                .difference(&after)
+                .difference(after)
                 .map(|(_, _, point)| (point.clone(), MountChange::Unmounted)),
         )
         .collect();
@@ -82,7 +93,7 @@ pub fn mount_changes(before: &str, after: &str) -> Vec<(PathBuf, MountChange)> {
 
 /// The keys of the mounts in mountinfo text: mount id, `major:minor` and unescaped mount point. A
 /// line with fewer than five fields is skipped.
-fn mount_keys(mountinfo: &str) -> HashSet<(String, String, PathBuf)> {
+pub(super) fn mount_keys(mountinfo: &str) -> HashSet<MountKey> {
     mountinfo
         .lines()
         .filter_map(|line| {

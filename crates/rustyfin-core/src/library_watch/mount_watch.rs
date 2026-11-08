@@ -1,21 +1,25 @@
 //! Follows the mount table, so a library path whose mounts change is set up again. inotify doesn't
 //! see into a filesystem mounted over a watched folder, and a path's method is picked only once,
 //! when its monitor starts. A polled path that keeps its last state is set up again only when it
-//! can be watched now, or when a mount under it went away.
+//! can be watched now, or when a mount under it went away. The table is read at most twice in a
+//! row, then about once a second: a burst of changes is read about once a second, while a lone
+//! change, or two changes in a row, are read at once.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use super::mounts::{
-    MountChange, automount_points, fs_type_from_mountinfo, is_local_fs_type, mount_changes,
-    restarts_monitor, restarts_polled_monitor,
+    MountChange, automount_points, changes_between, fs_type_from_mountinfo, is_local_fs_type,
+    mount_keys, restarts_monitor, restarts_polled_monitor,
 };
 use super::{
     Inner, LIBRARY_PATH_GONE, Method, MonitoredPath, NOT_LOCAL, PATH_NOT_FOUND, take_injected,
@@ -23,6 +27,13 @@ use super::{
 
 /// The mount table of this process. The kernel wakes a poll of it once per change.
 const MOUNT_TABLE: &str = "/proc/self/mountinfo";
+
+/// Once `READ_BURST` readings of the mount table came back to back, one more is allowed each
+/// `READ_INTERVAL`, so a burst of mount changes is read about once a second.
+const READ_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How many readings of the mount table may come back to back. See `READ_INTERVAL`.
+const READ_BURST: u32 = 2;
 
 /// Follows the mount table in a task, which marks the monitors that a mount change restarts. The
 /// table is read before this returns, so a monitor set up after it sees a table at least as new.
@@ -53,8 +64,15 @@ pub(super) fn follow(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
 }
 
 /// Waits for the kernel to wake the poll of the table, then reads the table and marks the monitors
-/// that its changes restart. Ends, after a warning, when a wait or a read fails.
+/// that its changes restart. Up to `READ_BURST` readings come back to back; after that the follower
+/// sleeps until one more reading is allowed, so a burst of changes is read about once a second,
+/// while a lone change, or two changes in a row, are read at once. The sleep comes after the wait
+/// and before the read. The readiness stays set during it, so a change made meanwhile is part of
+/// the reading after the sleep. A reading with the same text as the last one changes nothing. Ends,
+/// after a warning, when a wait or a read fails.
 async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
+    let mut keys = mount_keys(&table);
+    let mut due = Instant::now();
     loop {
         let mut ready = match fd.ready(Interest::PRIORITY).await {
             Ok(ready) => ready,
@@ -63,6 +81,14 @@ async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
                 return;
             }
         };
+        // Each reading moves `due` one `READ_INTERVAL` on. A reading may come up to `slack` before
+        // `due`, which lets `READ_BURST` readings come back to back.
+        let ahead = due.saturating_duration_since(Instant::now());
+        let slack = READ_INTERVAL * (READ_BURST - 1);
+        if ahead > slack {
+            tokio::time::sleep(ahead - slack).await;
+        }
+        due = due.max(Instant::now()) + READ_INTERVAL;
         ready.clear_ready();
         inner.mount_reads.fetch_add(1, Ordering::Relaxed);
         let read = if take_injected(&inner.fail_mount_reads) {
@@ -77,10 +103,14 @@ async fn follow_table(inner: Arc<Inner>, fd: AsyncFd<File>, mut table: String) {
                 return;
             }
         };
-        let changes = mount_changes(&table, &new);
-        table = new;
-        if !changes.is_empty() {
-            mark_restarts(&inner, &table, &changes);
+        if new != table {
+            let new_keys = mount_keys(&new);
+            let changes = changes_between(&keys, &new_keys);
+            table = new;
+            keys = new_keys;
+            if !changes.is_empty() {
+                mark_restarts(&inner, &table, &changes);
+            }
         }
     }
 }
