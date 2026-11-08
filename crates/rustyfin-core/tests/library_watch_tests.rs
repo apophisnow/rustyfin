@@ -1835,7 +1835,7 @@ mod kernel {
         );
         let warning = |path: &Path| {
             format!(
-                "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead. Raise fs.inotify.max_user_watches to watch it.",
+                "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead. Raise fs.inotify.max_user_watches to watch it; the next SIGHUP or library change tries again.",
                 path.display()
             )
         };
@@ -1885,6 +1885,58 @@ mod kernel {
             .await;
         recorder
             .wait_for(&folder_unit(&lib, more.join("Casablanca (1942)")), 1)
+            .await;
+        watcher.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_over_the_watch_limit_is_watched_once_the_limit_is_lifted_and_libraries_change()
+    {
+        // Fix round 1, item 2: a fallback at a limit is not for good. A library change (a SIGHUP
+        // makes one too) sets the path up again: polled again while the limit holds, without a
+        // second warning, and watched once the limit allows it.
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Kernel L Films", &[tree.root()]).await;
+        let watcher = LibraryWatcher::new(pool.clone(), changes.clone(), tree.outside("data"));
+        watcher.set_watch_limit(Some(2));
+        watcher.set_poll_interval(Duration::from_millis(100));
+        watcher.start();
+        let polling = format!(
+            "library monitor: polling '{}' of 'Kernel L Films' (",
+            tree.root().display()
+        );
+        let polled = [
+            polling.as_str(),
+            ", watch limit reached): 4 folders, every 100ms, baseline in ",
+        ];
+        wait_for_log(&polled).await;
+
+        // The limit still holds: polled again after the change, and warned about once.
+        watcher.libraries_changed();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log_lines(&polled).len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the path is set up again at a library change"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let warning = format!(
+            "library monitor: the kernel's inotify watch limit is reached; polling '{}' instead.",
+            tree.root().display()
+        );
+        assert_eq!(log_lines(&[&warning]).len(), 1, "warned about once");
+
+        // Lifted: watched after the next change, and a change is a folder rescan.
+        watcher.set_watch_limit(None);
+        watcher.libraries_changed();
+        wait_watched(&watcher, &tree.root(), 4).await;
+        write(&tree.at("Heat (1995)/Heat (1995).en.srt"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Heat (1995)")), 1)
             .await;
         watcher.stop();
     }
