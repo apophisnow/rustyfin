@@ -455,7 +455,7 @@ type MetadataRows = (Vec<MetaDbRow>, Vec<ImageDbRow>, Vec<CreditDbRow>);
 
 /// The tables `read_snapshot` reads from `jellyfin.db`, each checked by `check_tables` (B20 round
 /// 2, finding 3).
-const JELLYFIN_TABLES: &[&str] = &[
+pub(super) const JELLYFIN_TABLES: &[&str] = &[
     "Users",
     "Permissions",
     "BaseItems",
@@ -468,7 +468,8 @@ const JELLYFIN_TABLES: &[&str] = &[
 ];
 /// The tables `read_old_layout` reads from `library.db`, each checked by `check_tables` (B20 round
 /// 2, finding 3).
-const LIBRARY_TABLES: &[&str] = &["TypedBaseItems", "UserDatas", "mediastreams", "People"];
+pub(super) const LIBRARY_TABLES: &[&str] =
+    &["TypedBaseItems", "UserDatas", "mediastreams", "People"];
 
 /// Refuses a source whose named tables are not plain: a view, a virtual or shadow table, or a table
 /// with generated columns can make a query run without end or make values of any size. It also
@@ -582,8 +583,7 @@ pub async fn read_snapshot(
     data_dir: &Path,
 ) -> Result<Snapshot, ImportError> {
     let file = location.data_path.join(JELLYFIN_DB);
-    let mut conn = open_snapshot(&file, data_dir).await?;
-    check_tables(&mut conn, &file, JELLYFIN_TABLES).await?;
+    let mut conn = open_snapshot(&file, data_dir, JELLYFIN_TABLES).await?;
     let db = read_jellyfin_db(&mut conn, choice)
         .await
         .map_err(|e| unreadable(&file, &e))?;
@@ -779,8 +779,7 @@ async fn read_old_layout(
     data_dir: &Path,
 ) -> Result<(ItemRows, MetadataRows), ImportError> {
     let file = library_file(data_path)?;
-    let mut conn = open_snapshot(&file, data_dir).await?;
-    check_tables(&mut conn, &file, LIBRARY_TABLES).await?;
+    let mut conn = open_snapshot(&file, data_dir, LIBRARY_TABLES).await?;
     let (item_rows, data_rows, stream_rows) = read_library_db(&mut conn)
         .await
         .map_err(|e| unreadable(&file, &e))?;
@@ -1281,11 +1280,14 @@ pub(crate) type FreeSpace = fn(&Path) -> std::io::Result<u64>;
 /// and `-wal` up to `IN_MEMORY_LIMIT` bytes in all are read into memory once; bigger ones are
 /// copied into `data_dir` for as long as the snapshot is open. SQLite never opens the source, so
 /// nothing is created or changed in the source folder, and the snapshot is one state of the files.
+/// `tables` are the tables the caller reads: their trees are walked (`check_tree_depth`), then
+/// checked (`check_tables`), so the walk covers what each `quick_check` reads.
 pub(crate) async fn open_snapshot(
     file: &Path,
     data_dir: &Path,
+    tables: &[&str],
 ) -> Result<SnapshotConn, ImportError> {
-    open_snapshot_with(file, data_dir, IN_MEMORY_LIMIT).await
+    open_snapshot_with(file, data_dir, tables, IN_MEMORY_LIMIT).await
 }
 
 /// `open_snapshot` with its in-memory limit given (0 always copies). Each try takes both sizes and
@@ -1294,9 +1296,10 @@ pub(crate) async fn open_snapshot(
 pub(crate) async fn open_snapshot_with(
     file: &Path,
     data_dir: &Path,
+    tables: &[&str],
     limit: u64,
 ) -> Result<SnapshotConn, ImportError> {
-    open_snapshot_with_free(file, data_dir, limit, free_space).await
+    open_snapshot_with_free(file, data_dir, tables, limit, free_space).await
 }
 
 /// `open_snapshot_with`, with the free space of the copy's folder taken by `free`, which
@@ -1304,11 +1307,13 @@ pub(crate) async fn open_snapshot_with(
 pub(crate) async fn open_snapshot_with_free(
     file: &Path,
     data_dir: &Path,
+    tables: &[&str],
     limit: u64,
     free: FreeSpace,
 ) -> Result<SnapshotConn, ImportError> {
     for attempt in 1..=SNAPSHOT_TRIES {
-        if let Some(snapshot) = snapshot_try(file, data_dir, limit, free).await? {
+        if let Some(mut snapshot) = snapshot_try(file, data_dir, tables, limit, free).await? {
+            check_tables(&mut snapshot, file, tables).await?;
             return Ok(snapshot);
         }
         if attempt < SNAPSHOT_TRIES {
@@ -1325,6 +1330,7 @@ pub(crate) async fn open_snapshot_with_free(
 async fn snapshot_try(
     file: &Path,
     data_dir: &Path,
+    tables: &[&str],
     limit: u64,
     free: FreeSpace,
 ) -> Result<Option<SnapshotConn>, ImportError> {
@@ -1338,7 +1344,7 @@ async fn snapshot_try(
         let budget = progress_budget(page_count(&image, image.len() as u64));
         let mut conn = connection_of_image(file, &image).await?;
         let cancel = guard_connection(file, &mut conn, budget).await?;
-        let roots = read_roots(file, &mut conn).await?;
+        let roots = read_roots(file, &mut conn, tables).await?;
         // Walk the schema and roots over the retained image before a quick_check reads them.
         let owner = file.to_path_buf();
         on_blocking(file, move || {
@@ -1374,7 +1380,7 @@ async fn snapshot_try(
     let header = on_blocking(file, move || read_header(&header_db)).await?;
     let budget = progress_budget(page_count(&header, db_len));
     let cancel = guard_connection(file, &mut conn, budget).await?;
-    let roots = read_roots(file, &mut conn).await?;
+    let roots = read_roots(file, &mut conn, tables).await?;
     // Walk the schema and roots over the copied files before a quick_check reads them.
     let copy_wal = copy.path.join(COPY_WAL);
     let owner = file.to_path_buf();
@@ -1505,23 +1511,69 @@ fn read_header(path: &Path) -> Result<Vec<u8>, ImportError> {
     Ok(header[..read].to_vec())
 }
 
-/// Every table's and index's root page in `conn`'s schema, as `(name, rootpage)`. The progress guard
-/// is already installed, so a crafted schema that makes this query spin is still interrupted. A root
-/// that does not fit a page number becomes `u32::MAX`, which the walk refuses as out of range.
+/// The root pages `check_tables`' `quick_check` reads for `tables`, as `(table, rootpage)`: each
+/// table's own and its indexes' (fix round 5, R3). A table the file lacks, or one that is not a plain
+/// table, gives none: `check_tables` skips or refuses it before its `quick_check`. The roots come
+/// from the check SQLite compiles (`EXPLAIN`, which doesn't run it): its `IntegrityCk` step lists
+/// them, so they are the trees the check reads whatever the rows' `tbl_name` say. SQLite checks that
+/// column against a row's SQL, but an automatic index's row has none and is bound by its name alone.
+/// The progress guard is already installed, so a crafted schema that makes the schema load spin is
+/// still interrupted.
 async fn read_roots(
     file: &Path,
     conn: &mut SqliteConnection,
+    tables: &[&str],
 ) -> Result<Vec<(String, u32)>, ImportError> {
-    let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT name, rootpage FROM sqlite_schema WHERE rootpage IS NOT NULL AND rootpage > 0",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| unreadable(file, &e))?;
-    Ok(rows
-        .into_iter()
-        .map(|(name, root)| (name, u32::try_from(root).unwrap_or(u32::MAX)))
-        .collect())
+    use sqlx::Row as _;
+    let mut roots = Vec::new();
+    for &table in tables {
+        let kind: Option<(String,)> = sqlx::query_as(
+            "SELECT type FROM pragma_table_list WHERE schema = 'main' AND name = ?1 \
+             COLLATE NOCASE",
+        )
+        .bind(table)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
+        if !kind.is_some_and(|(kind,)| kind == "table") {
+            continue;
+        }
+        let sql = format!("EXPLAIN PRAGMA main.quick_check(\"{table}\")");
+        let steps = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| unreadable(file, &e))?;
+        let listed = steps
+            .iter()
+            .find(|step| {
+                step.try_get::<String, _>("opcode")
+                    .is_ok_and(|opcode| opcode == "IntegrityCk")
+            })
+            .and_then(|step| {
+                let count = step.try_get::<i64, _>("p2").ok()?;
+                integrity_roots(count, &step.try_get::<Option<String>, _>("p4").ok()??)
+            });
+        // Roots SQLite doesn't list as expected can't be walked, so the table is refused as a tree
+        // the walk can't read would be.
+        let Some(pages) = listed else {
+            return Err(tree_damaged(file, Some(table)));
+        };
+        roots.extend(pages.into_iter().map(|page| (table.to_string(), page)));
+    }
+    Ok(roots)
+}
+
+/// The root pages in an `IntegrityCk` step's P4 (`[0,2,5]`) when it lists `count` (its P2) of them.
+/// The 0s (the mark of a check limited to one table) are dropped; the check skips them too.
+pub(super) fn integrity_roots(count: i64, list: &str) -> Option<Vec<u32>> {
+    let pages: Vec<u32> = list
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .split(',')
+        .map(|page| page.parse().ok())
+        .collect::<Option<_>>()?;
+    (i64::try_from(pages.len()).ok()? == count)
+        .then(|| pages.into_iter().filter(|&page| page != 0).collect())
 }
 
 /// Raw page access for `check_tree_depth`: the in-memory image (`ImagePages`) or the copied database

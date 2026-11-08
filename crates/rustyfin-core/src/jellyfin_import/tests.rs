@@ -14,10 +14,10 @@ use super::metadata::planned_credits;
 use super::paths::{PathMapping, suggest_metadata, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
-    FreeSpace, IN_MEMORY_LIMIT, JfCredit, JfImage, JfStream, JfUserData, ProviderIds, StreamKind,
-    copy_at_most, copy_fits, free_space, guid_from_blob, guid_from_text, locate, open_snapshot,
-    open_snapshot_with_free, parse_jellyfin_date, parse_old_images, parse_provider_ids,
-    read_library_folders, read_snapshot, reads_in_memory,
+    FreeSpace, IN_MEMORY_LIMIT, JELLYFIN_TABLES, JfCredit, JfImage, JfStream, JfUserData,
+    ProviderIds, StreamKind, copy_at_most, copy_fits, free_space, guid_from_blob, guid_from_text,
+    locate, open_snapshot, open_snapshot_with_free, parse_jellyfin_date, parse_old_images,
+    parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -1356,7 +1356,7 @@ async fn wal_writer(dir: &Path) -> sqlx::SqliteConnection {
 /// (0 always copies). The data folder it gets is empty again once the snapshot is dropped.
 async fn snapshot_rows_with(file: &Path, limit: u64) -> Vec<i64> {
     let data = TempDir::new();
-    let mut conn = open_snapshot_with_free(file, &data.0, limit, |_| Ok(u64::MAX))
+    let mut conn = open_snapshot_with_free(file, &data.0, &[], limit, |_| Ok(u64::MAX))
         .await
         .unwrap_or_else(|e| panic!("{}: {e:?}", file.display()));
     let rows: Vec<i64> = sqlx::query_scalar("SELECT n FROM t ORDER BY n")
@@ -1513,7 +1513,11 @@ fn snapshot_within_5s(file: &Path) -> Option<Result<(), ImportError>> {
             .build()
             .unwrap();
         let data = TempDir::new();
-        let _ = sender.send(runtime.block_on(open_snapshot(&file, &data.0)).map(drop));
+        let _ = sender.send(
+            runtime
+                .block_on(open_snapshot(&file, &data.0, &[]))
+                .map(drop),
+        );
     });
     receiver
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -1662,7 +1666,7 @@ async fn b20_snapshot_copies_a_big_source_to_the_data_folder() {
     let total = std::fs::metadata(&file).unwrap().len() + wal.len() as u64;
     for (limit, copied) in [(total, false), (total - 1, true)] {
         let data = TempDir::new();
-        let mut conn = open_snapshot_with_free(&file, &data.0, limit, |_| Ok(u64::MAX))
+        let mut conn = open_snapshot_with_free(&file, &data.0, &[], limit, |_| Ok(u64::MAX))
             .await
             .unwrap_or_else(|e| panic!("limit {limit}: {e:?}"));
         let main: String =
@@ -2367,6 +2371,109 @@ async fn b20_snapshot_refuses_damaged_tables() {
     );
 }
 
+/// Zeroes the root page of `table` in the SQLite file `file`, as a torn write can leave a page: no
+/// b-tree page at all. The file must have no -wal.
+async fn zero_root_page(file: &Path, table: &str) {
+    use sqlx::{ConnectOptions, Connection};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(file)
+        .connect()
+        .await
+        .unwrap();
+    let (root,): (i64,) = sqlx::query_as("SELECT rootpage FROM sqlite_schema WHERE name = ?1")
+        .bind(table)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let (size,): (i64,) = sqlx::query_as("PRAGMA page_size")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    assert!(
+        !file.with_extension("db-wal").exists(),
+        "{}",
+        file.display()
+    );
+    let (root, size) = (
+        usize::try_from(root).unwrap(),
+        usize::try_from(size).unwrap(),
+    );
+    let mut bytes = std::fs::read(file).unwrap();
+    bytes[(root - 1) * size..root * size].fill(0);
+    std::fs::write(file, bytes).unwrap();
+}
+
+// Fix round 5, R3: the walk covers page 1 and the trees `quick_check` reads, so a bad page in a
+// table the import never reads leaves the read alone, and the same page in a checked table, or in
+// one of its indexes, is refused, on both paths.
+#[tokio::test]
+async fn b20_snapshot_walks_only_checked_tables() {
+    use super::source::integrity_roots;
+    const ACTIVITY_LOGS: &str = "\
+        CREATE TABLE ActivityLogs (Id INTEGER PRIMARY KEY, Name TEXT NOT NULL); \
+        INSERT INTO ActivityLogs (Name) VALUES ('Started');";
+    // The schema row of Users' automatic index (for its TEXT primary key) names another table.
+    // SQLite checks a row's `tbl_name` against the row's SQL, but this row has none: SQLite binds
+    // it to the index by name alone, so `quick_check(Users)` reads it all the same.
+    const MISNAMED_INDEX: &str = "\
+        PRAGMA writable_schema = ON; \
+        UPDATE sqlite_schema SET tbl_name = 'ActivityLogs' \
+            WHERE name = 'sqlite_autoindex_Users_1'; \
+        PRAGMA writable_schema = OFF;";
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let mut outcomes = Vec::new();
+    for damaged in ["ActivityLogs", "Permissions", "sqlite_autoindex_Users_1"] {
+        let dir = tmp.0.join(damaged);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("jellyfin.db");
+        write_db(
+            &db,
+            &[USERS_DDL, NEW_LIBRARY_DDL, ACTIVITY_LOGS, MISNAMED_INDEX],
+        )
+        .await;
+        zero_root_page(&db, damaged).await;
+        let shown = |outcome: Result<(), ImportError>| match outcome {
+            Ok(()) => "read".to_string(),
+            Err(ImportError::BadSource(text)) => text.replace(&dir.display().to_string(), "<dir>"),
+            Err(other) => format!("{other:?}"),
+        };
+        let read = read_within_5s(&dir).map_or_else(|| "still reading after 5 s".into(), shown);
+        // The in-memory path, then the copy path.
+        let mut opened = Vec::new();
+        for limit in [u64::MAX, 0] {
+            let open =
+                open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX))
+                    .await;
+            opened.push(shown(open.map(drop)));
+        }
+        outcomes.push((damaged, read, opened));
+    }
+    let read = "read".to_string();
+    let damaged = |table: &str| format!("<dir>/jellyfin.db: {table} is damaged");
+    let (permissions, users) = (damaged("Permissions"), damaged("Users"));
+    assert_eq!(
+        outcomes,
+        [
+            ("ActivityLogs", read.clone(), vec![read.clone(), read]),
+            (
+                "Permissions",
+                permissions.clone(),
+                vec![permissions.clone(), permissions]
+            ),
+            (
+                "sqlite_autoindex_Users_1",
+                users.clone(),
+                vec![users.clone(), users]
+            ),
+        ]
+    );
+    // A root list SQLite doesn't give as expected is refused, never walked in part.
+    assert_eq!(integrity_roots(3, "[0,2,5]"), Some(vec![2, 5]));
+    assert_eq!(integrity_roots(4, "[0,2,5]"), None);
+    assert_eq!(integrity_roots(3, "[0,2,5"), None);
+}
+
 // Fix round 3, 3: a copy of a big source holds at most the measured bytes, and starts only when
 // the data folder has room for it and 1 GiB to spare. The free space is injected, so no test fills
 // the disk, and the one copy made is of a small database.
@@ -2420,7 +2527,7 @@ async fn b20_copies_fit_the_disk() {
     ];
     let mut outcomes = Vec::new();
     for (case, free) in cases {
-        let outcome = match open_snapshot_with_free(&file, &data.0, 0, free).await {
+        let outcome = match open_snapshot_with_free(&file, &data.0, &[], 0, free).await {
             Ok(conn) => {
                 let copied = folder.is_dir();
                 drop(conn);
