@@ -1907,15 +1907,21 @@ fn file_name_text(path: &Path) -> String {
 /// big file, such as a film, from being read whole.
 const MBLINK_LIMIT: u64 = 64 << 10;
 
+/// The most `.mblink` text one source may hold, across all its library folders. A link holds one
+/// path (at most PATH_MAX); the cap keeps a folder of many links from holding gigabytes of text.
+const MBLINK_TOTAL: u64 = 1 << 20;
+
 /// The Jellyfin library folders under `P/root/default`, sorted by name (spec 2.8). A missing
 /// folder gives none; a folder that can't be read is a 400 naming it. A `.mblink` over 64 KiB is
-/// a 400 naming it.
+/// a 400 naming it, as is a source whose `.mblink` text tops 1 MiB in total (naming the folder
+/// that crossed it).
 pub fn read_library_folders(program_data: &Path) -> Result<Vec<LibraryFolder>, ImportError> {
     let root = program_data.join("root").join("default");
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut folders = Vec::new();
+    let mut mblink_total: u64 = 0;
     for folder in sorted_children(&root)? {
         if !folder.is_dir() {
             continue;
@@ -1942,6 +1948,13 @@ pub fn read_library_folders(program_data: &Path) -> Result<Vec<LibraryFolder>, I
                 })?;
                 let link = text.trim();
                 if !link.is_empty() {
+                    mblink_total = mblink_total.saturating_add(link.len() as u64);
+                    if mblink_total > MBLINK_TOTAL {
+                        return Err(ImportError::BadSource(format!(
+                            "{}: its .mblink files hold more than 1 MiB of paths",
+                            folder.display()
+                        )));
+                    }
                     mblinks.push(link.to_string());
                 }
             } else if let Some(kind) = file_name.strip_suffix(".collection") {

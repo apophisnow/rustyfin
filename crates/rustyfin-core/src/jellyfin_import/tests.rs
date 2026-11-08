@@ -2548,3 +2548,35 @@ fn b20_person_images_are_added_once() {
         "a person's images are added once across all credits, not once per credit"
     );
 }
+
+// F3 (round 4): the total .mblink text across a source is capped at 1 MiB. 32 links of 32 KiB each
+// (exactly 1 MiB) are read; a 33rd that crosses 1 MiB is a BadSource naming the folder. On 8758ca9
+// only the per-file 64 KiB cap exists, so the "over" folder reads without error. The links are
+// small files, not large or sparse ones.
+#[test]
+fn b20_mblink_text_is_capped() {
+    const S: usize = 32 << 10; // 32 KiB per link, well under the 64 KiB per-file cap.
+    let tmp = TempDir::new();
+    let films = |case: &str| tmp.0.join(case).join("root/default/Films");
+    let path_of = |len: usize| format!("/media/{}", "a".repeat(len - "/media/".len()));
+    for (case, n) in [("under", 32usize), ("over", 33usize)] {
+        let dir = films(case);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..n {
+            std::fs::write(dir.join(format!("link{i:03}.mblink")), path_of(S)).unwrap();
+        }
+    }
+    // 32 x 32 KiB = exactly 1 MiB: all read.
+    let under = read_library_folders(&tmp.0.join("under")).unwrap();
+    let count: usize = under.iter().map(|folder| folder.mblinks.len()).sum();
+    assert_eq!(count, 32, "32 links of 32 KiB (exactly 1 MiB) are all read");
+    // The 33rd link crosses 1 MiB: a bad source naming the folder.
+    let folder = films("over");
+    match read_library_folders(&tmp.0.join("over")) {
+        Err(ImportError::BadSource(text)) => assert!(
+            text.contains(&folder.display().to_string()),
+            "the bad source must name the folder, got: {text}"
+        ),
+        other => panic!("expected a bad source over the 1 MiB total, got {other:?}"),
+    }
+}
