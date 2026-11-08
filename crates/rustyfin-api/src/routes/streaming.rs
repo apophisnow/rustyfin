@@ -1012,25 +1012,30 @@ fn is_stream_type(stream: &rustyfin_model::media_source::MediaStream, kind: &str
     stream.codec_type.eq_ignore_ascii_case(kind)
 }
 
-/// Whether the client takes the first H.264 video stream of `source` as it is, by the rule in
-/// `transcode::client_takes_h264`. A source with no H.264 video has nothing to refuse.
+/// Whether the client takes the first video stream of `source` as it is, by the rule in
+/// `transcode::client_takes_h264`. That is the stream `codecs_playable` checks; one that isn't
+/// H.264, or no video at all, has nothing to refuse.
 fn client_takes_h264_video(
     source: &rustyfin_model::media_source::MediaSourceResponse,
     query: &VideoPlaybackInfoQuery,
 ) -> bool {
     use super::transcode::{H264Request, client_takes_h264};
 
-    let video = source.media_streams.iter().find(|s| {
-        is_stream_type(s, "Video")
-            && s.codec.as_deref().is_some_and(|codec| {
-                ["h264", "avc", "avc1"]
-                    .iter()
-                    .any(|name| codec.eq_ignore_ascii_case(name))
-            })
-    });
-    let Some(video) = video else {
+    let Some(video) = source
+        .media_streams
+        .iter()
+        .find(|s| is_stream_type(s, "Video"))
+    else {
         return true;
     };
+    let is_h264 = video.codec.as_deref().is_some_and(|codec| {
+        ["h264", "avc", "avc1"]
+            .iter()
+            .any(|name| codec.eq_ignore_ascii_case(name))
+    });
+    if !is_h264 {
+        return true;
+    }
     let request = H264Request {
         profile: query.profile.as_deref(),
         h264_profile: query.h264_profile.as_deref(),
@@ -1788,6 +1793,29 @@ mod tests {
         source.media_streams[0].profile = Some("Profile 2".into());
         source.media_streams[0].bit_depth = Some(10);
         assert_eq!(direct(LISTS, &source), [true, true]);
+    }
+
+    #[test]
+    fn test_deep_h264_is_direct_when_it_is_not_the_first_video_stream() {
+        // The rule reads the first video stream, as the codec lists do: here HEVC Main 10, which
+        // the client lists
+        let mut source = source_with("mp4", "hevc", "aac");
+        source.media_streams[0].profile = Some("Main 10".into());
+        source.media_streams[0].bit_depth = Some(10);
+        source.media_streams[1].index = 2;
+        source.media_streams.insert(
+            1,
+            rustyfin_model::media_source::MediaStream {
+                index: 1,
+                codec: Some("h264".into()),
+                codec_type: "Video".into(),
+                profile: Some("High 10".into()),
+                bit_depth: Some(10),
+                ..Default::default()
+            },
+        );
+        let params = "VideoCodecs=hevc,h264&AudioCodecs=aac";
+        assert_eq!(direct(params, &source), [true, true]);
     }
 
     // ── B16: version selection ──
