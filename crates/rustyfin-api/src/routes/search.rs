@@ -153,6 +153,41 @@ fn search_answer(result: &QueryResult) -> Result<serde_json::Value, ApiError> {
         .map_err(|e| ApiError::Internal(format!("could not serialize the search answer: {e}")))
 }
 
+/// The item types that `/Search` looks in: those named in `IncludeItemTypes`, matched without
+/// ASCII case and with spaces trimmed as Jellyfin's binder does, and each bound once however
+/// often it is named, sorted by name. Unknown names are skipped. Without the parameter, movies,
+/// series, episodes and audio.
+fn parse_item_types(include_item_types: Option<&str>) -> Vec<MediaType> {
+    if let Some(types) = include_item_types {
+        let mut item_types: Vec<MediaType> = types
+            .split(',')
+            .filter_map(|t| {
+                let t = t.trim();
+                [
+                    ("Movie", MediaType::Movie),
+                    ("Series", MediaType::Series),
+                    ("Episode", MediaType::Episode),
+                    ("Audio", MediaType::Audio),
+                    ("Photo", MediaType::Photo),
+                ]
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(t))
+                .map(|(_, kind)| kind)
+            })
+            .collect();
+        item_types.sort_unstable_by_key(|t| t.item_kind());
+        item_types.dedup_by_key(|t| t.item_kind());
+        item_types
+    } else {
+        vec![
+            MediaType::Movie,
+            MediaType::Series,
+            MediaType::Episode,
+            MediaType::Audio,
+        ]
+    }
+}
+
 async fn full_search(
     State(state): State<AppState>,
     Query(query): Query<FullSearchQuery>,
@@ -170,33 +205,7 @@ async fn full_search(
     let start_index = query.start_index.unwrap_or(0) as usize;
     let limit = query.limit as usize;
 
-    // Parse include_item_types: names match without ASCII case and with spaces trimmed, as
-    // Jellyfin's binder does; unknown names are skipped.
-    let item_types: Vec<MediaType> = if let Some(ref types) = query.include_item_types {
-        types
-            .split(',')
-            .filter_map(|t| {
-                let t = t.trim();
-                [
-                    ("Movie", MediaType::Movie),
-                    ("Series", MediaType::Series),
-                    ("Episode", MediaType::Episode),
-                    ("Audio", MediaType::Audio),
-                    ("Photo", MediaType::Photo),
-                ]
-                .into_iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(t))
-                .map(|(_, kind)| kind)
-            })
-            .collect()
-    } else {
-        vec![
-            MediaType::Movie,
-            MediaType::Series,
-            MediaType::Episode,
-            MediaType::Audio,
-        ]
-    };
+    let item_types = parse_item_types(query.include_item_types.as_deref());
 
     // Check cache first. The cached value is the reply as it was first serialized.
     let cache_key = full_search_cache_key(&term, &item_types, start_index, limit);
@@ -239,4 +248,39 @@ async fn full_search(
         cache.save_search_to_l2(&key, &l2_value).await;
     });
     Ok(Json(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B27: cache keys
+
+    #[test]
+    fn b27_each_named_type_is_searched_once_in_any_case() {
+        assert_eq!(
+            parse_item_types(Some("Series,movie, MOVIE ,Movie,Bogus")),
+            [MediaType::Movie, MediaType::Series]
+        );
+    }
+
+    /// More names than SQLite's 32,766 variables, so binding each name made the query fail.
+    #[test]
+    fn b27_forty_thousand_movie_names_are_one_type() {
+        let names = "Movie,".repeat(40_000);
+        assert_eq!(parse_item_types(Some(&names)), [MediaType::Movie]);
+    }
+
+    #[test]
+    fn b27_without_names_search_looks_in_movies_series_episodes_and_audio() {
+        assert_eq!(
+            parse_item_types(None),
+            [
+                MediaType::Movie,
+                MediaType::Series,
+                MediaType::Episode,
+                MediaType::Audio
+            ]
+        );
+    }
 }
