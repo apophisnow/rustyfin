@@ -10,10 +10,11 @@ use uuid::Uuid;
 use super::images::{resolve, signature};
 use super::job::{ImportJob, ImportStage, ImportStatus, JobState};
 use super::merge::{MappedTracks, convert_rating, harmonize, merge};
+use super::metadata::planned_credits;
 use super::paths::{PathMapping, suggest_metadata, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
-    FreeSpace, IN_MEMORY_LIMIT, JfImage, JfStream, JfUserData, ProviderIds, StreamKind,
+    FreeSpace, IN_MEMORY_LIMIT, JfCredit, JfImage, JfStream, JfUserData, ProviderIds, StreamKind,
     copy_at_most, copy_fits, free_space, guid_from_blob, guid_from_text, locate, open_snapshot,
     open_snapshot_with, open_snapshot_with_free, parse_jellyfin_date, parse_old_images,
     parse_provider_ids, read_library_folders, read_snapshot, reads_in_memory,
@@ -2449,5 +2450,45 @@ async fn b20_copies_fit_the_disk() {
                 0
             ),
         ]
+    );
+}
+
+// F5 (round 4): planned_credits drops repeated names in linear time. 80,000 distinct names are the
+// worst case for the old O(n^2) scan (each new name compared with every earlier one): on 8758ca9
+// the debug run takes tens of seconds, while a HashSet of the planned names is milliseconds. The
+// count is correct either way; the time bound is what fails on 8758ca9. Debug profile (opt-level 0).
+#[test]
+fn b20_credits_are_deduplicated() {
+    const N: usize = 80_000;
+    let mut credits: Vec<JfCredit> = (0..N)
+        .map(|i| JfCredit {
+            name: std::sync::Arc::from(i.to_string().as_str()),
+            kind: None,
+            role: None,
+            list_order: Some(i as i64),
+            sort_order: Some(i as i64),
+        })
+        .collect();
+    // A block of repeats of one existing name: they must all collapse to the single planned credit.
+    for _ in 0..1_000 {
+        credits.push(JfCredit {
+            name: std::sync::Arc::from("0"),
+            kind: None,
+            role: None,
+            list_order: Some(0),
+            sort_order: Some(0),
+        });
+    }
+    let start = std::time::Instant::now();
+    let planned = planned_credits(&credits);
+    let elapsed = start.elapsed();
+    assert_eq!(
+        planned.len(),
+        N,
+        "each distinct name is planned once, repeats dropped"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "planned_credits of {N} distinct names took {elapsed:?}; it must be linear, not quadratic"
     );
 }

@@ -673,7 +673,7 @@ fn studio_rows(value: Option<&str>) -> Vec<(String, String)> {
 }
 
 /// A person of an item, planned (spec 5.7).
-struct PlannedLink {
+pub(super) struct PlannedLink {
     name: Arc<str>,
     kind: String,
     role: Option<String>,
@@ -681,15 +681,17 @@ struct PlannedLink {
 
 /// The people of an item in DTO order (spec 5.7): ListOrder, then SortOrder with NULLs last, then
 /// source order. Names are trimmed; empty and repeated names are dropped; kind and role are trimmed.
-fn planned_credits(credits: &[JfCredit]) -> Vec<PlannedLink> {
+pub(super) fn planned_credits(credits: &[JfCredit]) -> Vec<PlannedLink> {
     let mut sorted: Vec<&JfCredit> = credits.iter().collect();
     sorted.sort_by(|a, b| {
         nulls_last(a.list_order, b.list_order).then_with(|| nulls_last(a.sort_order, b.sort_order))
     });
     let mut planned: Vec<PlannedLink> = Vec::new();
+    // Names already planned: a repeat is skipped in O(1) instead of scanning `planned`.
+    let mut seen: HashSet<&str> = HashSet::new();
     for credit in sorted {
         let trimmed = credit.name.trim();
-        if trimmed.is_empty() || planned.iter().any(|link| link.name.as_ref() == trimmed) {
+        if trimmed.is_empty() || !seen.insert(trimmed) {
             continue;
         }
         // Credits of one person share a name; only a name that trimming changed is copied.
