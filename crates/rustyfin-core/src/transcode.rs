@@ -1787,6 +1787,47 @@ exec sleep 30
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_a_stopped_play_session_does_not_start_again() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        start(&mgr, item, "p", "").await.unwrap();
+        assert_eq!(mgr.stop_play_session(None, "p", "").await, 1);
+        // A request still on its way when the player closed must not start a transcode
+        assert!(start(&mgr, item, "p", "").await.is_err());
+        assert_eq!(mgr.sessions.len(), 0);
+        // Another play session still plays
+        start(&mgr, item, "q", "").await.unwrap();
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_stop_before_the_first_request_holds() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        // The player closed before its first request arrived; the stop ignores case, as a
+        // start's lookup does
+        assert_eq!(mgr.stop_play_session(None, "P", "").await, 0);
+        assert!(start(&mgr, item, "p", "").await.is_err());
+        assert_eq!(mgr.sessions.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_device_stop_does_not_block_the_next_play() {
+        let (_dir, mgr) = fake_manager("good", Duration::from_secs(5));
+        let item = Uuid::new_v4();
+        start(&mgr, item, "", "d").await.unwrap();
+        assert_eq!(mgr.stop_play_session(None, "", "d").await, 1);
+        // A client without a PlaySessionId can play again at once
+        start(&mgr, item, "", "d").await.unwrap();
+
+        mgr.stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_ffmpeg_exit_error_is_returned() {
         let (dir, mgr) = fake_manager("fail", Duration::from_secs(20));
         let item = Uuid::new_v4();
