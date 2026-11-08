@@ -44,7 +44,7 @@ pub struct ImageSubtitle {
     pub video_size: Option<(u32, u32)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscodeProfile {
     pub max_video_bitrate_kbps: u32,
     pub max_audio_bitrate_kbps: u32,
@@ -116,7 +116,7 @@ struct TranscodeSession {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
     last_access: Instant, // last playlist or segment request
-    _profile: TranscodeProfile,
+    profile: TranscodeProfile,
 }
 
 /// What a starting session looked like when it was polled.
@@ -180,9 +180,9 @@ impl TranscodeManager {
     }
 
     /// Start the HLS transcode of `input_path` for a request, or reuse the item's transcode of
-    /// the same input file and the same play session (else device). Returns the playlist path and
-    /// the playback id once ffmpeg has written the playlist. Fails when ffmpeg exits first, or when
-    /// no playlist appears within `playlist_wait`; ffmpeg then keeps running.
+    /// the same input file, the same play session (else device) and the same profile. Returns the
+    /// playlist path and the playback id once ffmpeg has written the playlist. Fails when ffmpeg
+    /// exits first, or when no playlist appears within `playlist_wait`; ffmpeg then keeps running.
     pub async fn start_transcode(
         &self,
         item_id: Uuid,
@@ -194,6 +194,12 @@ impl TranscodeManager {
         let playback_id = {
             let _lock = self.start_lock.lock().await;
             match self.find_session(item_id, input_path, play_session_id, device_id) {
+                Some(id) if !self.same_profile(id, profile) => {
+                    // Other tracks, another start or other limits: the transcode is replaced
+                    self.stop_session(id).await;
+                    self.spawn_session(item_id, input_path, profile, play_session_id, device_id)
+                        .await?
+                }
                 Some(id) if self.touch_live_session(id) => id,
                 Some(id) => {
                     // ffmpeg exited without a playlist: start again
@@ -245,6 +251,15 @@ impl TranscodeManager {
                     && same_key(session, play_session_id, device_id)
             })
             .map(|e| *e.key())
+    }
+
+    /// Whether the session `playback_id` runs the transcode of `profile`. A request of the same
+    /// play session (else device) with other tracks, another start or other limits replaces the
+    /// transcode: its client has moved on from the old one.
+    fn same_profile(&self, playback_id: Uuid, profile: &TranscodeProfile) -> bool {
+        self.sessions
+            .get(&playback_id)
+            .is_some_and(|session| session.profile == *profile)
     }
 
     /// Touch a session that can still serve (its playlist exists or its ffmpeg runs) and
@@ -347,7 +362,7 @@ impl TranscodeManager {
                 stderr_task,
                 stderr_tail,
                 last_access: Instant::now(),
-                _profile: profile.clone(),
+                profile: profile.clone(),
             },
         );
         Ok(playback_id)
