@@ -395,11 +395,7 @@ async fn reset_password_pin(
     // (AC22, AC41). The PIN is already spent here, so its file goes too.
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
     if !password_allowed(&state.db, &config, &user).await? {
-        let _ = std::fs::remove_file(
-            state
-                .data_dir
-                .join(rustyfin_auth::reset_pin_filename(&user.name)),
-        );
+        remove_reset_pin_files(&state.data_dir, &user.name);
         return Err(ApiError::Forbidden(PASSWORD_RESET_OFF.to_string()));
     }
 
@@ -412,16 +408,19 @@ async fn reset_password_pin(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let _ = std::fs::remove_file(
-        state
-            .data_dir
-            .join(rustyfin_auth::reset_pin_filename(&user.name)),
-    );
+    remove_reset_pin_files(&state.data_dir, &user.name);
 
     Ok(Json(serde_json::json!({
         "Success": true,
         "UsersReset": [user.name],
     })))
+}
+
+/// Removes the reset PIN files of `name`: the one named from its name key, and the one an older
+/// server named from the uppercased name (AC65). The redeem calls it on both of its paths.
+fn remove_reset_pin_files(data_dir: &std::path::Path, name: &str) {
+    let _ = std::fs::remove_file(data_dir.join(rustyfin_auth::reset_pin_filename(name)));
+    let _ = std::fs::remove_file(data_dir.join(rustyfin_auth::legacy_reset_pin_filename(name)));
 }
 
 async fn reset_password(

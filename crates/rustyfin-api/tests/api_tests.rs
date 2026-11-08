@@ -6593,7 +6593,6 @@ async fn b21_sign_in_refuses_an_over_long_username() {
 }
 
 #[tokio::test]
-#[ignore = "B21 round 5 fix 2"]
 async fn b21_a_redeemed_reset_leaves_no_pin_file() {
     let t = b21().await;
     let before = b21_pin_file(&t.app, "ＡＬＩＣＥ").await;
