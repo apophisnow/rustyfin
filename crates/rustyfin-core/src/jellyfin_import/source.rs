@@ -1,8 +1,11 @@
-//! Reading a Jellyfin data folder (spec 2.1-2.4, 2.12-2.13). Each database is read into memory once,
-//! with its `-wal` applied, and queried there (`open_snapshot`); the source folder is never written.
+//! Reading a Jellyfin data folder (spec 2.1-2.4, 2.12-2.13). Each database is read with its `-wal`
+//! applied and queried from a snapshot (`open_snapshot`): read into memory once, or copied to
+//! Rustyfin's data folder when it is too big for memory. The source folder is never written.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,6 +14,7 @@ use rustyfin_model::image::ImageType;
 use rustyfin_model::media::MediaType;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
+use tokio::sync::MutexGuard;
 use uuid::Uuid;
 
 use super::{ImportError, Layout, LayoutChoice};
@@ -426,13 +430,14 @@ type MetadataRows = (Vec<MetaDbRow>, Vec<ImageDbRow>, Vec<CreditDbRow>);
 
 /// Reads the source's users and importable items (spec 2.2, 2.3). The new layout comes from
 /// `jellyfin.db`; the old one from `library.db`, else `library.db.old`. Users always come from
-/// `jellyfin.db`.
+/// `jellyfin.db`. A database too big for memory is copied into `data_dir` while it is read.
 pub async fn read_snapshot(
     location: &SourceLocation,
     choice: LayoutChoice,
+    data_dir: &Path,
 ) -> Result<Snapshot, ImportError> {
     let file = location.data_path.join(JELLYFIN_DB);
-    let mut conn = open_snapshot(&file).await?;
+    let mut conn = open_snapshot(&file, data_dir).await?;
     let db = read_jellyfin_db(&mut conn, choice)
         .await
         .map_err(|e| unreadable(&file, &e))?;
@@ -445,9 +450,10 @@ pub async fn read_snapshot(
             ((db.items, db.user_data, db.streams), metadata)
         }
         Layout::Old => {
-            // The old layout's rows come from `library.db`, read next: this image is done with.
+            // The old layout's rows come from `library.db`, read next: this snapshot is done with,
+            // and a copy of `library.db` would wait for its lock.
             drop(conn);
-            read_old_layout(&location.data_path, &db.users).await?
+            read_old_layout(&location.data_path, &db.users, data_dir).await?
         }
     };
     Ok(Snapshot {
@@ -615,15 +621,16 @@ async fn read_new_layout(conn: &mut SqliteConnection) -> Result<ItemRows, sqlx::
     ))
 }
 
-/// The old layout's items, user-data rows, streams and metadata rows, all from one image of
+/// The old layout's items, user-data rows, streams and metadata rows, all from one snapshot of
 /// `library.db` (else `library.db.old`). A row reaches every importable item that has its `key`
-/// (`UserDataKey`).
+/// (`UserDataKey`). `data_dir` is where a copy goes when the file is too big for memory.
 async fn read_old_layout(
     data_path: &Path,
     users: &[JfUser],
+    data_dir: &Path,
 ) -> Result<(ItemRows, MetadataRows), ImportError> {
     let file = library_file(data_path)?;
-    let mut conn = open_snapshot(&file).await?;
+    let mut conn = open_snapshot(&file, data_dir).await?;
     let (item_rows, data_rows, stream_rows) = read_library_db(&mut conn)
         .await
         .map_err(|e| unreadable(&file, &e))?;
@@ -1005,21 +1012,110 @@ fn library_file(data_path: &Path) -> Result<PathBuf, ImportError> {
     )))
 }
 
-/// How long `open_snapshot` waits before it reads the files again (spec Fix 7).
+/// How long `open_snapshot` waits before it tries the files again (spec Fix 7).
 const SNAPSHOT_RETRY: Duration = Duration::from_millis(100);
-/// How many reads `open_snapshot` makes before it gives up on files that keep changing.
+/// How many tries `open_snapshot` makes before it gives up on files that keep changing.
 const SNAPSHOT_TRIES: usize = 5;
-/// The piece size in which `same_bytes` compares a file with the bytes read before.
+/// The piece size in which `same_bytes` and `same_file` compare files, so that neither is ever
+/// held twice in memory.
 const COMPARE_CHUNK: u64 = 1 << 20;
+/// A database and its `-wal` up to this many bytes in all are read into memory; bigger ones are
+/// copied into the data folder first (spec Fix 2). SQLite's one buffer for an image refuses more
+/// than 2,147,483,391 bytes, so the limit stays below that.
+pub(crate) const IN_MEMORY_LIMIT: u64 = 256 << 20;
+const _: () = assert!(IN_MEMORY_LIMIT <= 2_147_483_391);
+/// The folder under the data folder that holds a copy of a big source while it is read.
+const COPY_FOLDER: &str = "jellyfin-import-copy";
+/// The copied database and `-wal` in that folder. SQLite finds the `-wal` by its name.
+const COPY_DB: &str = "source.db";
+const COPY_WAL: &str = "source.db-wal";
+/// The copy lock: one copy at a time, so that the disk holds one (spec Fix 2).
+static COPY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Reads `file` into memory once, applies its `-wal` as SQLite's recovery does, and returns a
-/// read-only connection to that image (spec Fix 7). SQLite never opens the file, so nothing is
-/// created or changed in the source folder, and the image is one state of the file.
-pub(crate) async fn open_snapshot(file: &Path) -> Result<SqliteConnection, ImportError> {
-    let owned = file.to_path_buf();
-    let mut image = tokio::task::spawn_blocking(move || read_image(&owned))
+/// Opens a read-only snapshot of `file` with its `-wal` applied (spec Fix 7, Fix 2). A database
+/// and `-wal` up to `IN_MEMORY_LIMIT` bytes in all are read into memory once; bigger ones are
+/// copied into `data_dir` for as long as the snapshot is open. SQLite never opens the source, so
+/// nothing is created or changed in the source folder, and the snapshot is one state of the files.
+pub(crate) async fn open_snapshot(
+    file: &Path,
+    data_dir: &Path,
+) -> Result<SnapshotConn, ImportError> {
+    open_snapshot_with(file, data_dir, IN_MEMORY_LIMIT).await
+}
+
+/// `open_snapshot` with its in-memory limit given (0 always copies). Each try takes both sizes and
+/// picks its path; a try in which the files changed is repeated `SNAPSHOT_RETRY` later, up to
+/// `SNAPSHOT_TRIES` tries.
+pub(crate) async fn open_snapshot_with(
+    file: &Path,
+    data_dir: &Path,
+    limit: u64,
+) -> Result<SnapshotConn, ImportError> {
+    for attempt in 1..=SNAPSHOT_TRIES {
+        if let Some(snapshot) = snapshot_try(file, data_dir, limit).await? {
+            return Ok(snapshot);
+        }
+        if attempt < SNAPSHOT_TRIES {
+            tokio::time::sleep(SNAPSHOT_RETRY).await;
+        }
+    }
+    Err(ImportError::BadSource(format!(
+        "{} kept changing while it was read; try again when Jellyfin is idle or stopped",
+        file.display()
+    )))
+}
+
+/// One try of `open_snapshot_with`: None when the files changed while they were read.
+async fn snapshot_try(
+    file: &Path,
+    data_dir: &Path,
+    limit: u64,
+) -> Result<Option<SnapshotConn>, ImportError> {
+    let path = file.to_path_buf();
+    let (db_len, wal_len) = on_blocking(file, move || source_sizes(&path)).await?;
+    if reads_in_memory(db_len, wal_len, limit) {
+        let path = file.to_path_buf();
+        let Some(image) = on_blocking(file, move || read_once(&path, limit)).await? else {
+            return Ok(None);
+        };
+        let conn = connection_of_image(file, image).await?;
+        return Ok(Some(SnapshotConn { conn, _copy: None }));
+    }
+    // The lock moves into the blocking task that copies, so a request dropped while the copy runs
+    // can't let a second copy into the folder. The copy's drop releases it.
+    let lock = COPY_LOCK.lock().await;
+    let path = file.to_path_buf();
+    let folder = data_dir.join(COPY_FOLDER);
+    let Some(copy) = on_blocking(file, move || copy_once(&path, &folder, lock)).await? else {
+        return Ok(None);
+    };
+    let conn = SqliteConnectOptions::new()
+        .filename(copy.path.join(COPY_DB))
+        .read_only(true)
+        .connect()
         .await
-        .map_err(|e| unreadable_path(file, &std::io::Error::other(e)))??;
+        .map_err(|e| unreadable(file, &e))?;
+    Ok(Some(SnapshotConn {
+        conn,
+        _copy: Some(copy),
+    }))
+}
+
+/// Runs `work` on the blocking pool. A task that panics or is cancelled is an error reading `file`.
+async fn on_blocking<T: Send + 'static>(
+    file: &Path,
+    work: impl FnOnce() -> Result<T, ImportError> + Send + 'static,
+) -> Result<T, ImportError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| unreadable_path(file, &std::io::Error::other(e)))?
+}
+
+/// A read-only in-memory connection to `image`, a database with its `-wal` applied (`read_once`).
+async fn connection_of_image(
+    file: &Path,
+    mut image: Vec<u8>,
+) -> Result<SqliteConnection, ImportError> {
     // Header bytes 18 and 19 are the file format versions; 2 means WAL, which a deserialized
     // image refuses. The applied image is a rollback-journal database, so they say 1.
     if image.len() >= 100 {
@@ -1039,35 +1135,72 @@ pub(crate) async fn open_snapshot(file: &Path) -> Result<SqliteConnection, Impor
     Ok(conn)
 }
 
-/// The image of `file` with its `-wal` applied, from a read in which the files stayed the same. Up
-/// to `SNAPSHOT_TRIES` reads, `SNAPSHOT_RETRY` apart; then `BadSource`.
-fn read_image(file: &Path) -> Result<Vec<u8>, ImportError> {
-    for attempt in 1..=SNAPSHOT_TRIES {
-        if let Some(image) = read_once(file)? {
-            return Ok(image);
-        }
-        if attempt < SNAPSHOT_TRIES {
-            std::thread::sleep(SNAPSHOT_RETRY);
-        }
+/// A read-only connection to one snapshot of a source database, for as long as it lives. It
+/// derefs to its `SqliteConnection`. On the copy path it also holds the copy, and dropping it
+/// releases the connection, removes the copy's folder, then releases the copy lock.
+pub(crate) struct SnapshotConn {
+    conn: SqliteConnection,
+    /// The copy, None on the in-memory path. Only its drop matters.
+    _copy: Option<CopyFolder>,
+}
+
+impl Deref for SnapshotConn {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &SqliteConnection {
+        &self.conn
     }
-    Err(ImportError::BadSource(format!(
-        "{} kept changing while it was read; try again when Jellyfin is idle or stopped",
-        file.display()
-    )))
+}
+
+impl DerefMut for SnapshotConn {
+    fn deref_mut(&mut self) -> &mut SqliteConnection {
+        &mut self.conn
+    }
+}
+
+/// A copy's folder and the lock that lets only one copy exist. Dropping it removes the folder,
+/// then releases the lock, which is the last field and so drops last.
+struct CopyFolder {
+    path: PathBuf,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for CopyFolder {
+    fn drop(&mut self) {
+        // Best effort: a folder that stays is removed when the next copy starts.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Whether a database of `db_len` bytes with a `-wal` of `wal_len` bytes is read into memory: the
+/// image is at most `limit` bytes (spec Fix 2). The applied image is at most the two files together,
+/// since the applier refuses a commit that names more pages, so it fits SQLite's buffer whenever
+/// `limit` does.
+pub(crate) fn reads_in_memory(db_len: u64, wal_len: u64, limit: u64) -> bool {
+    db_len.saturating_add(wal_len) <= limit
 }
 
 /// One read of `file` and its `-wal`, in this order: the `-wal` head, the database, the `-wal`,
 /// the database again (compared byte for byte), the `-wal` head again. None when the files changed
-/// in between: the two heads differ, or the `-wal`'s head is not the one read first.
-fn read_once(file: &Path) -> Result<Option<Vec<u8>>, ImportError> {
+/// in between: the two heads differ, or the `-wal`'s head is not the one read first. None too when
+/// the database and `-wal` are more than `limit` bytes in all, or either is more than `limit` alone,
+/// so no more than `limit + 1` bytes of either are ever held.
+fn read_once(file: &Path, limit: u64) -> Result<Option<Vec<u8>>, ImportError> {
     let wal_file = wal_path(file);
     let head1 = wal_head(&wal_file)?;
-    let db = std::fs::read(file).map_err(|e| unreadable_path(file, &e))?;
-    let wal = match std::fs::read(&wal_file) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(unreadable_path(&wal_file, &e)),
+    let Some(db) = read_up_to(file, open_database(file)?, limit)? else {
+        return Ok(None);
     };
+    let wal = match open_regular(&wal_file)? {
+        Some(handle) => read_up_to(&wal_file, handle, limit)?,
+        None => Some(Vec::new()),
+    };
+    let Some(wal) = wal else {
+        return Ok(None);
+    };
+    if (db.len() as u64).saturating_add(wal.len() as u64) > limit {
+        return Ok(None);
+    }
     let same = same_bytes(file, &db)?;
     let head2 = wal_head(&wal_file)?;
     let wal_matches = head1.as_ref().map(|head| &head[..]) == wal.get(..32);
@@ -1078,6 +1211,185 @@ fn read_once(file: &Path) -> Result<Option<Vec<u8>>, ImportError> {
     }
 }
 
+/// Opens `path` if it is a regular file (spec Fix 1). A missing file gives None, and so does one
+/// that goes missing between the check and the open. Any other file (a FIFO, a device, a folder)
+/// is a BadSource that names it, found before anything is read from it, so that nothing blocks on
+/// it or reads from it. `std::fs::metadata` follows links, so a link to a regular file is fine. The
+/// open handle is checked as well.
+fn open_regular(path: &Path) -> Result<Option<File>, ImportError> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(not_regular(path)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable_path(path, &e)),
+    }
+    let handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable_path(path, &e)),
+    };
+    match handle.metadata() {
+        Ok(meta) if meta.is_file() => Ok(Some(handle)),
+        Ok(_) => Err(not_regular(path)),
+        Err(e) => Err(unreadable_path(path, &e)),
+    }
+}
+
+/// The error for a source that is not a regular file.
+fn not_regular(path: &Path) -> ImportError {
+    ImportError::BadSource(format!("{} is not a regular file", path.display()))
+}
+
+/// The database `file`, opened through `open_regular`. A database that is not there is the
+/// NotFound error it has always been, not a retry.
+fn open_database(file: &Path) -> Result<File, ImportError> {
+    open_regular(file)?
+        .ok_or_else(|| unreadable_path(file, &std::io::Error::from(ErrorKind::NotFound)))
+}
+
+/// The bytes of `handle`, an open `file`, when there are no more than `limit` of them; None when
+/// there are more. The read stops at `limit + 1` bytes, so a file that grew is never read whole.
+fn read_up_to(file: &Path, handle: File, limit: u64) -> Result<Option<Vec<u8>>, ImportError> {
+    let mut bytes = Vec::new();
+    handle
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| unreadable_path(file, &e))?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
+/// The sizes of the database `file` and of its `-wal` (0 when there is none), each taken from an
+/// open handle through `open_regular`.
+fn source_sizes(file: &Path) -> Result<(u64, u64), ImportError> {
+    let db_len = open_database(file)?
+        .metadata()
+        .map_err(|e| unreadable_path(file, &e))?
+        .len();
+    let wal_file = wal_path(file);
+    let wal_len = match open_regular(&wal_file)? {
+        Some(wal) => wal
+            .metadata()
+            .map_err(|e| unreadable_path(&wal_file, &e))?
+            .len(),
+        None => 0,
+    };
+    Ok((db_len, wal_len))
+}
+
+/// One copy of `file` and its `-wal` into `folder`, made while `lock` is held (spec Fix 2). A folder
+/// that a stopped copy left behind is removed first, then the folder is made private. The result
+/// holds the folder, which removes itself when dropped. None when the copy is not one state of the
+/// files, and the folder is removed then too.
+fn copy_once(
+    file: &Path,
+    folder: &Path,
+    lock: MutexGuard<'static, ()>,
+) -> Result<Option<CopyFolder>, ImportError> {
+    match std::fs::remove_dir_all(folder) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(copy_error(file, folder, &e)),
+    }
+    create_private_dir(folder).map_err(|e| copy_error(file, folder, &e))?;
+    // From here on, each return drops `copy`: the folder goes first, then the lock.
+    let copy = CopyFolder {
+        path: folder.to_path_buf(),
+        _lock: lock,
+    };
+    let wal_file = wal_path(file);
+    let head1 = wal_head(&wal_file)?;
+    copy_bytes(file, folder)?;
+    let same = same_file(file, folder)?;
+    let head2 = wal_head(&wal_file)?;
+    let copied_head = wal_head(&folder.join(COPY_WAL))?;
+    if same && head1 == head2 && copied_head == head1 {
+        Ok(Some(copy))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Copies the database at `file` to `folder/source.db`, and its `-wal`, if it has one, to
+/// `folder/source.db-wal`. A `-wal` that is not a regular file is a BadSource, as in `open_regular`.
+fn copy_bytes(file: &Path, folder: &Path) -> Result<(), ImportError> {
+    copy_into(file, folder, open_database(file)?, &folder.join(COPY_DB))?;
+    if let Some(wal) = open_regular(&wal_path(file))? {
+        copy_into(file, folder, wal, &folder.join(COPY_WAL))?;
+    }
+    Ok(())
+}
+
+/// Copies everything in `from` into a new private file at `to`.
+fn copy_into(file: &Path, folder: &Path, mut from: File, to: &Path) -> Result<(), ImportError> {
+    let mut into = create_private_file(to).map_err(|e| copy_error(file, folder, &e))?;
+    std::io::copy(&mut from, &mut into).map_err(|e| copy_error(file, folder, &e))?;
+    Ok(())
+}
+
+/// Whether the database at `file` and its copy in `folder` hold the same bytes, compared in
+/// `COMPARE_CHUNK` pieces so that neither is held in memory whole.
+fn same_file(file: &Path, folder: &Path) -> Result<bool, ImportError> {
+    let mut source = open_database(file)?;
+    let mut copy = File::open(folder.join(COPY_DB)).map_err(|e| copy_error(file, folder, &e))?;
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    loop {
+        left.clear();
+        right.clear();
+        (&mut source)
+            .take(COMPARE_CHUNK)
+            .read_to_end(&mut left)
+            .map_err(|e| unreadable_path(file, &e))?;
+        (&mut copy)
+            .take(COMPARE_CHUNK)
+            .read_to_end(&mut right)
+            .map_err(|e| copy_error(file, folder, &e))?;
+        if left != right {
+            return Ok(false);
+        }
+        if left.is_empty() {
+            return Ok(true);
+        }
+    }
+}
+
+/// The error for a copy of `file` into `folder` that failed.
+fn copy_error(file: &Path, folder: &Path, error: &std::io::Error) -> ImportError {
+    ImportError::BadSource(format!(
+        "cannot copy {} to {}: {error}",
+        file.display(),
+        folder.display()
+    ))
+}
+
+/// Creates `path` as a new folder that only this user can use (mode 0700).
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+/// Creates `path` as a new file for writing, which only this user can read (mode 0600). It must not
+/// exist already, so a planted link is never followed.
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
 /// The `-wal` file of a database: its path with `-wal` appended.
 fn wal_path(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_owned();
@@ -1085,12 +1397,11 @@ fn wal_path(file: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The first 32 bytes of the `-wal` at `wal`; None when the file is missing or shorter.
+/// The first 32 bytes of the `-wal` at `wal`; None when the file is missing or shorter. A `-wal`
+/// that is not a regular file is a BadSource (`open_regular`).
 fn wal_head(wal: &Path) -> Result<Option<[u8; 32]>, ImportError> {
-    let mut handle = match std::fs::File::open(wal) {
-        Ok(handle) => handle,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(unreadable_path(wal, &e)),
+    let Some(mut handle) = open_regular(wal)? else {
+        return Ok(None);
     };
     let mut head = [0u8; 32];
     match handle.read_exact(&mut head) {
@@ -1103,7 +1414,7 @@ fn wal_head(wal: &Path) -> Result<Option<[u8; 32]>, ImportError> {
 /// Whether `file` holds exactly `expected`, compared in `COMPARE_CHUNK` pieces so that the file is
 /// never held twice in memory.
 fn same_bytes(file: &Path, expected: &[u8]) -> Result<bool, ImportError> {
-    let mut handle = std::fs::File::open(file).map_err(|e| unreadable_path(file, &e))?;
+    let mut handle = open_database(file)?;
     let mut chunk = Vec::new();
     let mut offset = 0;
     loop {

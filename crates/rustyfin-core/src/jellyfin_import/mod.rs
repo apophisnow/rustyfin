@@ -179,7 +179,7 @@ pub async fn preview(
     req: &ImportRequest,
     data_dir: &Path,
 ) -> Result<ImportReport, ImportError> {
-    let prepared = prepare(req).await?;
+    let prepared = prepare(req, data_dir).await?;
     let report = plan_report(db, req, &prepared, data_dir, None).await?;
 
     let layout = report.layout;
@@ -219,10 +219,11 @@ pub struct Prepared {
     pub folders: Vec<source::LibraryFolder>,
 }
 
-/// Locates and reads the source of `req`, with the preview's errors (spec 2.17, 2.18, 2.26).
-pub async fn prepare(req: &ImportRequest) -> Result<Prepared, ImportError> {
+/// Locates and reads the source of `req`, with the preview's errors (spec 2.17, 2.18, 2.26). A
+/// database too big for memory is copied into `data_dir` while it is read (`source::read_snapshot`).
+pub async fn prepare(req: &ImportRequest, data_dir: &Path) -> Result<Prepared, ImportError> {
     let location = source::locate(Path::new(&req.source_path))?;
-    let snapshot = source::read_snapshot(&location, req.layout).await?;
+    let snapshot = source::read_snapshot(&location, req.layout, data_dir).await?;
     let folders = source::read_library_folders(&location.program_data_path)?;
     Ok(Prepared {
         location,

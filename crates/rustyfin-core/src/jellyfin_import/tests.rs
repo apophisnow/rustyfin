@@ -13,8 +13,9 @@ use super::merge::{MappedTracks, convert_rating, harmonize, merge};
 use super::paths::{PathMapping, suggest_metadata, translate_path};
 use super::plan::{UserMatch, match_user_name};
 use super::source::{
-    JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob, guid_from_text, locate,
-    open_snapshot, parse_jellyfin_date, parse_old_images, parse_provider_ids,
+    IN_MEMORY_LIMIT, JfImage, JfStream, JfUserData, ProviderIds, StreamKind, guid_from_blob,
+    guid_from_text, locate, open_snapshot, open_snapshot_with, parse_jellyfin_date,
+    parse_old_images, parse_provider_ids, reads_in_memory,
 };
 use super::tracks::{choose_source, map_track, normalize_codec};
 use super::{
@@ -1349,15 +1350,29 @@ async fn wal_writer(dir: &Path) -> sqlx::SqliteConnection {
     conn
 }
 
-/// The `n` of every row of `t` in the snapshot of `file`.
-async fn snapshot_rows(file: &Path) -> Vec<i64> {
-    let mut conn = open_snapshot(file)
+/// The `n` of every row of `t` in the snapshot of `file`, read with `limit` as the in-memory limit
+/// (0 always copies). The data folder it gets is empty again once the snapshot is dropped.
+async fn snapshot_rows_with(file: &Path, limit: u64) -> Vec<i64> {
+    let data = TempDir::new();
+    let mut conn = open_snapshot_with(file, &data.0, limit)
         .await
         .unwrap_or_else(|e| panic!("{}: {e:?}", file.display()));
-    sqlx::query_scalar("SELECT n FROM t ORDER BY n")
-        .fetch_all(&mut conn)
+    let rows: Vec<i64> = sqlx::query_scalar("SELECT n FROM t ORDER BY n")
+        .fetch_all(&mut *conn)
         .await
+        .unwrap();
+    drop(conn);
+    let left: Vec<PathBuf> = std::fs::read_dir(&data.0)
         .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(left.is_empty(), "left in the data folder: {left:?}");
+    rows
+}
+
+/// The `n` of every row of `t` in the snapshot of `file`, read as the importer reads it.
+async fn snapshot_rows(file: &Path) -> Vec<i64> {
+    snapshot_rows_with(file, IN_MEMORY_LIMIT).await
 }
 
 /// Each entry of `dir` with its size and modification time.
@@ -1479,6 +1494,208 @@ async fn b20_snapshot_stops_at_a_damaged_frame_and_ignores_a_damaged_header() {
         snapshot_rows(&tmp.0.join("jellyfin.db")).await,
         [1, 2, 3, 4]
     );
+}
+
+// Fix round 2, 1: a database or `-wal` that is not a regular file is a bad source, found before any
+// open. A FIFO's open waits for a writer forever; a link to /dev/zero would be read until memory runs
+// out (/dev/null stands in for it here).
+
+/// What `open_snapshot` gives for `file`, or None while it is still busy after 5 s. It runs on its
+/// own thread and runtime, so an open that never returns can't hold up the test.
+fn snapshot_within_5s(file: &Path) -> Option<Result<(), ImportError>> {
+    let file = file.to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let data = TempDir::new();
+        let _ = sender.send(runtime.block_on(open_snapshot(&file, &data.0)).map(drop));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .ok()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn b20_snapshot_refuses_files_that_are_not_regular_files() {
+    let tmp = TempDir::new();
+    let mut writer = wal_writer(&tmp.0).await;
+    sqlx::query("INSERT INTO t VALUES (2, '')")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    let wal = std::fs::read(tmp.0.join("jellyfin.db-wal")).unwrap();
+    let mkfifo = |path: &Path| {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo {}", path.display());
+    };
+    // A folder `name` with a copy of the database (row 1; row 2 is only in the -wal).
+    let folder = |name: &str| {
+        let dir = tmp.0.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(tmp.0.join("jellyfin.db"), dir.join("jellyfin.db")).unwrap();
+        dir
+    };
+    let fifo_wal = folder("fifo_wal");
+    mkfifo(&fifo_wal.join("jellyfin.db-wal"));
+    let null_wal = folder("null_wal");
+    std::os::unix::fs::symlink("/dev/null", null_wal.join("jellyfin.db-wal")).unwrap();
+    let fifo_db = tmp.0.join("fifo_db");
+    std::fs::create_dir_all(&fifo_db).unwrap();
+    mkfifo(&fifo_db.join("jellyfin.db"));
+    let null_db = tmp.0.join("null_db");
+    std::fs::create_dir_all(&null_db).unwrap();
+    std::os::unix::fs::symlink("/dev/null", null_db.join("jellyfin.db")).unwrap();
+    for (case, dir, odd) in [
+        ("FIFO -wal", &fifo_wal, "jellyfin.db-wal"),
+        ("-wal linked to /dev/null", &null_wal, "jellyfin.db-wal"),
+        ("FIFO database", &fifo_db, "jellyfin.db"),
+        ("database linked to /dev/null", &null_db, "jellyfin.db"),
+    ] {
+        match snapshot_within_5s(&dir.join("jellyfin.db")) {
+            Some(Err(ImportError::BadSource(text))) => assert!(
+                text.contains(&format!("{odd} is not a regular file")),
+                "{case}: {text}"
+            ),
+            None => panic!("{case}: open_snapshot still busy after 5 s"),
+            Some(other) => panic!("{case}: {other:?}, want BadSource naming {odd}"),
+        }
+    }
+    // A link to a regular file is fine: a -wal linked to a real one is read.
+    let real_wal = tmp.0.join("real.wal");
+    std::fs::write(&real_wal, &wal).unwrap();
+    let linked = folder("linked_wal");
+    std::os::unix::fs::symlink(&real_wal, linked.join("jellyfin.db-wal")).unwrap();
+    assert_eq!(snapshot_rows(&linked.join("jellyfin.db")).await, [1, 2]);
+}
+
+// Fix round 2, 2: SQLite's one buffer for an image refuses more than 2,147,483,391 bytes, so a source
+// above the in-memory limit is copied to a private folder in Rustyfin's data folder and opened there
+// read-only; SQLite's own recovery applies the copied -wal.
+
+#[test]
+fn b20_big_sources_are_not_read_into_memory() {
+    const SQLITE_MAX_ALLOCATION: u64 = 2_147_483_391;
+    assert!(
+        reads_in_memory(IN_MEMORY_LIMIT, 0, SQLITE_MAX_ALLOCATION),
+        "an image at the limit must fit SQLite's buffer"
+    );
+    assert!(reads_in_memory(IN_MEMORY_LIMIT, 0, IN_MEMORY_LIMIT));
+    assert!(reads_in_memory(
+        IN_MEMORY_LIMIT - 4096,
+        4096,
+        IN_MEMORY_LIMIT
+    ));
+    assert!(!reads_in_memory(IN_MEMORY_LIMIT, 1, IN_MEMORY_LIMIT));
+    assert!(!reads_in_memory(
+        SQLITE_MAX_ALLOCATION + 1,
+        0,
+        IN_MEMORY_LIMIT
+    ));
+    assert!(!reads_in_memory(
+        0,
+        SQLITE_MAX_ALLOCATION + 1,
+        IN_MEMORY_LIMIT
+    ));
+    assert!(!reads_in_memory(u64::MAX, u64::MAX, IN_MEMORY_LIMIT));
+    assert!(reads_in_memory(0, 0, 0));
+    assert!(!reads_in_memory(1, 0, 0));
+}
+
+#[tokio::test]
+async fn b20_snapshot_copies_a_big_source_to_the_data_folder() {
+    let tmp = TempDir::new();
+    let mut writer = wal_writer(&tmp.0).await;
+    sqlx::query("INSERT INTO t VALUES (2, '')")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    let wal_path = tmp.0.join("jellyfin.db-wal");
+    let first = std::fs::metadata(&wal_path).unwrap().len() as usize;
+    sqlx::query(
+        "WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < 20) \
+         INSERT INTO t SELECT 3, hex(randomblob(2000)) FROM k",
+    )
+    .execute(&mut writer)
+    .await
+    .unwrap();
+    let wal = std::fs::read(&wal_path).unwrap();
+    let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+    let frame = 24 + page_size;
+    // A limit of 0 copies: committed frames only, and the source folder stays as it was. Without a
+    // -wal (Jellyfin stopped cleanly) the copy is a WAL-mode database alone.
+    let mut all = vec![1, 2];
+    all.extend([3; 20]);
+    for (case, cut, rows) in [
+        ("no wal", None, &all[..1]),
+        (
+            "frames without their commit",
+            Some(first + 2 * frame + 100),
+            &all[..2],
+        ),
+        ("whole wal", Some(wal.len()), &all[..]),
+    ] {
+        let dir = tmp.0.join(case.replace(' ', "_"));
+        let file = source_with_wal(&tmp.0, &dir, &wal[..cut.unwrap_or(0)]);
+        if cut.is_none() {
+            std::fs::remove_file(dir.join("jellyfin.db-wal")).unwrap();
+        }
+        let before = folder_listing(&dir);
+        assert_eq!(snapshot_rows_with(&file, 0).await, rows, "{case}");
+        assert_eq!(
+            folder_listing(&dir),
+            before,
+            "{case}: the source folder changed"
+        );
+    }
+    // Database and -wal at the limit are read in memory; one byte more is copied, into a folder of
+    // the data folder that only the server can read, and the copy goes with the connection.
+    let file = tmp.0.join("whole_wal").join("jellyfin.db");
+    let total = std::fs::metadata(&file).unwrap().len() + wal.len() as u64;
+    for (limit, copied) in [(total, false), (total - 1, true)] {
+        let data = TempDir::new();
+        let mut conn = open_snapshot_with(&file, &data.0, limit)
+            .await
+            .unwrap_or_else(|e| panic!("limit {limit}: {e:?}"));
+        let main: String =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        let main = PathBuf::from(main);
+        let in_data = main.starts_with(&data.0) || main.starts_with(data.0.canonicalize().unwrap());
+        assert_eq!(
+            in_data,
+            copied,
+            "limit {limit} of {total}: main database {}",
+            main.display()
+        );
+        #[cfg(unix)]
+        if copied {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(main.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "the copy's folder is open to others: {mode:o}"
+            );
+        }
+        drop(conn);
+        assert_eq!(
+            std::fs::read_dir(&data.0).unwrap().count(),
+            0,
+            "limit {limit}: the copy outlived its connection"
+        );
+    }
 }
 
 /// Writes a JPEG of `len` bytes to `path`: the signature, then `fill`.

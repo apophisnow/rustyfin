@@ -54,7 +54,7 @@ async fn run_route(
     State(state): State<AppState>,
     Json(req): Json<ImportRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let prepared = prepare(&req).await.map_err(import_error)?;
+    let prepared = prepare(&req, &state.data_dir).await.map_err(import_error)?;
     let handle = state
         .jellyfin_import
         .try_start()
