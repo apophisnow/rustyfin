@@ -131,7 +131,8 @@ pub struct ByNameEntry {
     pub kind: ByNameKind,
     /// The id from `by_name_id`.
     pub id: Uuid,
-    /// The smallest spelling among the rows that were counted.
+    /// The most common spelling among all the rows of the entry, whatever the filter; a tie goes
+    /// to the smallest spelling.
     pub name: String,
     /// The counts of the items behind the entry.
     pub counts: ByNameCounts,
@@ -192,19 +193,20 @@ pub async fn list(
         if row.in_scope && passes_type_filters(filter, row.media) {
             group.items.insert(row.item, row.media);
         }
-        if group.name.is_empty() || row.name < group.name {
-            group.name = row.name;
-        }
+        *group.spellings.entry(row.name).or_default() += 1;
     }
 
     let mut entries: Vec<ByNameEntry> = groups
         .into_iter()
         .filter(|(folded, group)| !group.items.is_empty() && passes_name_filters(filter, folded))
-        .map(|(_, group)| ByNameEntry {
-            kind,
-            id: by_name_id(kind, &group.name),
-            counts: counts_of(&group.items),
-            name: group.name,
+        .map(|(_, group)| {
+            let name = group.name();
+            ByNameEntry {
+                kind,
+                id: by_name_id(kind, &name),
+                counts: counts_of(&group.items),
+                name,
+            }
         })
         .collect();
     entries.sort_by_cached_key(|entry| order_key(kind, &entry.name));
@@ -270,12 +272,23 @@ pub async fn get_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<ByNameEntry
     Ok(None)
 }
 
-/// The rows behind one entry: the smallest spelling among all its rows, and each counted item
-/// with its type.
+/// The rows behind one entry: the number of rows with each spelling, among all its rows, and each
+/// counted item with its type.
 #[derive(Default)]
 struct Group {
-    name: String,
+    spellings: BTreeMap<String, usize>,
     items: BTreeMap<String, MediaType>,
+}
+
+impl Group {
+    /// The most common spelling; a tie goes to the smallest.
+    fn name(&self) -> String {
+        self.spellings
+            .iter()
+            .max_by(|(a, a_rows), (b, b_rows)| a_rows.cmp(b_rows).then_with(|| b.cmp(a)))
+            .map(|(spelling, _)| spelling.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// One item and one of its names, as `name_rows` reads them.

@@ -1735,6 +1735,36 @@ async fn j5_accented_and_nfd_spellings_are_one_entry() {
     assert_eq!(j5_list(pool, ByNameKind::Genre, &search).await, "1: Acao");
 }
 
+#[tokio::test]
+async fn j5_an_entry_is_named_by_its_most_common_spelling() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let odd = j5_library(pool, "J5 Odd", LibraryContentType::Movies).await;
+    for name in ["A", "B", "C"] {
+        j5_item(pool, films, None, name, "Movie", "Sci-Fi", None).await;
+    }
+    j5_item(pool, odd, None, "D", "Movie", "SCI-FI|DRAMA", None).await;
+    j5_item(pool, films, None, "E", "Movie", "Drama", None).await;
+
+    // Three Sci-Fi beat one SCI-FI, also where only the SCI-FI item counts. A tie goes to the
+    // smallest spelling, so DRAMA beats Drama.
+    assert_eq!(
+        j5_list(pool, ByNameKind::Genre, &ByNameFilter::default()).await,
+        "2: DRAMA, Sci-Fi"
+    );
+    let in_odd = ByNameFilter {
+        parent_id: Some(odd),
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, ByNameKind::Genre, &in_odd).await,
+        "2: DRAMA, Sci-Fi"
+    );
+    let found = j5_lookup(pool, ByNameKind::Genre, "sci-fi").await;
+    assert_eq!(found, Some((ByNameKind::Genre, "Sci-Fi".to_string(), 4)));
+}
+
 // ── Media Item Repository Tests ──
 
 fn make_movie(library_id: Uuid, name: &str) -> MediaItem {
