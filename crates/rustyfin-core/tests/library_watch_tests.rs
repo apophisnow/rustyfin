@@ -2941,6 +2941,91 @@ mod kernel {
         wait_for_log(&[&watching]).await;
         watcher.stop();
     }
+
+    /// Fix round 2, item I. A symlinked folder is watched at its target. A share at the target
+    /// that goes away is forgotten, and nothing is reported; mounted there again, the library path
+    /// is set up again, so what then changes on the share is reported by its path in the library.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_mounted_again_at_a_symlinked_folder_is_watched_after() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        // A tmpfs, not a bind mount: inotify drops the watches on a filesystem that is unmounted,
+        // but those on a bind mount watch the source, which stays.
+        let target = tree.outside("mnt");
+        let mut share = Share::mount(&target);
+        write(&target.join("Alpha (2001).mkv"), 10);
+        symlink(&target, tree.at("Alpha (2001)")).unwrap();
+        let point = std::fs::canonicalize(&target).unwrap();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount I Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 5).await;
+
+        share.unmount();
+        wait_watched(&watcher, &tree.root(), 4).await;
+        let _share = Share::mount(&target);
+        wait_watched(&watcher, &tree.root(), 5).await;
+        let alpha = folder_unit(&lib, tree.at("Alpha (2001)"));
+        assert_eq!(recorder.count(&alpha), 0, "the share's coming and going");
+        write(&target.join("Alpha (2001).mkv"), 10);
+        recorder.wait_for(&alpha, 1).await;
+        let mounted = format!(
+            "library monitor: '{}' was mounted; setting up '{}' of 'Mount I Films' again",
+            point.display(),
+            tree.root().display()
+        );
+        assert_eq!(log_lines(&[&mounted]).len(), 1, "logged once");
+        watcher.stop();
+    }
+
+    /// A guard for fix round 2, item I: a library path that is a symlink is matched with the
+    /// mount table by its canonical path, so a share mounted at its target sets it up again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_mounted_at_the_target_of_a_symlinked_library_path_is_watched_after() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        let link = tree.outside("link");
+        symlink(tree.root(), &link).unwrap();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount J Films", std::slice::from_ref(&link)).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &link, 1).await;
+
+        let _share = Share::mount(&tree.root());
+        let mounted = format!(
+            "library monitor: '{}' was mounted; setting up '{}' of 'Mount J Films' again",
+            std::fs::canonicalize(tree.root()).unwrap().display(),
+            link.display()
+        );
+        wait_for_log(&[&mounted]).await;
+        let watching = format!(
+            "library monitor: watching '{}' of 'Mount J Films' (",
+            link.display()
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log_lines(&[&watching]).len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the path is not watched again on the share within 20 s: {:?}",
+                watcher.monitored()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        write(&link.join("Film (2001)/Film (2001).mkv"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, link.join("Film (2001)")), 1)
+            .await;
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:
