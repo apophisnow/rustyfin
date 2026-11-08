@@ -1369,26 +1369,27 @@ async fn snapshot_try(
     else {
         return Ok(None);
     };
+    // The page size and count SQLite reads the copy by, checked before they size the budget and
+    // the walk (spec Fix round 5, N1).
     let copy_db = copy.path.join(COPY_DB);
+    let (owner, db_path, wal_path) = (
+        file.to_path_buf(),
+        copy_db.clone(),
+        copy.path.join(COPY_WAL),
+    );
+    let pages = on_blocking(file, move || CopyPages::open(&owner, &db_path, &wal_path)).await?;
     let mut conn = SqliteConnectOptions::new()
         .filename(&copy_db)
         .read_only(true)
         .connect()
         .await
         .map_err(|e| unreadable(file, &e))?;
-    let header_db = copy_db.clone();
-    let header = on_blocking(file, move || read_header(&header_db)).await?;
-    let budget = progress_budget(page_count(&header, db_len));
+    let budget = progress_budget(pages.page_count());
     let cancel = guard_connection(file, &mut conn, budget).await?;
     let roots = read_roots(file, &mut conn, tables).await?;
     // Walk the schema and roots over the copied files before a quick_check reads them.
-    let copy_wal = copy.path.join(COPY_WAL);
     let owner = file.to_path_buf();
-    on_blocking(file, move || {
-        let pages = CopyPages::open(&owner, &copy_db, &copy_wal)?;
-        check_tree_depth(&pages, &owner, &roots)
-    })
-    .await?;
+    on_blocking(file, move || check_tree_depth(&pages, &owner, &roots)).await?;
     Ok(Some(SnapshotConn {
         _cancel: CancelOnDrop(cancel),
         conn,
@@ -1492,23 +1493,6 @@ pub(super) async fn guard_connection(
         .map_err(|e| unreadable(file, &e))?
         .set_progress_handler(PROGRESS_OPS, move || guard.tick());
     Ok(cancel)
-}
-
-/// The first bytes of `path`'s SQLite header, enough for `page_count` to read the page size. A short
-/// read is not an error here: `page_count` treats a short header as the largest page.
-fn read_header(path: &Path) -> Result<Vec<u8>, ImportError> {
-    let mut file = File::open(path).map_err(|e| unreadable_path(path, &e))?;
-    let mut header = [0u8; 18];
-    let mut read = 0;
-    while read < header.len() {
-        match file.read(&mut header[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(unreadable_path(path, &e)),
-        }
-    }
-    Ok(header[..read].to_vec())
 }
 
 /// The root pages `check_tables`' `quick_check` reads for `tables`, as `(table, rootpage)`: each
@@ -2336,6 +2320,13 @@ pub(super) struct CopyPages {
 }
 
 impl CopyPages {
+    /// Maps the copied `-wal` and takes the page size SQLite reads the copy by: page 1's, read as
+    /// `lockBtree` reads it, through page 1's latest committed frame, else from the database file.
+    /// When the `-wal` commits frames, a copy whose database header, `-wal` header and page 1 don't
+    /// name one valid size is refused as `apply_wal` refuses it, and so is a commit naming more
+    /// pages than the file and frames hold, before that count sizes the walk or the budget (spec Fix
+    /// round 5, N1). With no committed frames page 1 is the file's header; a size SQLite can't use
+    /// leaves no page to read, so SQLite refuses the file itself and the walk refuses page 1.
     pub(super) fn open(file: &Path, db_path: &Path, wal_path: &Path) -> Result<Self, ImportError> {
         let db = File::open(db_path).map_err(|e| unreadable_path(db_path, &e))?;
         let db_len = db
@@ -2344,37 +2335,74 @@ impl CopyPages {
             .len();
         let mut header = [0u8; 100];
         let read = read_at(&db, 0, &mut header).map_err(|e| unreadable_path(db_path, &e))?;
-        let page_size = db_page_size(&header[..read])
-            .unwrap_or(65_536)
-            .clamp(512, 65_536);
-        let reserved = header.get(20).copied().map_or(0, usize::from);
+        let header = &header[..read];
         // The copied -wal, when present, overrides pages: its committed frames win over the database
         // file. It is streamed a frame at a time to map them, holding offsets only; the last
         // committed frame for a page wins. A copy with no -wal reads the database file alone.
-        let (wal, page_count, frames) = match File::open(wal_path) {
+        let (wal, commit) = match File::open(wal_path) {
             Ok(wal) => {
                 let commit = wal_commit_frames(file, |offset, buf| {
                     read_at(&wal, offset, buf).map_err(|e| unreadable_path(wal_path, &e))
                 })?;
-                match commit {
-                    Some(commit) => (Some(wal), u64::from(commit.pages), commit.frames),
-                    None => (Some(wal), db_len / page_size as u64, HashMap::new()),
-                }
+                (Some(wal), commit)
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                (None, db_len / page_size as u64, HashMap::new())
-            }
+            Err(e) if e.kind() == ErrorKind::NotFound => (None, None),
             Err(e) => return Err(unreadable_path(wal_path, &e)),
         };
+        let mut first = [0u8; 100];
+        let first_len = match (&wal, commit.as_ref().and_then(|c| c.frames.get(&1))) {
+            (Some(wal), Some(&offset)) => {
+                read_at(wal, offset, &mut first).map_err(|e| unreadable_path(wal_path, &e))?
+            }
+            _ => {
+                first[..read].copy_from_slice(header);
+                read
+            }
+        };
+        let first = &first[..first_len];
+        let size = sqlite_page_size(first);
+        let reserved = first.get(20).copied().map_or(0, usize::from);
+        let Some(commit) = commit else {
+            let (page_size, page_count) =
+                size.map_or((512, 0), |size| (size, db_len / size as u64));
+            return Ok(CopyPages {
+                db,
+                wal,
+                frames: HashMap::new(),
+                page_size,
+                reserved,
+                page_count,
+            });
+        };
+        let mismatch = || bad_wal(file, "its database file does not match its -wal");
+        let page_size = size.ok_or_else(mismatch)?;
+        if sqlite_page_size(header) != Some(page_size) || commit.page_size != page_size {
+            return Err(mismatch());
+        }
+        let held = db_len
+            .div_ceil(page_size as u64)
+            .saturating_add(commit.committed);
+        if u64::from(commit.pages) > held {
+            return Err(bad_wal(
+                file,
+                "its -wal commits more pages than its database holds",
+            ));
+        }
         Ok(CopyPages {
             db,
             wal,
-            frames,
+            frames: commit.frames,
             page_size,
             reserved,
-            page_count,
+            page_count: u64::from(commit.pages),
         })
     }
+}
+
+/// The page size SQLite reads a database by, from page 1's header (bytes 16-17, 1 meaning 65536),
+/// when it is one SQLite can use (`lockBtree`): a power of two from 512 to 65536.
+fn sqlite_page_size(page1: &[u8]) -> Option<usize> {
+    db_page_size(page1).filter(|size| size.is_power_of_two() && (512..=65_536).contains(size))
 }
 
 impl Pages for CopyPages {

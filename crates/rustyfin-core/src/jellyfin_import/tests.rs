@@ -3143,3 +3143,90 @@ fn b20_wal_streams_only_committed_frames() {
         assert_eq!(buf, page(byte), "page {pgno}");
     }
 }
+
+// Fix round 5, N1: the copy path reads the copy by the page size SQLite uses, page 1's as read
+// through the -wal. A copy whose database header, -wal header and page 1 disagree is refused with
+// apply_wal's text, and so is a commit naming more pages than the file and frames hold. Before, the
+// copy path took the size from the database header alone and the page count from the commit as is.
+#[tokio::test]
+async fn b20_copy_path_reads_sqlites_page_size() {
+    use sqlx::ConnectOptions;
+    let tmp = TempDir::new();
+    let data = TempDir::new();
+    // A WAL-mode database with 1024-byte pages whose tables were made after the last checkpoint,
+    // so its -wal commits page 1. The writer stays open: closing it would checkpoint the -wal.
+    let mut writer = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(tmp.0.join("jellyfin.db"))
+        .create_if_missing(true)
+        .page_size(1024)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::raw_sql("PRAGMA wal_autocheckpoint = 0;")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USERS_DDL).execute(&mut writer).await.unwrap();
+    let live_wal = std::fs::read(tmp.0.join("jellyfin.db-wal")).unwrap();
+    assert_eq!(
+        live_wal[8..12],
+        1024u32.to_be_bytes(),
+        "the -wal's page size"
+    );
+
+    // Re-check 4, point 4 (c): the database header says 512, the -wal and its page 1 say 1024.
+    let small_header = source_with_wal(&tmp.0, &tmp.0.join("small_header"), &live_wal);
+    let mut bytes = std::fs::read(&small_header).unwrap();
+    bytes[16..18].copy_from_slice(&512u16.to_be_bytes());
+    std::fs::write(&small_header, bytes).unwrap();
+
+    // The tables checkpointed into the file, then hand-made -wals over it that carry page 1: one
+    // whose page 1 says 512 while both headers say 1024, and one whose commit names two pages
+    // more than the file's and its one frame.
+    sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
+        .execute(&mut writer)
+        .await
+        .unwrap();
+    let db = std::fs::read(tmp.0.join("jellyfin.db")).unwrap();
+    let db_pages = u32::try_from(db.len() / 1024).unwrap();
+    let page1 = db[..1024].to_vec();
+    let mut small_page1 = page1.clone();
+    small_page1[16..18].copy_from_slice(&512u16.to_be_bytes());
+    let small_first = source_with_wal(
+        &tmp.0,
+        &tmp.0.join("small_page1"),
+        &build_wal(1024, db_pages, &[(1, small_page1)]),
+    );
+    let past_end = source_with_wal(
+        &tmp.0,
+        &tmp.0.join("past_end"),
+        &build_wal(1024, db_pages + 2, &[(1, page1)]),
+    );
+
+    let shown = |file: &Path, outcome: Result<(), ImportError>| match outcome {
+        Ok(()) => "read".to_string(),
+        Err(ImportError::BadSource(text)) => text.replace(&file.display().to_string(), "<file>"),
+        Err(other) => format!("{other:?}"),
+    };
+    let (mut copied, mut in_memory) = (Vec::new(), Vec::new());
+    for file in [&small_header, &small_first, &past_end] {
+        for (limit, outcomes) in [(0, &mut copied), (u64::MAX, &mut in_memory)] {
+            let outcome =
+                open_snapshot_with_free(file, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX))
+                    .await;
+            outcomes.push(shown(file, outcome.map(drop)));
+        }
+    }
+    drop(writer);
+    let mismatch = "<file>: its database file does not match its -wal";
+    let past = "<file>: its -wal commits more pages than its database holds";
+    assert_eq!(copied, [mismatch, mismatch, past], "the copy path");
+    // The in-memory path refused the first and the last already. Its image is read by its page 1's
+    // size, whatever that says, so the second is checked on the copy path only.
+    assert_eq!(
+        [&in_memory[0], &in_memory[2]],
+        [mismatch, past],
+        "the in-memory path"
+    );
+}
