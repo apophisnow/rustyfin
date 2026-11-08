@@ -7727,6 +7727,81 @@ async fn b23_a_sort_list_of_any_length_answers_as_its_distinct_keys() {
     }
 }
 
+/// A request to send: what it is, its URI, the token it is sent with, and the names it answers
+/// with an empty query cache.
+type B23Request = (&'static str, String, String, &'static [&'static str]);
+
+/// Two requests whose filters gave the same 64-bit query-cache key: the owner's favorite movies, and
+/// the viewer's favorites less 63 excluded item types, the owner's id second, which run through the
+/// owner's cached query listed the owner's favorites. The owner's favorite is "G1c Movie 1"; the
+/// viewer's are "G1c Movie 2" and "B23 Series".
+async fn b23_colliding_requests() -> (axum::Router, [B23Request; 2]) {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (owner, owner_id, viewer, viewer_id) = g1_owner_and_viewer(&state, &app).await;
+    let movies = g1c_insert_movies(&state, 2).await;
+    let series = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
+         SELECT ?, library_id, 'B23 Series', 'B23 Series', 'Series', path || '.series' \
+         FROM media_items WHERE id = ?",
+    )
+    .bind(series.to_string())
+    .bind(movies[0].to_string())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let favorites = [
+        (&owner_id, movies[0]),
+        (&viewer_id, movies[1]),
+        (&viewer_id, series),
+    ];
+    for (user, item) in favorites {
+        rustyfin_db::repo_playback::set_favorite(&state.db, user.parse().unwrap(), item, true)
+            .await
+            .unwrap();
+    }
+    let mut excluded = vec!["Movie".to_string(), owner_id, "100".into(), "0".into()];
+    excluded.extend((4..63).map(|i| format!("Type{i}")));
+    let excluded = excluded.join(",");
+    let owners = "/Items?Recursive=true&IncludeItemTypes=Movie&IsFavorite=true".to_string();
+    let crafted = format!("/Items?Recursive=true&ExcludeItemTypes={excluded}&IsFavorite=true");
+    let (owner_sees, viewer_sees): (&[&str], &[&str]) = (&["G1c Movie 1"], &["B23 Series"]);
+    let requests = [
+        ("the owner's favorite movies", owners, owner, owner_sees),
+        ("the viewer's crafted list", crafted, viewer, viewer_sees),
+    ];
+    (app, requests)
+}
+
+/// Sends each request in turn and asserts that it answers as with an empty query cache.
+async fn b23_assert_answers(app: &axum::Router, requests: &[B23Request]) {
+    for (what, uri, token, expected) in requests {
+        let (status, items, total) = g1c_list(app, uri, token).await;
+        assert_eq!(status, StatusCode::OK, "{what}");
+        let mut names: Vec<&str> = items
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap_or_default())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, *expected, "{what}");
+        assert_eq!(total, expected.len() as i64, "{what}: TotalRecordCount");
+    }
+}
+
+#[tokio::test]
+async fn b23_a_cached_query_serves_only_its_own_shape() {
+    // The owner's query is in the cache when the viewer's crafted request comes.
+    let (app, requests) = b23_colliding_requests().await;
+    b23_assert_answers(&app, &requests).await;
+}
+
+#[tokio::test]
+async fn b23_a_crafted_query_cached_first_does_not_break_the_view() {
+    let (app, [owners, crafted]) = b23_colliding_requests().await;
+    b23_assert_answers(&app, &[crafted, owners]).await;
+}
+
 // ── G1c ──
 // One user's data stays theirs: GET /Items/Resume lists only the caller's items (or those of the
 // user a userId names, under path_user's rules), IsFavorite/IsPlayed/IsUnplayed match only the

@@ -2620,47 +2620,20 @@ pub async fn get_folder_counts_batch(
 
 mod tests {
 
+    /// Serializes the tests that empty or fill the process-wide query cache.
+    #[cfg(test)]
+    static QUERY_CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn test_hash_combine_no_overflow() {
-        let mut h = 0u64;
-        for i in 0..100 {
-            h = super::hash_combine(h, i);
-        }
-        assert_ne!(h, 0);
-
-        let key = super::filter_cache_key(
-            1,
-            0,
-            2,
-            1,
-            0,
-            0,
-            0,
-            false,
-            None,
-            None,
-            None,
-            "SortName",
-            "Ascending",
-        );
-        assert_ne!(key, 0);
-
-        let key2 = super::filter_cache_key(
-            1,
-            0,
-            2,
-            1,
-            0,
-            0,
-            0,
-            false,
-            Some(true),
-            None,
-            None,
-            "SortName",
-            "Ascending",
-        );
-        assert_ne!(key, key2);
+    fn test_filter_cache_key_tells_flags_apart() {
+        let (sort_by, sort_order) = ("SortName", "Ascending");
+        let key = |fav| {
+            super::filter_cache_key(
+                1, 0, 2, 1, 0, 0, 0, false, fav, None, None, sort_by, sort_order,
+            )
+        };
+        assert_eq!(key(None), key(None));
+        assert_ne!(key(None), key(Some(true)));
     }
 
     #[test]
@@ -2774,12 +2747,13 @@ mod tests {
 
     #[test]
     fn test_filter_query_cache_is_keyed_on_parsed_terms_and_bounded() {
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let key = |sort_by: &str, sort_order: &str| {
             super::filter_cache_key(
                 0, 0, 0, 0, 0, 0, 0, true, None, None, None, sort_by, sort_order,
             )
         };
-        let build = |key: u64, genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
+        let build = |key, genres: Option<&[String]>, sort_by: &str, sort_order: &str| {
             super::build_filtered_query(
                 key, true, None, None, genres, None, None, None, None, None, None, None, sort_by,
                 sort_order,
@@ -2794,29 +2768,35 @@ mod tests {
         assert_ne!(key("SortName", "Ascending"), key("SortNameA", "scending"));
         // A shape is stored while there is room.
         let sort_by = "DateCreated,SortName,ProductionYear";
-        let common = key(sort_by, "Descending");
-        let built = build(common, None, sort_by, "Descending");
-        assert_eq!(super::FILTER_QUERY_CACHE.lock().get(&common), Some(&built));
+        let built = build(key(sort_by, "Descending"), None, sort_by, "Descending");
+        assert_eq!(
+            super::FILTER_QUERY_CACHE
+                .lock()
+                .get(&key(sort_by, "Descending")),
+            Some(&built)
+        );
         // A query over 16 KiB is not: each genre adds a clause.
         let genres = vec!["Drama".to_string(); 1000];
-        let big = super::filter_cache_key(
-            0,
-            0,
-            genres.len(),
-            0,
-            0,
-            0,
-            0,
-            true,
-            None,
-            None,
-            None,
-            "SortName",
-            "Ascending",
-        );
-        let (count_sql, data_sql) = build(big, Some(genres.as_slice()), "SortName", "Ascending");
+        let big = || {
+            super::filter_cache_key(
+                0,
+                0,
+                genres.len(),
+                0,
+                0,
+                0,
+                0,
+                true,
+                None,
+                None,
+                None,
+                "SortName",
+                "Ascending",
+            )
+        };
+        let (count_sql, data_sql) = build(big(), Some(genres.as_slice()), "SortName", "Ascending");
         assert!(count_sql.len() + data_sql.len() > 16 * 1024);
-        assert!(!super::FILTER_QUERY_CACHE.lock().contains_key(&big));
+        assert!(!super::FILTER_QUERY_CACHE.lock().contains_key(&big()));
         // However many distinct lists come, at most 256 entries are kept.
         let keys = [
             "SortName",
@@ -2846,5 +2826,55 @@ mod tests {
         }
         assert_eq!(lists, 1008);
         assert!(super::FILTER_QUERY_CACHE.lock().len() <= 256);
+    }
+
+    /// One included type and 63 excluded types, all else alike, gave the same 64-bit key, so the
+    /// shape stored first served its SQL to the other. Each gets its own, in either order.
+    #[test]
+    fn test_filter_query_cache_serves_each_shape_its_own_sql() {
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let included = ["Movie".to_string()];
+        let excluded: Vec<String> = (0..63).map(|i| format!("Type{i}")).collect();
+        let (fav, sort_by, sort_order) = (Some(true), "SortName", "Ascending");
+        let build = |include: Option<&[String]>, exclude: Option<&[String]>| {
+            let key = super::filter_cache_key(
+                include.map_or(0, <[String]>::len),
+                exclude.map_or(0, <[String]>::len),
+                0,
+                0,
+                0,
+                0,
+                0,
+                true,
+                fav,
+                None,
+                None,
+                sort_by,
+                sort_order,
+            );
+            super::build_filtered_query(
+                key, true, include, exclude, None, None, None, None, None, fav, None, None,
+                sort_by, sort_order,
+            )
+        };
+        let one = || build(Some(included.as_slice()), None);
+        let many = || build(None, Some(excluded.as_slice()));
+        // What each gets from an empty cache.
+        super::FILTER_QUERY_CACHE.lock().clear();
+        let one_sql = one();
+        super::FILTER_QUERY_CACHE.lock().clear();
+        let many_sql = many();
+        assert!(one_sql.1.contains("media_type IN (?)"));
+        let not_in = format!("media_type NOT IN ({})", ["?"; 63].join(","));
+        assert!(many_sql.1.contains(&not_in));
+        // Whichever is stored first, each still gets its own.
+        super::FILTER_QUERY_CACHE.lock().clear();
+        assert_eq!(one(), one_sql);
+        assert_eq!(many(), many_sql, "after one included type");
+        assert_eq!(one(), one_sql);
+        super::FILTER_QUERY_CACHE.lock().clear();
+        assert_eq!(many(), many_sql);
+        assert_eq!(one(), one_sql, "after 63 excluded types");
+        assert_eq!(many(), many_sql);
     }
 }
