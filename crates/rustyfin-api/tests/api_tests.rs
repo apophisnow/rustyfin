@@ -10800,7 +10800,8 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, embedded);
 
-    // One cache file per source, stream and input version, holding what was served
+    // One cache file per source and stream, named for the cache format: its first line is the
+    // input's stamp, and the rest is the WebVTT that was served
     let meta = std::fs::metadata(&file).unwrap();
     let mtime = meta
         .modified()
@@ -10808,17 +10809,23 @@ async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let name = format!("{msid}-2-{}-{mtime}.vtt", meta.len());
-    assert_eq!(
-        std::fs::read_to_string(cache.join(&name)).unwrap(),
-        embedded
-    );
+    let cached = std::fs::read_to_string(cache.join(format!("v1-{msid}-2.vtt"))).unwrap();
+    let (stamp, text) = cached.split_once('\n').unwrap();
+    let (hash, rest) = stamp.split_once('-').unwrap();
+    assert_eq!(hash.len(), 16, "{stamp}");
+    assert_eq!(rest, format!("{}-{mtime}", meta.len()));
+    assert_eq!(text, embedded);
     let names: Vec<String> = std::fs::read_dir(&cache)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(names.len(), 3, "{names:?}");
-    assert!(names.iter().all(|n| n.ends_with(".vtt")), "{names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|n| n.starts_with("v1-") && n.ends_with(".vtt")),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]

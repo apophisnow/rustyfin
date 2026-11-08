@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use rustyfin_core::subtitle::{
@@ -288,12 +290,15 @@ async fn subtitle_vtt(
         })
         .collect();
     let cache_dir = state.data_dir.join("cache").join("subtitle-vtt");
-    let cache_file = cache_dir.join(format!("{source_key}-{index}-{}-{mtime}.vtt", meta.len()));
+    // One cache file per stream; its stamp names the input it was made from
+    let cache_file = cache_dir.join(format!("v1-{source_key}-{index}.vtt"));
+    let input_hash = fnv1a(input.as_os_str().as_encoded_bytes());
+    let stamp = format!("{input_hash:016x}-{}-{mtime}", meta.len());
 
     // The whole WebVTT text, from the cache or from ffmpeg
-    let text = match tokio::fs::read_to_string(&cache_file).await {
-        Ok(text) => text,
-        Err(_) => {
+    let text = match read_cached(&cache_file, &stamp).await {
+        Some(text) => text,
+        None => {
             let cp1252 = stream.is_external && is_cp1252(&input).await;
             let demuxer = if stream.is_external {
                 subtitle_demuxer(&input)
@@ -306,8 +311,11 @@ async fn subtitle_vtt(
                 codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
             });
             let text = if ass { strip_ass_blocks(&text) } else { text };
-            if let Err(e) = write_cache(&cache_dir, &cache_file, &text).await {
-                tracing::warn!("Cannot cache the subtitle at {}: {e}", cache_file.display());
+            match write_cache(&cache_dir, &cache_file, &stamp, &text).await {
+                Ok(()) => sweep_vtt_cache_daily(&cache_dir),
+                Err(e) => {
+                    tracing::warn!("Cannot cache the subtitle at {}: {e}", cache_file.display());
+                }
             }
             text
         }
@@ -401,17 +409,44 @@ async fn is_cp1252(file: &std::path::Path) -> bool {
     !utf16 && std::str::from_utf8(&bytes).is_err()
 }
 
-/// Writes a cache file through a temporary file beside it and a rename, so that a reader never
-/// sees a part-written file.
+/// FNV-1a with 64 bits: the hash of an input's path in a cache stamp.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The WebVTT text in cache file `file` when its first line is `stamp`, the stamp of the input it
+/// was made from; None otherwise. A hit sets the file's mtime to now, the time of its last read, on
+/// a blocking thread that is not waited for.
+async fn read_cached(file: &std::path::Path, stamp: &str) -> Option<String> {
+    let cached = tokio::fs::read_to_string(file).await.ok()?;
+    let (found, text) = cached.split_once('\n')?;
+    if found != stamp {
+        return None;
+    }
+    let file = file.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::File::open(&file).and_then(|f| f.set_modified(SystemTime::now()));
+    });
+    Some(text.to_string())
+}
+
+/// Writes a cache file as `stamp` on its first line and then `text`, through a temporary file
+/// beside it and a rename, so that a reader never sees a part-written file.
 async fn write_cache(
     dir: &std::path::Path,
     file: &std::path::Path,
+    stamp: &str,
     text: &str,
 ) -> std::io::Result<()> {
     tokio::fs::create_dir_all(dir).await?;
     // A name of its own beside the file, so that concurrent writers do not collide
     let tmp = file.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
-    let written = match tokio::fs::write(&tmp, text).await {
+    let written = match tokio::fs::write(&tmp, format!("{stamp}\n{text}")).await {
         Ok(()) => tokio::fs::rename(&tmp, file).await,
         Err(e) => Err(e),
     };
@@ -419,6 +454,87 @@ async fn write_cache(
         let _ = tokio::fs::remove_file(&tmp).await;
     }
     written
+}
+
+/// Removes stale files from the WebVTT cache `dir` as of `now` and returns how many it removed.
+/// Only regular files directly in `dir` count. A `.tmp` file over an hour old is left by a failed
+/// write, a `.vtt` file not named `v1-*` is an older format, and a `v1-*.vtt` file unread for 30
+/// days is stale (its mtime is its last read). Then the least recently read `v1-*.vtt` files go
+/// while the rest total over `max_bytes`. Other files stay.
+fn sweep_vtt_cache(dir: &std::path::Path, now: SystemTime, max_bytes: u64) -> usize {
+    const HOUR: Duration = Duration::from_secs(3600);
+    const THIRTY_DAYS: Duration = Duration::from_secs(30 * 86_400);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    // The `v1-*.vtt` files that stay, as (last read, length, path)
+    let mut kept: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(read) = meta.modified() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let age = now.duration_since(read).unwrap_or_default();
+        let stale = if name.ends_with(".tmp") {
+            age > HOUR
+        } else if name.ends_with(".vtt") {
+            !name.starts_with("v1-") || age > THIRTY_DAYS
+        } else {
+            false
+        };
+        if stale {
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        } else if name.starts_with("v1-") && name.ends_with(".vtt") {
+            kept.push((read, meta.len(), path));
+        }
+    }
+    // Then the least recently read go while the rest total over the cap
+    kept.sort_by_key(|(read, _, _)| *read);
+    let mut total: u64 = kept.iter().map(|(_, len, _)| *len).sum();
+    for (_, len, path) in kept {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The most the WebVTT cache may hold, in bytes: the sweep removes the least recently read past it.
+const MAX_VTT_CACHE: u64 = 512 << 20;
+
+/// The Unix time in seconds of the last sweep of the WebVTT cache; 0 before the first one.
+static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// Sweeps the WebVTT cache `dir` on a blocking thread, at most once a day: the first write of a day
+/// claims the day in `LAST_SWEEP`, and the writes after it do not sweep.
+fn sweep_vtt_cache_daily(dir: &std::path::Path) {
+    let now = SystemTime::now();
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let last = LAST_SWEEP.load(Ordering::Relaxed);
+    if secs < last + 86_400 {
+        return;
+    }
+    if LAST_SWEEP
+        .compare_exchange(last, secs, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || sweep_vtt_cache(&dir, now, MAX_VTT_CACHE));
+    }
 }
 
 async fn search_remote_subtitles(
