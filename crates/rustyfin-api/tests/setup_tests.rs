@@ -80,6 +80,7 @@ async fn test_state() -> (AppState, DataDir) {
             Default::default(),
         ),
         oidc: rustyfin_api::oidc::OidcState::new(),
+        jellyfin_import: Default::default(),
     };
     (state, DataDir(data_dir))
 }

@@ -106,9 +106,29 @@ async fn get_user_views_no_user(State(state): State<AppState>) -> Result<Json<Va
     Ok(Json(views))
 }
 
-async fn get_libraries(State(state): State<AppState>) -> Result<Json<Vec<Library>>, ApiError> {
+/// A library in `GET /Library/VirtualFolders`, with its saved options.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LibraryWithOptions {
+    #[serde(flatten)]
+    library: Library,
+    library_options: LibraryOptions,
+}
+
+async fn get_libraries(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<LibraryWithOptions>>, ApiError> {
     let libs = rustyfin_db::repo_library::get_all_libraries(&state.db_ro).await?;
-    Ok(Json(libs))
+    let mut items = Vec::with_capacity(libs.len());
+    for library in libs {
+        let library_options =
+            rustyfin_db::repo_library::get_library_options(&state.db_ro, library.id).await?;
+        items.push(LibraryWithOptions {
+            library,
+            library_options,
+        });
+    }
+    Ok(Json(items))
 }
 
 /// Checks each library folder path, in request order. Returns one sentence for
@@ -165,6 +185,10 @@ async fn create_library(
     };
     rustyfin_db::repo_library::create_library(&state.db, &lib).await?;
     state.cache.invalidate_library_lists();
+    if let Some(options) = &req.library_options {
+        rustyfin_db::repo_library::set_library_options(&state.db, lib.id, options).await?;
+    }
+    state.task_scheduler.watcher().libraries_changed();
     Ok(Json(lib))
 }
 
@@ -174,6 +198,7 @@ async fn remove_library(
 ) -> Result<Json<Value>, ApiError> {
     rustyfin_db::repo_library::delete_library(&state.db, id).await?;
     state.cache.invalidate_library_lists();
+    state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -187,6 +212,41 @@ async fn scan_library(
 
     // The registry lists the scan from here until it ends, its probes included.
     let ticket = state.task_scheduler.scans().queue(lib.id);
+    // Claimed here, not when the scan starts, so that a Scan all reaching this library skips it.
+    // A run another caller has claimed is scanned by that caller, so this request answers at once.
+    if !ticket.claim_announced() {
+        // The scheduler claims a run without sending its Started or Completed. The first request
+        // that joins such a run sends them, and its Completed comes when the run ends.
+        if ticket.announce() {
+            broadcast_event(
+                &state,
+                WsEvent::ScheduledTaskStarted {
+                    data: json!({
+                        "Name": format!("Library scan: {}", lib.name),
+                        "State": "Running",
+                        "ItemId": lib.id.to_string(),
+                    }),
+                },
+            )
+            .await;
+            let ws_broadcast = state.ws_broadcast.clone();
+            let lib_name = lib.name.clone();
+            let lib_id = lib.id;
+            tokio::spawn(ticket.wait_end_then(move || {
+                // A send fails only when no socket is listening, which is fine.
+                let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
+                    data: json!({
+                        "Name": format!("Library scan: {}", lib_name),
+                        "State": "Completed",
+                        "ItemId": lib_id.to_string(),
+                        "ItemsScanned": 0,
+                    }),
+                });
+            }));
+        }
+        // Otherwise this request drops its ticket here, and does not wait for the run.
+        return Ok(Json(json!({ "items_scanned": 0 })));
+    }
 
     // Broadcast scan started event
     broadcast_event(
@@ -234,25 +294,22 @@ async fn scan_library(
     )
     .await;
 
-    // Completed goes out once the scan has ended, which is after its probes.
-    let state_clone = state.clone();
+    // Completed goes out once the scan has ended, which is after its probes. The registry sends it
+    // before the run's waiters wake, so a Scan all waiting on this run completes after it.
+    let ws_broadcast = state.ws_broadcast.clone();
     let lib_name = lib.name.clone();
     let lib_id = lib.id;
-    tokio::spawn(async move {
-        ticket.wait_end().await;
-        broadcast_event(
-            &state_clone,
-            WsEvent::ScheduledTaskCompleted {
-                data: json!({
-                    "Name": format!("Library scan: {}", lib_name),
-                    "State": "Completed",
-                    "ItemId": lib_id.to_string(),
-                    "ItemsScanned": count,
-                }),
-            },
-        )
-        .await;
-    });
+    tokio::spawn(ticket.wait_end_then(move || {
+        // A send fails only when no socket is listening, which is fine.
+        let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
+            data: json!({
+                "Name": format!("Library scan: {}", lib_name),
+                "State": "Completed",
+                "ItemId": lib_id.to_string(),
+                "ItemsScanned": count,
+            }),
+        });
+    }));
     Ok(Json(json!({ "items_scanned": count })))
 }
 
@@ -290,7 +347,17 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         .map(|lib| state.task_scheduler.scans().queue(lib.id))
         .collect();
     let mut total = 0u32;
+    // Libraries another caller claimed. Their runs end on their own, and Scan all completes after them.
+    let mut others = Vec::new();
+    // The Completed events of the libraries this request scans.
+    let mut ends = Vec::new();
     for (lib, ticket) in libs.iter().zip(tickets) {
+        // Only the caller that claimed a library's run scans it, so a claimed library is skipped.
+        // This request sends the library's Started and Completed, so the claim announces the run.
+        if !ticket.claim_announced() {
+            others.push(ticket);
+            continue;
+        }
         tracing::info!(
             "refresh_all: scanning library '{}' (id={})",
             lib.name,
@@ -320,6 +387,9 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             &ticket,
         )
         .await;
+        // Caches are cleared after each library's scan, before its LibraryChanged, as scan_library does.
+        state.cache.invalidate_on_scan();
+        state.image_cache.invalidate_all();
         match result {
             Ok(count) => {
                 tracing::info!(
@@ -340,56 +410,57 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
                 )
                 .await;
 
-                // Completed goes out once this library's scan has ended, after its probes.
-                let state_clone = state.clone();
+                // Completed goes out once this library's scan has ended, after its probes. The registry
+                // sends it before the run's waiters wake, so the overall Completed comes after it.
+                let ws_broadcast = state.ws_broadcast.clone();
                 let lib_name = lib.name.clone();
                 let lib_id = lib.id;
                 let scanned_count = count;
-                tokio::spawn(async move {
-                    ticket.wait_end().await;
-                    broadcast_event(
-                        &state_clone,
-                        WsEvent::ScheduledTaskCompleted {
-                            data: json!({
-                                "Name": format!("Library scan: {}", lib_name),
-                                "State": "Completed",
-                                "ItemId": lib_id.to_string(),
-                                "ItemsScanned": scanned_count,
-                            }),
-                        },
-                    )
-                    .await;
-                });
+                ends.push(tokio::spawn(ticket.wait_end_then(move || {
+                    let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
+                        data: json!({
+                            "Name": format!("Library scan: {}", lib_name),
+                            "State": "Completed",
+                            "ItemId": lib_id.to_string(),
+                            "ItemsScanned": scanned_count,
+                        }),
+                    });
+                })));
             }
             Err(e) => {
                 tracing::error!("failed to scan library '{}': {}", lib.name, e);
-                let state_clone = state.clone();
+                // Failed goes out once this library's run has ended, as Completed does above.
+                // The registry sends it before the run's waiters wake, so the overall Completed
+                // comes after it.
+                let ws_broadcast = state.ws_broadcast.clone();
                 let lib_name = lib.name.clone();
                 let lib_id = lib.id;
                 let error_msg = e.to_string();
-                tokio::spawn(async move {
-                    broadcast_event(
-                        &state_clone,
-                        WsEvent::ScheduledTaskCompleted {
-                            data: json!({
-                                "Name": format!("Library scan: {}", lib_name),
-                                "State": "Failed",
-                                "ItemId": lib_id.to_string(),
-                                "Error": error_msg,
-                            }),
-                        },
-                    )
-                    .await;
-                });
+                ends.push(tokio::spawn(ticket.wait_end_then(move || {
+                    let _ = ws_broadcast.send(WsEvent::ScheduledTaskCompleted {
+                        data: json!({
+                            "Name": format!("Library scan: {}", lib_name),
+                            "State": "Failed",
+                            "ItemId": lib_id.to_string(),
+                            "Error": error_msg,
+                        }),
+                    });
+                })));
             }
         }
     }
 
-    // Broadcast all libraries scan completed
+    // Broadcast all libraries scan completed, once every library's run has ended
     {
         let state_clone = state.clone();
         let total_scanned = total;
         tokio::spawn(async move {
+            for end in ends {
+                let _ = end.await;
+            }
+            for ticket in others {
+                ticket.wait_end().await;
+            }
             broadcast_event(
                 &state_clone,
                 WsEvent::ScheduledTaskCompleted {
@@ -404,9 +475,6 @@ async fn refresh_all(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
         });
     }
 
-    // Invalidate caches after scan
-    state.cache.invalidate_on_scan();
-    state.image_cache.invalidate_all();
     Ok(Json(json!({ "items_scanned": total })))
 }
 
@@ -415,22 +483,8 @@ async fn get_library_options(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<LibraryOptions>, ApiError> {
-    let key = format!("library_options_{}", id);
-    let value: Option<String> =
-        sqlx::query_scalar("SELECT value FROM configuration WHERE key = ?1")
-            .bind(&key)
-            .fetch_optional(&state.db_ro)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    match value {
-        Some(json) => {
-            let options: LibraryOptions =
-                serde_json::from_str(&json).map_err(|e| ApiError::Internal(e.to_string()))?;
-            Ok(Json(options))
-        }
-        None => Ok(Json(LibraryOptions::default())),
-    }
+    let options = rustyfin_db::repo_library::get_library_options(&state.db_ro, id).await?;
+    Ok(Json(options))
 }
 
 /// POST /Library/{id}/Options — Update library options.
@@ -439,19 +493,8 @@ async fn update_library_options(
     Path(id): Path<Uuid>,
     Json(options): Json<LibraryOptions>,
 ) -> Result<Json<Value>, ApiError> {
-    let key = format!("library_options_{}", id);
-    let json = serde_json::to_string(&options).map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    sqlx::query(
-        "INSERT INTO configuration (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(&key)
-    .bind(&json)
-    .execute(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
-
+    rustyfin_db::repo_library::set_library_options(&state.db, id, &options).await?;
+    state.task_scheduler.watcher().libraries_changed();
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -491,6 +534,7 @@ async fn remove_library_paths(
     rustyfin_db::repo_library::update_library_paths(&state.db, lib_id, &new_paths)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.task_scheduler.watcher().libraries_changed();
 
     Ok(Json(json!({})))
 }

@@ -11,7 +11,7 @@ let serverVersion = '0.3.0';
 let playerReportInterval = null;
 let playerHideTimeout = null;
 let activeItem = null;
-// Library id -> scan percent while it scans (0 = not known yet, so its ring spins). Absent when not scanning.
+// Library id -> { percent, queued } while it scans (percent 0 = not known yet, so its ring spins; queued = waiting its turn). Absent when not scanning.
 let scanStatuses = {};
 
 // --- DOM & Helper Utilities ---
@@ -81,17 +81,22 @@ function escapeHtml(str) {
 
 // Inner markup of a scan ring: nothing when the library is not scanning, else a progressbar with a track and an arc
 function scanRingInner(libId, name) {
-    const p = scanStatuses[libId];
-    if (p === undefined) return '';
+    const s = scanStatuses[libId];
+    if (s === undefined) return '';
+    const p = s.percent;
     const known = p > 0;
-    const label = escapeHtml(known ? t('library.scanning_percent', { name, percent: p }) : t('library.scanning', { name }));
-    const valueNow = known ? ` aria-valuenow="${p}"` : '';
-    const spin = known ? '' : ' motion-safe:animate-spin';
+    const label = escapeHtml(s.queued ? t('library.scan_queued', { name }) : known ? t('library.scanning_percent', { name, percent: p }) : t('library.scanning', { name }));
+    const valueNow = known && !s.queued ? ` aria-valuenow="${p}"` : '';
+    const spin = known || s.queued ? '' : ' motion-safe:animate-spin';
     const arc = known ? p : 25;
+    // A queued scan has no arc: only the track, drawn dashed
+    const track = s.queued
+        ? '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25" pathLength="100" stroke-dasharray="6.25 6.25"/>'
+        : '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>';
+    const arcCircle = s.queued ? '' : `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" pathLength="100" stroke-dasharray="${arc} 100" transform="rotate(-90 8 8)"/>`;
     return `<span role="progressbar" class="block w-full h-full text-[#00a4dc]" title="${label}" aria-label="${label}" aria-valuemin="0" aria-valuemax="100"${valueNow}>`
         + `<svg aria-hidden="true" viewBox="0 0 16 16" class="w-full h-full${spin}">`
-        + '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" opacity="0.25"/>'
-        + `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" pathLength="100" stroke-dasharray="${arc} 100" transform="rotate(-90 8 8)"/>`
+        + track + arcCircle
         + '</svg></span>';
 }
 
@@ -373,6 +378,7 @@ const clickActions = {
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
+    'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
     'stop-task': el => stopTaskAction(el.dataset.id, el.dataset.name),
     'dir-open': el => navigateDirectoryPicker(el.dataset.path),
@@ -965,14 +971,18 @@ async function renderLibrary(libId) {
                 </div>
 
                 <div class="flex flex-wrap items-center gap-2">
-                    <!-- Sort selector -->
-                    <select id="lib-sort" class="jf-input !py-1.5 text-xs">
-                        <option value="SortName:Ascending">${t('library.sort_name_asc')}</option>
-                        <option value="SortName:Descending">${t('library.sort_name_desc')}</option>
-                        <option value="PremiereDate:Descending">${t('library.sort_release_date')}</option>
-                        <option value="DateCreated:Descending">${t('library.sort_date_added')}</option>
-                        <option value="CommunityRating:Descending">${t('library.sort_rating')}</option>
-                    </select>
+                    <!-- Sort selector, with a toggle that reverses its order -->
+                    <div class="flex items-center gap-1">
+                        <select id="lib-sort" class="jf-input !py-1.5 text-xs">
+                            <option value="SortName,ProductionYear:Ascending">${t('library.sort_name')}</option>
+                            <option value="PremiereDate,SortName,ProductionYear:Descending">${t('library.sort_release_date')}</option>
+                            <option value="DateCreated,SortName,ProductionYear:Descending">${t('library.sort_date_added')}</option>
+                            <option value="CommunityRating,SortName,ProductionYear:Descending">${t('library.sort_rating')}</option>
+                        </select>
+                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5 7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5"/></svg>
+                        </button>
+                    </div>
 
                     <!-- Genre filter -->
                     ${genres.length > 0 ? `
@@ -992,6 +1002,11 @@ async function renderLibrary(libId) {
             <div id="lib-grid-container"></div>
         </div>`;
         $('lib-sort')?.addEventListener('change', () => reloadLibrary(libId));
+        $('lib-sort-reverse')?.addEventListener('click', e => {
+            const btn = e.currentTarget;
+            btn.setAttribute('aria-pressed', btn.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+            reloadLibrary(libId);
+        });
         $('lib-genre')?.addEventListener('change', () => reloadLibrary(libId));
         fillLibraryGrid(items, total);
     } catch (e) {
@@ -999,6 +1014,14 @@ async function renderLibrary(libId) {
         page.classList.remove('jf-with-rail');
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
+}
+
+// The library list's sort: the select's value, with the order flipped while the reverse toggle is pressed
+function librarySort() {
+    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName,ProductionYear:Ascending').split(':');
+    const reversed = $('lib-sort-reverse')?.getAttribute('aria-pressed') === 'true';
+    if (!reversed) return { sortBy, sortOrder };
+    return { sortBy, sortOrder: sortOrder === 'Ascending' ? 'Descending' : 'Ascending' };
 }
 
 // The /Items query for the library list; paging is added per request
@@ -1011,7 +1034,7 @@ function libraryListQuery(libId) {
     else if (contentType === 'Music') includeItemTypes = 'MusicAlbum';
     else if (contentType === 'Movies') includeItemTypes = 'Movie';
 
-    const [sortBy, sortOrder] = ($('lib-sort')?.value || 'SortName:Ascending').split(':');
+    const { sortBy, sortOrder } = librarySort();
     return {
         LibraryId: libId,
         IncludeItemTypes: includeItemTypes,
@@ -1183,12 +1206,12 @@ async function jumpToLetter(libId, letter) {
     }
 }
 
-// The letter rail (#lib-letter-rail in index.html) shows for the name sorts, in list order
+// The letter rail (#lib-letter-rail in index.html) shows for the name sorts, its letters reversed for a descending order
 function renderLetterRail(libId) {
-    const sort = $('lib-sort')?.value || 'SortName:Ascending';
-    $('page-library').classList.toggle('jf-with-rail', sort.startsWith('SortName:'));
+    const { sortBy, sortOrder } = librarySort();
+    $('page-library').classList.toggle('jf-with-rail', sortBy.startsWith('SortName'));
     const letters = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'];
-    if (sort === 'SortName:Descending') letters.reverse();
+    if (sortOrder === 'Descending') letters.reverse();
     $('lib-letter-rail').innerHTML = letters.map(l =>
         `<button type="button" data-action="jump-letter" data-letter="${l}" data-id="${escapeHtml(libId)}">${l}</button>`).join('');
     railAnchor = null;
@@ -1534,13 +1557,21 @@ async function renderSearch(term) {
     term = decodeURIComponent(term || '').trim();
     if ($('search-input')) $('search-input').value = term;
     const page = $('page-search');
+    const showNoResults = () => {
+        page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+    };
+    // A blank term never reaches the server: /Search/Hints answers 400 to it.
+    if (!term) {
+        showNoResults();
+        return;
+    }
     page.innerHTML = '<div class="flex justify-center items-center py-24"><div class="w-10 h-10 border-3 border-[#00a4dc] border-t-transparent rounded-full animate-spin"></div></div>';
 
     try {
         const data = await API.search(term, 50);
         const hints = data.SearchHints || data.search_hints || [];
         if (!hints.length) {
-            page.innerHTML = `<div class="text-center py-24 text-white/40 jf-page"><p class="text-lg">${t('search.no_results', { term: escapeHtml(term) })}</p></div>`;
+            showNoResults();
             return;
         }
         const items = hints.map(h => ({
@@ -1592,6 +1623,8 @@ let activePlayback = null;
 let pendingStop = Promise.resolve();
 // Incremented by each playItem call, so a call that finishes loading after a newer one gives up
 let playRequest = 0;
+// True while the seek bar is being dragged, so the timeline does not move the thumb
+let seekDragging = false;
 
 // Ticks to resume from. Items at or past 90 % of their runtime count as watched and start over.
 function resumePositionTicks(item) {
@@ -1652,6 +1685,363 @@ function stopPlayback() {
     return pendingStop;
 }
 
+// Loads the stream of a session from startTicks (item ticks) and attaches it to the video element
+async function openStream(session, startTicks) {
+    const video = $('video-player');
+    const { itemId, streamType } = session;
+    const load = ++session.loads;
+    // This load stays current until the session stops or a newer load starts
+    const current = () => activePlayback === session && session.loads === load;
+    const startSeconds = startTicks / 1e7;
+    // Capture the subtitle before the request so a change made during it sees this load's burn-in
+    const requestedSubtitle = session.subtitleIndex;
+    session.burnedIn = streamType === 'Videos' && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+
+    let url;
+    let isHls = false;
+    let playSessionId = null;
+    let mediaSourceId = null;
+    if (streamType === 'Videos') {
+        // Use Universal endpoint to get the optimal playback URL
+        try {
+            const data = await API.getUniversalVideoUrl(itemId, {
+                startTimeTicks: startTicks,
+                mediaSourceId: session.mediaSourceId,
+                audioStreamIndex: session.audioIndex,
+                subtitleStreamIndex: session.subtitleIndex,
+            });
+            if (!current()) return;
+            if (data && data.url) {
+                // Add auth token to the stream URL so the video element can authenticate
+                const sep = data.url.includes('?') ? '&' : '?';
+                url = API.base + data.url + sep + 'api_key=' + encodeURIComponent(API.token);
+                isHls = data.url.includes('.m3u8');
+                // Determine playback method from the URL, not from SupportsDirectPlay flag
+                // which may be stale from the database
+                let method;
+                if (isHls) {
+                    method = t('player.hls_transcode');
+                } else if (data.url.includes('/stream')) {
+                    // Check if it's a static direct play or direct stream
+                    method = data.url.includes('Static=true') ? t('player.direct_play') : t('player.direct_stream');
+                } else {
+                    method = t('player.stream');
+                }
+                $('player-subtitle').textContent = method;
+                playSessionId = isHls ? data.PlaySessionId : null;
+                mediaSourceId = data.MediaSources?.[0]?.Id || null;
+            } else {
+                // Fallback: direct stream
+                url = API.streamUrl(itemId, streamType);
+                $('player-subtitle').textContent = t('player.video_stream_fallback');
+            }
+        } catch (e) {
+            if (!current()) return;
+            console.warn('Universal endpoint failed, using direct stream:', e);
+            url = API.streamUrl(itemId, streamType);
+            $('player-subtitle').textContent = t('player.video_stream_fallback');
+        }
+    } else if (streamType === 'Audio') {
+        url = API.streamUrl(itemId, streamType);
+        $('player-subtitle').textContent = t('player.audio_stream');
+    } else {
+        url = API.streamUrl(itemId, streamType);
+        $('player-subtitle').textContent = t('player.stream');
+    }
+
+    session.offset = isHls ? startSeconds : 0;
+    session.startAt = startSeconds;
+    session.isHls = isHls;
+    session.playSessionId = playSessionId;
+    session.mediaSourceId = mediaSourceId || session.mediaSourceId;
+    session.burnedIn = isHls && isImageSubtitle(findStream(session, 'subtitle', requestedSubtitle)?.Codec);
+
+    video.onerror = () => {
+        if (!current()) return;
+        console.error('Video playback error:', video.error);
+        const errMsg = video.error ? video.error.message : t('common.unknown_error');
+        $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
+    };
+
+    // Handle HLS streams with hls.js
+    if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
+        // The transcode already starts at startTicks, so its playlist starts at 0
+        hlsInstance = new Hls({
+            enableWorker: true,
+            lowLatencyMode: false,
+            startPosition: 0,
+        });
+        hlsInstance.loadSource(url);
+        hlsInstance.attachMedia(video);
+        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (!current()) return;
+            video.play().catch(e => console.warn('Autoplay block:', e));
+        });
+        // A transcode that starts after the last keyframe of copied video lists no time: nothing is left
+        // to play, so end the playback as the stream's end does
+        hlsInstance.on(Hls.Events.LEVEL_LOADED, (event, data) => { if (current() && session.offset > 0 && data.details.totalduration === 0) session.stop(); });
+        hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+            if (!current()) return;
+            console.error('HLS error:', data);
+            if (data.fatal) {
+                $('player-subtitle').textContent = t('player.hls_error');
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    hlsInstance.startLoad();
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    hlsInstance.recoverMediaError();
+                } else {
+                    hlsInstance.destroy();
+                }
+            }
+        });
+    } else if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari native HLS support; its playlist also starts at startTicks, so it needs no seek
+        video.src = url;
+        video.addEventListener('loadedmetadata', () => {
+            if (!current()) return;
+            video.play().catch(e => console.warn('Autoplay block:', e));
+        }, { once: true });
+    } else {
+        // Direct play/stream
+        video.src = url;
+        if (startSeconds > 0) {
+            video.addEventListener('loadedmetadata', () => {
+                if (current()) video.currentTime = startSeconds;
+            }, { once: true });
+        }
+        video.play().catch(e => console.warn('Autoplay block:', e));
+    }
+    if (streamType === 'Videos') showTextSubtitle(session);
+    updatePlayerControls(session);
+}
+
+// Shows the item time and the bar; the bar stays still while the thumb is being dragged
+function updatePlayerControls(session) {
+    const pos = session.position();
+    const total = session.total();
+    $('player-duration').textContent = formatDurationSeconds(total);
+    // previewSeek owns the elapsed time and the bar during a drag
+    if (seekDragging) return;
+    $('player-cur-time').textContent = formatDurationSeconds(pos);
+    $('player-seek').value = total > 0 ? Math.min(100, pos / total * 100) : 0;
+}
+
+// Moves within the transcoded range in place; any other HLS point restarts the transcode after a pause
+function seekTo(session, seconds) {
+    const video = $('video-player');
+    const total = session.total();
+    if (total > 0) seconds = Math.min(seconds, total);
+    seconds = Math.max(0, seconds);
+    // A waiting track change restarts at the new point instead
+    if (session.tracksChanged) return scheduleRestart(session, seconds);
+    if (!session.isHls) {
+        video.currentTime = seconds;
+        return;
+    }
+    const rel = seconds - session.offset;
+    const seekable = video.seekable;
+    const end = seekable.length ? seekable.end(seekable.length - 1) : 0;
+    if (rel >= 0 && rel <= end) {
+        clearTimeout(session.seekTimer);
+        session.seekTimer = null;
+        session.pendingSeek = null;
+        video.currentTime = rel;
+        return;
+    }
+    scheduleRestart(session, seconds);
+}
+
+// Waits 400 ms after the last seek, then restarts the transcode at that point
+function scheduleRestart(session, seconds) {
+    session.pendingSeek = seconds;
+    updatePlayerControls(session);
+    clearTimeout(session.seekTimer);
+    session.seekTimer = setTimeout(() => { session.seekTimer = null; restartStream(session, seconds); }, 400);
+}
+
+// Starts the transcode again at seconds of item time, stopping the old transcode first
+async function restartStream(session, seconds) {
+    const total = session.total();
+    // The last second holds nothing to transcode, so end the playback as the stream's end does
+    // (pendingSeek makes the Stopped report say the end)
+    if (total > 0 && seconds > total - 1) {
+        session.pendingSeek = total;
+        session.stop();
+        return;
+    }
+    session.tracksChanged = false;
+    session.pendingSeek = seconds;
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
+    if (session.isHls && session.playSessionId) API.stopActiveEncodings(session.playSessionId).catch(() => {});
+    await openStream(session, Math.round(seconds * 1e7));
+    // A newer seek keeps its own target
+    if (activePlayback === session && session.pendingSeek === seconds && !session.seekTimer) session.pendingSeek = null;
+}
+
+// Seeks to a point on the bar once the drag ends
+function seekVideo(percent) {
+    seekDragging = false;
+    if (!activePlayback) return;
+    seekTo(activePlayback, percent / 100 * activePlayback.total());
+}
+
+// Skips relative to the current item time
+function skipTime(deltaSeconds) {
+    if (!activePlayback) return;
+    seekTo(activePlayback, activePlayback.position() + deltaSeconds);
+}
+
+// Shows the elapsed time under the thumb while the bar is being dragged
+function previewSeek(percent) {
+    if (!activePlayback) return;
+    seekDragging = true;
+    $('player-cur-time').textContent = formatDurationSeconds(percent / 100 * activePlayback.total());
+}
+
+// Picks another audio track and restarts the transcode at the current point
+function changeAudioTrack(value) {
+    const session = activePlayback;
+    if (!session) return;
+    session.audioIndex = Number(value);
+    session.tracksChanged = true;
+    scheduleRestart(session, session.position());
+}
+
+// A text subtitle is added to the player; a picture one is burned in, so it restarts the transcode
+function changeSubtitleTrack(value) {
+    const session = activePlayback;
+    if (!session) return;
+    session.subtitleIndex = Number(value);
+    if (session.burnedIn || isImageSubtitle(findStream(session, 'subtitle', session.subtitleIndex)?.Codec)) {
+        clearTextSubtitle();
+        session.tracksChanged = true;
+        scheduleRestart(session, session.position());
+    } else {
+        showTextSubtitle(session);
+    }
+}
+
+// CodecType comes lower case from the server: 'audio', 'subtitle' or 'video'
+function isStreamType(s, type) {
+    return (s.CodecType || '').toLowerCase() === type;
+}
+
+// The stream of this type with this index, if the session has one
+function findStream(session, type, index) {
+    return session.streams.find(s => s.Index === index && isStreamType(s, type));
+}
+
+// Picture subtitles are burned in by the transcode (the server's codec names)
+function isImageSubtitle(codec) {
+    const c = (codec || '').toLowerCase();
+    return c.includes('pgs') || ['dvd_subtitle', 'dvdsub', 'vobsub', 'dvb_subtitle', 'dvbsub', 'xsub', 'sup'].includes(c);
+}
+
+// Removes the text subtitle track that showTextSubtitle added
+function clearTextSubtitle() {
+    $('video-player').querySelectorAll('track[data-player-subtitle]').forEach(track => track.remove());
+}
+
+// Adds the chosen text subtitle as WebVTT; without a label, hls.js leaves the track alone
+function showTextSubtitle(session) {
+    clearTextSubtitle();
+    const stream = findStream(session, 'subtitle', session.subtitleIndex);
+    if (!session.mediaSourceId || !stream || isImageSubtitle(stream.Codec)) return;
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.dataset.playerSubtitle = '1';
+    // The route takes the start in ticks: the transcode's offset, or 0 for direct play
+    track.src = API.base + '/Videos/' + session.itemId + '/' + encodeURIComponent(session.mediaSourceId) +
+        '/Subtitles/' + stream.Index + '/' + Math.round(session.offset * 1e7) + '/Stream.vtt?api_key=' +
+        encodeURIComponent(API.token);
+    track.addEventListener('error', () => {
+        if (activePlayback === session) $('player-subtitle').textContent = t('player.subtitles_error');
+    });
+    $('video-player').appendChild(track);
+    track.track.mode = 'showing';
+}
+
+// Language name in the page's language; und, mis, mul and zxx name no language
+function trackLanguageName(code) {
+    if (!code || ['und', 'mis', 'mul', 'zxx'].includes(code.toLowerCase())) return '';
+    let name = code;
+    try {
+        name = new Intl.DisplayNames([document.documentElement.lang || 'en'], { type: 'language' }).of(code) || code;
+    } catch (e) {
+        // Not a code Intl knows: the code stays as it is
+    }
+    return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+// The title, then each tag the title does not already contain (Jellyfin's DisplayTitle)
+function trackTitle(title, tags) {
+    const parts = tags.filter(Boolean);
+    if (!title) return parts.join(' - ');
+    const extra = parts.filter(tag => !title.toLowerCase().includes(tag.toLowerCase()));
+    return [title, ...extra].join(' - ');
+}
+
+// Audio menu label: language, profile or codec, channel layout or count, then the flags
+function audioTrackLabel(s) {
+    const codec = (s.Codec || '').toLowerCase();
+    const codecNames = { ac3: 'Dolby Digital', eac3: 'Dolby Digital+', dca: 'DTS' };
+    const profile = s.Profile || '';
+    const layout = s.ChannelLayout ? s.ChannelLayout.charAt(0).toUpperCase() + s.ChannelLayout.slice(1) : '';
+    const tags = [
+        trackLanguageName(s.Language),
+        (profile && profile.toLowerCase() !== 'lc') ? profile : (codecNames[codec] || codec.toUpperCase()),
+        layout || (s.Channels ? t('player.track_channels', { count: s.Channels }) : ''),
+        s.IsDefault ? t('player.track_default') : '',
+        s.IsExternal ? t('player.track_external') : '',
+    ];
+    return trackTitle(s.Title, tags) || t('player.track_undefined');
+}
+
+// Subtitle menu label: language, default and forced flags, codec name, then external
+function subtitleTrackLabel(s) {
+    const codec = (s.Codec || '').toLowerCase();
+    const codecNames = { dvb_subtitle: 'DVBSUB', dvb_teletext: 'DVBTXT', dvd_subtitle: 'DVDSUB', hdmv_pgs_subtitle: 'PGSSUB' };
+    const tags = [
+        trackLanguageName(s.Language) || t('player.track_undefined'),
+        s.IsDefault ? t('player.track_default') : '',
+        s.IsForced ? t('player.track_forced') : '',
+        codecNames[codec] || codec.toUpperCase(),
+        s.IsExternal ? t('player.track_external') : '',
+    ];
+    return trackTitle(s.Title, tags) || t('player.track_undefined');
+}
+
+// Jellyfin's Default mode: external first, then forced in the audio's language, forced, default
+function defaultSubtitleIndex(subs, chosenAudio) {
+    const audioLang = (chosenAudio?.Language || '').toLowerCase();
+    let best = null;
+    let bestKey = 0;
+    for (const s of subs) {
+        const sameLanguage = (s.Language || '').toLowerCase() === audioLang;
+        const key = (s.IsExternal ? 8 : 0) + (s.IsForced && sameLanguage ? 4 : 0) + (s.IsForced ? 2 : 0) + (s.IsDefault ? 1 : 0);
+        if (key > bestKey) {
+            best = s;
+            bestKey = key;
+        }
+    }
+    return best ? best.Index : -1;
+}
+
+// Fills the audio and subtitle menus from the session; null hides both
+function renderTrackMenus(session) {
+    const audio = session ? session.streams.filter(s => isStreamType(s, 'audio')) : [];
+    const subs = session ? session.streams.filter(s => isStreamType(s, 'subtitle')) : [];
+    $('player-audio').replaceChildren(...audio.map(s => new Option(audioTrackLabel(s), s.Index)));
+    $('player-subs').replaceChildren(new Option(t('player.subtitles_off'), -1), ...subs.map(s => new Option(subtitleTrackLabel(s), s.Index)));
+    $('player-audio').value = String(session?.audioIndex ?? '');
+    $('player-subs').value = String(session?.subtitleIndex ?? '');
+    $('player-audio-wrap').hidden = audio.length < 2;
+    $('player-subs-wrap').hidden = subs.length < 1;
+}
+
 // --- Video Player (Cinema Mode) ---
 async function playItem(itemId, streamType = 'Videos', title = '', { fromStart = false } = {}) {
     const video = $('video-player');
@@ -1670,6 +2060,13 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     $('player-title').textContent = title || t('player.playback');
     $('player-subtitle').textContent = t('player.loading');
+    // Clear the times and the bar so the previous item's values never show
+    $('player-cur-time').textContent = '0:00';
+    $('player-duration').textContent = '0:00';
+    $('player-seek').value = 0;
+    seekDragging = false;
+    clearTextSubtitle();
+    renderTrackMenus(null);
 
     // Show modal immediately while loading
     if (!modal.open) {
@@ -1679,131 +2076,94 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
 
     // Read the resume point only after the Stopped report, so it includes the position just saved
     await pendingStop;
-    let item = null;
-    try {
-        item = await API.get('/Items/' + itemId);
-    } catch (e) {
-        console.warn('Could not load item for resume point:', e);
-    }
+    // The item gives the resume point and PlaybackInfo the tracks; a failed PlaybackInfo leaves no menus
+    const [item, info] = await Promise.all([
+        API.get('/Items/' + itemId).catch(e => {
+            console.warn('Could not load item for resume point:', e);
+            return null;
+        }),
+        streamType === 'Videos'
+            ? API.getPlaybackInfo(itemId).catch(e => {
+                console.warn('Could not load playback info:', e);
+                return null;
+            })
+            : null,
+    ]);
     if (!modal.open || request !== playRequest) return; // closed or replaced while loading
     if (!title && item?.Name) $('player-title').textContent = item.Name;
 
     const startTicks = (streamType !== 'Videos' || fromStart) ? 0 : resumePositionTicks(item);
-    const startSeconds = startTicks / 1e7;
+    const runtimeTicks = item?.RunTimeTicks || 0;
 
-    let url;
-    let isHls = false;
-    if (streamType === 'Videos') {
-        // Use Universal endpoint to get the optimal playback URL
-        try {
-            const data = await API.getUniversalVideoUrl(itemId);
-            if (data && data.url) {
-                // Add auth token to the stream URL so the video element can authenticate
-                const sep = data.url.includes('?') ? '&' : '?';
-                url = API.base + data.url + sep + 'api_key=' + encodeURIComponent(API.token);
-                isHls = data.url.includes('.m3u8');
-                // Determine playback method from the URL, not from SupportsDirectPlay flag
-                // which may be stale from the database
-                let method;
-                if (isHls) {
-                    method = t('player.hls_transcode');
-                } else if (data.url.includes('/stream')) {
-                    // Check if it's a static direct play or direct stream
-                    method = data.url.includes('Static=true') ? t('player.direct_play') : t('player.direct_stream');
-                } else {
-                    method = t('player.stream');
-                }
-                $('player-subtitle').textContent = method;
-            } else {
-                // Fallback: direct stream
-                url = API.streamUrl(itemId, streamType);
-                $('player-subtitle').textContent = t('player.video_stream_fallback');
-            }
-        } catch (e) {
-            console.warn('Universal endpoint failed, using direct stream:', e);
-            url = API.streamUrl(itemId, streamType);
-            $('player-subtitle').textContent = t('player.video_stream_fallback');
-        }
-    } else if (streamType === 'Audio') {
-        url = API.streamUrl(itemId, streamType);
-        $('player-subtitle').textContent = t('player.audio_stream');
-    } else {
-        url = API.streamUrl(itemId, streamType);
-        $('player-subtitle').textContent = t('player.stream');
+    // Track choices as Jellyfin's defaults pick them; with no PlaybackInfo there are none
+    const source = info?.MediaSources?.[0];
+    const streams = source?.MediaStreams || [];
+    const audioStreams = streams.filter(s => isStreamType(s, 'audio'));
+    const subStreams = streams.filter(s => isStreamType(s, 'subtitle'));
+    const defaultAudio = source?.DefaultAudioStreamIndex;
+    const chosenAudio = audioStreams.find(s => s.Index === defaultAudio) || audioStreams.find(s => s.IsDefault) || audioStreams[0] || null;
+    let audioIndex = null;
+    let subtitleIndex = null;
+    if (source) {
+        audioIndex = chosenAudio ? chosenAudio.Index : null;
+        const defaultSub = source.DefaultSubtitleStreamIndex;
+        subtitleIndex = (defaultSub === -1 || subStreams.some(s => s.Index === defaultSub))
+            ? defaultSub
+            : defaultSubtitleIndex(subStreams, chosenAudio);
     }
-
-    if (!modal.open || request !== playRequest) return; // closed or replaced while loading
-
-    video.onerror = () => {
-        console.error('Video playback error:', video.error);
-        const errMsg = video.error ? video.error.message : t('common.unknown_error');
-        $('player-subtitle').textContent = t('common.error_message', { message: errMsg });
-    };
-
-    // Handle HLS streams with hls.js
-    if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
-        hlsInstance = new Hls({
-            enableWorker: true,
-            lowLatencyMode: false,
-            startPosition: startTicks > 0 ? startSeconds : -1,
-        });
-        hlsInstance.loadSource(url);
-        hlsInstance.attachMedia(video);
-        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (activePlayback !== session) return;
-            video.play().catch(e => console.warn('Autoplay block:', e));
-        });
-        hlsInstance.on(Hls.Events.ERROR, (event, data) => {
-            if (activePlayback !== session) return;
-            console.error('HLS error:', data);
-            if (data.fatal) {
-                $('player-subtitle').textContent = t('player.hls_error');
-                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                    hlsInstance.startLoad();
-                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                    hlsInstance.recoverMediaError();
-                } else {
-                    hlsInstance.destroy();
-                }
-            }
-        });
-    } else if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Safari native HLS support
-        video.src = url;
-        video.addEventListener('loadedmetadata', () => {
-            if (activePlayback !== session) return;
-            if (startTicks > 0) video.currentTime = startSeconds;
-            video.play().catch(e => console.warn('Autoplay block:', e));
-        }, { once: true });
-    } else {
-        // Direct play/stream
-        video.src = url;
-        if (startTicks > 0) {
-            video.addEventListener('loadedmetadata', () => {
-                if (activePlayback === session) video.currentTime = startSeconds;
-            }, { once: true });
-        }
-        video.play().catch(e => console.warn('Autoplay block:', e));
-    }
-
-    API.reportPlaying(itemId, startTicks).catch(() => {});
 
     // The session owns this playback: stop() reports the position once and tears the player down
     let stopped = false;
     const session = {
+        itemId,
+        streamType,
+        runtime: runtimeTicks > 0 ? runtimeTicks / 1e7 : null,
+        offset: 0,
+        startAt: startTicks / 1e7,
+        isHls: false,
+        playSessionId: null,
+        mediaSourceId: source?.Id || null,
+        streams,
+        audioIndex,
+        subtitleIndex,
+        burnedIn: false,
+        tracksChanged: false,
+        loads: 0,
+        pendingSeek: null,
+        seekTimer: null,
+        // Item time in seconds: the pending seek target, else where the stream is
+        position() {
+            if (this.pendingSeek !== null) return this.pendingSeek;
+            const video = $('video-player');
+            // Before metadata has loaded currentTime reads 0 even when resuming, so use the start position
+            if (video.readyState < HTMLMediaElement.HAVE_METADATA) return this.startAt;
+            return this.offset + video.currentTime;
+        },
+        // The item's runtime when known, else the stream's length
+        total() {
+            if (this.runtime) return this.runtime;
+            const duration = $('video-player').duration;
+            return Number.isFinite(duration) && duration > 0 ? this.offset + duration : 0;
+        },
+        // The track ids the playback reports carry; a null one is left out
+        reportFields() {
+            const fields = {};
+            if (this.mediaSourceId !== null) fields.MediaSourceId = this.mediaSourceId;
+            if (this.audioIndex !== null) fields.AudioStreamIndex = this.audioIndex;
+            if (this.subtitleIndex !== null) fields.SubtitleStreamIndex = this.subtitleIndex;
+            return fields;
+        },
         stop() {
             if (stopped) return pendingStop;
             stopped = true;
-            // Before metadata has loaded currentTime reads 0 even when resuming, so report the start position then
-            const ticks = video.readyState >= HTMLMediaElement.HAVE_METADATA
-                ? Math.round(video.currentTime * 10000000)
-                : startTicks;
+            clearTimeout(session.seekTimer);
+            const ticks = Math.round(session.position() * 1e7);
             if (playerReportInterval) {
                 clearInterval(playerReportInterval);
                 playerReportInterval = null;
             }
             if (activePlayback === session) activePlayback = null;
-            const reported = API.reportStopped(itemId, ticks).catch(e => console.warn('Reporting playback stop failed:', e));
+            const reported = API.reportStopped(itemId, ticks, session.reportFields()).catch(e => console.warn('Reporting playback stop failed:', e));
             pendingStop = reported;
             // Once the Stopped report is in, refresh the open view so it shows the new resume point
             reported.then(() => {
@@ -1817,31 +2177,28 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
                 hlsInstance.destroy();
                 hlsInstance = null;
             }
+            if (session.isHls && session.playSessionId) API.stopActiveEncodings(session.playSessionId).catch(e => console.warn('Stopping the transcode failed:', e));
             video.removeAttribute('src');
             video.load();
+            clearTextSubtitle();
             return reported;
         },
     };
     activePlayback = session;
+    renderTrackMenus(session);
 
     // Periodic progress reporting
     if (playerReportInterval) clearInterval(playerReportInterval);
     playerReportInterval = setInterval(() => {
         if (!video.paused && !video.ended) {
-            const ticks = Math.round(video.currentTime * 10000000);
-            API.reportProgress(itemId, ticks, false).catch(() => {});
+            const ticks = Math.round(session.position() * 1e7);
+            API.reportProgress(itemId, ticks, false, session.reportFields()).catch(() => {});
         }
     }, 8000);
 
     // Video events for custom UI
     video.ontimeupdate = () => {
-        const cur = video.currentTime;
-        const dur = video.duration || 0;
-        $('player-cur-time').textContent = formatDurationSeconds(cur);
-        $('player-duration').textContent = formatDurationSeconds(dur);
-        if (dur > 0) {
-            $('player-seek').value = (cur / dur) * 100;
-        }
+        if (activePlayback === session) updatePlayerControls(session);
     };
 
     video.onplay = () => updatePlayIcon(true);
@@ -1855,6 +2212,9 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
     video.onended = () => {
         if (activePlayback === session) session.stop();
     };
+
+    await openStream(session, startTicks);
+    if (activePlayback === session) API.reportPlaying(itemId, startTicks, session.reportFields()).catch(() => {});
 }
 
 function closePlayer() {
@@ -1879,18 +2239,6 @@ function updatePlayIcon(isPlaying) {
             ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
             : '<path d="M8 5v14l11-7z"/>';
     }
-}
-
-function seekVideo(percent) {
-    const v = $('video-player');
-    if (!v || !v.duration) return;
-    v.currentTime = (percent / 100) * v.duration;
-}
-
-function skipTime(deltaSeconds) {
-    const v = $('video-player');
-    if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + deltaSeconds));
 }
 
 function setVolume(val) {
@@ -2126,7 +2474,9 @@ function oidcCardHtml(enabled, account) {
 }
 
 // --- Login Page Renderer ---
+let pendingSetup = null; // { username, code } of an imported user's one-time code; memory only
 function renderLogin(data) {
+    pendingSetup = null;
     html('page-login', `
     <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
         <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
@@ -2158,7 +2508,7 @@ function renderLogin(data) {
     else if (oidcError !== null) showLoginError(oidcErrorText(oidcError));
 }
 
-// The steps after any sign-in, password or OpenID Connect.
+// The steps after any sign-in: password, setup code or OpenID Connect.
 async function finishSignIn() {
     updateAuthUI();
     // Replace a socket or retry left from an earlier session, so the new token is used now
@@ -2171,13 +2521,66 @@ async function finishSignIn() {
 
 async function handleLogin(e) {
     e.preventDefault();
+    const username = $('login-user').value;
+    const password = $('login-pass').value;
     try {
-        await API.login($('login-user').value, $('login-pass').value);
+        await API.login(username, password);
     } catch (err) {
+        if (err.setupRequired) {
+            renderSetupPassword(username, password);
+            return;
+        }
         showLoginError(err.status === 403 ? t('oidc.password_sign_in_off') : err.message);
         return;
     }
     await finishSignIn();
+}
+
+// Shown when a sign-in answers "setup required" for an imported user. The code is kept in memory only.
+function renderSetupPassword(username, code) {
+    pendingSetup = { username, code };
+    html('page-login', `
+    <div class="flex justify-center items-center min-h-[70vh] jf-page px-4">
+        <div class="w-full max-w-sm p-8 rounded-2xl bg-[#131822] border border-white/10 shadow-2xl">
+            <div class="text-center mb-8">
+                <img src="/web/assets/logo.png" alt="Rustyfin" class="w-20 h-20 mx-auto rounded-2xl shadow-xl mb-3 p-1 bg-white/5 border border-white/10">
+                <h2 class="text-2xl font-black text-white tracking-tight">${t('jellyfin_import.setup_title')}</h2>
+                <p class="text-white/40 text-xs mt-1">${t('jellyfin_import.setup_text', { name: escapeHtml(username) })}</p>
+            </div>
+            <form id="setup-form" onsubmit="handleSetupPassword(event)" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.new_password')}</label>
+                    <input type="password" id="setup-pass" class="jf-input w-full" autocomplete="new-password" autofocus>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.confirm_password')}</label>
+                    <input type="password" id="setup-pass2" class="jf-input w-full" autocomplete="new-password">
+                </div>
+                <button type="submit" class="jf-btn-primary w-full !py-3 font-bold text-sm shadow-lg mt-2">
+                    ${t('jellyfin_import.setup_submit')}
+                </button>
+                <div id="setup-error" class="text-red-400 text-xs text-center hidden p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+                <button type="button" id="setup-back" class="w-full text-xs text-white/50 hover:text-white transition py-2" onclick="pendingSetup = null; renderLogin()">${t('jellyfin_import.back')}</button>
+            </form>
+        </div>
+    </div>`);
+}
+
+async function handleSetupPassword(e) {
+    e.preventDefault();
+    const pw = $('setup-pass').value;
+    const pw2 = $('setup-pass2').value;
+    const fail = message => { $('setup-error').textContent = message; show('setup-error'); };
+    if (!pw) return fail(t('jellyfin_import.password_required'));
+    if (pw !== pw2) return fail(t('jellyfin_import.password_mismatch'));
+    if (!pendingSetup) { renderLogin(); return; }
+    try {
+        await API.loginWithSetupCode(pendingSetup.username, pendingSetup.code, pw);
+        pendingSetup = null;
+        await finishSignIn();
+    } catch (err) {
+        fail(err.status === 401 ? t('jellyfin_import.code_invalid') : err.message);
+    }
 }
 
 function doLogout() {
@@ -2403,8 +2806,8 @@ async function renderAdmin() {
         ]);
         const accountById = new Map(accounts.map(a => [oidcAccountKey(a.UserId), a]));
 
-        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab')];
-        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin'];
+        const tabs = [t('admin.overview'), t('admin.users'), t('admin.libraries'), t('admin.tasks'), t('admin.sessions'), t('admin.activity_log_tab'), t('admin.live_log'), t('oidc.admin_tab'), t('jellyfin_import.tab')];
+        const tabIds = ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'];
 
         page.innerHTML = `
         <div class="max-w-6xl mx-auto jf-page">
@@ -2515,6 +2918,7 @@ async function renderAdmin() {
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('common.type')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.paths')}</th>
+                                <th class="pb-3 font-semibold">${t('admin.realtime_monitor')}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.actions')}</th>
                             </tr>
                         </thead>
@@ -2524,6 +2928,7 @@ async function renderAdmin() {
                                 <td class="py-3 font-bold text-white"><span class="inline-flex items-center gap-1.5">${escapeHtml(l.name || l.Name)}${scanRing(l.id || l.Id, l.name || l.Name)}</span></td>
                                 <td class="py-3"><span class="px-2 py-0.5 rounded bg-white/10 text-white/70">${escapeHtml(l.content_type || l.ContentType || t('admin.mixed'))}</span></td>
                                 <td class="py-3 text-white/40 font-mono">${escapeHtml((l.paths || l.Paths || []).join(', '))}</td>
+                                <td class="py-3"><input type="checkbox" data-action="toggle-realtime-monitor" data-id="${escapeHtml(l.id || l.Id)}" aria-label="${escapeHtml(t('admin.realtime_monitor_for', { name: l.name || l.Name }))}" ${(l.LibraryOptions || {}).EnableRealtimeMonitor === false ? '' : 'checked'} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-right space-x-2">
                                     <button class="text-[#00a4dc] hover:text-[#38bdf8]" data-action="scan-library-admin" data-id="${escapeHtml(l.id || l.Id)}">${t('admin.scan')}</button>
                                     <button class="text-red-400 hover:text-red-300" data-action="delete-library" data-id="${escapeHtml(l.id || l.Id)}">${t('common.delete')}</button>
@@ -2607,6 +3012,8 @@ async function renderAdmin() {
 
             <!-- Tab 7: Sign-in (OpenID Connect settings, filled by loadOidcAdminTab) -->
             <div id="admin-signin" class="hidden jf-settings-card"></div>
+
+            ${jiPanelHtml()}
         </div>`;
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
@@ -2619,7 +3026,7 @@ function showAdminTab(btn, tabId) {
     });
     btn.className = 'px-4 py-2 rounded-xl text-xs font-semibold whitespace-nowrap transition bg-[#00a4dc] text-white shadow-lg';
 
-    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin'].forEach(id => {
+    ['admin-overview', 'admin-users', 'admin-libs', 'admin-tasks', 'admin-sessions', 'admin-activity', 'admin-livelog', 'admin-signin', 'admin-import'].forEach(id => {
         const el = $(id);
         if (el) el.classList.toggle('hidden', id !== tabId);
     });
@@ -2627,6 +3034,7 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-activity') loadActivityLog();
     if (tabId === 'admin-livelog') initLiveLog();
     if (tabId === 'admin-signin') loadOidcAdminTab();
+    if (tabId === 'admin-import') loadJellyfinImport();
 }
 
 // An administrator removes another user's provider link. The users tab is shown again after the page is rendered.
@@ -2792,6 +3200,468 @@ async function saveOidcAdminSettings() {
     }
     toast(t('oidc.settings_saved'));
     renderOidcAdminSettings(saved);
+}
+
+// --- Jellyfin import (B20) ---
+// Admin tab: imports users, watch data and track choices from a Jellyfin data folder.
+let jiPreviewed = false; // a preview is on screen; from then on the request carries the pairs and the checked users
+let jiRunning = false;   // the last status read said Running
+let jiTimer = null;      // the one status poll loop
+const jiChoice = new Map();     // JellyfinId -> checked; kept across previews of the same folder and layout
+const jiConfirm = new Map();    // JellyfinId -> UserId of a ticked suggested match; kept like jiChoice
+let jiPendingNames = new Map(); // UserId -> Name of the pending users (names stay out of onclick attributes)
+const jiShownCodes = new Map(); // UserId -> { name, code } of a new code shown in the pending list
+const jiLayoutKeys = { New: 'jellyfin_import.layout_new', Old: 'jellyfin_import.layout_old' };
+const jiMetadataModeKeys = { FillEmpty: 'jellyfin_import.metadata_fill_empty', Replace: 'jellyfin_import.metadata_replace', None: 'jellyfin_import.metadata_none' };
+const jiStageKeys = {
+    Reading: 'jellyfin_import.stage_reading',
+    Matching: 'jellyfin_import.stage_matching',
+    Users: 'jellyfin_import.stage_users',
+    WatchData: 'jellyfin_import.stage_watch_data',
+    Metadata: 'jellyfin_import.stage_metadata'
+};
+const jiActionKeys = {
+    Match: 'jellyfin_import.action_match',
+    Create: 'jellyfin_import.action_create',
+    Skip: 'jellyfin_import.action_skip'
+};
+const jiReasonKeys = {
+    Ambiguous: 'jellyfin_import.reason_ambiguous',
+    NotSelected: 'jellyfin_import.reason_not_selected',
+    NotConfirmed: 'jellyfin_import.reason_not_confirmed',
+    ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other'
+};
+
+function jiPanelHtml() {
+    return `
+    <div id="admin-import" class="hidden space-y-6">
+        <div class="jf-settings-card">
+            <h3 class="font-bold text-white text-base mb-2">${t('jellyfin_import.title')}</h3>
+            <p class="text-xs text-white/60 mb-3">${t('jellyfin_import.help_intro')}</p>
+            <p class="text-xs text-white/60 mb-2">${t('jellyfin_import.help_mount')}</p>
+            <pre class="text-[11px] font-mono bg-black/50 border border-white/10 rounded-lg p-3 text-white/80 overflow-x-auto">-v /path/to/jellyfin/config:/import/jellyfin:ro</pre>
+            <p class="text-xs text-white/60 mt-3">${t('jellyfin_import.help_path')}</p>
+            <div class="grid gap-4 sm:grid-cols-2 mt-5">
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.folder')}</span>
+                    <input type="text" id="ji-source" class="jf-input w-full" placeholder="/import/jellyfin" oninput="jiForget()">
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.layout')}</span>
+                    <select id="ji-layout" class="jf-input w-full" onchange="jiForget()">
+                        <option value="Auto">${t('jellyfin_import.layout_auto')}</option>
+                        <option value="New">${t('jellyfin_import.layout_new')}</option>
+                        <option value="Old">${t('jellyfin_import.layout_old')}</option>
+                    </select>
+                </label>
+                <label class="block">
+                    <span class="block text-xs font-semibold text-white/70 mb-1.5">${t('jellyfin_import.metadata')}</span>
+                    <select id="ji-metadata" class="jf-input w-full">
+                        <option value="FillEmpty">${t('jellyfin_import.metadata_fill_empty')}</option>
+                        <option value="Replace">${t('jellyfin_import.metadata_replace')}</option>
+                        <option value="None">${t('jellyfin_import.metadata_none')}</option>
+                    </select>
+                    <span class="block text-xs text-white/50 mt-1.5">${t('jellyfin_import.metadata_help')}</span>
+                </label>
+            </div>
+            <button id="ji-preview-btn" class="jf-btn-primary !py-2 !px-4 text-sm mt-5" onclick="jiPreview()">${t('jellyfin_import.preview')}</button>
+        </div>
+
+        <div id="ji-error" class="hidden text-red-400 text-xs p-2 rounded bg-red-500/10 border border-red-500/20"></div>
+
+        <div id="ji-preview" class="hidden jf-settings-card space-y-5">
+            <p id="ji-found" class="text-xs text-white/70"></p>
+            <div>
+                <h4 class="font-semibold text-white text-sm">${t('jellyfin_import.pairs_title')}</h4>
+                <p class="text-xs text-white/50 mb-3">${t('jellyfin_import.pairs_help')}</p>
+                <div id="ji-pairs" class="space-y-2"></div>
+                <button id="ji-add-pair" class="jf-btn-ghost !py-1.5 !px-3 text-xs mt-3" onclick="jiAddPair()">${t('jellyfin_import.add_pair')}</button>
+                <div id="ji-unpaired" class="mt-3 space-y-1"></div>
+            </div>
+            <div>
+                <h4 class="font-semibold text-white text-sm mb-2">${t('jellyfin_import.users_title')}</h4>
+                <div id="ji-users" class="space-y-2"></div>
+            </div>
+            <div id="ji-counts" class="space-y-1 text-xs text-white/70"></div>
+            <div id="ji-samples" class="space-y-1"></div>
+            <button id="ji-run-btn" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiRun()">${t('jellyfin_import.run')}</button>
+        </div>
+
+        <div id="ji-progress" class="hidden jf-settings-card space-y-3">
+            <p id="ji-progress-text" class="text-sm text-white"></p>
+            <div id="ji-progress-detail">
+                <div class="h-2 rounded-full bg-white/10 overflow-hidden"><div id="ji-bar" class="h-2 bg-[#00a4dc]" style="width: 0%"></div></div>
+                <p id="ji-progress-count" class="text-xs text-white/50 mt-2"></p>
+            </div>
+        </div>
+
+        <div id="ji-result" class="hidden jf-settings-card space-y-4">
+            <p id="ji-result-text" class="text-sm font-semibold text-white"></p>
+            <div id="ji-result-report" class="space-y-2 text-xs text-white/70"></div>
+            <div id="ji-codes-box" class="hidden rounded-xl border border-amber-400/40 bg-amber-500/10 p-4 space-y-3">
+                <h4 class="font-bold text-amber-300 text-sm">${t('jellyfin_import.codes_title')}</h4>
+                <p class="text-xs font-semibold text-amber-200">${t('jellyfin_import.codes_warning')}</p>
+                <table id="ji-codes" class="w-full text-sm"></table>
+                <button id="ji-copy-codes" class="jf-btn-primary !py-2 !px-4 text-sm" onclick="jiCopyCodes()">${t('jellyfin_import.copy_codes')}</button>
+            </div>
+            <p id="ji-former-admins" class="hidden text-xs text-amber-300"></p>
+        </div>
+
+        <div id="ji-pending" class="jf-settings-card">
+            <h4 class="font-semibold text-white text-sm">${t('jellyfin_import.pending_title')}</h4>
+            <p class="text-xs text-white/50 mb-3">${t('jellyfin_import.pending_help')}</p>
+            <div id="ji-pending-list"></div>
+        </div>
+    </div>`;
+}
+
+function jiPairRowHtml(from, to) {
+    return `
+    <div class="ji-pair flex items-center gap-2">
+        <input type="text" class="ji-from jf-input flex-1 font-mono text-xs" placeholder="${escapeHtml(t('jellyfin_import.pair_from'))}" value="${escapeHtml(from)}">
+        <span class="text-white/40 text-xs">→</span>
+        <input type="text" class="ji-to jf-input flex-1 font-mono text-xs" placeholder="${escapeHtml(t('jellyfin_import.pair_to'))}" value="${escapeHtml(to)}">
+        <button type="button" class="ji-pair-remove jf-btn-ghost !py-1 !px-2 text-xs" title="${escapeHtml(t('jellyfin_import.remove_pair'))}" onclick="this.closest('.ji-pair').remove()">×</button>
+    </div>`;
+}
+
+function jiAddPair() {
+    $('ji-pairs').insertAdjacentHTML('beforeend', jiPairRowHtml('', ''));
+}
+
+// The pairs with both sides filled, trimmed.
+function jiPairs() {
+    return [...document.querySelectorAll('#ji-pairs .ji-pair')]
+        .map(row => ({ From: row.querySelector('.ji-from').value.trim(), To: row.querySelector('.ji-to').value.trim() }))
+        .filter(p => p.From && p.To);
+}
+
+// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs, checked users and ticked matches.
+function jiRequest() {
+    const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value, MetadataMode: $('ji-metadata').value };
+    if (jiPreviewed) {
+        req.PathMappings = jiPairs();
+        req.UserIds = [...document.querySelectorAll('#ji-users .ji-user:checked:not(:disabled)')].map(el => el.value);
+        req.ConfirmedMatches = [...document.querySelectorAll('#ji-users .ji-confirm:checked')]
+            .map(el => ({ JellyfinId: el.value, UserId: el.dataset.userId }));
+    }
+    return req;
+}
+
+function jiBusy(busy) {
+    ['ji-preview-btn', 'ji-run-btn'].forEach(id => { const b = $(id); if (b) b.disabled = busy; });
+}
+
+function jiShowError(message) {
+    $('ji-error').textContent = message;
+    show('ji-error');
+}
+
+// A changed folder or layout forgets the preview, its pairs and the checkbox choices.
+function jiForget() {
+    jiPreviewed = false;
+    jiChoice.clear();
+    jiConfirm.clear();
+    $('ji-pairs').innerHTML = '';
+    $('ji-users').innerHTML = '';
+    hide('ji-preview');
+}
+
+function jiSetChoice(el) {
+    jiChoice.set(el.value, el.checked);
+}
+
+function jiSetConfirm(el) {
+    if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
+    else jiConfirm.delete(el.value);
+}
+
+async function jiPreview() {
+    const btn = $('ji-preview-btn');
+    btn.disabled = true;
+    btn.textContent = t('jellyfin_import.previewing');
+    hide('ji-error');
+    try {
+        jiRenderPreview(await API.jellyfinImportPreview(jiRequest()));
+    } catch (err) {
+        jiShowError(err.message);
+    } finally {
+        btn.disabled = jiRunning;
+        btn.textContent = t('jellyfin_import.preview');
+    }
+}
+
+function jiRenderPreview(r) {
+    jiPreviewed = true;
+    $('ji-found').innerHTML = t('jellyfin_import.found', { layout: t(jiLayoutKeys[r.Layout]), path: escapeHtml(r.DataPath) });
+    $('ji-pairs').innerHTML = (r.PathMappings || []).map(m => jiPairRowHtml(m.From, m.To)).join('');
+    $('ji-unpaired').innerHTML = jiUnpairedHtml(r);
+    $('ji-users').innerHTML = jiUsersHtml(r.Users || []);
+    $('ji-counts').innerHTML = jiCountsHtml(r);
+    $('ji-samples').innerHTML = jiSamplesHtml(r);
+    show('ji-preview');
+}
+
+function jiUsersHtml(users) {
+    return users.map(u => {
+        const ambiguous = u.Reason === 'Ambiguous';
+        const checked = !ambiguous && (jiChoice.has(u.JellyfinId) ? jiChoice.get(u.JellyfinId) : true);
+        return `
+        <div>
+            <label class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
+                <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
+                <span class="font-semibold">${escapeHtml(u.Name)}</span>
+                ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
+                <span class="text-xs text-white/50">${jiActionText(u)}</span>
+            </label>${jiConfirmHtml(u)}
+        </div>`;
+    }).join('');
+}
+
+// A name match goes into the existing account only when its box is ticked. It starts unticked, and
+// stays ticked only while the suggestion names the same account. Account names are escaped.
+function jiConfirmHtml(u) {
+    const s = u.SuggestedMatch;
+    if (!s) return '';
+    const checked = jiConfirm.get(u.JellyfinId) === s.UserId;
+    return `
+            <label class="flex items-center gap-2 ml-7 mt-1 text-xs text-white/70">
+                <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''}>
+                <span>${t('jellyfin_import.confirm_match', { name: escapeHtml(s.Name) })}</span>
+            </label>`;
+}
+
+// "Action", or "Action: reason" when there is a reason. The translations are static text.
+function jiActionText(u) {
+    const action = t(jiActionKeys[u.Action]);
+    return u.Reason ? `${action}: ${t(jiReasonKeys[u.Reason])}` : action;
+}
+
+// Counts are numbers and are not escaped: escapeHtml(0) would be ''.
+function jiCountsHtml(r) {
+    const { Items: i, WatchData: w, Tracks: k, Metadata: m } = r;
+    let metadata = '';
+    if (m && m.Mode === 'None') {
+        metadata = `<p>${t('jellyfin_import.metadata_summary_none')}</p>`;
+    } else if (m) {
+        metadata = `<p>${t('jellyfin_import.metadata_summary', { mode: t(jiMetadataModeKeys[m.Mode]), items: m.Items, fields: m.Fields, people: m.People, images: m.Images, missing: m.ImagesMissing, locked: m.Locked })}</p>`;
+    }
+    return `
+        <p>${t('jellyfin_import.items_summary', { total: i.Total, by_path: i.MatchedByPath, by_id: i.MatchedById, unmatched: i.Unmatched })}</p>
+        <p>${t('jellyfin_import.watch_summary', { rows: w.Rows, imported: w.Imported, unchanged: w.Unchanged, unmatched: w.Unmatched })}</p>
+        <p>${t('jellyfin_import.tracks_summary', { audio: k.Audio, subtitle: k.Subtitle, off: k.SubtitleOff, unmapped: k.Unmapped })}</p>${metadata}`;
+}
+
+function jiUnpairedHtml(r) {
+    const paths = r.UnpairedLibraryPaths || [];
+    if (!paths.length) return '';
+    return `
+        <p class="text-xs text-amber-300">${t('jellyfin_import.unpaired')}</p>
+        <ul class="font-mono text-[11px] text-white/60 space-y-0.5">${paths.map(p => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`;
+}
+
+function jiSamplesHtml(r) {
+    const samples = r.Items.UnmatchedSamples || [];
+    if (!samples.length) return '';
+    return `
+        <p class="text-xs font-semibold text-white/70 mt-2">${t('jellyfin_import.samples_title')}</p>
+        <ul class="text-xs text-white/60 space-y-0.5">${samples.map(s => `<li>${escapeHtml(s.Type)} · ${escapeHtml(s.Name)} · <span class="font-mono text-[11px]">${escapeHtml(s.Path)}</span></li>`).join('')}</ul>`;
+}
+
+function jiUserActionsHtml(users) {
+    if (!users.length) return '';
+    return `
+        <p class="font-semibold text-white/80">${t('jellyfin_import.users_title')}</p>
+        <ul class="space-y-0.5">${users.map(u => `<li><span class="text-white">${escapeHtml(u.Name)}</span>${u.WasAdministrator ? ` <span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''} · ${jiActionText(u)}</li>`).join('')}</ul>`;
+}
+
+async function jiRun() {
+    const req = jiRequest();
+    jiBusy(true);
+    hide('ji-error');
+    try {
+        await API.jellyfinImportRun(req);
+    } catch (err) {
+        jiShowError(err.message);
+        jiBusy(false);
+        return;
+    }
+    jiRunning = true;
+    jiShowProgress({ Stage: null, Done: 0, Total: 0 });
+    jiPoll();
+}
+
+// Running: the stage, or "starting" before the first one; a bar and a count when the total is known.
+function jiShowProgress(st) {
+    show('ji-progress');
+    hide('ji-result');
+    $('ji-progress-text').innerHTML = st.Stage
+        ? t('jellyfin_import.running', { stage: t(jiStageKeys[st.Stage]) })
+        : t('jellyfin_import.starting');
+    if (st.Total > 0) {
+        $('ji-bar').style.width = `${Math.min(100, Math.round(100 * st.Done / st.Total))}%`;
+        $('ji-progress-count').innerHTML = t('jellyfin_import.progress', { done: st.Done, total: st.Total });
+        show('ji-progress-detail');
+    } else {
+        hide('ji-progress-detail');
+    }
+}
+
+// Completed: the report and the new users' codes (the first read after completion carries them). Failed: the error.
+function jiShowResult(st) {
+    hide('ji-progress');
+    if (st.State === 'Failed') {
+        show('ji-result');
+        $('ji-result-text').innerHTML = t('jellyfin_import.failed', { error: escapeHtml(st.Error) });
+        $('ji-result-report').innerHTML = '';
+        hide('ji-codes-box');
+        hide('ji-former-admins');
+        return;
+    }
+    if (st.State !== 'Completed' || !st.Result) {
+        hide('ji-result');
+        return;
+    }
+    const r = st.Result;
+    const users = r.Users || [];
+    show('ji-result');
+    $('ji-result-text').innerHTML = t('jellyfin_import.done');
+    $('ji-result-report').innerHTML = jiCountsHtml(r) + jiUnpairedHtml(r) + jiSamplesHtml(r) + jiUserActionsHtml(users);
+    const coded = users.filter(u => u.Code);
+    $('ji-codes').innerHTML = coded.map(u => `
+        <tr><td class="py-1 pr-4 text-white">${escapeHtml(u.Name)}</td><td class="ji-code py-1 font-mono select-all text-amber-200">${escapeHtml(u.Code)}</td></tr>`).join('');
+    if (coded.length) show('ji-codes-box');
+    else hide('ji-codes-box');
+    const admins = users.filter(u => u.Action === 'Create' && u.WasAdministrator);
+    $('ji-former-admins').innerHTML = t('jellyfin_import.former_admins', { names: admins.map(u => escapeHtml(u.Name)).join(', ') });
+    if (admins.length) show('ji-former-admins');
+    else hide('ji-former-admins');
+}
+
+// One loop: read the status and show it; while it runs, the next read follows in one second.
+async function jiPoll() {
+    clearTimeout(jiTimer);
+    jiTimer = null;
+    if (!$('admin-import')) return; // the panel left the page
+    let st;
+    try {
+        st = await API.jellyfinImportStatus();
+    } catch (err) {
+        jiShowError(err.message);
+        if (jiRunning) jiSchedule();
+        return;
+    }
+    hide('ji-error');
+    const wasRunning = jiRunning;
+    jiRunning = st.State === 'Running';
+    if (jiRunning) {
+        jiBusy(true);
+        jiShowProgress(st);
+        jiSchedule();
+        return;
+    }
+    jiBusy(false);
+    jiShowResult(st);
+    if (wasRunning) jiLoadPending();
+}
+
+function jiSchedule() {
+    clearTimeout(jiTimer);
+    jiTimer = $('admin-import') ? setTimeout(jiPoll, 1000) : null;
+}
+
+async function jiLoadPending() {
+    try {
+        jiRenderPending(await API.jellyfinImportPendingUsers());
+    } catch (err) {
+        jiShowError(err.message);
+    }
+}
+
+function jiRenderPending(users) {
+    const list = $('ji-pending-list');
+    if (!list) return;
+    jiPendingNames = new Map(users.map(u => [u.UserId, u.Name]));
+    for (const id of [...jiShownCodes.keys()]) {
+        if (!jiPendingNames.has(id)) jiShownCodes.delete(id);
+    }
+    list.innerHTML = users.length
+        ? users.map(u => jiPendingRowHtml(u)).join('')
+        : `<p class="text-xs text-white/50">${t('jellyfin_import.pending_none')}</p>`;
+}
+
+function jiPendingRowHtml(u) {
+    const shown = jiShownCodes.get(u.UserId);
+    const action = shown
+        ? jiCodeLineHtml(shown.name, shown.code)
+        : `<button class="jf-btn-ghost !py-1.5 !px-3 text-xs ji-new-code" data-user-id="${escapeHtml(u.UserId)}" onclick="jiNewCode(this)">${t('jellyfin_import.new_code')}</button>`;
+    return `
+        <div class="ji-pending-row flex flex-wrap items-center justify-between gap-3 py-3 border-b border-white/5">
+            <div>
+                <p class="text-sm font-semibold text-white">${escapeHtml(u.Name)}</p>
+                <p class="text-xs text-white/40">${t('jellyfin_import.pending_since', { date: escapeHtml(new Date(u.CreatedAt).toLocaleString()) })}</p>
+            </div>
+            <div class="ji-row-action">${action}</div>
+        </div>`;
+}
+
+function jiCodeLineHtml(name, code) {
+    return `
+        <p class="text-xs text-amber-300">${t('jellyfin_import.new_code_shown', { name: escapeHtml(name) })}</p>
+        <div class="ji-code font-mono text-sm text-amber-200 select-all">${escapeHtml(code)}</div>`;
+}
+
+async function jiNewCode(btn) {
+    const id = btn.dataset.userId;
+    const name = jiPendingNames.get(id) || '';
+    if (!confirm(t('jellyfin_import.new_code_confirm', { name }))) return;
+    try {
+        const res = await API.jellyfinImportNewCode(id);
+        const shownName = res.Name || name;
+        jiShownCodes.set(id, { name: shownName, code: res.Code });
+        const cell = btn.closest('.ji-row-action');
+        if (cell) cell.innerHTML = jiCodeLineHtml(shownName, res.Code);
+    } catch (err) {
+        toast(err.message, 'error');
+        if (err.status === 409) {
+            jiShownCodes.delete(id);
+            jiLoadPending();
+        }
+    }
+}
+
+async function jiCopyCodes() {
+    const table = $('ji-codes');
+    if (window.isSecureContext && navigator.clipboard) {
+        try {
+            const text = [...table.rows].map(row => `${row.cells[0].textContent}\t${row.cells[1].textContent}`).join('\n');
+            await navigator.clipboard.writeText(text);
+            toast(t('jellyfin_import.copied'));
+            return;
+        } catch (err) {
+            // Not allowed here: fall through and select the codes.
+        }
+    }
+    window.getSelection().selectAllChildren(table);
+    toast(t('jellyfin_import.copy_manually'));
+}
+
+// Opening the tab reloads the pending users. The status is read once per rendered panel, so
+// switching tabs never re-renders a result or drops a code on screen.
+async function loadJellyfinImport() {
+    const panel = $('admin-import');
+    if (!panel) return;
+    const first = !panel.dataset.loaded;
+    panel.dataset.loaded = '1';
+    if (first) {
+        // A new panel has no preview on screen, so the old pairs, choices and codes go.
+        jiPreviewed = false;
+        jiChoice.clear();
+        jiConfirm.clear();
+        jiShownCodes.clear();
+    }
+    jiLoadPending();
+    if (first) await jiPoll();
 }
 
 // --- Scheduled Tasks UI ---
@@ -3075,6 +3945,21 @@ async function deleteLibraryFromAdmin(id) {
     renderAdmin();
 }
 
+// Saves the checkbox's new state; a failure puts the checkbox back and shows a toast
+async function toggleRealtimeMonitor(el) {
+    const enabled = el.checked;
+    el.disabled = true;
+    try {
+        const options = await API.getLibraryOptions(el.dataset.id);
+        await API.saveLibraryOptions(el.dataset.id, { ...options, EnableRealtimeMonitor: enabled });
+    } catch (err) {
+        el.checked = !enabled;
+        toast(t('admin.realtime_monitor_failed', { message: err.message }), 'error');
+    } finally {
+        el.disabled = false;
+    }
+}
+
 // Directory picker state
 let directoryPickerPath = '/';
 let directoryPickerHistory = ['/'];
@@ -3109,7 +3994,7 @@ async function submitAddLibrary(e) {
     let lib;
     if (submitBtn) submitBtn.disabled = true;
     try {
-        lib = await API.createLibrary(name, type, paths);
+        lib = await API.createLibrary(name, type, paths, { EnableRealtimeMonitor: f.realtimeMonitor.checked });
     } catch (err) {
         setAddLibraryError(t('library.create_failed', { message: err.message }));
         return;
@@ -3311,12 +4196,14 @@ function initScanProgressWebSocket() {
                 // Refresh tasks tab if visible
                 if (currentPage === 'admin') refreshTasks();
             } else if (data.MessageType === 'RefreshProgress') {
-                // Scan progress: "0" when queued, each whole percent, "100" when done
+                // Scan progress: State "Queued" while it waits its turn, "Active" with each whole percent, "Idle" at "100" when done
                 const id = data.Data?.ItemId;
                 const p = Number(data.Data?.Progress ?? NaN);
+                const state = data.Data?.State;
                 if (id && Number.isFinite(p)) {
-                    if (p >= 100) delete scanStatuses[id];
-                    else scanStatuses[id] = Math.max(scanStatuses[id] ?? 0, p);
+                    // Taken as is, not maxed: a new run of the same library can start lower than the last one
+                    if (state === 'Idle' || p >= 100) delete scanStatuses[id];
+                    else scanStatuses[id] = { percent: p, queued: state === 'Queued' };
                     updateScanRings(id);
                 }
             } else if (data.MessageType === 'LibraryChanged') {
@@ -3576,6 +4463,7 @@ window.addEventListener('hashchange', handleHash);
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
     $('player-modal')?.addEventListener('close', () => stopPlayback());
+    window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
     if (!wizardActive) {

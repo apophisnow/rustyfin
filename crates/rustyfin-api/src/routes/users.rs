@@ -704,6 +704,7 @@ async fn delete_user_played_item(
     Path(item_id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::routes::playback::require_item(&state, item_id).await?;
     rustyfin_db::repo_playback::mark_unplayed(&state.db, claims.sub, item_id)
         .await
         .ok();
@@ -716,6 +717,7 @@ async fn delete_user_favorite_item(
     Path(item_id): Path<Uuid>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::routes::playback::require_item(&state, item_id).await?;
     rustyfin_db::repo_playback::set_favorite(&state.db, claims.sub, item_id, false)
         .await
         .ok();

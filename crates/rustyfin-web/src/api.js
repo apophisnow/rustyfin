@@ -221,6 +221,7 @@ const API = {
             const err = await res.json().catch(() => ({}));
             const error = new Error(err.Message || err.message || t('login.failed'));
             error.status = res.status;
+            error.setupRequired = res.status === 401 && res.headers.get('X-Rustyfin-Setup-Required') === 'true';
             throw error;
         }
         const data = await res.json();
@@ -228,7 +229,7 @@ const API = {
         return data;
     },
 
-    // Keeps the session that an AuthenticateByName-style answer carries (password or OpenID Connect sign-in).
+    // Keeps the session that an AuthenticateByName-style answer carries (password, setup-code or OpenID Connect sign-in).
     _storeSession(data, fallbackName = '') {
         this.token = data.AccessToken || data.access_token;
         const userObj = data.User || data.user || {};
@@ -259,6 +260,22 @@ const API = {
         });
         if (!res.ok) throw await this._requestError('POST', '/Auth/Oidc/Complete', res);
         this._storeSession(await res.json());
+    },
+
+    // Signs in an imported user with the one-time code and the password chosen now.
+    async loginWithSetupCode(username, code, newPw) {
+        const res = await fetch(this.base + '/Users/AuthenticateWithSetupCode', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Emby-Authorization': this.authHeader()
+            },
+            body: JSON.stringify({ Username: username, Code: code, NewPw: newPw })
+        });
+        if (!res.ok) throw await this._requestError('POST', '/Users/AuthenticateWithSetupCode', res);
+        const data = await res.json();
+        this._storeSession(data, username);
+        return data;
     },
 
     logout() {
@@ -316,10 +333,14 @@ const API = {
             content_type: types[v.CollectionType] || 'Mixed',
         })));
     },
-    createLibrary(name, contentType, paths) {
-        return this.post('/Library/VirtualFolders', { Name: name, ContentType: contentType, Paths: paths });
+    createLibrary(name, contentType, paths, libraryOptions) {
+        const body = { Name: name, ContentType: contentType, Paths: paths };
+        if (libraryOptions) body.LibraryOptions = libraryOptions;
+        return this.post('/Library/VirtualFolders', body);
     },
     deleteLibrary(id) { return this.del(`/Library/VirtualFolders/${id}`); },
+    getLibraryOptions(id) { return this.get(`/Library/${id}/Options`); },
+    saveLibraryOptions(id, options) { return this.post(`/Library/${id}/Options`, options); },
     scanLibrary(id) { 
         this.invalidateCache('/Items');
         return this.post(`/Library/VirtualFolders/${id}/Refresh`); 
@@ -378,14 +399,14 @@ const API = {
     },
 
     // Playback
-    reportPlaying(itemId, positionTicks = 0) {
-        return this.post('/Sessions/Playing', { ItemId: itemId, PositionTicks: positionTicks });
+    reportPlaying(itemId, positionTicks = 0, fields = {}) {
+        return this.post('/Sessions/Playing', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
     },
-    reportProgress(itemId, positionTicks, isPaused = false) {
-        return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused });
+    reportProgress(itemId, positionTicks, isPaused = false, fields = {}) {
+        return this.post('/Sessions/Playing/Progress', { ItemId: itemId, PositionTicks: positionTicks, IsPaused: isPaused, ...fields });
     },
-    reportStopped(itemId, positionTicks) {
-        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks });
+    reportStopped(itemId, positionTicks, fields = {}) {
+        return this.post('/Sessions/Playing/Stopped', { ItemId: itemId, PositionTicks: positionTicks, ...fields });
     },
     markPlayed(itemId) { return this.post(`/Users/${this.userId}/PlayedItems/${itemId}`); },
     markUnplayed(itemId) { return this.del(`/Users/${this.userId}/PlayedItems/${itemId}`); },
@@ -438,10 +459,21 @@ const API = {
         const codecs = this.playableCodecs();
         q.set('VideoCodecs', codecs.video.join(','));
         q.set('AudioCodecs', codecs.audio.join(','));
+        if (params.startTimeTicks > 0) q.set('StartTimeTicks', params.startTimeTicks);
+        if (params.mediaSourceId) q.set('MediaSourceId', params.mediaSourceId);
+        if (params.audioStreamIndex != null) q.set('AudioStreamIndex', params.audioStreamIndex);
+        if (params.subtitleStreamIndex != null) q.set('SubtitleStreamIndex', params.subtitleStreamIndex);
         const data = await this.get(`/Videos/${itemId}/Universal?${q.toString()}`);
         // The player reads `url`; the server sends `Url`
         if (data && !data.url) data.url = data.Url;
         return data;
+    },
+
+    // Stops the transcode of one play session; keepalive lets the request outlive the page
+    async stopActiveEncodings(playSessionId) {
+        const path = `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playSessionId)}`;
+        const res = await fetch(this.base + path, { method: 'DELETE', headers: this.headers(), keepalive: true });
+        if (!res.ok) throw await this._requestError('DELETE', path, res);
     },
 
     // Search
@@ -485,7 +517,14 @@ const API = {
 
     // Live Log
     getLogLevel() { return this.get('/System/LogLevel'); },
-    setLogLevel(level) { return this.post('/System/LogLevel', { LogLevel: level }); }
+    setLogLevel(level) { return this.post('/System/LogLevel', { LogLevel: level }); },
+
+    // Jellyfin import (B20)
+    jellyfinImportPreview(req) { return this.post('/JellyfinImport/Preview', req); },
+    jellyfinImportRun(req) { return this.post('/JellyfinImport/Run', req); },
+    jellyfinImportStatus() { return this.get('/JellyfinImport/Status'); },
+    jellyfinImportPendingUsers() { return this.get('/JellyfinImport/PendingUsers'); },
+    jellyfinImportNewCode(userId) { return this.post('/JellyfinImport/Users/' + encodeURIComponent(userId) + '/SetupCode'); }
 };
 
 if (typeof window !== 'undefined') {

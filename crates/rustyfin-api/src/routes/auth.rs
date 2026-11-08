@@ -1,8 +1,9 @@
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use rustyfin_model::auth::{AuthResponse, AuthSessionInfo, LoginRequest};
+use rustyfin_model::auth::{AuthResponse, AuthSessionInfo, LoginRequest, SetupCodeLoginRequest};
 use rustyfin_model::user::{User, UserDto};
 use uuid::Uuid;
 
@@ -18,15 +19,36 @@ pub fn routes() -> Router<AppState> {
             "/Users/AuthenticateWithQuickConnect",
             post(quick_connect_sign_in),
         )
+        .route(
+            "/Users/AuthenticateWithSetupCode",
+            post(login_with_setup_code),
+        )
 }
+
+/// Set on a failed sign-in whose password is a pending user's one-time code (B20 3.2).
+const SETUP_REQUIRED_HEADER: &str = "x-rustyfin-setup-required";
 
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let device = token_device(&headers);
-    let user = rustyfin_auth::check_password(&state.db, &req.username, &req.password).await?;
+    let user = match rustyfin_auth::check_password(&state.db, &req.username, &req.password).await {
+        Ok(user) => user,
+        Err(rustyfin_auth::AuthError::InvalidCredentials) => {
+            // The password may be a pending user's one-time code: the header says so (B20 3.2).
+            if !rustyfin_auth::setup_code_pending(&state.db, &req.username, &req.password).await? {
+                return Err(ApiError::Unauthorized);
+            }
+            let mut response = ApiError::Unauthorized.into_response();
+            response
+                .headers_mut()
+                .insert(SETUP_REQUIRED_HEADER, HeaderValue::from_static("true"));
+            return Ok(response);
+        }
+        Err(e) => return Err(ApiError::from(e)),
+    };
     // While password sign-in is off, only an administrator whose rights were given by hand may
     // sign in with a password (AC21, AC41).
     let config = rustyfin_db::repo_oidc::get_settings(&state.db).await?;
@@ -34,7 +56,7 @@ async fn login(
         return Err(ApiError::Forbidden(PASSWORD_SIGN_IN_OFF.to_string()));
     }
     let (user, token) = rustyfin_auth::issue_login_token(&state.db, user.id, &device).await?;
-    Ok(Json(start_session(&state, &device, user, token).await))
+    Ok(Json(start_session(&state, &device, user, token).await).into_response())
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` – signs in with the secret of a Quick Connect request
@@ -51,6 +73,28 @@ async fn quick_connect_sign_in(
     let approver = quick_connect::redeem(&state, secret).await?;
     let device = token_device(&headers);
     let (user, token) = rustyfin_auth::authenticate_approved(&state.db, approver, &device).await?;
+    Ok(Json(start_session(&state, &device, user, token).await))
+}
+
+/// `POST /Users/AuthenticateWithSetupCode` (B20 3.3): a pending user's code sets the new password
+/// and signs in. It is routed with the login endpoints, so the login rate limit covers it.
+async fn login_with_setup_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetupCodeLoginRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    if req.new_pw.is_empty() {
+        return Err(ApiError::BadRequest("NewPw is required.".to_string()));
+    }
+    let device = token_device(&headers);
+    let (user, token) = rustyfin_auth::authenticate_with_setup_code(
+        &state.db,
+        &req.username,
+        &req.code,
+        &req.new_pw,
+        &device,
+    )
+    .await?;
     Ok(Json(start_session(&state, &device, user, token).await))
 }
 

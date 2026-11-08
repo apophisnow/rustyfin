@@ -1816,6 +1816,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
+dependencies = [
+ "bitflags 2.13.2",
+ "inotify-sys",
+ "libc",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c033f80b2c113cdf91ab7a33faa9cbc014726dcad99880c8609af2a370edf37d"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "interpolate_name"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3111,6 +3131,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dashmap",
+ "form_urlencoded",
  "futures-util",
  "hmac 0.12.1",
  "http-body-util",
@@ -3135,6 +3156,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "uuid",
 ]
@@ -3178,14 +3200,19 @@ dependencies = [
  "chrono",
  "dashmap",
  "image",
+ "inotify",
+ "libc",
  "libloading",
+ "libsqlite3-sys",
  "moka",
  "quick-xml",
  "reqwest",
+ "rustyfin-auth",
  "rustyfin-db",
  "rustyfin-model",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "socket2",
  "sqlx",
  "thiserror 2.0.21",
@@ -3205,10 +3232,12 @@ dependencies = [
  "rand 0.8.8",
  "rustyfin-model",
  "serde_json",
+ "sha1 0.10.7",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

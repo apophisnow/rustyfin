@@ -48,4 +48,6 @@ pub struct AppState {
     pub tmdb: rustyfin_core::tmdb_client::TmdbClient,
     /// OIDC provider cache and HTTP client (discovery and JWKS are fetched through it).
     pub oidc: crate::oidc::OidcState,
+    /// The one import from Jellyfin this server runs at a time, and its status.
+    pub jellyfin_import: rustyfin_core::jellyfin_import::ImportJob,
 }

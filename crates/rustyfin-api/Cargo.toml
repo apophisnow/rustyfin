@@ -33,6 +33,8 @@ base64 = "0.22"
 futures-util = "0.3"
 dashmap = "6"
 ipnet = "2"
+form_urlencoded = "1"
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

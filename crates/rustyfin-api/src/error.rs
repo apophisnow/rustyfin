@@ -20,11 +20,12 @@ pub struct JellyfinError {
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
+    Conflict(String),
+    PayloadTooLarge(String),
     Unauthorized,
     Forbidden(String),
     Internal(String),
     BadGateway(String),
-    Conflict(String),
     RateLimited,
 }
 
@@ -33,6 +34,12 @@ impl IntoResponse for ApiError {
         let (status, title, detail) = match self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found".to_string(), msg),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad Request".to_string(), msg),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, "Conflict".to_string(), msg),
+            Self::PayloadTooLarge(msg) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload Too Large".to_string(),
+                msg,
+            ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "Unauthorized".to_string(),
@@ -45,7 +52,6 @@ impl IntoResponse for ApiError {
                 msg,
             ),
             Self::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Bad Gateway".to_string(), msg),
-            Self::Conflict(msg) => (StatusCode::CONFLICT, "Conflict".to_string(), msg),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too Many Requests".to_string(),
@@ -89,11 +95,12 @@ impl std::fmt::Display for ApiError {
         match self {
             Self::NotFound(msg) => write!(f, "Not Found: {msg}"),
             Self::BadRequest(msg) => write!(f, "Bad Request: {msg}"),
+            Self::Conflict(msg) => write!(f, "Conflict: {msg}"),
+            Self::PayloadTooLarge(msg) => write!(f, "Payload Too Large: {msg}"),
             Self::Unauthorized => write!(f, "Unauthorized"),
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
             Self::Internal(msg) => write!(f, "Internal: {msg}"),
             Self::BadGateway(msg) => write!(f, "Bad Gateway: {msg}"),
-            Self::Conflict(msg) => write!(f, "Conflict: {msg}"),
             Self::RateLimited => write!(f, "Rate Limited"),
         }
     }
