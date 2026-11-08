@@ -238,6 +238,21 @@ fn range_type_satisfied(c: &ProfileCondition, current: Option<&str>) -> bool {
     )
 }
 
+/// Parses an integer as Jellyfin's `int.TryParse` does, for the transcoding conditions.
+pub(super) fn try_int(text: &str) -> Option<i32> {
+    parse_int(text)
+}
+
+/// Parses a double as Jellyfin's `double.TryParse` does, for the transcoding conditions.
+pub(super) fn try_double(text: &str) -> Option<f64> {
+    parse_double(text)
+}
+
+/// Parses a boolean as Jellyfin's `bool.TryParse` does, for the transcoding conditions.
+pub(super) fn try_bool(text: &str) -> Option<bool> {
+    parse_bool(text)
+}
+
 /// Parses an integer as .NET's `NumberStyles.Integer` does: surrounding white space and a sign.
 fn parse_int(text: &str) -> Option<i32> {
     text.trim().parse().ok()

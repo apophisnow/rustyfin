@@ -3,8 +3,14 @@
 
 pub mod conditions;
 mod facts;
+mod url;
+mod video;
 
 use std::ops::{BitOr, BitOrAssign};
+
+use rustyfin_model::device_profile::{
+    DeviceProfile, EncodingContext, ProfileType, StreamProtocol, SubtitleDeliveryMethod,
+};
 
 pub use facts::{SourceFacts, StreamFacts};
 
@@ -249,5 +255,217 @@ impl BitOrAssign for TranscodeReasons {
 impl BitOrAssign<TranscodeReason> for TranscodeReasons {
     fn bitor_assign(&mut self, rhs: TranscodeReason) {
         self.0 |= rhs.bit();
+    }
+}
+
+/// What a client asks for when it plays one item: Jellyfin's `MediaOptions`, for the fields that
+/// the video decision reads. `Default` allows every method.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamRequest {
+    /// The item to play.
+    pub item_id: String,
+    /// Whether the item is video or audio.
+    pub media_kind: MediaKind,
+    /// The bitrate limit in bits per second. `None` uses the device profile's limit.
+    pub max_bitrate: Option<i32>,
+    /// The position to start at, in ticks.
+    pub start_time_ticks: i64,
+    /// The media source the client chose. Empty when it chose none.
+    pub media_source_id: String,
+    /// The audio stream the client chose. It counts only for the source named above.
+    pub audio_stream_index: Option<i32>,
+    /// The subtitle stream the client chose. It counts only for the source named above.
+    pub subtitle_stream_index: Option<i32>,
+    /// The most audio channels the client accepts.
+    pub max_audio_channels: Option<i32>,
+    /// Whether the client may play the file as it is.
+    pub enable_direct_play: bool,
+    /// Whether the client may stream the file with a video copy.
+    pub enable_direct_stream: bool,
+    /// Whether the client may transcode.
+    pub enable_transcoding: bool,
+    /// Whether the video may be copied into the transcode.
+    pub allow_video_stream_copy: bool,
+    /// Whether the audio may be copied into the transcode.
+    pub allow_audio_stream_copy: bool,
+    /// Whether subtitles are burned in when the stream is transcoded.
+    pub always_burn_in_subtitle: bool,
+    /// The requesting device.
+    pub device_id: String,
+    /// The play session.
+    pub play_session_id: String,
+    /// The access token, written into the transcode URL.
+    pub access_token: String,
+}
+
+impl Default for StreamRequest {
+    fn default() -> Self {
+        Self {
+            item_id: String::new(),
+            media_kind: MediaKind::Video,
+            max_bitrate: None,
+            start_time_ticks: 0,
+            media_source_id: String::new(),
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            max_audio_channels: None,
+            enable_direct_play: true,
+            enable_direct_stream: true,
+            enable_transcoding: true,
+            allow_video_stream_copy: true,
+            allow_audio_stream_copy: true,
+            always_burn_in_subtitle: false,
+            device_id: String::new(),
+            play_session_id: String::new(),
+            access_token: String::new(),
+        }
+    }
+}
+
+/// How one subtitle stream reaches the client. Subtitle delivery is not ported yet (T3b), so
+/// [`DeviceData::subtitles`] is empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubtitleDelivery {
+    /// The index of the subtitle stream.
+    pub index: i32,
+    /// How the subtitle is delivered.
+    pub method: SubtitleDeliveryMethod,
+    /// The URL of the subtitle, when it is fetched separately.
+    pub url: Option<String>,
+}
+
+/// What a device can do with one media source: Jellyfin's `SetDeviceSpecificData` result. The
+/// transcode URL is set only when a transcoding profile was applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceData {
+    /// Whether the device can play the file as it is.
+    pub supports_direct_play: bool,
+    /// Whether the device can stream the file with a video copy.
+    pub supports_direct_stream: bool,
+    /// Whether the device can transcode the file.
+    pub supports_transcoding: bool,
+    /// How the file plays, or `None` when it doesn't play.
+    pub play_method: Option<PlayMethod>,
+    /// The source container, normalized to one container.
+    pub container: String,
+    /// The transcode URL, relative to the server.
+    pub transcoding_url: Option<String>,
+    /// The protocol of the transcode.
+    pub transcoding_sub_protocol: StreamProtocol,
+    /// The container of the transcode.
+    pub transcoding_container: Option<String>,
+    /// Why the file can't play as it is.
+    pub transcode_reasons: TranscodeReasons,
+    /// The audio stream that plays.
+    pub default_audio_stream_index: Option<i32>,
+    /// The subtitle stream that plays.
+    pub default_subtitle_stream_index: Option<i32>,
+    /// How each subtitle reaches the client.
+    pub subtitles: Vec<SubtitleDelivery>,
+}
+
+/// The suffix that the transcode URL gets for the request's stream-copy and burn-in flags (MIH
+/// `SetDeviceSpecificData`). Each suffix is written only when its flag differs from the default.
+fn transcode_suffix(request: &StreamRequest) -> String {
+    let mut suffix = String::new();
+    if !request.allow_video_stream_copy {
+        suffix.push_str("&allowVideoStreamCopy=false");
+    }
+    if !request.allow_audio_stream_copy {
+        suffix.push_str("&allowAudioStreamCopy=false");
+    }
+    if request.always_burn_in_subtitle {
+        suffix.push_str("&alwaysBurnInSubtitleWhenTranscoding=true");
+    }
+    suffix
+}
+
+/// Jellyfin's `SetDeviceSpecificData` for one source (MIH steps 1 to 4): what the device can do
+/// with `source`, and the transcode URL when the file needs one. Only the video plan is ported.
+/// An audio request gets the flags of step 2 and no plan. Subtitles are not delivered yet (T3b).
+pub fn device_data(
+    source: &SourceFacts,
+    profile: &DeviceProfile,
+    request: &StreamRequest,
+) -> DeviceData {
+    // Step 1: the request's stream indexes count only for the source that it names.
+    let selected = request.media_source_id.eq_ignore_ascii_case(&source.id);
+    let options = video::VideoOptions {
+        profile,
+        request,
+        audio_stream_index: request.audio_stream_index.filter(|_| selected),
+        subtitle_stream_index: request.subtitle_stream_index.filter(|_| selected),
+        max_bitrate: request.max_bitrate.or(profile.max_streaming_bitrate),
+    };
+
+    // Step 2: the request's flags. A direct stream needs a video copy too.
+    let mut copy = source.clone();
+    copy.supports_direct_play &= request.enable_direct_play;
+    copy.supports_direct_stream &= request.enable_direct_stream && request.allow_video_stream_copy;
+    copy.supports_transcoding &= request.enable_transcoding;
+
+    // Step 3: the plan. Audio has no plan yet (T3c), so it keeps the flags of step 2.
+    let plan = match request.media_kind {
+        MediaKind::Video => video::plan_video(&copy, &options),
+        MediaKind::Audio => {
+            return DeviceData {
+                supports_direct_play: copy.supports_direct_play,
+                supports_direct_stream: copy.supports_direct_stream,
+                supports_transcoding: copy.supports_transcoding,
+                play_method: None,
+                container: source.container.clone(),
+                transcoding_url: None,
+                transcoding_sub_protocol: StreamProtocol::Http,
+                transcoding_container: None,
+                transcode_reasons: TranscodeReasons::default(),
+                default_audio_stream_index: None,
+                default_subtitle_stream_index: None,
+                subtitles: Vec::new(),
+            };
+        }
+    };
+
+    // Step 4: the flags follow the plan. A direct stream is the direct play here, since the
+    // DirectStream branch is off (MIH 280-283). A transcode URL needs an applied profile.
+    let direct = plan.direct_play;
+    let profile_has_hls = profile.transcoding_profiles.iter().any(|tp| {
+        tp.r#type == ProfileType::Video
+            && tp.context == EncodingContext::Streaming
+            && tp.protocol == StreamProtocol::Hls
+    });
+    let mut supports_transcoding = plan.transcode.is_some() || profile_has_hls;
+    let mut play_method = direct.then_some(PlayMethod::DirectPlay);
+    let mut transcoding_url = None;
+    if !direct && supports_transcoding {
+        match &plan.transcode {
+            Some(stream) => {
+                play_method = Some(PlayMethod::Transcode);
+                transcoding_url = Some(format!("{}{}", stream.to_url(), transcode_suffix(request)));
+            }
+            None => supports_transcoding = false,
+        }
+    }
+
+    let (transcoding_container, transcoding_sub_protocol) = plan
+        .transcode
+        .as_ref()
+        .map_or((None, StreamProtocol::Http), |stream| {
+            (stream.container.clone(), stream.sub_protocol)
+        });
+
+    // Step 5: the defaults and reasons of the plan.
+    DeviceData {
+        supports_direct_play: direct,
+        supports_direct_stream: direct,
+        supports_transcoding,
+        play_method,
+        container: plan.container,
+        transcoding_url,
+        transcoding_sub_protocol,
+        transcoding_container,
+        transcode_reasons: plan.transcode_reasons,
+        default_audio_stream_index: plan.audio_stream_index,
+        default_subtitle_stream_index: plan.subtitle_stream_index,
+        subtitles: Vec::new(),
     }
 }
