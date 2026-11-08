@@ -7415,7 +7415,8 @@ async fn b23_order(app: &axum::Router, token: &str, uri: &str, ids: &[uuid::Uuid
         .collect()
 }
 
-/// Six movies with gaps and ties in every field the library toolbar sorts by.
+/// Six movies with gaps and ties in every field the library toolbar sorts by, and names whose order
+/// differs from their sort names'.
 fn b23_movies() -> Vec<B23Item> {
     let movie = |name, sort_name, year, premiere, rating, added, runtime| B23Item {
         name,
@@ -7439,7 +7440,7 @@ fn b23_movies() -> Vec<B23Item> {
             Some(6000),
         ),
         movie(
-            "Delta",
+            "The Delta",
             "delta",
             None,
             Some("2012-05-04T00:00:00+00:00"),
@@ -7475,7 +7476,7 @@ fn b23_movies() -> Vec<B23Item> {
             Some(3000),
         ),
         movie(
-            "The Foxtrot",
+            "Foxtrot",
             "foxtrot",
             Some(2012),
             None,
@@ -7497,40 +7498,43 @@ async fn b23_each_key_sorts_both_ways_with_missing_values_and_ties_as_in_jellyfi
     let cases: [(&str, [&str; 6], [&str; 6]); 7] = [
         (
             "SortName",
-            ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "The Foxtrot"],
-            ["The Foxtrot", "Echo", "Delta", "Charlie", "Bravo", "Alpha"],
+            ["Alpha", "Bravo", "Charlie", "The Delta", "Echo", "Foxtrot"],
+            ["Foxtrot", "Echo", "The Delta", "Charlie", "Bravo", "Alpha"],
         ),
+        // By the name itself, so The Delta comes last.
         (
             "Name",
-            ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "The Foxtrot"],
-            ["The Foxtrot", "Echo", "Delta", "Charlie", "Bravo", "Alpha"],
+            ["Alpha", "Bravo", "Charlie", "Echo", "Foxtrot", "The Delta"],
+            ["The Delta", "Foxtrot", "Echo", "Charlie", "Bravo", "Alpha"],
         ),
         (
             "DateCreated",
-            ["Bravo", "Charlie", "Echo", "The Foxtrot", "Delta", "Alpha"],
-            ["Alpha", "Delta", "The Foxtrot", "Charlie", "Echo", "Bravo"],
+            ["Bravo", "Charlie", "Echo", "Foxtrot", "The Delta", "Alpha"],
+            ["Alpha", "The Delta", "Foxtrot", "Charlie", "Echo", "Bravo"],
         ),
         (
             "PremiereDate",
-            ["Bravo", "Alpha", "Echo", "Charlie", "The Foxtrot", "Delta"],
-            ["Delta", "Charlie", "The Foxtrot", "Echo", "Alpha", "Bravo"],
+            ["Bravo", "Alpha", "Echo", "Charlie", "Foxtrot", "The Delta"],
+            ["The Delta", "Charlie", "Foxtrot", "Echo", "Alpha", "Bravo"],
         ),
         (
             "ProductionYear",
-            ["Bravo", "Delta", "Alpha", "Echo", "Charlie", "The Foxtrot"],
-            ["Charlie", "The Foxtrot", "Echo", "Alpha", "Bravo", "Delta"],
+            ["Bravo", "The Delta", "Alpha", "Echo", "Charlie", "Foxtrot"],
+            ["Charlie", "Foxtrot", "Echo", "Alpha", "Bravo", "The Delta"],
         ),
         (
             "CommunityRating",
-            ["Alpha", "Delta", "Bravo", "Echo", "Charlie", "The Foxtrot"],
-            ["Charlie", "The Foxtrot", "Bravo", "Echo", "Alpha", "Delta"],
+            ["Alpha", "The Delta", "Bravo", "Echo", "Charlie", "Foxtrot"],
+            ["Charlie", "Foxtrot", "Bravo", "Echo", "Alpha", "The Delta"],
         ),
         (
             "Runtime",
-            ["Delta", "The Foxtrot", "Alpha", "Bravo", "Echo", "Charlie"],
-            ["Charlie", "Bravo", "Echo", "Alpha", "Delta", "The Foxtrot"],
+            ["The Delta", "Foxtrot", "Alpha", "Bravo", "Echo", "Charlie"],
+            ["Charlie", "Bravo", "Echo", "Alpha", "The Delta", "Foxtrot"],
         ),
     ];
+    // The data must tell Name from SortName.
+    assert_ne!(cases[0].1, cases[1].1);
     for (key, ascending, descending) in cases {
         for (order, expected) in [("Ascending", ascending), ("Descending", descending)] {
             let uri = format!(
@@ -7547,7 +7551,7 @@ async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
     let movies = rustyfin_model::library::LibraryContentType::Movies;
     let (token, user_id, _) = b23_library(&state, movies, &b23_movies()).await;
     let app = app(state);
-    let rating_down_year_up = ["Charlie", "The Foxtrot", "Bravo", "Echo", "Delta", "Alpha"];
+    let rating_down_year_up = ["Charlie", "Foxtrot", "Bravo", "Echo", "The Delta", "Alpha"];
     let cases = [
         // Each key takes the order at its position.
         (
@@ -7562,37 +7566,37 @@ async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
         // Keys past the orders take the first one...
         (
             "SortBy=CommunityRating,ProductionYear&SortOrder=Descending",
-            ["Charlie", "The Foxtrot", "Echo", "Bravo", "Alpha", "Delta"],
+            ["Charlie", "Foxtrot", "Echo", "Bravo", "Alpha", "The Delta"],
         ),
         // ...or Ascending when there is none.
         (
             "SortBy=CommunityRating,ProductionYear",
-            ["Delta", "Alpha", "Bravo", "Echo", "Charlie", "The Foxtrot"],
+            ["The Delta", "Alpha", "Bravo", "Echo", "Charlie", "Foxtrot"],
         ),
         // Orders past the keys are ignored.
         (
             "SortBy=ProductionYear&SortOrder=Descending,Ascending",
-            ["Charlie", "The Foxtrot", "Echo", "Alpha", "Bravo", "Delta"],
+            ["Charlie", "Foxtrot", "Echo", "Alpha", "Bravo", "The Delta"],
         ),
         // An order that isn't one is dropped, so the next one is the first.
         (
             "SortBy=ProductionYear,SortName&SortOrder=Sideways,Descending",
-            ["The Foxtrot", "Charlie", "Echo", "Alpha", "Delta", "Bravo"],
+            ["Foxtrot", "Charlie", "Echo", "Alpha", "The Delta", "Bravo"],
         ),
         // Default, and Random after the first key, order nothing but keep their order's place, as
         // Jellyfin pairs keys with orders before it drops them.
         (
             "SortBy=Default,ProductionYear&SortOrder=Ascending,Descending",
-            ["Charlie", "The Foxtrot", "Echo", "Alpha", "Bravo", "Delta"],
+            ["Charlie", "Foxtrot", "Echo", "Alpha", "Bravo", "The Delta"],
         ),
         (
             "SortBy=ProductionYear,Random,CommunityRating&SortOrder=Ascending,Ascending,Descending",
-            ["Bravo", "Delta", "Alpha", "Echo", "Charlie", "The Foxtrot"],
+            ["Bravo", "The Delta", "Alpha", "Echo", "Charlie", "Foxtrot"],
         ),
         // jellyfin-web's "Date added", newest first.
         (
             "SortBy=DateCreated,SortName,ProductionYear&SortOrder=Descending",
-            ["Alpha", "Delta", "The Foxtrot", "Echo", "Charlie", "Bravo"],
+            ["Alpha", "The Delta", "Foxtrot", "Echo", "Charlie", "Bravo"],
         ),
     ];
     for (query, expected) in cases {
