@@ -47,15 +47,18 @@ const LIBRARY_PATH_GONE: &str = "library path gone";
 const NOT_LOCAL: &str = "network or unknown filesystem";
 
 /// The reason of a path polled because the kernel's watch limit is reached. The next reload tries
-/// the kernel again, so the path is polled again while the limit holds.
+/// the kernel again once a limit has changed (a test limit, an inotify limit or the open file
+/// limit); while none has changed, the monitor is kept with its baseline.
 const WATCH_LIMIT_REACHED: &str = "watch limit reached";
 
-/// The reason of a path polled because the kernel's inotify instance limit is reached. The next
-/// reload tries the kernel again, as with `WATCH_LIMIT_REACHED`.
+/// The reason of a path polled because the kernel's inotify instance limit is reached. Like
+/// `WATCH_LIMIT_REACHED`, the next reload tries the kernel again once a limit has changed, and
+/// keeps the monitor with its baseline while none has.
 const INSTANCE_LIMIT_REACHED: &str = "inotify instance limit reached";
 
-/// The reason of a path polled because the process's open file limit is reached. The next reload
-/// tries the kernel again, as with `WATCH_LIMIT_REACHED`.
+/// The reason of a path polled because the process's open file limit is reached. Like
+/// `WATCH_LIMIT_REACHED`, the next reload tries the kernel again once a limit has changed, and
+/// keeps the monitor with its baseline while none has.
 const FILE_LIMIT_REACHED: &str = "open file limit reached";
 
 /// How a library path is monitored.
@@ -146,6 +149,8 @@ struct Monitor {
     /// cannot be canonicalized; the key's path stands in then.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     canonical: Option<PathBuf>,
+    /// The limits when its kernel setup gave up at a limit; None otherwise.
+    limits: Option<Limits>,
     /// Set when a mount change concerns the path. Reconcile then replaces this monitor.
     restart: bool,
     /// All paths of the library: a report is coalesced by them.
@@ -153,6 +158,54 @@ struct Monitor {
     /// Notified by `fake_overflow`, which stands in for an overflow of the kernel's queue.
     overflow: Arc<Notify>,
     task: JoinHandle<()>,
+}
+
+/// The limits a kernel setup can run into. A monitor that fell back at a limit is replaced once
+/// one of them has changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Limits {
+    /// The test limit of kernel watches; see `set_watch_limit`.
+    test_watches: Option<usize>,
+    /// The kernel's `fs.inotify.max_user_watches`.
+    max_user_watches: Option<u64>,
+    /// The kernel's `fs.inotify.max_user_instances`.
+    max_user_instances: Option<u64>,
+    /// The soft limit on open files of the process.
+    open_files: Option<u64>,
+}
+
+impl Limits {
+    /// The limits as they are now. A value that cannot be read or parsed is None.
+    fn read(inner: &Inner) -> Self {
+        let test_watches = *inner
+            .watch_limit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Self {
+            test_watches,
+            max_user_watches: std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+                .ok()
+                .and_then(|text| text.trim().parse().ok()),
+            max_user_instances: std::fs::read_to_string("/proc/sys/fs/inotify/max_user_instances")
+                .ok()
+                .and_then(|text| text.trim().parse().ok()),
+            open_files: std::fs::read_to_string("/proc/self/limits")
+                .ok()
+                .and_then(|text| open_file_limit(&text)),
+        }
+    }
+}
+
+/// The soft limit on open files in the text of `/proc/self/limits`, where `unlimited` is
+/// `u64::MAX`. None when there is no `Max open files` line or its value does not parse.
+fn open_file_limit(limits: &str) -> Option<u64> {
+    let rest = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))?;
+    match rest.split_whitespace().next()? {
+        "unlimited" => Some(u64::MAX),
+        soft => soft.parse().ok(),
+    }
 }
 
 /// How a monitor starts: its method, the filesystem type (`unknown` when the path cannot be
@@ -341,10 +394,9 @@ fn stop_monitor(monitors: &mut BTreeMap<MonitorKey, Monitor>, key: &MonitorKey) 
 /// Brings the monitors in line with the libraries: stops the ones not wanted any more, starts
 /// the missing ones and updates the library names and paths of the others. A monitor whose task
 /// ended early, or whose path was missing at start or gone from its kernel watch, and has appeared
-/// since, is replaced by a new one for its key. A monitor polling because the kernel's watch or
-/// instance limit, or the process's open file limit, is reached is replaced too, ready or not: the
-/// new one tries the kernel again and falls back again while the limit holds. A database error
-/// keeps the monitors as they are.
+/// since, is replaced by a new one for its key. A monitor polling because a kernel limit is
+/// reached is replaced too, ready or not, once a limit has changed since it fell back. While none
+/// has changed, it is kept with its baseline. A database error keeps the monitors as they are.
 async fn reconcile(inner: &Arc<Inner>, generation: u64) {
     let libraries = match monitored_libraries(&inner.pool).await {
         Ok(libraries) => libraries,
@@ -355,6 +407,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             return;
         }
     };
+    let limits = Limits::read(inner);
     let mut guard = inner.lock();
     let state = &mut *guard;
     if state.generation != generation {
@@ -384,10 +437,10 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
             if let Some(monitor) = state.monitors.get_mut(&key) {
                 let replaced = monitor.task.is_finished()
                     || monitor.restart
-                    || matches!(
-                        monitor.info.reason.as_deref(),
-                        Some(WATCH_LIMIT_REACHED | INSTANCE_LIMIT_REACHED | FILE_LIMIT_REACHED)
-                    )
+                    || monitor
+                        .limits
+                        .as_ref()
+                        .is_some_and(|at_fallback| *at_fallback != limits)
                     || (matches!(
                         monitor.info.reason.as_deref(),
                         Some(PATH_NOT_FOUND | LIBRARY_PATH_GONE)
@@ -429,6 +482,7 @@ async fn reconcile(inner: &Arc<Inner>, generation: u64) {
                     id,
                     info,
                     canonical: None,
+                    limits: None,
                     restart: false,
                     library_paths: library.paths.clone(),
                     overflow,
@@ -507,13 +561,21 @@ async fn run_monitor(
             else {
                 return;
             };
-            // The kernel gave up on the path: it is polled from now on, for this reason.
+            // The kernel gave up on the path: it is polled from now on, for this reason. The
+            // limits are read before the state lock is taken, and kept for a limit reason only.
+            let limits = match reason.as_str() {
+                WATCH_LIMIT_REACHED | INSTANCE_LIMIT_REACHED | FILE_LIMIT_REACHED => {
+                    Some(Limits::read(&inner))
+                }
+                _ => None,
+            };
             let listed = inner.with_monitor(&key, id, |monitor| {
                 monitor.info.method = Method::Poll;
                 monitor.info.reason = Some(reason.clone());
                 monitor.info.folders = 0;
                 monitor.info.watches = 0;
                 monitor.info.ready = false;
+                monitor.limits = limits;
             });
             if listed.is_none() {
                 return;
