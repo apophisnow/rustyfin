@@ -1586,7 +1586,7 @@ fn shutdown_does_not_wait_for_a_poll_that_hangs() {
 #[cfg(target_os = "linux")]
 mod kernel {
     use std::future::Future;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::pin::Pin;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2454,6 +2454,10 @@ mod kernel {
     /// Set for the run of the `mount_ns_` tests under `unshare -rm`.
     const MOUNT_NS: &str = "RUSTYFIN_TEST_MOUNT_NS";
 
+    /// Set to 1 to make `mount_changes_in_a_namespace` fail where `unshare -rm` is refused,
+    /// instead of skipping.
+    const REQUIRE_MOUNT_NS: &str = "RUSTYFIN_REQUIRE_MOUNT_NS";
+
     #[test]
     fn mount_changes_in_a_namespace() {
         let allowed = Command::new("unshare")
@@ -2481,6 +2485,52 @@ mod kernel {
                 && text.contains("test result: ok.")
                 && !text.contains(" 0 passed"),
             "the mount tests failed under `unshare -rm`:\n{text}"
+        );
+    }
+
+    /// Fix round 2, item B: where `unshare -rm` is refused, `mount_changes_in_a_namespace` says so
+    /// on stderr, which libtest doesn't hide when the test passes, and `RUSTYFIN_REQUIRE_MOUNT_NS=1`
+    /// makes it fail instead. An `unshare` that exits 1, first on `PATH`, stands in for the refusal.
+    #[test]
+    fn a_refused_unshare_is_shown_and_can_be_made_to_fail() {
+        let tree = Tree::new();
+        let bin = tree.outside("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let unshare = bin.join("unshare");
+        std::fs::write(&unshare, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&unshare, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let run = |require: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["kernel::mount_changes_in_a_namespace", "--exact"])
+                .env("PATH", &path)
+                .env_remove(MOUNT_NS)
+                .env_remove(REQUIRE_MOUNT_NS);
+            if require {
+                command.env(REQUIRE_MOUNT_NS, "1");
+            }
+            command.output().unwrap()
+        };
+
+        let skipped = run(false);
+        let stderr = String::from_utf8_lossy(&skipped.stderr);
+        assert!(
+            skipped.status.success(),
+            "a refused unshare skips:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("SKIPPED: unshare refused"),
+            "the skip is not shown on stderr:\n{stderr}"
+        );
+        let required = run(true);
+        assert!(
+            !required.status.success(),
+            "{REQUIRE_MOUNT_NS}=1 doesn't make a refused unshare fail:\n{}",
+            String::from_utf8_lossy(&required.stdout)
         );
     }
 
