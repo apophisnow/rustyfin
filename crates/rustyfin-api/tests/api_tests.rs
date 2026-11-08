@@ -6559,10 +6559,11 @@ async fn b21_over_long_names_sign_in_only_exactly() {
         assert_eq!(body, unknown.1, "{why}");
     }
 
-    // ForgotPassword finds over-long names only exactly too (AC61).
+    // ForgotPassword finds over-long names only exactly too (AC61). The folded spelling is fullwidth:
+    // in upper case it still differs from the exact name, so the two never share a PIN file.
     assert!(b21_reset_pin(&t.app, &legacy).await.is_some(), "exact");
     assert_eq!(
-        b21_reset_pin(&t.app, &"E\u{301}".repeat(128)).await,
+        b21_reset_pin(&t.app, &"\u{FF45}\u{301}".repeat(128)).await,
         None,
         "no PIN for a folded match"
     );
