@@ -3517,6 +3517,89 @@ async fn j5_user_id_is_checked_and_does_not_change_the_lists() {
     assert_eq!(theirs, server.get("/Genres").await.1);
 }
 
+/// The `Name` and `Id` of each entry in an item's `GenreItems` or `Studios`, checking that each
+/// id is a UUID.
+fn j5_name_ids(entries: &serde_json::Value) -> Vec<(String, String)> {
+    entries
+        .as_array()
+        .unwrap_or_else(|| panic!("not an array: {entries}"))
+        .iter()
+        .map(|entry| {
+            let id = entry["Id"].as_str().unwrap_or_default().to_string();
+            assert!(uuid::Uuid::parse_str(&id).is_ok(), "not a UUID: {entry}");
+            (entry["Name"].as_str().unwrap_or_default().to_string(), id)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn j5_item_genre_and_studio_ids_are_the_ids_of_the_lists() {
+    let server = J5Server::new().await;
+    let (_, genres) = server.get("/Genres").await;
+    let (_, music_genres) = server.get("/MusicGenres").await;
+    let (_, studios) = server.get("/Studios").await;
+    // Each item keeps its own spelling and takes the id of the entry that lists it.
+    let pairs = |list: &serde_json::Value, names: &[(&str, &str)]| -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|(own, listed)| (own.to_string(), j5_id(list, listed)))
+            .collect()
+    };
+    let alpha_genres = pairs(&genres, &[("Action", "Action"), ("Sci-Fi", "Sci-Fi")]);
+    let alpha_studios = pairs(&studios, &[("Pixar", "Pixar")]);
+    assert_eq!(alpha_genres[0].1, J5_ACTION);
+    assert_eq!(alpha_studios[0].1, J5_PIXAR);
+    let rock = pairs(&music_genres, &[("rock", "Rock")]);
+    assert_eq!(rock[0].1, J5_MUSIC_ROCK);
+
+    let (status, films) = server
+        .get("/Items?IncludeItemTypes=Movie&Recursive=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{films}");
+    let (status, music) = server
+        .get("/Items?IncludeItemTypes=MusicAlbum,Audio&Recursive=true")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{music}");
+    let listed = [
+        (j5_named(&films, "Alpha"), alpha_genres.clone()),
+        (
+            j5_named(&films, "Bravo"),
+            pairs(&genres, &[("action", "Action"), ("Animation", "Animation")]),
+        ),
+        (
+            j5_named(&music, "Blue"),
+            pairs(&music_genres, &[("Rock", "Rock"), ("Jazz", "Jazz")]),
+        ),
+        (j5_named(&music, "One"), rock.clone()),
+    ];
+    for (item, expected) in listed {
+        assert_eq!(j5_name_ids(&item["GenreItems"]), expected, "{item}");
+    }
+
+    // A single item carries its studios too.
+    let alpha = j5_named(&films, "Alpha")["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let one = j5_named(&music, "One")["Id"].as_str().unwrap().to_string();
+    let single = [
+        (alpha, alpha_genres, alpha_studios),
+        (
+            server.echo.to_string(),
+            pairs(&genres, &[("Drama", "Drama"), ("Comedy", "Comedy")]),
+            pairs(&studios, &[("HBO", "HBO")]),
+        ),
+        (one, rock, Vec::new()),
+    ];
+    for (id, genre_items, studio_items) in single {
+        let uri = format!("/Items/{id}?userId={}", server.admin);
+        let (status, item) = server.get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {item}");
+        assert_eq!(j5_name_ids(&item["GenreItems"]), genre_items, "{item}");
+        assert_eq!(j5_name_ids(&item["Studios"]), studio_items, "{item}");
+    }
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]

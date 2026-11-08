@@ -90,6 +90,17 @@ pub fn by_name_id(kind: ByNameKind, name: &str) -> Uuid {
     uuid::Builder::from_sha1_bytes(bytes).into_uuid()
 }
 
+/// The kind of the genres of an item of type `media`: music genres for audio and albums, genres for
+/// every other item. Jellyfin picks the id of a genre on an item the same way, by whether the item
+/// has music genres (`Emby.Server.Implementations/Dto/DtoService.cs:1027-1035`).
+pub fn genre_kind_of(media: MediaType) -> ByNameKind {
+    if matches!(media, MediaType::Audio | MediaType::MusicAlbum) {
+        ByNameKind::MusicGenre
+    } else {
+        ByNameKind::Genre
+    }
+}
+
 /// Splits a `genres` value into names. The value is `|`-separated, or a JSON array of strings from
 /// before migration 014. Names are trimmed, empty names are dropped, and a name that folds like an
 /// earlier one is dropped too.
@@ -398,10 +409,8 @@ fn stored_media_type(stored: &str) -> MediaType {
 /// Whether an item of type `media` feeds `kind`. Genres skip music, music genres take only audio and
 /// albums, and studios and years take every item.
 fn in_kind(kind: ByNameKind, media: MediaType) -> bool {
-    let music = matches!(media, MediaType::Audio | MediaType::MusicAlbum);
     match kind {
-        ByNameKind::Genre => !music,
-        ByNameKind::MusicGenre => music,
+        ByNameKind::Genre | ByNameKind::MusicGenre => genre_kind_of(media) == kind,
         ByNameKind::Studio | ByNameKind::Year => true,
     }
 }
