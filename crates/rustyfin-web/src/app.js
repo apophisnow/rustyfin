@@ -972,7 +972,7 @@ async function renderLibrary(libId) {
                             <option value="DateCreated,SortName,ProductionYear:Descending">${t('library.sort_date_added')}</option>
                             <option value="CommunityRating,SortName,ProductionYear:Descending">${t('library.sort_rating')}</option>
                         </select>
-                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
+                        <button id="lib-sort-reverse" type="button" class="jf-btn-ghost self-stretch !py-1.5 !px-2 text-xs" aria-pressed="false" title="${escapeHtml(t('library.sort_reverse'))}" aria-label="${escapeHtml(t('library.sort_reverse'))}">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5 7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5"/></svg>
                         </button>
                     </div>
