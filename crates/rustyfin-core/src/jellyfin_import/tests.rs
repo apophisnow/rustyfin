@@ -2997,6 +2997,18 @@ fn b20_check_tree_depth_walks_and_refuses() {
 /// Builds a one-commit `-wal` (big-endian magic) over `page_size` carrying `frames` as
 /// (page number, page bytes); the last frame commits and sets the database size to `db_pages`.
 fn build_wal(page_size: usize, db_pages: u32, frames: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let last = frames.len().saturating_sub(1);
+    let frames: Vec<(u32, u32, Vec<u8>)> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, (pgno, page))| (*pgno, if i == last { db_pages } else { 0 }, page.clone()))
+        .collect();
+    build_wal_commits(page_size, &frames)
+}
+
+/// Builds a `-wal` (big-endian magic) over `page_size` carrying `frames` as (page number, the
+/// database size a commit frame sets or 0 for none, page bytes).
+fn build_wal_commits(page_size: usize, frames: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
     use super::source::checksum;
     let mut wal = vec![0u8; 32];
     wal[0..4].copy_from_slice(&0x377f_0683u32.to_be_bytes());
@@ -3007,8 +3019,7 @@ fn build_wal(page_size: usize, db_pages: u32, frames: &[(u32, Vec<u8>)]) -> Vec<
     wal[24..28].copy_from_slice(&h0.to_be_bytes());
     wal[28..32].copy_from_slice(&h1.to_be_bytes());
     let mut running = (h0, h1);
-    for (i, (pgno, page)) in frames.iter().enumerate() {
-        let commit = if i + 1 == frames.len() { db_pages } else { 0 };
+    for (pgno, commit, page) in frames {
         let mut frame = vec![0u8; 24];
         frame[0..4].copy_from_slice(&pgno.to_be_bytes());
         frame[4..8].copy_from_slice(&commit.to_be_bytes());
@@ -3026,27 +3037,26 @@ fn build_wal(page_size: usize, db_pages: u32, frames: &[(u32, Vec<u8>)]) -> Vec<
 
 #[test]
 fn b20_wal_commit_frames_maps_the_latest_frame() {
-    use super::source::{CopyPages, Pages, wal_commit_frames};
+    use super::source::{CopyPages, Pages, read_slice, wal_commit_frames};
     let ps = 512;
     let file = Path::new("jellyfin.db");
 
-    // Two commit frames for page 2: the first carries X, the last carries Y and commits two pages.
+    // Two frames for page 2: the first carries X, the last carries Y and commits two pages.
     let x = vec![0xAAu8; ps];
     let y = vec![0xBBu8; ps];
     let wal = build_wal(ps, 2, &[(2, x.clone()), (2, y.clone())]);
-    let commit = wal_commit_frames(file, &wal)
+    let commit = wal_commit_frames(file, read_slice(&wal))
         .unwrap()
         .expect("a valid commit");
     assert_eq!(commit.page_size, ps);
     assert_eq!(commit.pages, 2);
+    assert_eq!(commit.committed, 2, "the commit covers both frames");
     assert_eq!(
         commit.frames.len(),
-        2,
-        "both frames for page 2 are kept, in order"
+        1,
+        "page 2 maps to one frame, the later"
     );
-    assert_eq!(commit.frames[0].0, 2);
-    assert_eq!(commit.frames[1].0, 2);
-    let (_, last_off) = commit.frames[1];
+    let last_off = commit.frames[&2] as usize;
     assert_eq!(
         &wal[last_off..last_off + ps],
         y.as_slice(),
@@ -3071,4 +3081,65 @@ fn b20_wal_commit_frames_maps_the_latest_frame() {
         buf, y,
         "page 2 reads the WAL frame (Y), overriding the db page (X)"
     );
+}
+
+// Fix round 5, R1: the copy path streams the copied -wal a frame at a time (at 3a2d9da `read_whole`
+// read all of it into one buffer) and maps each page to its latest committed frame. Two commits,
+// page 2 rewritten across them, and an uncommitted tail that rewrites page 3 and adds page 5.
+#[test]
+fn b20_wal_streams_only_committed_frames() {
+    use super::source::{CopyPages, Pages, read_slice, wal_commit_frames};
+    use std::collections::HashMap;
+    let ps = 512;
+    let file = Path::new("jellyfin.db");
+    let page = |byte: u8| vec![byte; ps];
+    let wal = build_wal_commits(
+        ps,
+        &[
+            (2, 0, page(0xA1)),
+            (3, 3, page(0xB1)), // commit 1: three pages
+            (2, 0, page(0xA2)), // page 2 rewritten
+            (4, 4, page(0xC1)), // commit 2: four pages
+            (3, 0, page(0xB2)), // the uncommitted tail
+            (5, 0, page(0xD1)),
+        ],
+    );
+    // Frame i (from 0) holds its page at 32 + i * (24 + ps) + 24.
+    let data = |i: u64| 32 + i * (24 + ps as u64) + 24;
+    let expected = HashMap::from([(2, data(2)), (3, data(1)), (4, data(3))]);
+
+    // The scan asks for one frame at a time.
+    let mut largest = 0;
+    let mut slice = read_slice(&wal);
+    let commit = wal_commit_frames(file, |offset, buf| {
+        largest = largest.max(buf.len());
+        slice(offset, buf)
+    })
+    .unwrap()
+    .expect("a valid commit");
+    assert!(
+        largest <= 24 + ps,
+        "the largest read is {largest} bytes, more than one frame"
+    );
+    assert_eq!((commit.pages, commit.committed), (4, 4));
+    assert_eq!(commit.frames, expected);
+
+    // The copy path streams the copied file to the same map and reads pages through it. The db
+    // file holds three pages, 2 and 3 filled with 0xEE.
+    let dir = TempDir::new();
+    let mut db = vec![0u8; 3 * ps];
+    db[16..18].copy_from_slice(&(ps as u16).to_be_bytes());
+    db[ps..].fill(0xEE);
+    let db_path = dir.0.join("source.db");
+    let wal_path = dir.0.join("source.db-wal");
+    std::fs::write(&db_path, &db).unwrap();
+    std::fs::write(&wal_path, &wal).unwrap();
+    let pages = CopyPages::open(file, &db_path, &wal_path).expect("open the copy");
+    assert_eq!(pages.frames, expected);
+    assert_eq!(pages.page_count(), 4);
+    let mut buf = vec![0u8; ps];
+    for (pgno, byte) in [(2, 0xA2), (3, 0xB1), (4, 0xC1)] {
+        assert!(pages.read_page(pgno, &mut buf), "page {pgno} reads");
+        assert_eq!(buf, page(byte), "page {pgno}");
+    }
 }

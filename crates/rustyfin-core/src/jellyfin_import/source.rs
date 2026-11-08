@@ -2121,27 +2121,40 @@ fn same_bytes(file: &Path, expected: &[u8]) -> Result<bool, ImportError> {
     }
 }
 
-/// A valid `-wal`'s committed frames, shared by `apply_wal` (in-memory) and `CopyPages` (copy path).
-/// `page_size` is the `-wal`'s page size, `pages` the database size its last commit frame names, and
-/// `frames` each committed frame as (page number, byte offset of its page data in `wal`), in order
-/// and truncated to that commit. None when the `-wal` holds no commit (a short or non-SQLite header,
-/// a failed checksum, or no commit frame). An error (a format version this import can't read) names
-/// `file` and says nothing about the data.
+/// A valid `-wal`'s last commit, shared by `apply_wal` (in-memory) and `CopyPages` (copy path).
+/// `page_size` is the `-wal`'s page size, `pages` the database size its last commit frame names,
+/// `committed` how many frames that commit covers (a page's rewrites included), and `frames` each
+/// committed page's latest frame as page number → byte offset of its page data in the `-wal`; frames
+/// after the last commit stay out. None when the `-wal` holds no commit (a short or non-SQLite
+/// header, a failed checksum, or no commit frame). An error (a format version this import can't
+/// read, or a read that fails) names the file and says nothing about the data.
 pub(super) struct WalCommit {
     pub(super) page_size: usize,
     pub(super) pages: u32,
-    pub(super) frames: Vec<(u32, usize)>,
+    pub(super) committed: u64,
+    pub(super) frames: HashMap<u32, u64>,
 }
 
-pub(super) fn wal_commit_frames(file: &Path, wal: &[u8]) -> Result<Option<WalCommit>, ImportError> {
+/// Reads a `-wal` frame by frame through `read`, which fills its buffer from a byte offset and
+/// returns how many bytes it could (fewer than asked at the end), so only one frame is held at a
+/// time however long the `-wal` is (spec Fix round 5, R1). The map is O(frames), as SQLite's own
+/// wal-index is.
+pub(super) fn wal_commit_frames(
+    file: &Path,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<usize, ImportError>,
+) -> Result<Option<WalCommit>, ImportError> {
     // The header is 32 bytes. A short one, a magic or page size that isn't SQLite's, or a checksum
     // that fails means no frames at all.
+    let mut header = [0u8; 32];
+    if read(0, &mut header)? < header.len() {
+        return Ok(None);
+    }
     let (Some(magic), Some(version), Some(page), Some(sum0), Some(sum1)) = (
-        be32(wal, 0),
-        be32(wal, 4),
-        be32(wal, 8),
-        be32(wal, 24),
-        be32(wal, 28),
+        be32(&header, 0),
+        be32(&header, 4),
+        be32(&header, 8),
+        be32(&header, 24),
+        be32(&header, 28),
     ) else {
         return Ok(None);
     };
@@ -2154,8 +2167,7 @@ pub(super) fn wal_commit_frames(file: &Path, wal: &[u8]) -> Result<Option<WalCom
     if !page.is_power_of_two() || !(512..=65_536).contains(&page) {
         return Ok(None);
     }
-    // The header is 32 bytes long, so its first 24 are there to checksum.
-    if checksum(&wal[..24], big_endian, (0, 0)) != (sum0, sum1) {
+    if checksum(&header[..24], big_endian, (0, 0)) != (sum0, sum1) {
         return Ok(None);
     }
     if version != 3_007_000 {
@@ -2165,17 +2177,21 @@ pub(super) fn wal_commit_frames(file: &Path, wal: &[u8]) -> Result<Option<WalCom
         ));
     }
 
-    // The frames from offset 32 while a whole one fits. `frames` holds the valid ones as (page
-    // number, offset of the page); `commit` is the size of the last commit frame and how many
-    // frames it covers.
+    // The frames from offset 32 while a whole one is there, read into one buffer. `pending` holds
+    // the valid frames since the last commit frame as (page number, offset of the page); a commit
+    // frame moves them into `frames`, the later frame for a page winning, so whatever follows the
+    // last commit stays out. `commit` is that frame's database size and how many frames it covers.
     let frame_len = 24 + page;
-    let salts = &wal[16..24];
+    let salts = &header[16..24];
     let mut running = (sum0, sum1);
-    let mut frames: Vec<(u32, usize)> = Vec::new();
-    let mut commit: Option<(u32, usize)> = None;
-    let mut at = 32;
-    while let Some(frame) = wal.get(at..).and_then(|rest| rest.get(..frame_len)) {
-        let (Some(number), Some(size)) = (be32(frame, 0), be32(frame, 4)) else {
+    let mut frame = vec![0u8; frame_len];
+    let mut frames: HashMap<u32, u64> = HashMap::new();
+    let mut pending: Vec<(u32, u64)> = Vec::new();
+    let mut commit: Option<(u32, u64)> = None;
+    let mut seen = 0u64;
+    let mut at = 32u64;
+    while read(at, &mut frame)? == frame_len {
+        let (Some(number), Some(size)) = (be32(&frame, 0), be32(&frame, 4)) else {
             break;
         };
         if number == 0 || frame[8..16] != *salts {
@@ -2183,25 +2199,42 @@ pub(super) fn wal_commit_frames(file: &Path, wal: &[u8]) -> Result<Option<WalCom
         }
         let sum = checksum(&frame[..8], big_endian, running);
         let sum = checksum(&frame[24..], big_endian, sum);
-        if be32(frame, 16) != Some(sum.0) || be32(frame, 20) != Some(sum.1) {
+        if be32(&frame, 16) != Some(sum.0) || be32(&frame, 20) != Some(sum.1) {
             break;
         }
         running = sum;
-        frames.push((number, at + 24));
+        seen += 1;
+        pending.push((number, at + 24));
         if size != 0 {
-            commit = Some((size, frames.len()));
+            frames.extend(pending.drain(..));
+            commit = Some((size, seen));
         }
-        at += frame_len;
+        at += frame_len as u64;
     }
-    let Some((commit_size, applied)) = commit else {
+    let Some((pages, committed)) = commit else {
         return Ok(None);
     };
-    frames.truncate(applied);
     Ok(Some(WalCommit {
         page_size: page,
-        pages: commit_size,
+        pages,
+        committed,
         frames,
     }))
+}
+
+/// `wal_commit_frames`' reader over a `-wal` held in memory (the in-memory path).
+pub(super) fn read_slice(
+    bytes: &[u8],
+) -> impl FnMut(u64, &mut [u8]) -> Result<usize, ImportError> + '_ {
+    |offset, buf| {
+        let rest = usize::try_from(offset)
+            .ok()
+            .and_then(|start| bytes.get(start..))
+            .unwrap_or_default();
+        let read = rest.len().min(buf.len());
+        buf[..read].copy_from_slice(&rest[..read]);
+        Ok(read)
+    }
 }
 
 /// `file`'s image with `wal` applied as SQLite's recovery applies it (file format section 4): only
@@ -2211,12 +2244,13 @@ fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, Import
     let Some(WalCommit {
         page_size: page,
         pages: commit_size,
+        committed,
         frames,
-    }) = wal_commit_frames(file, wal)?
+    }) = wal_commit_frames(file, read_slice(wal))?
     else {
         return Ok(db);
     };
-    let applied = frames.len();
+    let applied = usize::try_from(committed).unwrap_or(usize::MAX);
 
     // A non-empty database file must be a whole database of the -wal's page size; an empty one is
     // built from the frames alone. The commit may not name more pages than the file and frames give.
@@ -2225,7 +2259,7 @@ fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, Import
         return Err(bad_wal(file, "its database file does not match its -wal"));
     }
     let pages = commit_size as usize;
-    if pages > db.len().div_ceil(page) + applied {
+    if pages > db.len().div_ceil(page).saturating_add(applied) {
         return Err(bad_wal(
             file,
             "its -wal commits more pages than its database holds",
@@ -2235,12 +2269,14 @@ fn apply_wal(file: &Path, mut db: Vec<u8>, wal: &[u8]) -> Result<Vec<u8>, Import
         .checked_mul(page)
         .ok_or_else(|| bad_wal(file, "its -wal commits more pages than fit in memory"))?;
     db.resize(size, 0);
+    // Each page's latest committed frame, which is what applying them all in order leaves.
     for (number, start) in frames {
         let number = number as usize;
         if number > pages {
             continue;
         }
         let dest = (number - 1) * page;
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
         if let (Some(out), Some(data)) = (
             db.get_mut(dest..).and_then(|rest| rest.get_mut(..page)),
             wal.get(start..).and_then(|rest| rest.get(..page)),
@@ -2288,12 +2324,12 @@ pub(super) fn checksum(data: &[u8], big_endian: bool, mut sum: (u32, u32)) -> (u
 
 /// `check_tree_depth`'s page source over a copied database file and its copied `-wal`. `read_page`
 /// returns the page from the latest committed WAL frame that names it, else from the database file,
-/// each by `pread`, so a page is held only as long as the walk needs it. The `-wal` is read once to
-/// validate and map its frames, then dropped; each mapped frame is preaded on demand.
+/// each by `pread`, so a page is held only as long as the walk needs it. The `-wal` is streamed once,
+/// a frame at a time, to validate and map its frames; each mapped frame is preaded on demand.
 pub(super) struct CopyPages {
     db: File,
     wal: Option<File>,
-    frames: HashMap<u32, u64>,
+    pub(super) frames: HashMap<u32, u64>,
     page_size: usize,
     reserved: usize,
     page_count: u64,
@@ -2313,19 +2349,15 @@ impl CopyPages {
             .clamp(512, 65_536);
         let reserved = header.get(20).copied().map_or(0, usize::from);
         // The copied -wal, when present, overrides pages: its committed frames win over the database
-        // file. Read it once to map its frames, holding offsets so the bytes drop here; the last
-        // frame for a page wins. A copy with no -wal reads the database file alone.
+        // file. It is streamed a frame at a time to map them, holding offsets only; the last
+        // committed frame for a page wins. A copy with no -wal reads the database file alone.
         let (wal, page_count, frames) = match File::open(wal_path) {
             Ok(wal) => {
-                let bytes = read_whole(&wal, wal_path)?;
-                match wal_commit_frames(file, &bytes)? {
-                    Some(commit) => {
-                        let mut map = HashMap::with_capacity(commit.frames.len());
-                        for (number, offset) in commit.frames {
-                            map.insert(number, offset as u64);
-                        }
-                        (Some(wal), u64::from(commit.pages), map)
-                    }
+                let commit = wal_commit_frames(file, |offset, buf| {
+                    read_at(&wal, offset, buf).map_err(|e| unreadable_path(wal_path, &e))
+                })?;
+                match commit {
+                    Some(commit) => (Some(wal), u64::from(commit.pages), commit.frames),
                     None => (Some(wal), db_len / page_size as u64, HashMap::new()),
                 }
             }
@@ -2400,18 +2432,6 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
         }
     }
     Ok(read)
-}
-
-/// The whole of an already-open file, for validating a copied `-wal`. Bounded by the file's size.
-fn read_whole(file: &File, path: &Path) -> Result<Vec<u8>, ImportError> {
-    let len = file
-        .metadata()
-        .map_err(|e| unreadable_path(path, &e))?
-        .len();
-    let mut bytes = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-    let read = read_at(file, 0, &mut bytes).map_err(|e| unreadable_path(path, &e))?;
-    bytes.truncate(read);
-    Ok(bytes)
 }
 
 /// The 2.9 type of a .NET type name (its last part, with that part); other types are `None`.
