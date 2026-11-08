@@ -6020,8 +6020,8 @@ async fn b26_old_tracks_are_read_again_once() {
         (0, 0, 0),
         "a second scan read a track again"
     );
-    // A probe would replace the source row within this second.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // A music scan's re-reads run under the scan lock, which `b18_rescan` waits for, so a re-read
+    // of either track would have replaced its source by now.
     assert_eq!(b18_track_probed(pool, &song_path, &[]).await, second);
     assert_eq!(b18_track_probed(pool, &other_path, &[]).await, other_id);
 }
@@ -6568,4 +6568,42 @@ async fn b26_scan_without_ffprobe() {
         "the Mixed-library scan read the old audio file again"
     );
     assert_eq!(b26_item_sources(pool, song_item).await, [song_source]);
+}
+
+/// ffmpeg. B26 review 1, findings 11 and 12: a scan does not read a photo again for its version,
+/// as the doc of `PROBE_VERSION` says. An image stream has no language or title to read.
+#[tokio::test]
+async fn b26_photos_are_not_read_again() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("photos", LibraryContentType::Photos).await;
+    let pool = &fx.pool;
+    let photo = "Beach (2012).jpg";
+    let path = root_of(&lib).join(photo);
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=64x48", "-frames:v", "1"])
+        .arg(&path)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg could not write {}",
+        path.display()
+    );
+    scan_idle(pool, &lib).await;
+    b26_fresh_versions(pool, &lib, &[photo]).await;
+    b26_make_old(pool, &lib, &[photo]).await;
+    let before = b18_source_ids(pool, &lib).await;
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "the scan read the photo again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, before);
+    assert_eq!(b26_versions(pool, &lib).await, [(photo.to_string(), 0)]);
 }
