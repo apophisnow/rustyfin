@@ -1565,6 +1565,19 @@ async fn read_roots(
     tables: &[&str],
 ) -> Result<Vec<(String, u32)>, ImportError> {
     use sqlx::Row as _;
+    // `EXPLAIN PRAGMA quick_check` only *compiles* the integrity-check plan, but a crafted chain of
+    // virtual generated columns (`cK AS (c{K-1}+c{K-1})`) doubles that plan's op array per level, so
+    // ~25 levels exhaust memory during the compile. The progress guard, the F4 budget and the R4
+    // cancel all act on execution steps, so none can interrupt it. Two independent things drive the
+    // blow-up, so two guards sit before the `EXPLAIN`: `quick_check` inlines a CHECK over the chain
+    // (turn check constraints off to stop that), and a *typed* generated column expands on its own
+    // affinity regardless of that pragma (refuse any generated column outright, below). `check_tables`
+    // repeats both with the same messages, but only once the snapshot is open — after this runs (B20
+    // re-check 5, H1).
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
     let mut roots = Vec::new();
     for &table in tables {
         let kind: Option<(String,)> = sqlx::query_as(
@@ -1577,6 +1590,21 @@ async fn read_roots(
         .map_err(|e| unreadable(file, &e))?;
         if !kind.is_some_and(|(kind,)| kind == "table") {
             continue;
+        }
+        // Refuse a generated column before the `EXPLAIN` compiles its expression (see above); the
+        // pragma alone does not stop a typed chain. `check_tables` repeats this with the same message.
+        let (generated,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_xinfo(?1, 'main') WHERE hidden IN (2, 3)",
+        )
+        .bind(table)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| unreadable(file, &e))?;
+        if generated > 0 {
+            return Err(ImportError::BadSource(format!(
+                "{}: {table} has generated columns",
+                file.display()
+            )));
         }
         let sql = format!("EXPLAIN PRAGMA main.quick_check(\"{table}\")");
         let steps = sqlx::query(sqlx::AssertSqlSafe(sql))

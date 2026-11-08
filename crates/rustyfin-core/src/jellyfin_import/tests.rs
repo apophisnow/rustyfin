@@ -3529,3 +3529,79 @@ async fn b20_snapshot_refuses_a_spinning_schema() {
         "the in-memory path (u64::MAX), then the copy path (0)"
     );
 }
+
+// Fix round 6 (re-check 5, H1): `read_roots` compiles `EXPLAIN PRAGMA quick_check(<table>)` to find
+// a table's roots, and at 480c971 it did so with no guard against a generated-column chain. A
+// crafted `Users` carrying a deep chain of *typed* (INTEGER) virtual generated columns (each the sum
+// of the one below) makes `quick_check` double its op array per level as it compiles each column's
+// affinity, exhausting memory at *compile* time — the progress guard fires on execution, so it can't
+// stop a compile — on a few-hundred-byte source (SQLITE_NOMEM, or an OOM kill on a capped host).
+// Typing drives the blow-up through affinity, not a CHECK, so `PRAGMA ignore_check_constraints = ON`
+// does not flatten it: the fix refuses any generated column before the first `EXPLAIN` (as
+// `check_tables` already does once the snapshot is open), returning "<file>: Users has generated
+// columns" on both paths. On 480c971 the `EXPLAIN` instead compiles the chain and the open fails with
+// "out of memory" (seen in ~2 s under `timeout`+`prlimit`): that is the red.
+//
+// The schema is written straight into `sqlite_schema` with `writable_schema`, leaving the real root
+// page intact, as a hand-built source would store it — so building the fixture never compiles the
+// chain, only the buggy `EXPLAIN` does.
+#[tokio::test]
+async fn b20_read_roots_refuses_a_generated_column_chain_before_the_explain() {
+    use sqlx::{ConnectOptions, Connection};
+    let (tmp, data) = (TempDir::new(), TempDir::new());
+    let db = tmp.0.join("jellyfin.db");
+    write_db(&db, &[USERS_DDL]).await;
+    // 30 virtual generated columns, each `c{k} = c{k-1} + c{k-1}`, typed INTEGER: the op array
+    // `quick_check` compiles doubles per level as it resolves each column's affinity, past SQLite's
+    // 0x7fffff00 realloc cap well before this depth. Typing drives it, not a CHECK, so the pragma the
+    // fix sets cannot flatten it — only refusing the generated columns keeps the compile from running.
+    const DEPTH: usize = 30;
+    let mut cols = String::from("c0 INTEGER");
+    for k in 1..=DEPTH {
+        let prev = k - 1;
+        cols.push_str(&format!(", c{k} INTEGER AS (c{prev} + c{prev})"));
+    }
+    let malicious = format!(
+        "CREATE TABLE Users (Id TEXT NOT NULL PRIMARY KEY, InternalId INTEGER NOT NULL, \
+         Username TEXT NOT NULL, {cols})"
+    );
+    {
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .connect()
+            .await
+            .unwrap();
+        // Swap Users' stored schema text for the malicious one without SQLite validating or
+        // expanding it, so the chain is compiled only when `read_roots` reaches its `EXPLAIN`.
+        sqlx::query("PRAGMA writable_schema = ON")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE name = 'Users'")
+            .bind(&malicious)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA writable_schema = OFF")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let expected = format!("{}: Users has generated columns", db.display());
+    let mut texts = Vec::new();
+    for limit in [u64::MAX, 0] {
+        let open =
+            open_snapshot_with_free(&db, &data.0, JELLYFIN_TABLES, limit, |_| Ok(u64::MAX)).await;
+        texts.push(match open.map(drop) {
+            Ok(()) => "read".to_string(),
+            Err(ImportError::BadSource(text)) => text,
+            Err(other) => format!("{other:?}"),
+        });
+    }
+    assert_eq!(
+        texts,
+        [expected.clone(), expected],
+        "the in-memory path (u64::MAX), then the copy path (0)"
+    );
+}
