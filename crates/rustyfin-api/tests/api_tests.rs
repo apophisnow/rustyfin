@@ -10637,6 +10637,367 @@ async fn g4_universal_direct_plays_a_probed_mp4() {
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
 }
 
+// ── B22: player tracks ──
+//
+// Subtitles reach the player as WebVTT through Jellyfin's
+// `/Videos/{id}/{msid}/Subtitles/{index}[/{startTicks}]/Stream.vtt`, embedded or external, and
+// the playback reports carry the chosen tracks. Tests that need ffmpeg skip without it.
+
+/// GETs `uri` with a bearer token; returns the status, the content type and the body as text.
+async fn b22_get(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, String, String) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+}
+
+/// Stores a source for `file` with `streams` (MediaStream JSON) and returns the id it is stored
+/// under.
+async fn b22_insert_source(
+    state: &AppState,
+    item: uuid::Uuid,
+    file: &std::path::Path,
+    streams: serde_json::Value,
+) -> String {
+    let source: rustyfin_model::media_source::MediaSourceResponse =
+        serde_json::from_value(serde_json::json!({
+            "Id": uuid::Uuid::new_v4().to_string(),
+            "Uid": uuid::Uuid::new_v4().to_string(),
+            "Container": "mkv",
+            "Protocol": "File",
+            "Path": file.to_str().unwrap(),
+            "MediaStreams": streams,
+        }))
+        .unwrap();
+    rustyfin_db::repo_media_source::insert_media_source_with_streams(&state.db, &item, &source)
+        .await
+        .unwrap()
+        .to_string()
+}
+
+/// Makes `B22 Film.mkv` in the media folder `folder`: 5 s of video (stream 0), FLAC audio (1)
+/// and an embedded SubRip subtitle (2) with cues at 1-2 s and 3-4 s, beside `B22 Film.eng.srt`
+/// (UTF-8) and `B22 Film.ger.srt` (Windows-1252). FLAC has no encoder delay, so the file starts
+/// at 0 and the cues keep their times (AAC would start it at -21 ms, which every time follows).
+/// Probes it as the scanner does and returns the item id, the source id and the film's path.
+async fn b22_film(state: &AppState, folder: &str) -> (uuid::Uuid, String, std::path::PathBuf) {
+    let dir = std::path::PathBuf::from(media_folder(state, folder));
+    let cues = state.data_dir.join(format!("{folder}-cues.srt"));
+    std::fs::write(
+        &cues,
+        "1\n00:00:01,000 --> 00:00:02,000\nEmbedded one\n\n\
+         2\n00:00:03,000 --> 00:00:04,000\nEmbedded two\n",
+    )
+    .unwrap();
+    let file = dir.join("B22 Film.mkv");
+    g4_make_media(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000",
+        "-i",
+        cues.to_str().unwrap(),
+        "-t",
+        "5",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:s",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "flac",
+        "-c:s",
+        "srt",
+        file.to_str().unwrap(),
+    ]);
+    std::fs::write(
+        dir.join("B22 Film.eng.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nExternal English\n",
+    )
+    .unwrap();
+    // "Grüße" in Windows-1252, as many older German files are
+    std::fs::write(
+        dir.join("B22 Film.ger.srt"),
+        b"1\r\n00:00:01,000 --> 00:00:02,000\r\nGr\xfc\xdfe\r\n",
+    )
+    .unwrap();
+    let id = g4_insert_item(state, "Movie", &file).await;
+    rustyfin_core::probe::probe_and_save(&state.db, &id, file.to_str().unwrap())
+        .await
+        .unwrap();
+    let sources = rustyfin_db::repo_media_source::get_media_sources(&state.db, &id)
+        .await
+        .unwrap();
+    assert_eq!(sources.len(), 1);
+    (id, sources[0].id.clone(), file)
+}
+
+#[tokio::test]
+async fn b22_subtitle_vtt_converts_embedded_and_external_subtitles() {
+    if !g4_have_ffmpeg("b22_subtitle_vtt_converts_embedded_and_external_subtitles") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (id, msid, file) = b22_film(&state, "b22-vtt").await;
+    let cache = state.data_dir.join("cache").join("subtitle-vtt");
+    let app = app(state);
+
+    // The embedded stream 2, then the external files after the highest index, in name order
+    let vtt = |index: i32| format!("/Videos/{id}/{msid}/Subtitles/{index}/Stream.vtt");
+    let (status, content_type, embedded) = b22_get(&app, &vtt(2), &token).await;
+    assert_eq!(status, StatusCode::OK, "{embedded}");
+    assert_eq!(content_type, "text/vtt; charset=utf-8");
+    assert!(embedded.starts_with("WEBVTT"), "{embedded}");
+    assert!(
+        embedded.contains("00:01.000 --> ")
+            && embedded.contains("Embedded one")
+            && embedded.contains("Embedded two"),
+        "{embedded}"
+    );
+
+    let (status, _, body) = b22_get(&app, &vtt(3), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("External English") && !body.contains("Embedded"),
+        "{body}"
+    );
+
+    // Windows-1252 text arrives as UTF-8; the format matches without case
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/4/Stream.VTT");
+    let (status, _, body) = b22_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Grüße"), "{body}");
+
+    // The item's own id, sent without dashes as clients do, names its primary source
+    let uri = format!("/Videos/{id}/{}/Subtitles/2/Stream.vtt", id.simple());
+    let (status, _, body) = b22_get(&app, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, embedded);
+
+    // One cache file per source, stream and input version, holding what was served
+    let meta = std::fs::metadata(&file).unwrap();
+    let mtime = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let name = format!("{msid}-2-{}-{mtime}.vtt", meta.len());
+    assert_eq!(
+        std::fs::read_to_string(cache.join(&name)).unwrap(),
+        embedded
+    );
+    let names: Vec<String> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(names.iter().all(|n| n.ends_with(".vtt")), "{names:?}");
+}
+
+#[tokio::test]
+async fn b22_subtitle_vtt_moves_cues_back_by_the_start() {
+    if !g4_have_ffmpeg("b22_subtitle_vtt_moves_cues_back_by_the_start") {
+        return;
+    }
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let (id, msid, _) = b22_film(&state, "b22-vtt-start").await;
+    let app = app(state);
+
+    // From 1.5 s: the first cue keeps its last half second, the second moves to 1.5 s
+    let at = |index: i32, ticks: i64| {
+        format!("/Videos/{id}/{msid}/Subtitles/{index}/{ticks}/Stream.vtt")
+    };
+    let (status, content_type, body) = b22_get(&app, &at(2, 15_000_000), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type, "text/vtt; charset=utf-8");
+    assert!(body.starts_with("WEBVTT"), "{body}");
+    assert!(
+        body.contains("00:00:00.000 --> 00:00:00.500\nEmbedded one"),
+        "{body}"
+    );
+    assert!(
+        body.contains("00:00:01.500 --> 00:00:02.500\nEmbedded two"),
+        "{body}"
+    );
+
+    // An external file moves the same way
+    let (status, _, body) = b22_get(&app, &at(3, 15_000_000), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("00:00:00.000 --> 00:00:00.500\nExternal English"),
+        "{body}"
+    );
+
+    // After the last cue: the header alone
+    let (status, _, body) = b22_get(&app, &at(2, 50_000_000), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.starts_with("WEBVTT") && !body.contains("-->"),
+        "{body}"
+    );
+
+    // A start of 0 is the whole subtitle
+    let whole = format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt");
+    let (_, _, whole) = b22_get(&app, &whole, &token).await;
+    let (status, _, body) = b22_get(&app, &at(2, 0), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, whole);
+}
+
+#[tokio::test]
+async fn b22_subtitle_vtt_refuses_bad_requests() {
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b22-bad");
+    let file = std::path::Path::new(&folder).join("B22 Disc.mkv");
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let streams = serde_json::json!([
+        { "Index": 0, "CodecType": "video", "Codec": "h264" },
+        { "Index": 1, "CodecType": "audio", "Codec": "aac" },
+        { "Index": 2, "CodecType": "subtitle", "Codec": "hdmv_pgs_subtitle" },
+        { "Index": 3, "CodecType": "subtitle", "Codec": "subrip" },
+    ]);
+    let msid = b22_insert_source(&state, id, &file, streams).await;
+    let app = app(state);
+
+    let other = uuid::Uuid::new_v4();
+    let cases = [
+        // Only WebVTT is served
+        (
+            format!("/Videos/{id}/{msid}/Subtitles/3/Stream.srt"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // A picture subtitle has no text: players burn it in
+        (
+            format!("/Videos/{id}/{msid}/Subtitles/2/Stream.vtt"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/Videos/{id}/{msid}/Subtitles/2/600000000/Stream.vtt"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // An unknown item, a source that isn't the item's, a stream that is no subtitle, none
+        (
+            format!("/Videos/{other}/{msid}/Subtitles/3/Stream.vtt"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/Videos/{id}/{other}/Subtitles/3/Stream.vtt"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/Videos/{id}/{msid}/Subtitles/1/Stream.vtt"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/Videos/{id}/{msid}/Subtitles/9/Stream.vtt"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/Videos/{id}/{msid}/Subtitles/9/600000000/Stream.vtt"),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (uri, want) in cases {
+        let (status, _, body) = b22_get(&app, &uri, &token).await;
+        assert_eq!(status, want, "{uri}: {body}");
+    }
+
+    // Signed in only
+    let uri = format!("/Videos/{id}/{msid}/Subtitles/3/Stream.vtt");
+    let (status, _, _) = g4_get(&app, &uri).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn b22_report_bodies_carry_track_indexes() {
+    use rustyfin_model::playback::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
+
+    let item = uuid::Uuid::new_v4();
+    let report = serde_json::json!({
+        "ItemId": item,
+        "MediaSourceId": "b22-source",
+        "PositionTicks": 50_000_000,
+        "AudioStreamIndex": 2,
+        "SubtitleStreamIndex": -1,
+    });
+    let start: PlaybackStartInfo = serde_json::from_value(report.clone()).unwrap();
+    assert_eq!(
+        (start.audio_stream_index, start.subtitle_stream_index),
+        (Some(2), Some(-1))
+    );
+    let progress: PlaybackProgressInfo = serde_json::from_value(report.clone()).unwrap();
+    assert_eq!(
+        (progress.audio_stream_index, progress.subtitle_stream_index),
+        (Some(2), Some(-1))
+    );
+    let stop: PlaybackStopInfo = serde_json::from_value(report).unwrap();
+    assert_eq!(
+        (stop.audio_stream_index, stop.subtitle_stream_index),
+        (Some(2), Some(-1))
+    );
+    // Clients that send neither still report
+    let bare: PlaybackStopInfo =
+        serde_json::from_value(serde_json::json!({ "ItemId": item })).unwrap();
+    assert_eq!(
+        (bare.audio_stream_index, bare.subtitle_stream_index),
+        (None, None)
+    );
+
+    // The handlers take them and answer as before
+    let state = test_state().await;
+    let _dir = G4Dir(state.data_dir.to_path_buf());
+    let (token, _) = admin_session(&state).await;
+    let folder = media_folder(&state, "b22-reports");
+    let file = std::path::Path::new(&folder).join("B22 Report.mkv");
+    let id = g4_insert_item(&state, "Movie", &file).await;
+    let app = app(state);
+    for uri in [
+        "/Sessions/Playing",
+        "/Sessions/Playing/Progress",
+        "/Sessions/Playing/Stopped",
+    ] {
+        let body = serde_json::json!({
+            "ItemId": id,
+            "MediaSourceId": "b22-source",
+            "PositionTicks": 50_000_000,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 4,
+        });
+        let (status, json) = send(&app, request("POST", uri, Some(&token), Some(body))).await;
+        assert!(status.is_success(), "{uri}: {status} {json}");
+    }
+}
+
 // ── B16: media source selection ──
 //
 // A movie with two versions, each a media source on its own file. `MediaSourceId` picks the

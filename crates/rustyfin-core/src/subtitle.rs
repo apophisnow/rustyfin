@@ -158,6 +158,121 @@ pub fn is_image_subtitle(codec: &str) -> bool {
         )
 }
 
+/// Moves the cues of a WebVTT text back by `start_ticks` (100 ns units), so that a player starting
+/// there gets them. A cue that has ended by then is dropped; the others start at 0 at the earliest.
+/// The other blocks (the header, NOTE, STYLE and REGION) are kept as they are. Blocks are joined by
+/// one blank line and the text ends with a newline. A start of 0 or less returns the text unchanged.
+pub fn shift_vtt(vtt: &str, start_ticks: i64) -> String {
+    if start_ticks <= 0 {
+        return vtt.to_string();
+    }
+    let shift = start_ticks / 10_000;
+    let mut out = String::with_capacity(vtt.len());
+    for block in vtt_blocks(vtt) {
+        let Some(lines) = shift_block(&block, shift) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The blocks of a WebVTT text: runs of lines between blank lines, without their line endings.
+fn vtt_blocks(vtt: &str) -> Vec<Vec<&str>> {
+    let mut blocks = Vec::new();
+    let mut block = Vec::new();
+    for line in vtt.lines() {
+        if !line.is_empty() {
+            block.push(line);
+        } else if !block.is_empty() {
+            blocks.push(std::mem::take(&mut block));
+        }
+    }
+    if !block.is_empty() {
+        blocks.push(block);
+    }
+    blocks
+}
+
+/// The lines of a block moved back by `shift` milliseconds, or None when the block is a cue that
+/// has ended. A cue's timing line is the first or second line; a line before it is an identifier.
+fn shift_block(block: &[&str], shift: i64) -> Option<Vec<String>> {
+    let mut lines: Vec<String> = block.iter().map(|line| line.to_string()).collect();
+    let Some(at) = block.iter().take(2).position(|line| line.contains(" --> ")) else {
+        return Some(lines);
+    };
+    let Some((start, end, settings)) = parse_timing(block[at]) else {
+        return Some(lines);
+    };
+    if end <= shift {
+        return None;
+    }
+    lines[at] = format!(
+        "{} --> {}{settings}",
+        format_vtt_time((start - shift).max(0)),
+        format_vtt_time((end - shift).max(0)),
+    );
+    Some(lines)
+}
+
+/// A timing line `start --> end settings` as the start and end in milliseconds, and the settings
+/// after the end time with their leading space. None when a time does not read.
+fn parse_timing(line: &str) -> Option<(i64, i64, &str)> {
+    let (start, rest) = line.split_once(" --> ")?;
+    let rest = rest.trim_start();
+    let end_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (end, settings) = rest.split_at(end_len);
+    Some((
+        parse_vtt_time(start.trim())?,
+        parse_vtt_time(end)?,
+        settings,
+    ))
+}
+
+/// Reads `hh:mm:ss.ttt` (hours of one or more digits) or `mm:ss.ttt` as milliseconds.
+fn parse_vtt_time(text: &str) -> Option<i64> {
+    let (clock, millis) = text.split_once('.')?;
+    if millis.len() != 3 {
+        return None;
+    }
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [h, m, s] => (digits(h)?, digits(m)?, digits(s)?),
+        [m, s] => (0, digits(m)?, digits(s)?),
+        _ => return None,
+    };
+    let total = hours
+        .checked_mul(3600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    total.checked_mul(1000)?.checked_add(digits(millis)?)
+}
+
+/// The number `text` is when it is one or more ASCII digits.
+fn digits(text: &str) -> Option<i64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Writes milliseconds as `HH:MM:SS.mmm`, with at least two digits for the hours.
+fn format_vtt_time(ms: i64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        (ms / 60_000) % 60,
+        (ms / 1_000) % 60,
+        ms % 1_000
+    )
+}
+
 /// Remote subtitle search result
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -439,5 +554,73 @@ mod tests {
         ] {
             assert!(!is_image_subtitle(codec), "{codec}");
         }
+    }
+
+    // ── shift_vtt ──
+
+    #[test]
+    fn test_shift_vtt_without_a_start_returns_the_input() {
+        let vtt = "WEBVTT\n\n00:01.000 --> 00:02.000\nOne\n\n";
+        assert_eq!(shift_vtt(vtt, 0), vtt);
+        assert_eq!(shift_vtt(vtt, -10_000_000), vtt);
+    }
+
+    #[test]
+    fn test_shift_vtt_drops_ended_cues_and_moves_the_rest() {
+        let vtt = "WEBVTT\n\n\
+                   00:00:01.000 --> 00:00:02.500\nOne\n\n\
+                   00:00:09.000 --> 00:00:11.000\nTwo\n\n\
+                   00:01:05.250 --> 00:01:07.000 align:start line:0\nThree\nlines\n\n\
+                   01:00:00.000 --> 01:00:02.000\nFour\n\n";
+        // 10 s: the first cue has ended, the second started before and is clamped at 0
+        let shifted = shift_vtt(vtt, 100_000_000);
+        assert_eq!(
+            shifted,
+            "WEBVTT\n\n\
+             00:00:00.000 --> 00:00:01.000\nTwo\n\n\
+             00:00:55.250 --> 00:00:57.000 align:start line:0\nThree\nlines\n\n\
+             00:59:50.000 --> 00:59:52.000\nFour\n"
+        );
+    }
+
+    #[test]
+    fn test_shift_vtt_drops_a_cue_that_ends_at_the_start() {
+        let vtt = "WEBVTT\n\n00:01.000 --> 00:02.000\nOne\n\n00:02.000 --> 00:03.000\nTwo\n";
+        assert_eq!(
+            shift_vtt(vtt, 20_000_000),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nTwo\n"
+        );
+        // Ticks below a millisecond are dropped: 2.0009 s starts at 2.000 s
+        assert_eq!(
+            shift_vtt(vtt, 20_009_999),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nTwo\n"
+        );
+        // Every cue has ended: the header alone
+        assert_eq!(shift_vtt(vtt, 30_000_000), "WEBVTT\n");
+    }
+
+    #[test]
+    fn test_shift_vtt_keeps_the_header_notes_and_cue_ids() {
+        // ffmpeg writes mm:ss.ttt below an hour; files may use CRLF
+        let vtt = "WEBVTT\r\nKind: captions\r\n\r\n\
+                   NOTE made by hand\r\n\r\n\
+                   intro\r\n00:04.000 --> 00:06.000\r\n<i>Hello</i>\r\n\r\n\
+                   12:34.567 --> 12:35.000\r\nLater\r\n";
+        assert_eq!(
+            shift_vtt(vtt, 30_000_000),
+            "WEBVTT\nKind: captions\n\n\
+             NOTE made by hand\n\n\
+             intro\n00:00:01.000 --> 00:00:03.000\n<i>Hello</i>\n\n\
+             00:12:31.567 --> 00:12:32.000\nLater\n"
+        );
+    }
+
+    #[test]
+    fn test_shift_vtt_writes_long_hours() {
+        let vtt = "WEBVTT\n\n100:00:00.000 --> 100:00:01.000\nLong\n";
+        assert_eq!(
+            shift_vtt(vtt, 36_000_000_000),
+            "WEBVTT\n\n99:00:00.000 --> 99:00:01.000\nLong\n"
+        );
     }
 }
