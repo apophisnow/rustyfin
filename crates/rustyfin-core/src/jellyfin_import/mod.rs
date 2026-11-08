@@ -351,12 +351,17 @@ fn metadata_image_paths<'a>(
     matched: &HashMap<Uuid, Uuid>,
 ) -> Vec<&'a str> {
     let mut paths = Vec::new();
+    let mut seen_people: HashSet<&str> = HashSet::new();
     for jf_id in matched.keys() {
         if let Some(meta) = snapshot.metadata.items.get(jf_id) {
             paths.extend(meta.images.iter().map(|image| image.path.as_str()));
         }
         for credit in snapshot.metadata.credits.get(jf_id).into_iter().flatten() {
-            if let Some(images) = snapshot.metadata.person_images.get(credit.name.trim()) {
+            let name = credit.name.trim();
+            if !seen_people.insert(name) {
+                continue;
+            }
+            if let Some(images) = snapshot.metadata.person_images.get(name) {
                 paths.extend(images.iter().map(|image| image.path.as_str()));
             }
         }

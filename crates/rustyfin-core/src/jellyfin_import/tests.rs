@@ -2492,3 +2492,59 @@ fn b20_credits_are_deduplicated() {
         "planned_credits of {N} distinct names took {elapsed:?}; it must be linear, not quadratic"
     );
 }
+
+// F2 (round 4): metadata_image_paths adds each credited person's images once, not once per credit.
+// One person with 1,000 images credited 1,000 times on one matched item makes K x L = 10^6 entries
+// on 8758ca9 (~16 MB); the fix (a set of the people already added) makes it K + L. The item has no
+// images of its own, so the result is exactly the 1,000 person image paths.
+#[test]
+fn b20_person_images_are_added_once() {
+    use super::source::{JfImage, JfItemMeta, JfMetadata, Snapshot};
+    use rustyfin_model::image::ImageType;
+    let person = "Ann";
+    let images: Vec<JfImage> = (0..1_000)
+        .map(|i| JfImage {
+            path: format!("/config/metadata/People/a/ann/{i}.jpg"),
+            image_type: ImageType::Primary,
+            width: None,
+            height: None,
+            blurhash: None,
+        })
+        .collect();
+    let item = Uuid::from_u128(0xF1);
+    let credits: Vec<JfCredit> = (0..1_000)
+        .map(|_| JfCredit {
+            name: std::sync::Arc::from(person),
+            kind: None,
+            role: None,
+            list_order: None,
+            sort_order: None,
+        })
+        .collect();
+    let mut person_images = std::collections::HashMap::new();
+    person_images.insert(person.to_string(), images);
+    let mut meta_items = std::collections::HashMap::new();
+    meta_items.insert(item, JfItemMeta::default());
+    let mut meta_credits = std::collections::HashMap::new();
+    meta_credits.insert(item, credits);
+    let snapshot = Snapshot {
+        layout: Layout::New,
+        users: Vec::new(),
+        items: Vec::new(),
+        user_data: Vec::new(),
+        streams: Vec::new(),
+        metadata: JfMetadata {
+            items: meta_items,
+            credits: meta_credits,
+            person_images,
+        },
+    };
+    let mut matched = std::collections::HashMap::new();
+    matched.insert(item, Uuid::from_u128(0xA1));
+    let paths = super::metadata_image_paths(&snapshot, &matched);
+    assert_eq!(
+        paths.len(),
+        1_000,
+        "a person's images are added once across all credits, not once per credit"
+    );
+}
