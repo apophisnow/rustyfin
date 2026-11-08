@@ -2783,6 +2783,7 @@ const J5_MUSIC_ROCK: &str = "5682964f-dff2-51db-8651-c91285edb0a9";
 const J5_PIXAR: &str = "01aa62ee-902a-5a32-9c32-aca3fdee5582";
 const J5_YEAR_1999: &str = "3b638efc-32dc-5eee-8ba2-c24d7c3bf319";
 const J5_ACAO: &str = "ee352a6b-1d4c-581e-bbbf-ebde19828365";
+const J5_DRAMAS: &str = "46602e53-1af1-504d-823c-c1113b8387da";
 
 /// The keys of a genre, studio or year item without counts, sorted.
 const J5_DTO_KEYS: &[&str] = &[
@@ -3462,6 +3463,78 @@ async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
         let (status, body) = get(uri.into()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
     }
+}
+
+#[tokio::test]
+async fn j5_names_fold_a_final_sigma_as_jellyfin_does() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Sigma", LibraryContentType::Movies).await;
+    let s = &state;
+    j5_item(s, films, None, "Upper", "Movie", "ΔΡΆΜΑΣ|Μασκαράδα", None).await;
+    j5_item(s, films, None, "Lower", "Movie", "δράμας", None).await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await }
+    };
+
+    // "ΜΑΣ" folds to "μασ", as .NET lowercases it, which "Μασκαράδα" ("μασκαραδα") contains.
+    let (status, body) = get("/Genres?SearchTerm=%CE%9C%CE%91%CE%A3".into()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["ΔΡΆΜΑΣ", "Μασκαράδα"]);
+    assert_eq!(body["TotalRecordCount"], 2);
+    // "ΔΡΆΜΑΣ" and "δράμας" are one entry, "δραμασ", whose id finds both films.
+    let (_, body) = get("/Genres".into()).await;
+    assert_eq!(j5_names(&body), ["ΔΡΆΜΑΣ", "Μασκαράδα"]);
+    assert_eq!(j5_id(&body, "ΔΡΆΜΑΣ"), J5_DRAMAS);
+    let (status, body) = get(format!("/Items?GenreIds={J5_DRAMAS}&Recursive=true")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names = j5_names(&body);
+    names.sort();
+    assert_eq!(names, ["Lower", "Upper"]);
+}
+
+#[tokio::test]
+async fn j5_names_drop_the_characters_jellyfin_deletes() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Deleted", LibraryContentType::Movies).await;
+    let s = &state;
+    j5_item(
+        s,
+        films,
+        None,
+        "Marked",
+        "Movie",
+        "¡Acción!|Rock\u{fffd}",
+        None,
+    )
+    .await;
+    j5_item(s, films, None, "Plain", "Movie", "Acción!|Rock", None).await;
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await }
+    };
+
+    // U+FFFD, "¡" and "¿" leave names and search terms, as Jellyfin deletes them.
+    for (uri, names) in [
+        ("/Genres", vec!["Acción!", "Rock"]),
+        ("/Genres?SearchTerm=%C2%BFrock", vec!["Rock"]),
+    ] {
+        let (status, body) = get(uri.into()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(j5_names(&body), names, "{uri}");
+        assert_eq!(body["TotalRecordCount"], names.len(), "{uri}");
+    }
+    let (status, body) = get("/Genres/%C2%A1Acci%C3%B3n!".into()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Name"], "Acción!");
 }
 
 #[tokio::test]

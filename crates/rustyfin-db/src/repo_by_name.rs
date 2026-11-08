@@ -44,12 +44,18 @@ pub const BY_NAME_NAMESPACE: Uuid = Uuid::from_u128(0xbba0cef5b5394903ad04cdc449
 /// name is decomposed (NFD), the combining accents U+0300 to U+036F are dropped, the rest is composed
 /// again (NFC), and the letters that those tables fold but Unicode does not decompose are swapped by
 /// `unaccented`. That equals Jellyfin's fold on every letter of the tables; rarer accented letters
-/// that the tables leave alone, such as "ĉ", lose their accent here too.
+/// that the tables leave alone, such as "ĉ", lose their accent here too. The characters in `DELETED`
+/// are deleted first, as Jellyfin deletes them, and every "ς" becomes "σ", as .NET's
+/// `ToLowerInvariant` lowercases a word-final "Σ" to "σ".
 ///
 /// The fold is frozen: every entry id is built from it (`by_name_id`) and clients store those ids, so
 /// a change would change ids that clients hold.
 pub fn fold_name(name: &str) -> String {
-    let lower = name.trim().to_lowercase();
+    let lower = name
+        .replace(DELETED, "")
+        .trim()
+        .to_lowercase()
+        .replace('ς', "σ");
     lower
         .nfd()
         .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
@@ -57,6 +63,11 @@ pub fn fold_name(name: &str) -> String {
         .map(unaccented)
         .collect()
 }
+
+/// The characters that Jellyfin deletes from a name: U+FFFD, which
+/// `Jellyfin.Extensions.StringExtensions.RemoveDiacritics` strips, and "¡", "¿" and "⸘", which the
+/// Spanish table of Diacritics.NET maps to nothing.
+const DELETED: [char; 4] = ['\u{fffd}', '¡', '¿', '⸘'];
 
 /// The lowercase letters that Jellyfin's Diacritics.NET tables fold and Unicode does not decompose.
 fn unaccented(c: char) -> char {

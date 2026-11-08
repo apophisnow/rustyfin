@@ -1199,6 +1199,19 @@ fn j5_ids_are_uuid_v5_of_the_kind_and_the_folded_name() {
     assert_eq!(repo_by_name::fold_name("Come\u{301}dia"), "comedia");
     assert_eq!(repo_by_name::fold_name("Bjørk ŁÓDŹ"), "bjork lodz");
     assert_eq!(repo_by_name::fold_name("ガ"), "ガ");
+    // Every "ς" folds to "σ", as .NET's ToLowerInvariant lowercases "Σ" to "σ" at the end of a word
+    // too, so "ΔΡΆΜΑΣ" and "δράμας" are one name and "ΜΑΣ" is found in "Μασκαράδα".
+    assert_eq!(id(Genre, "ΔΡΆΜΑΣ"), "46602e53-1af1-504d-823c-c1113b8387da");
+    assert_eq!(id(Genre, "δράμας"), "46602e53-1af1-504d-823c-c1113b8387da");
+    assert_eq!(repo_by_name::fold_name("ΜΑΣ"), "μασ");
+    // U+FFFD, "¡", "¿" and "⸘" are deleted, as Jellyfin deletes them, before the name is trimmed.
+    assert_eq!(
+        id(Genre, "¡Acción!"),
+        "e85dbba9-8b4e-58ef-9479-5aab1317bfba"
+    );
+    assert_eq!(repo_by_name::fold_name("¡ Acción!"), "accion!");
+    assert_eq!(repo_by_name::fold_name("¿Qué? ⸘Qué?!"), "que? que?!");
+    assert_eq!(repo_by_name::fold_name("Rock\u{fffd}"), "rock");
     let kinds: Vec<_> = [Genre, MusicGenre, Studio, Year]
         .iter()
         .map(|k| k.as_str())
