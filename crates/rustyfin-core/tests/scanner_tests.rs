@@ -5551,12 +5551,26 @@ async fn b26_item_sources(pool: &SqlitePool, item: Uuid) -> Vec<String> {
         .unwrap()
 }
 
-/// B26 criteria 3 and 4, without ffprobe, as on CI's runner: a scan counts a movie whose source an
-/// older probe wrote as read again, before any probe runs, and leaves alone one whose source a
-/// probe at least as new as this one wrote. A version far above any real one stands for the
-/// current one, so the test holds when the version goes up.
+/// Makes the file at `path` unreadable to ffprobe without changing its stamp: zeros of its size,
+/// with its modification time. Only the version of its source then tells a scan to read it again.
+fn b26_break(path: &Path) {
+    let (size, modified) = stat(path);
+    std::fs::write(path, vec![0u8; usize::try_from(size).unwrap()]).unwrap();
+    b18_set_modified(path, u64::try_from(modified).unwrap());
+    assert_eq!(stat(path), (size, modified));
+}
+
+/// ffmpeg. B26 criteria 3 and 4: a scan counts a movie whose source an older probe wrote as read
+/// again, before any probe runs, and leaves alone one whose source a probe at least as new as this
+/// one wrote. A version far above any real one stands for the current one, so the test holds when
+/// the version goes up. Without ffprobe a scan reads nothing again, which
+/// `b26_a_scan_without_ffprobe_reads_nothing_again` tests.
 #[tokio::test]
 async fn b26_a_scan_counts_old_sources_as_rereads() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
     let fx = Fixture::new().await;
     let lib = fx.library("film", LibraryContentType::Movies).await;
     let pool = &fx.pool;
@@ -5874,7 +5888,8 @@ async fn b26_changed_old_files_are_read_once() {
 }
 
 /// ffmpeg. B26 criterion 6: a re-read skips a file whose probe failed before, as every scan does.
-/// An old file that no longer probes gets a failure record, and later scans leave it alone.
+/// An old file that no longer probes keeps its source and gets a failure record, and later scans
+/// leave it alone (review 1, finding 1).
 #[tokio::test]
 async fn b26_failed_probes_are_not_read_again() {
     if !have_ffmpeg() {
@@ -5905,13 +5920,10 @@ async fn b26_failed_probes_are_not_read_again() {
     )
     .await;
 
-    // Gamma no longer probes: zeros of its size, with its modification time, so only its version
-    // tells the scan to read it again.
+    // Gamma no longer probes, and only its version tells the scan to read it again.
     let gamma_path = root.join(gamma);
-    let (size, modified) = stat(&gamma_path);
-    std::fs::write(&gamma_path, vec![0u8; usize::try_from(size).unwrap()]).unwrap();
-    b18_set_modified(&gamma_path, u64::try_from(modified).unwrap());
-    assert_eq!(stat(&gamma_path), (size, modified));
+    b26_break(&gamma_path);
+    let before = b18_source_ids(pool, &lib).await;
 
     assert_eq!(
         b18_rescan(pool, &lib, &ScanScope::Library).await,
@@ -5931,6 +5943,20 @@ async fn b26_failed_probes_are_not_read_again() {
         failure(&gamma_path, &failed_at)
     );
     assert_eq!(b26_streams(pool, &lib, alpha).await, b26_clip_streams(true));
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [alpha]);
+    let kept = before
+        .iter()
+        .find(|(path, _)| path == gamma)
+        .expect("Gamma has no source");
+    assert!(
+        after.contains(kept),
+        "the failed re-read did not keep Gamma's source: {after:?}"
+    );
+    assert_eq!(
+        b26_streams(pool, &lib, gamma).await,
+        b26_clip_streams(false)
+    );
 
     exec(
         pool,
@@ -5951,6 +5977,7 @@ async fn b26_failed_probes_are_not_read_again() {
             path.display()
         );
     }
+    assert_eq!(b18_source_ids(pool, &lib).await, after);
 }
 
 /// ffmpeg. B26 criterion 9: a music scan reads again, once, a track whose source an older probe
@@ -6287,4 +6314,258 @@ async fn b26_a_scan_during_music_rereads_waits_for_them() {
         "the second scan did not wait for the first one's re-reads"
     );
     assert_eq!(b26_versions(pool, &lib).await, fresh);
+}
+
+/// ffmpeg. B26 review 1, finding 1: an alternate version whose re-read fails keeps its source, in
+/// its place after the primary's, while the primary is read again. Its failure is recorded, so
+/// later scans leave the movie alone.
+#[tokio::test]
+async fn b26_a_failed_alternate_keeps_its_source() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let uhd = "Beta (2002)/Beta (2002) Bluray-2160p.mkv";
+    let hd = "Beta (2002)/Beta (2002) Bluray-1080p.mkv";
+    for file in [uhd, hd] {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    b26_fresh_versions(pool, &lib, &[uhd, hd]).await;
+    assert_groups(pool, &lib, &[(uhd, &[uhd, hd])]).await;
+    b26_make_old(pool, &lib, &[uhd, hd]).await;
+    let hd_path = root.join(hd);
+    b26_break(&hd_path);
+    let before = b18_source_ids(pool, &lib).await;
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the scan did not read the movie again"
+    );
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [uhd]);
+    assert_groups(pool, &lib, &[(uhd, &[uhd, hd])]).await;
+    assert_eq!(b26_streams(pool, &lib, uhd).await, b26_clip_streams(true));
+    assert_eq!(b26_streams(pool, &lib, hd).await, b26_clip_streams(false));
+    let (_, _, failed_at) = failure_of(pool, &hd_path)
+        .await
+        .expect("the failed re-read is not recorded");
+    assert_eq!(
+        failure_of(pool, &hd_path).await,
+        failure(&hd_path, &failed_at)
+    );
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read the movie again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, after);
+}
+
+/// ffmpeg. B26 review 1, finding 1: a primary version whose re-read fails keeps its source and its
+/// place. The alternate is read again but does not take the item over. Later scans leave the
+/// movie alone.
+#[tokio::test]
+async fn b26_a_failed_primary_keeps_its_place() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("film", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let uhd = "Beta (2002)/Beta (2002) Bluray-2160p.mkv";
+    let hd = "Beta (2002)/Beta (2002) Bluray-1080p.mkv";
+    for file in [uhd, hd] {
+        b26_clip(&fx, &root, file);
+    }
+    scan_idle(pool, &lib).await;
+    b26_fresh_versions(pool, &lib, &[uhd, hd]).await;
+    let item = item_at(pool, &lib, uhd).await;
+    b26_make_old(pool, &lib, &[uhd, hd]).await;
+    let uhd_path = root.join(uhd);
+    b26_break(&uhd_path);
+    let before = b18_source_ids(pool, &lib).await;
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the scan did not read the movie again"
+    );
+    let after = b18_source_ids(pool, &lib).await;
+    assert_eq!(b18_reprobed(&before, &after), [hd]);
+    assert_groups(pool, &lib, &[(uhd, &[uhd, hd])]).await;
+    assert_eq!(item_at(pool, &lib, uhd).await, item);
+    assert_eq!(b26_streams(pool, &lib, uhd).await, b26_clip_streams(false));
+    assert_eq!(b26_streams(pool, &lib, hd).await, b26_clip_streams(true));
+    assert!(
+        failure_of(pool, &uhd_path).await.is_some(),
+        "the failed re-read is not recorded"
+    );
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read the movie again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, after);
+}
+
+/// ffmpeg. B26 review 1, finding 1: a track whose re-read fails keeps its source, and its failure
+/// is recorded with the file's stamp, so later scans leave it alone.
+#[tokio::test]
+async fn b26_a_failed_track_reread_keeps_its_source() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: needs ffmpeg and ffprobe");
+        return;
+    }
+    let fx = Fixture::new().await;
+    let lib = fx.library("music", LibraryContentType::Music).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let song = "Artist B/Album B/01 Song.ogg";
+    let other = "Artist B/Album B/02 Other.ogg";
+    let song_path = b26_track(&root, song);
+    b26_track(&root, other);
+    scan(pool, &lib).await;
+    b18_tracks_probed(pool, &lib).await;
+    b26_fresh_versions(pool, &lib, &[song, other]).await;
+    b26_make_old(pool, &lib, &[song]).await;
+    b26_break(&song_path);
+    let before = b18_source_ids(pool, &lib).await;
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the scan did not read the old track again, or not only it"
+    );
+    let (_, _, failed_at) = failure_of(pool, &song_path)
+        .await
+        .expect("the failed re-read is not recorded");
+    assert_eq!(
+        failure_of(pool, &song_path).await,
+        failure(&song_path, &failed_at)
+    );
+    assert_eq!(
+        b18_source_ids(pool, &lib).await,
+        before,
+        "the failed re-read did not keep the track's source"
+    );
+    assert_eq!(
+        b26_streams(pool, &lib, song).await,
+        b26_track_streams(false)
+    );
+
+    assert_eq!(
+        b18_rescan(pool, &lib, &ScanScope::Library).await,
+        (0, 0, 0),
+        "a later scan read the track again"
+    );
+    assert_eq!(b18_source_ids(pool, &lib).await, before);
+}
+
+/// Gives `item` a source at `path` that probe version 0 wrote. The source stores the file's size,
+/// and a modification time `age` seconds before the file's: with an `age` of 0, the file has not
+/// changed since that probe. Returns the source's id.
+async fn b26_old_source(pool: &SqlitePool, item: Uuid, path: &Path, age: i64) -> String {
+    let (size, modified) = stat(path);
+    let source = Uuid::new_v4().to_string();
+    exec(
+        pool,
+        "INSERT INTO media_sources (id, item_id, uid, path, size, modified, probe_version)
+         VALUES (?1, ?2, ?1, ?3, ?4, ?5, 0)",
+        &[
+            &source,
+            &item.to_string(),
+            path.to_str().unwrap(),
+            &size.to_string(),
+            &(modified - age).to_string(),
+        ],
+    )
+    .await;
+    source
+}
+
+/// B26 review 1, finding 1: before a scan reads the first file of an older probe again, it checks
+/// that ffprobe runs. When ffprobe does not, the scan reads no file again for its version, so every
+/// old source stays: a movie's, a music track's and a Mixed library's audio file's. A changed file
+/// is still probed, and loses its source when the probe fails, as before. The test runs itself
+/// again in a child process whose PATH holds no ffprobe.
+#[tokio::test]
+async fn b26_a_scan_without_ffprobe_reads_nothing_again() {
+    if std::env::var_os("B26_NO_FFPROBE").is_some() {
+        b26_scan_without_ffprobe().await;
+        return;
+    }
+    let fx = Fixture::new().await;
+    let empty = fx.path("no-ffprobe");
+    std::fs::create_dir_all(&empty).unwrap();
+    b26_rerun(
+        "b26_a_scan_without_ffprobe_reads_nothing_again",
+        &[
+            ("B26_NO_FFPROBE", std::ffi::OsStr::new("1")),
+            ("PATH", empty.as_os_str()),
+        ],
+    );
+}
+
+/// The child process of `b26_a_scan_without_ffprobe_reads_nothing_again`, with no ffprobe.
+async fn b26_scan_without_ffprobe() {
+    let fx = Fixture::new().await;
+    let pool = &fx.pool;
+
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&film);
+    let old = "Old (2001)/Old (2001).mkv";
+    let changed = "Changed (2002)/Changed (2002).mkv";
+    let old_path = touch(&root, old);
+    let old_item = insert_movie(pool, &film, &old_path, Movie::default()).await;
+    let old_source = b26_old_source(pool, old_item, &old_path, 0).await;
+    let changed_path = touch(&root, changed);
+    let changed_item = insert_movie(pool, &film, &changed_path, Movie::default()).await;
+    b26_old_source(pool, changed_item, &changed_path, 60).await;
+    assert_eq!(
+        b18_rescan(pool, &film, &ScanScope::Library).await,
+        (0, 0, 1),
+        "the scan read the unchanged old movie again, or did not probe the changed one"
+    );
+    assert_eq!(
+        b26_item_sources(pool, old_item).await,
+        [old_source],
+        "the unchanged old movie lost its source"
+    );
+    assert_eq!(
+        b26_versions(pool, &film).await,
+        [(old.to_string(), 0)],
+        "the changed movie kept a source its probe could not read, or the old one was replaced"
+    );
+
+    let music = fx.library("music", LibraryContentType::Music).await;
+    let track = touch(&root_of(&music), "Artist/Album/01 Song.ogg");
+    let track_item = insert_item(pool, &music, "Audio", &track, None).await;
+    let track_source = b26_old_source(pool, track_item, &track, 0).await;
+    assert_eq!(
+        b18_rescan(pool, &music, &ScanScope::Library).await,
+        (0, 0, 0),
+        "the music scan read the old track again"
+    );
+    assert_eq!(b26_item_sources(pool, track_item).await, [track_source]);
+
+    let mixed = fx.library("mixed", LibraryContentType::Mixed).await;
+    let song = touch(&root_of(&mixed), "Song.ogg");
+    let song_item = insert_item(pool, &mixed, "Audio", &song, None).await;
+    let song_source = b26_old_source(pool, song_item, &song, 0).await;
+    assert_eq!(
+        b18_rescan(pool, &mixed, &ScanScope::Library).await,
+        (0, 0, 0),
+        "the Mixed-library scan read the old audio file again"
+    );
+    assert_eq!(b26_item_sources(pool, song_item).await, [song_source]);
 }

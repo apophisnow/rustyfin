@@ -728,33 +728,86 @@ pub enum ProbeError {
 // Convenience: probe and save to DB
 // ---------------------------------------------------------------------------
 
-/// Probe a file and save it as the primary (only) media source for an item.
-/// The probe runs first: when it succeeds, the item's sources are replaced in one transaction;
-/// when it fails, they are deleted. So a probe cut short leaves the old sources.
-/// Each source records [`rustyfin_db::repo_media_source::PROBE_VERSION`], which tells a scan
-/// when to read the file again.
+/// Probes `path`, one of `files`, the files of the item's probe plan in order, and writes what it
+/// gave with `write_probe_outcome`. As the primary, a probe that read the file saves the item's
+/// runtime and chapters, and a failed probe that kept the file's source sets the item's runtime
+/// from that source. Returns the probe's result, and whether the item has a source at `path` now.
+async fn probe_and_write(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    files: &[String],
+    path: &str,
+    as_primary: bool,
+    stamp: Option<(i64, i64)>,
+) -> (Result<(), ProbeError>, bool) {
+    let probe = probe_file(path).await;
+    let outcome = match &probe {
+        Ok(result) => rustyfin_db::repo_media_source::ProbeOutcome::Probed(&result.source),
+        Err(_) => rustyfin_db::repo_media_source::ProbeOutcome::Failed { stamp },
+    };
+    let has_source = match rustyfin_db::repo_media_source::write_probe_outcome(
+        pool, item_id, files, path, outcome,
+    )
+    .await
+    {
+        Ok(has_source) => has_source,
+        // The transaction rolled back, so nothing changed and nothing must be promoted.
+        Err(e) => return (Err(ProbeError::Db(e)), true),
+    };
+    match probe {
+        Ok(result) => {
+            if as_primary {
+                save_runtime_and_chapters(
+                    pool,
+                    item_id,
+                    result.source.run_time_ticks,
+                    result.chapters,
+                )
+                .await;
+            }
+            (Ok(()), true)
+        }
+        Err(e) => {
+            if as_primary && has_source {
+                let updated = sqlx::query(
+                    "UPDATE media_items SET runtime_ticks = COALESCE((SELECT run_time_ticks \
+                     FROM media_sources WHERE item_id = ?1 AND path = ?2 ORDER BY rowid \
+                     LIMIT 1), runtime_ticks) WHERE id = ?1",
+                )
+                .bind(item_id.to_string())
+                .bind(path)
+                .execute(pool)
+                .await;
+                if let Err(e) = updated {
+                    warn!("failed to set the runtime of '{}': {}", path, e);
+                }
+            }
+            (Err(e), has_source)
+        }
+    }
+}
+
+/// Probe a file and save it as the primary (only) media source for an item. A probe that reads the
+/// file replaces the item's sources and saves its runtime and chapters. A probe that fails keeps
+/// the source of an unchanged file and deletes any other source. Each source records
+/// [`rustyfin_db::repo_media_source::PROBE_VERSION`], which tells a scan when to read
+/// the file again.
+/// Unlike a scan's probe step, this records no probe failure and stores no stamp.
 pub async fn probe_and_save(
     pool: &sqlx::SqlitePool,
     item_id: &uuid::Uuid,
     path: &str,
 ) -> Result<(), ProbeError> {
-    let result = match probe_file(path).await {
-        Ok(result) => result,
-        Err(e) => {
-            // A file that cannot be probed keeps no sources
-            let _ = rustyfin_db::repo_media_source::delete_media_sources(pool, item_id).await;
-            return Err(e);
-        }
-    };
-    let _source_id = rustyfin_db::repo_media_source::replace_media_sources_with_streams(
+    probe_and_write(
         pool,
         item_id,
-        &result.source,
+        &[path.to_string()],
+        path,
+        true,
+        scan_sync::file_stamp(path),
     )
-    .await?;
-    save_runtime_and_chapters(pool, item_id, result.source.run_time_ticks, result.chapters).await;
-
-    Ok(())
+    .await
+    .0
 }
 
 /// Probe a file and add it as an additional media source for an item.
@@ -767,9 +820,43 @@ pub async fn probe_and_add_source(
     probe_and_add_source_internal(pool, item_id, path).await
 }
 
+/// Runs one probe step: takes the file's stamp, probes and writes with `probe_and_write`, clears
+/// the file's probe failure when the probe read it, records one for an ffprobe or parse error, so
+/// that later scans skip the file until it changes, and stores the stamp on the file's source when
+/// it has one (a new source, or a kept one that was never stamped).
+async fn run_probe_step(
+    pool: &sqlx::SqlitePool,
+    item_id: &uuid::Uuid,
+    files: &[String],
+    path: &str,
+    as_primary: bool,
+) -> (Result<(), ProbeError>, bool) {
+    // Taken before the probe, so that a file that changes during it is probed again.
+    let stamp = scan_sync::file_stamp(path);
+    let (result, has_source) = probe_and_write(pool, item_id, files, path, as_primary, stamp).await;
+    // Keep the failure record in step with the probe. A DB error here is only logged.
+    let recorded = match &result {
+        Ok(()) => scan_sync::clear_probe_failure(pool, path).await,
+        Err(ProbeError::FfprobeFailed(_) | ProbeError::ParseError(_)) => {
+            scan_sync::record_probe_failure(pool, path, stamp).await
+        }
+        Err(_) => Ok(()),
+    };
+    if let Err(e) = recorded {
+        warn!("failed to record the probe of '{}': {}", path, e);
+    }
+    if has_source
+        && !matches!(result, Err(ProbeError::Db(_)))
+        && let Err(e) = scan_sync::store_stamp(pool, &item_id.to_string(), path, stamp).await
+    {
+        warn!("failed to store the stamp of '{}': {}", path, e);
+    }
+    (result, has_source)
+}
+
 /// Spawn a bounded probe task that respects the global concurrency limit.
-/// Returns a JoinHandle so the caller can await it if needed. When the probe succeeds, the file's
-/// stamp, taken before the probe, is stored on the new source.
+/// Returns a JoinHandle so the caller can await it if needed. The probe is the primary step of its
+/// file (see `run_probe_step`): a failure is logged, and an unchanged file keeps its source.
 pub fn spawn_probe_and_save(
     pool: sqlx::SqlitePool,
     item_id: uuid::Uuid,
@@ -778,16 +865,10 @@ pub fn spawn_probe_and_save(
     tokio::spawn(async move {
         // Acquire a permit from the semaphore to limit concurrent probes
         let _permit = probe_semaphore().acquire().await;
-        let stamp = scan_sync::file_stamp(&path);
-        match probe_and_save(&pool, &item_id, &path).await {
-            Ok(()) => {
-                if let Err(e) =
-                    scan_sync::store_stamp(&pool, &item_id.to_string(), &path, stamp).await
-                {
-                    tracing::warn!("failed to store the stamp of '{}': {}", path, e);
-                }
-            }
-            Err(e) => tracing::warn!("failed to probe '{}': {}", path, e),
+        let (result, _) =
+            run_probe_step(&pool, &item_id, std::slice::from_ref(&path), &path, true).await;
+        if let Err(e) = result {
+            tracing::warn!("failed to probe '{}': {}", path, e);
         }
     })
 }
@@ -810,20 +891,24 @@ pub fn spawn_probe_and_add_source(
 /// One file of a probe plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeStep {
-    /// Probes the file as the item's primary source: it replaces the item's sources, and sets its runtime and chapters.
+    /// Probes the file as the item's primary source: when the probe reads the file, its source
+    /// replaces the item's source at that file, and the item's runtime and chapters come from it.
     Primary(String),
-    /// Probes the file and adds it to the item as another source.
+    /// Probes the file and adds it to the item as another source, replacing the item's source at
+    /// that file.
     Alternate(String),
 }
 
-/// Runs `steps` for one item, in order, under one probe permit. A step that fails is logged, and
-/// the next step still runs. A step that succeeds clears the probe failure of its file and stores the
-/// file's stamp on its source. One that fails with an ffprobe or parse error records the failure, so
-/// that later scans skip the file.
+/// Runs `steps` for one item, in order, under one probe permit. Each step runs with
+/// `run_probe_step`, and the files of all the steps are the plan's files: a step writes the source
+/// of its own file and keeps the sources of the others in order. A step that fails is logged, and
+/// the next step still runs. A failed step keeps the source of an unchanged file, and records its
+/// failure for an ffprobe or parse error, so that later scans skip the file until it changes.
 ///
-/// After a failed `Primary` step the item has no primary, so the next step runs as the primary
-/// instead, with `probe_and_save`. If that step succeeds, its file becomes the item's path, and the
-/// steps after it are alternates again.
+/// A primary step that leaves the item without a source at its file makes the next step run as the
+/// primary instead. When that step leaves a source, its file becomes the item's path, and the
+/// steps after it are alternates again. A primary that keeps its source keeps the item's place, so
+/// the alternates do not take it over.
 pub fn spawn_probe_plan(
     pool: sqlx::SqlitePool,
     item_id: uuid::Uuid,
@@ -832,60 +917,52 @@ pub fn spawn_probe_plan(
     tokio::spawn(async move {
         // One permit for the whole plan, so that its steps run in order
         let _permit = probe_semaphore().acquire().await;
-        // Whether the item has no primary: true from a failed primary step until a step succeeds
+        let files: Vec<String> = steps
+            .iter()
+            .map(|step| match step {
+                ProbeStep::Primary(path) | ProbeStep::Alternate(path) => path.clone(),
+            })
+            .collect();
+        // Whether the item has no primary: true after a primary step leaves no source at its file.
+        // It is cleared when a later step leaves a source.
         let mut needs_primary = false;
         for step in steps {
-            let is_primary = matches!(step, ProbeStep::Primary(_));
-            // Taken before the probe, so that a file that changes during it is probed again.
-            let stamp = scan_sync::file_stamp(match &step {
-                ProbeStep::Primary(path) | ProbeStep::Alternate(path) => path,
-            });
-            let (path, result) = match &step {
-                ProbeStep::Primary(path) => (path, probe_and_save(&pool, &item_id, path).await),
-                ProbeStep::Alternate(path) if needs_primary => {
-                    (path, probe_and_save(&pool, &item_id, path).await)
-                }
-                ProbeStep::Alternate(path) => {
-                    (path, probe_and_add_alternate(&pool, &item_id, path).await)
-                }
+            let (path, is_primary) = match &step {
+                ProbeStep::Primary(path) => (path, true),
+                ProbeStep::Alternate(path) => (path, false),
             };
-            // Keep the failure record in step with the probe. A DB error here is only logged.
-            let recorded = match &result {
-                Ok(()) => scan_sync::clear_probe_failure(&pool, path).await,
-                Err(ProbeError::FfprobeFailed(_) | ProbeError::ParseError(_)) => {
-                    scan_sync::record_probe_failure(&pool, path, stamp).await
-                }
-                Err(_) => Ok(()),
-            };
-            if let Err(e) = recorded {
-                warn!("failed to record the probe of '{}': {}", path, e);
+            let (result, has_source) =
+                run_probe_step(&pool, &item_id, &files, path, is_primary || needs_primary).await;
+            if let Err(e) = &result {
+                warn!("failed to probe '{}': {}", path, e);
             }
-            match result {
-                Ok(()) => {
-                    if let Err(e) =
-                        scan_sync::store_stamp(&pool, &item_id.to_string(), path, stamp).await
-                    {
-                        warn!("failed to store the stamp of '{}': {}", path, e);
-                    }
-                    if needs_primary {
-                        let moved = sqlx::query("UPDATE media_items SET path = ?1 WHERE id = ?2")
-                            .bind(path.as_str())
-                            .bind(item_id.to_string())
-                            .execute(&pool)
-                            .await;
-                        if let Err(e) = moved {
-                            warn!("failed to set the path of '{}': {}", path, e);
-                        }
-                        needs_primary = false;
-                    }
+            if is_primary {
+                needs_primary = !has_source;
+            } else if needs_primary && has_source {
+                let moved = sqlx::query("UPDATE media_items SET path = ?1 WHERE id = ?2")
+                    .bind(path.as_str())
+                    .bind(item_id.to_string())
+                    .execute(&pool)
+                    .await;
+                if let Err(e) = moved {
+                    warn!("failed to set the path of '{}': {}", path, e);
                 }
-                Err(e) => {
-                    warn!("failed to probe '{}': {}", path, e);
-                    needs_primary |= is_primary;
-                }
+                needs_primary = false;
             }
         }
     })
+}
+
+/// True when `ffprobe -version` runs and exits 0.
+pub async fn ffprobe_runs() -> bool {
+    Command::new("ffprobe")
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
 }
 
 /// Adds `path` to an item as another source: probes the file and inserts it with its streams.
