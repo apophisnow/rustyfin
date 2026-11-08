@@ -1586,6 +1586,7 @@ fn shutdown_does_not_wait_for_a_poll_that_hangs() {
 #[cfg(target_os = "linux")]
 mod kernel {
     use std::future::Future;
+    use std::io::Write;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::pin::Pin;
     use std::process::Command;
@@ -2449,7 +2450,9 @@ mod kernel {
     // ── Mounts ──
     // Mounting needs a mount namespace of its own. `mount_changes_in_a_namespace` runs the ignored
     // `mount_ns_` tests again under `unshare -rm`, where they mount tmpfs; nothing is mounted
-    // outside it. Where unshare is not allowed (CI's container), it skips.
+    // outside it. Where unshare is not allowed (CI's container), it skips, and says so on stderr;
+    // `RUSTYFIN_REQUIRE_MOUNT_NS=1` makes it fail there instead. Its notes go to stderr with
+    // `writeln!`, which libtest doesn't capture, unlike `eprintln!`.
 
     /// Set for the run of the `mount_ns_` tests under `unshare -rm`.
     const MOUNT_NS: &str = "RUSTYFIN_TEST_MOUNT_NS";
@@ -2465,7 +2468,14 @@ mod kernel {
             .output()
             .is_ok_and(|out| out.status.success());
         if !allowed {
-            eprintln!("skipped: `unshare -rm` is not allowed here, so nothing can be mounted");
+            assert!(
+                std::env::var(REQUIRE_MOUNT_NS).as_deref() != Ok("1"),
+                "unshare refused; the mount_ns_ tests did not run, and {REQUIRE_MOUNT_NS}=1 requires them"
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED: unshare refused; the mount_ns_ tests did not run ({REQUIRE_MOUNT_NS}=1 makes this fail)"
+            );
             return;
         }
         let out = Command::new("unshare")
@@ -2486,6 +2496,12 @@ mod kernel {
                 && !text.contains(" 0 passed"),
             "the mount tests failed under `unshare -rm`:\n{text}"
         );
+        if let Some(result) = text.lines().find(|line| line.starts_with("test result:")) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "mount_ns_ tests under `unshare -rm`: {result}"
+            );
+        }
     }
 
     /// Fix round 2, item B: where `unshare -rm` is refused, `mount_changes_in_a_namespace` says so
@@ -2538,7 +2554,12 @@ mod kernel {
     fn in_mount_namespace() -> bool {
         let inside = std::env::var_os(MOUNT_NS).is_some();
         if !inside {
-            eprintln!("skipped: mount_changes_in_a_namespace runs it under `unshare -rm`");
+            let thread = std::thread::current();
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED: {} mounts, so it runs only under `unshare -rm`, from mount_changes_in_a_namespace",
+                thread.name().unwrap_or("this test")
+            );
         }
         inside
     }
