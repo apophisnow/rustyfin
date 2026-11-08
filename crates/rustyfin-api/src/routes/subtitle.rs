@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -290,7 +291,12 @@ async fn subtitle_vtt(
         Ok(text) => text,
         Err(_) => {
             let cp1252 = stream.is_external && is_cp1252(&input).await;
-            let text = ffmpeg_vtt(&input, &map, cp1252).await?;
+            let demuxer = if stream.is_external {
+                subtitle_demuxer(&input)
+            } else {
+                None
+            };
+            let text = ffmpeg_vtt(&input, &map, demuxer, cp1252).await?;
             // ffmpeg keeps the ASS override and comment blocks as text; no ASS renderer shows them
             let ass = stream.codec.as_deref().is_some_and(|codec| {
                 codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa")
@@ -316,19 +322,56 @@ async fn subtitle_vtt(
         .into_response())
 }
 
-/// Runs ffmpeg to write subtitle stream `map` of `input` as WebVTT, reading the file as
-/// Windows-1252 when `cp1252`. A failure is logged with ffmpeg's stderr; the 500 does not name
-/// the file.
-async fn ffmpeg_vtt(input: &std::path::Path, map: &str, cp1252: bool) -> Result<String, ApiError> {
-    let mut command = tokio::process::Command::new("ffmpeg");
-    command.args(["-nostdin", "-v", "error"]);
-    if cp1252 {
-        command.args(["-sub_charenc", "CP1252"]);
+/// The ffmpeg demuxer of the external subtitle file `path`, by its extension in lower case; None
+/// for an extension that names no format, so that ffmpeg probes the file.
+fn subtitle_demuxer(path: &std::path::Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "srt" => Some("srt"),
+        "ass" | "ssa" => Some("ass"),
+        "vtt" => Some("webvtt"),
+        _ => None,
     }
+}
+
+/// The ffmpeg arguments that write subtitle stream `map` of `input` as WebVTT on stdout. Input
+/// options go before `-i`: `-sub_charenc CP1252` when `cp1252`, and `-f {demuxer}` when a demuxer
+/// is given. The forced format keeps ffmpeg from reading an external file by its content (a
+/// playlist or concat list named `.srt` would open other files or URLs), and only local files
+/// open.
+fn vtt_args(
+    input: &std::path::Path,
+    map: &str,
+    demuxer: Option<&str>,
+    cp1252: bool,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["-nostdin", "-v", "error", "-protocol_whitelist", "file"]
+        .map(OsString::from)
+        .into();
+    if cp1252 {
+        args.extend(["-sub_charenc", "CP1252"].map(OsString::from));
+    }
+    if let Some(demuxer) = demuxer {
+        args.extend(["-f", demuxer].map(OsString::from));
+    }
+    args.push("-i".into());
+    args.push(input.into());
+    args.extend(["-map", map, "-f", "webvtt", "-"].map(OsString::from));
+    args
+}
+
+/// Runs ffmpeg with `vtt_args` to write subtitle stream `map` of `input` as WebVTT, reading the
+/// file in `demuxer`'s format when one is given and as Windows-1252 when `cp1252`. A failure is
+/// logged with ffmpeg's stderr; the 500 does not name the file.
+async fn ffmpeg_vtt(
+    input: &std::path::Path,
+    map: &str,
+    demuxer: Option<&str>,
+    cp1252: bool,
+) -> Result<String, ApiError> {
+    let mut command = tokio::process::Command::new("ffmpeg");
     command
-        .arg("-i")
-        .arg(input)
-        .args(["-map", map, "-f", "webvtt", "-"])
+        .args(vtt_args(input, map, demuxer, cp1252))
         .kill_on_drop(true);
     let stderr = match command.output().await {
         Ok(out) if out.status.success() => match String::from_utf8(out.stdout) {
