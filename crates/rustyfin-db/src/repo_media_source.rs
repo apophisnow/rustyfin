@@ -8,7 +8,10 @@ use uuid::Uuid;
 /// those files again. Photos are never read again for it, so a field that photos need takes a
 /// change to the scans as well. A file whose probe failed is read again only once it changes.
 ///
-/// 1: the language and title of each stream, which ffprobe nests under the stream's tags.
+/// 1: the language and title of each stream, which ffprobe nests under the stream's tags, and a
+/// subtitle's forced flag from its disposition alone, as in Jellyfin. That rule changed before
+/// version 1 shipped, so it kept version 1: every source that a title made forced is older, and
+/// is read again anyway.
 pub const PROBE_VERSION: i64 = 1;
 
 // ---------------------------------------------------------------------------

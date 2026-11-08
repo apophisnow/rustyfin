@@ -647,20 +647,9 @@ fn stream_to_model(s: FfprobeStream) -> MediaStream {
         None
     };
 
-    // Determine if forced for subtitles
-    let is_forced_sub = if s.codec_type.as_deref() == Some("subtitle") {
-        is_forced
-            || s.codec_name
-                .as_ref()
-                .map(|c| c.contains("forced"))
-                .unwrap_or(false)
-            || title
-                .as_ref()
-                .map(|t| t.contains("forced"))
-                .unwrap_or(false)
-    } else {
-        false
-    };
+    // As in Jellyfin, only the disposition makes a subtitle forced; a title or codec name
+    // that says "forced" does not
+    let is_forced_sub = s.codec_type.as_deref() == Some("subtitle") && is_forced;
 
     MediaStream {
         index: s.index,
@@ -1224,12 +1213,32 @@ mod tests {
     }
 
     #[test]
-    fn test_forced_subtitle_title_comes_from_tags() {
-        let json = r#"{"streams": [{"index": 4, "codec_name": "subrip", "codec_type": "subtitle",
-            "disposition": {"default": 0, "forced": 0},
-            "tags": {"language": "eng", "title": "english forced"}}]}"#;
+    fn test_subtitle_is_forced_only_by_its_disposition() {
+        // As in Jellyfin, a title or a codec name that says "forced" does not make a subtitle
+        // forced, and the title is still kept
+        let json = r#"{"streams": [
+            {"index": 4, "codec_name": "subrip", "codec_type": "subtitle",
+                "disposition": {"default": 0, "forced": 0},
+                "tags": {"language": "eng", "title": "english forced"}},
+            {"index": 5, "codec_name": "hdmv_pgs_subtitle", "codec_type": "subtitle",
+                "disposition": {"default": 0, "forced": 1},
+                "tags": {"language": "eng", "title": "English"}},
+            {"index": 6, "codec_name": "forced", "codec_type": "subtitle"}
+        ]}"#;
         let parsed: FfprobeOutput = serde_json::from_str(json).expect("should parse");
-        let stream = stream_to_model(parsed.streams.into_iter().next().unwrap());
-        assert!(stream.is_forced, "{stream:?}");
+        let streams: Vec<(i32, Option<String>, bool)> = parsed
+            .streams
+            .into_iter()
+            .map(stream_to_model)
+            .map(|s| (s.index, s.title, s.is_forced))
+            .collect();
+        assert_eq!(
+            streams,
+            vec![
+                (4, some("english forced"), false),
+                (5, some("English"), true),
+                (6, None, false),
+            ]
+        );
     }
 }
