@@ -2878,4 +2878,169 @@ mod tests {
         assert_eq!(one(), one_sql, "after 63 excluded types");
         assert_eq!(many(), many_sql);
     }
+
+    /// Each input the cache key holds tells two requests apart. For each pair that differs in one
+    /// input, whichever is stored first, both get the SQL they get from an empty cache. A key that
+    /// lost the input would serve one the other's SQL, with its binds in the wrong places.
+    #[test]
+    fn test_filter_query_cache_tells_every_shape_input_apart() {
+        /// The inputs `build_filtered_query` renders, for one request.
+        #[derive(Clone)]
+        struct FilterRequest {
+            media_types: Option<Vec<String>>,
+            exclude_media_types: Option<Vec<String>>,
+            genres: Option<Vec<String>>,
+            years: Option<Vec<i32>>,
+            official_ratings: Option<Vec<String>>,
+            tags: Option<Vec<String>>,
+            media_types_filter: Option<Vec<String>>,
+            is_favorite: Option<bool>,
+            is_unplayed: Option<bool>,
+            is_played: Option<bool>,
+            sort_by: &'static str,
+            sort_order: &'static str,
+        }
+        /// A list of `n` values, or no list for 0.
+        fn words(n: usize) -> Option<Vec<String>> {
+            (n > 0).then(|| (0..n).map(|i| format!("w{i}")).collect())
+        }
+        fn years(n: usize) -> Option<Vec<i32>> {
+            (n > 0).then(|| (0..n).map(|i| 2000 + i as i32).collect())
+        }
+        /// `r`'s SQL through the cache, keyed as `get_items_filtered` keys it.
+        fn cached_sql(r: &FilterRequest) -> (String, String) {
+            let len = |list: &Option<Vec<String>>| list.as_ref().map_or(0, Vec::len);
+            let key = super::filter_cache_key(
+                len(&r.media_types),
+                len(&r.exclude_media_types),
+                len(&r.genres),
+                r.years.as_ref().map_or(0, Vec::len),
+                len(&r.official_ratings),
+                len(&r.tags),
+                len(&r.media_types_filter),
+                true,
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            );
+            super::build_filtered_query(
+                key,
+                true,
+                r.media_types.as_deref(),
+                r.exclude_media_types.as_deref(),
+                r.genres.as_deref(),
+                r.years.as_deref(),
+                r.official_ratings.as_deref(),
+                r.tags.as_deref(),
+                r.media_types_filter.as_deref(),
+                r.is_favorite,
+                r.is_unplayed,
+                r.is_played,
+                r.sort_by,
+                r.sort_order,
+            )
+        }
+
+        let _serial = QUERY_CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let base = FilterRequest {
+            media_types: None,
+            exclude_media_types: None,
+            genres: None,
+            years: None,
+            official_ratings: None,
+            tags: None,
+            media_types_filter: None,
+            is_favorite: None,
+            is_unplayed: None,
+            is_played: None,
+            sort_by: "SortName",
+            sort_order: "Ascending",
+        };
+        let mut pairs = Vec::new();
+        let lists: [(&str, fn(&mut FilterRequest, usize)); 7] = [
+            ("media_types_len", |r, n| r.media_types = words(n)),
+            ("exclude_media_types_len", |r, n| {
+                r.exclude_media_types = words(n)
+            }),
+            ("genres_len", |r, n| r.genres = words(n)),
+            ("years_len", |r, n| r.years = years(n)),
+            ("official_ratings_len", |r, n| r.official_ratings = words(n)),
+            ("tags_len", |r, n| r.tags = words(n)),
+            ("media_types_filter_len", |r, n| {
+                r.media_types_filter = words(n)
+            }),
+        ];
+        for (field, set) in lists {
+            for (a, b) in [(0, 1), (1, 2)] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set(&mut x, a);
+                set(&mut y, b);
+                pairs.push((format!("{field} {a} vs {b}"), x, y));
+            }
+        }
+        let flags: [(&str, fn(&mut FilterRequest, Option<bool>)); 3] = [
+            ("is_favorite", |r, v| r.is_favorite = v),
+            ("is_unplayed", |r, v| r.is_unplayed = v),
+            ("is_played", |r, v| r.is_played = v),
+        ];
+        for (field, set) in flags {
+            for (a, b) in [
+                (None, Some(true)),
+                (None, Some(false)),
+                (Some(true), Some(false)),
+            ] {
+                let (mut x, mut y) = (base.clone(), base.clone());
+                set(&mut x, a);
+                set(&mut y, b);
+                pairs.push((format!("{field} {a:?} vs {b:?}"), x, y));
+            }
+        }
+        for (a, b) in [
+            (("SortName", "Ascending"), ("DateCreated", "Ascending")),
+            (("SortName", "Ascending"), ("SortName", "Descending")),
+            (
+                ("SortName", "Ascending"),
+                ("SortName,DateCreated", "Ascending"),
+            ),
+        ] {
+            let x = FilterRequest {
+                sort_by: a.0,
+                sort_order: a.1,
+                ..base.clone()
+            };
+            let y = FilterRequest {
+                sort_by: b.0,
+                sort_order: b.1,
+                ..base.clone()
+            };
+            pairs.push((format!("sort {a:?} vs {b:?}"), x, y));
+        }
+        assert_eq!(
+            pairs.len(),
+            26,
+            "7 lists at 2 pairs, 3 flags at 3 and 3 sorts"
+        );
+
+        let clear = || super::FILTER_QUERY_CACHE.lock().clear();
+        let mut shared = Vec::new();
+        for (case, x, y) in &pairs {
+            // What each gets from an empty cache. The pair must render different SQL.
+            clear();
+            let x_sql = cached_sql(x);
+            clear();
+            let y_sql = cached_sql(y);
+            assert_ne!(x_sql, y_sql, "{case}: both render the same SQL");
+            // Each order, from an empty cache.
+            clear();
+            let x_first = (cached_sql(x), cached_sql(y));
+            clear();
+            let y_first = (cached_sql(y), cached_sql(x));
+            if x_first != (x_sql.clone(), y_sql.clone()) || y_first != (y_sql, x_sql) {
+                shared.push(case.as_str());
+            }
+        }
+        assert!(shared.is_empty(), "these pairs shared SQL: {shared:?}");
+    }
 }
