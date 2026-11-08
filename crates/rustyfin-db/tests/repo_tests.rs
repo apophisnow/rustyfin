@@ -1073,6 +1073,615 @@ async fn test_filtered_query_with_name_starts_with() {
     assert_eq!(items_hash[0].name, "2001: A Space Odyssey");
 }
 
+// ── J5: genres, studios, years ──
+
+use rustyfin_db::repo_by_name::{self, ByNameEntry, ByNameFilter, ByNameKind};
+
+/// Creates a library of the given content type and returns its id.
+async fn j5_library(pool: &SqlitePool, name: &str, ct: LibraryContentType) -> Uuid {
+    let lib = make_library(name, ct);
+    rustyfin_db::repo_library::create_library(pool, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Inserts an item the way the scanner stores it since migration 014 and returns its id.
+async fn j5_item(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    parent_id: Option<Uuid>,
+    name: &str,
+    media_type: &str,
+    genres: &str,
+    year: Option<i64>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, parent_id, name, media_type, path, genres, production_year) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(parent_id.map(|p| p.to_string()))
+    .bind(name)
+    .bind(media_type)
+    .bind(format!("/media/j5/{id}"))
+    .bind(genres)
+    .bind(year)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Links an item to a studio, adding the studio the way TMDb metadata stores it.
+async fn j5_studio(pool: &SqlitePool, item_id: Uuid, studio: &str) {
+    let studio_id = format!("studio-{}", studio.trim().to_lowercase().replace(' ', "-"));
+    sqlx::query("INSERT OR IGNORE INTO studios (id, name) VALUES (?, ?)")
+        .bind(&studio_id)
+        .bind(studio)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_studios (item_id, studio_id) VALUES (?, ?)")
+        .bind(item_id.to_string())
+        .bind(&studio_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The names of the entries, in order.
+fn j5_names(entries: &[ByNameEntry]) -> Vec<&str> {
+    entries.iter().map(|e| e.name.as_str()).collect()
+}
+
+/// Lists `kind` under `filter` as `"<total>: <names in order>"`.
+async fn j5_list(pool: &SqlitePool, kind: ByNameKind, filter: &ByNameFilter) -> String {
+    let page = repo_by_name::list(pool, kind, filter).await.unwrap();
+    format!("{}: {}", page.total, j5_names(&page.items).join(", "))
+}
+
+/// Looks `name` up as `kind`, checks the entry's id, and returns its kind, name and item count.
+async fn j5_lookup(
+    pool: &SqlitePool,
+    kind: ByNameKind,
+    name: &str,
+) -> Option<(ByNameKind, String, i64)> {
+    let entry = repo_by_name::get_by_name(pool, kind, name).await.unwrap()?;
+    assert_eq!(entry.id, repo_by_name::by_name_id(kind, &entry.name));
+    Some((entry.kind, entry.name, entry.counts.items))
+}
+
+#[test]
+fn j5_ids_are_uuid_v5_of_the_kind_and_the_folded_name() {
+    use ByNameKind::{Genre, MusicGenre, Studio, Year};
+    let id = |kind: ByNameKind, name: &str| repo_by_name::by_name_id(kind, name).to_string();
+    assert_eq!(
+        repo_by_name::BY_NAME_NAMESPACE.to_string(),
+        "bba0cef5-b539-4903-ad04-cdc4497f4ca3"
+    );
+    assert_eq!(id(Genre, "Action"), "195d1858-f1fc-5450-9330-73e695447ff1");
+    assert_eq!(id(Genre, "Sci-Fi"), "a3577062-d445-5df8-a91e-9f6fdcc7770f");
+    assert_eq!(id(Genre, "Rock"), "c7e58572-d517-5ddd-b6cd-71fd7705a75d");
+    assert_eq!(
+        id(MusicGenre, "Rock"),
+        "5682964f-dff2-51db-8651-c91285edb0a9"
+    );
+    assert_eq!(id(Studio, "Pixar"), "01aa62ee-902a-5a32-9c32-aca3fdee5582");
+    assert_eq!(id(Year, "1999"), "3b638efc-32dc-5eee-8ba2-c24d7c3bf319");
+    assert_eq!(id(Genre, "AÇÃO"), "a5215451-4864-524e-b61c-aa09421c2f8a");
+    // Case and outer spaces don't change the id; other characters do.
+    assert_eq!(id(Genre, "  aCTION "), id(Genre, "Action"));
+    assert_ne!(id(Genre, "Sci Fi"), id(Genre, "Sci-Fi"));
+    assert_eq!(repo_by_name::by_name_id(Genre, "x").get_version_num(), 5);
+    assert_eq!(repo_by_name::fold_name("  AÇÃO "), "ação");
+    let kinds: Vec<_> = [Genre, MusicGenre, Studio, Year]
+        .iter()
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(kinds, ["Genre", "MusicGenre", "Studio", "Year"]);
+}
+
+#[test]
+fn j5_split_genres_reads_pipes_and_old_json_and_drops_blank_and_repeated_names() {
+    let split = repo_by_name::split_genres;
+    assert_eq!(split("Action|Sci-Fi"), ["Action", "Sci-Fi"]);
+    assert_eq!(split("A||B"), ["A", "B"]);
+    assert_eq!(split(" Action | action |Sci-Fi "), ["Action", "Sci-Fi"]);
+    assert_eq!(split(r#"["Drama", " War ","drama"]"#), ["Drama", "War"]);
+    assert_eq!(split("Ação|Comédia"), ["Ação", "Comédia"]);
+    // Migration 014 left compact JSON as one comma-joined name. Commas don't split.
+    assert_eq!(split("Action,Sci-Fi"), ["Action,Sci-Fi"]);
+    for blank in ["", "[]", " [ ] ", "|| |", "   "] {
+        assert!(split(blank).is_empty(), "{blank:?}");
+    }
+}
+
+#[tokio::test]
+async fn j5_genres_list_each_folded_name_once_sorted_with_counts() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    j5_item(pool, films, None, "Alpha", "Movie", "Action|Sci-Fi", None).await;
+    j5_item(pool, films, None, "Beta", "Movie", "action", None).await;
+    let gamma = j5_item(pool, films, None, "Gamma", "Series", "Drama| sci-fi ", None).await;
+    j5_item(pool, films, Some(gamma), "Gamma 1", "Episode", "", None).await;
+    j5_item(pool, films, None, "Song", "Audio", "Rock", None).await;
+
+    let page = repo_by_name::list(pool, ByNameKind::Genre, &ByNameFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&page.items), ["Action", "Drama", "Sci-Fi"]);
+    assert_eq!(page.total, 3);
+    for entry in &page.items {
+        assert_eq!(entry.kind, ByNameKind::Genre);
+        assert_eq!(
+            entry.id,
+            repo_by_name::by_name_id(ByNameKind::Genre, &entry.name)
+        );
+    }
+    let counts: Vec<_> = page
+        .items
+        .iter()
+        .map(|e| (e.counts.items, e.counts.movies, e.counts.series))
+        .collect();
+    assert_eq!(counts, [(2, 2, 0), (1, 0, 1), (2, 1, 1)]);
+}
+
+#[tokio::test]
+async fn j5_genre_lists_honour_parent_types_names_order_and_paging() {
+    use ByNameKind::Genre;
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let shows = j5_library(pool, "J5 Shows", LibraryContentType::TvShows).await;
+    j5_item(pool, films, None, "Alpha", "Movie", "Action|Sci-Fi", None).await;
+    j5_item(pool, films, None, "Beta", "Movie", "Comedy", None).await;
+    let show = j5_item(pool, shows, None, "Show", "Series", "Drama|Action", None).await;
+    let season = j5_item(pool, shows, Some(show), "Season 1", "Season", "", None).await;
+    j5_item(
+        pool,
+        shows,
+        Some(season),
+        "Pilot",
+        "Episode",
+        "Thriller",
+        None,
+    )
+    .await;
+
+    let all = "5: Action, Comedy, Drama, Sci-Fi, Thriller";
+    assert_eq!(j5_list(pool, Genre, &ByNameFilter::default()).await, all);
+
+    // A library, the items below an item (not the item itself), an unknown id.
+    let under = |id| ByNameFilter {
+        parent_id: Some(id),
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, Genre, &under(films)).await,
+        "3: Action, Comedy, Sci-Fi"
+    );
+    assert_eq!(
+        j5_list(pool, Genre, &under(shows)).await,
+        "3: Action, Drama, Thriller"
+    );
+    assert_eq!(j5_list(pool, Genre, &under(show)).await, "1: Thriller");
+    assert_eq!(j5_list(pool, Genre, &under(Uuid::new_v4())).await, "0: ");
+
+    // Item types match case-insensitively; unknown ones match nothing.
+    let types = |include: &[&str], exclude: &[&str]| ByNameFilter {
+        include_item_types: include.iter().map(|s| s.to_string()).collect(),
+        exclude_item_types: exclude.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, Genre, &types(&["Series"], &[])).await,
+        "2: Action, Drama"
+    );
+    assert_eq!(
+        j5_list(pool, Genre, &types(&["series"], &[])).await,
+        "2: Action, Drama"
+    );
+    assert_eq!(
+        j5_list(pool, Genre, &types(&["Movie", "Episode"], &[])).await,
+        "4: Action, Comedy, Sci-Fi, Thriller"
+    );
+    assert_eq!(
+        j5_list(pool, Genre, &types(&[], &["MOVIE"])).await,
+        "3: Action, Drama, Thriller"
+    );
+    assert_eq!(j5_list(pool, Genre, &types(&["BoxSet"], &[])).await, "0: ");
+
+    // Name filters compare folded names; a blank one filters nothing.
+    let search = ByNameFilter {
+        search_term: Some("SCI".into()),
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, Genre, &search).await, "1: Sci-Fi");
+    let blank = ByNameFilter {
+        search_term: Some("  ".into()),
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, Genre, &blank).await, all);
+    let starts = ByNameFilter {
+        name_starts_with: Some("c".into()),
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, Genre, &starts).await, "1: Comedy");
+    let from = ByNameFilter {
+        name_starts_with_or_greater: Some("D".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, Genre, &from).await,
+        "3: Drama, Sci-Fi, Thriller"
+    );
+    let below = ByNameFilter {
+        name_less_than: Some("comedy".into()),
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, Genre, &below).await, "1: Action");
+
+    // Order and paging; the total counts every entry.
+    let page = |start_index, limit, descending| ByNameFilter {
+        start_index,
+        limit,
+        descending,
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, Genre, &page(1, Some(2), false)).await,
+        "5: Comedy, Drama"
+    );
+    assert_eq!(
+        j5_list(pool, Genre, &page(0, Some(2), true)).await,
+        "5: Thriller, Sci-Fi"
+    );
+    assert_eq!(
+        j5_list(pool, Genre, &page(3, None, true)).await,
+        "5: Comedy, Action"
+    );
+    assert_eq!(j5_list(pool, Genre, &page(0, Some(0), false)).await, "5: ");
+    assert_eq!(j5_list(pool, Genre, &page(9, Some(2), false)).await, "5: ");
+}
+
+#[tokio::test]
+async fn j5_music_genres_come_from_albums_and_songs_only() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let tunes = j5_library(pool, "J5 Tunes", LibraryContentType::Music).await;
+    let album = j5_item(
+        pool,
+        tunes,
+        None,
+        "Kind of Blue",
+        "MusicAlbum",
+        "Jazz|Rock",
+        None,
+    )
+    .await;
+    j5_item(
+        pool,
+        tunes,
+        Some(album),
+        "So What",
+        "Audio",
+        "Rock| Modal",
+        None,
+    )
+    .await;
+    j5_item(
+        pool,
+        films,
+        None,
+        "School of Rock",
+        "Movie",
+        "Rock|Comedy",
+        None,
+    )
+    .await;
+
+    let music = repo_by_name::list(pool, ByNameKind::MusicGenre, &ByNameFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&music.items), ["Jazz", "Modal", "Rock"]);
+    let rock = &music.items[2];
+    assert_eq!(rock.kind, ByNameKind::MusicGenre);
+    assert_eq!(rock.id.to_string(), "5682964f-dff2-51db-8651-c91285edb0a9");
+    assert_eq!(
+        (rock.counts.items, rock.counts.albums, rock.counts.songs),
+        (2, 1, 1)
+    );
+    let in_album = ByNameFilter {
+        parent_id: Some(album),
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, ByNameKind::MusicGenre, &in_album).await,
+        "2: Modal, Rock"
+    );
+
+    let genres = repo_by_name::list(pool, ByNameKind::Genre, &ByNameFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&genres.items), ["Comedy", "Rock"]);
+    assert_eq!(
+        genres.items[1].id.to_string(),
+        "c7e58572-d517-5ddd-b6cd-71fd7705a75d"
+    );
+    assert_eq!(genres.items[1].counts.items, 1);
+}
+
+#[tokio::test]
+async fn j5_years_are_positive_production_years_and_studios_come_from_item_studios() {
+    use ByNameKind::{Studio, Year};
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let shows = j5_library(pool, "J5 Shows", LibraryContentType::TvShows).await;
+    let up = j5_item(pool, films, None, "Up", "Movie", "", Some(2009)).await;
+    let coco = j5_item(pool, films, None, "Coco", "Movie", "", Some(2017)).await;
+    j5_item(pool, films, None, "Matrix", "Movie", "", Some(1999)).await;
+    j5_item(pool, films, None, "Beowulf", "Movie", "", Some(800)).await;
+    j5_item(pool, films, None, "Undated", "Movie", "", None).await;
+    j5_item(pool, films, None, "Zero", "Movie", "", Some(0)).await;
+    let show = j5_item(pool, shows, None, "Show", "Series", "", Some(1999)).await;
+    j5_studio(pool, up, "Pixar").await;
+    j5_studio(pool, coco, "Pixar").await;
+    j5_studio(pool, coco, "  ").await;
+    j5_studio(pool, show, "A24").await;
+
+    // Years sort as numbers.
+    let years = repo_by_name::list(pool, Year, &ByNameFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&years.items), ["800", "1999", "2009", "2017"]);
+    assert_eq!(years.total, 4);
+    let y1999 = &years.items[1];
+    assert_eq!(y1999.kind, Year);
+    assert_eq!(y1999.id.to_string(), "3b638efc-32dc-5eee-8ba2-c24d7c3bf319");
+    assert_eq!(
+        (y1999.counts.items, y1999.counts.movies, y1999.counts.series),
+        (2, 1, 1)
+    );
+    let newest_first = ByNameFilter {
+        descending: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        j5_list(pool, Year, &newest_first).await,
+        "4: 2017, 2009, 1999, 800"
+    );
+    let series = ByNameFilter {
+        include_item_types: vec!["Series".into()],
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, Year, &series).await, "1: 1999");
+    // A series is no Video, so 1999 counts only the movie.
+    let video = ByNameFilter {
+        media_types: vec!["video".into()],
+        ..Default::default()
+    };
+    let videos = repo_by_name::list(pool, Year, &video).await.unwrap();
+    assert_eq!(j5_names(&videos.items), ["800", "1999", "2009", "2017"]);
+    assert_eq!(videos.items[1].counts.items, 1);
+
+    // Studios, without the blank name.
+    let studios = repo_by_name::list(pool, Studio, &ByNameFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&studios.items), ["A24", "Pixar"]);
+    assert_eq!(
+        studios.items[1].id.to_string(),
+        "01aa62ee-902a-5a32-9c32-aca3fdee5582"
+    );
+    assert_eq!(studios.items[1].kind, Studio);
+    assert_eq!(
+        (
+            studios.items[1].counts.items,
+            studios.items[1].counts.movies
+        ),
+        (2, 2)
+    );
+    assert_eq!(studios.items[0].counts.series, 1);
+    let in_films = ByNameFilter {
+        parent_id: Some(films),
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, Studio, &in_films).await, "1: Pixar");
+}
+
+#[tokio::test]
+async fn j5_single_lookups_fold_the_name_follow_slugs_and_resolve_ids() {
+    use ByNameKind::{Genre, MusicGenre, Studio, Year};
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let tunes = j5_library(pool, "J5 Tunes", LibraryContentType::Music).await;
+    let genres = "Sci-Fi|Action & Adventure|Ação";
+    let up = j5_item(pool, films, None, "Up", "Movie", genres, Some(1999)).await;
+    j5_studio(pool, up, "Pixar").await;
+    j5_item(pool, tunes, None, "Song", "Audio", "Rock", None).await;
+
+    let found = |kind: ByNameKind, name: &str| Some((kind, name.to_string(), 1_i64));
+    assert_eq!(
+        j5_lookup(pool, Genre, "sci-fi").await,
+        found(Genre, "Sci-Fi")
+    );
+    assert_eq!(j5_lookup(pool, Genre, " AÇÃO ").await, found(Genre, "Ação"));
+    // jellyfin-web writes `&`, `/` and `?` in names as `-`.
+    assert_eq!(
+        j5_lookup(pool, Genre, "Action - Adventure").await,
+        found(Genre, "Action & Adventure")
+    );
+    assert_eq!(j5_lookup(pool, Genre, "Western").await, None);
+    assert_eq!(j5_lookup(pool, Genre, "Rock").await, None);
+    assert_eq!(
+        j5_lookup(pool, MusicGenre, "ROCK").await,
+        found(MusicGenre, "Rock")
+    );
+    assert_eq!(
+        j5_lookup(pool, Studio, "pixar").await,
+        found(Studio, "Pixar")
+    );
+    assert_eq!(j5_lookup(pool, Year, "1999").await, found(Year, "1999"));
+    for missing in ["2000", "0", "-5", "abc", ""] {
+        assert_eq!(j5_lookup(pool, Year, missing).await, None, "{missing:?}");
+    }
+
+    let known = [
+        (Genre, "Sci-Fi"),
+        (Genre, "Ação"),
+        (MusicGenre, "Rock"),
+        (Studio, "Pixar"),
+        (Year, "1999"),
+    ];
+    for (kind, name) in known {
+        let id = repo_by_name::by_name_id(kind, name);
+        let entry = repo_by_name::get_by_id(pool, id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{kind:?} {name}"));
+        assert_eq!(
+            (entry.kind, entry.name.as_str(), entry.id),
+            (kind, name, id)
+        );
+    }
+    let unknown = repo_by_name::get_by_id(pool, Uuid::new_v4()).await.unwrap();
+    assert_eq!(unknown, None);
+    // "Rock" is only a music genre here, so its Genre id names nothing.
+    let rock = repo_by_name::by_name_id(Genre, "Rock");
+    assert_eq!(repo_by_name::get_by_id(pool, rock).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn j5_old_json_rows_and_odd_separators_list_without_error() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    j5_item(pool, films, None, "Pipes", "Movie", "A||B", None).await;
+    j5_item(
+        pool,
+        films,
+        None,
+        "Spaces",
+        "Movie",
+        "  Drama  | |War ",
+        None,
+    )
+    .await;
+    // Rows from before migration 014 keep JSON in both columns.
+    let old = r#"["Western", "Noir"]"#;
+    j5_item(pool, films, None, "Old", "\"Movie\"", old, None).await;
+    j5_item(pool, films, None, "Empty", "Movie", "[]", None).await;
+    j5_item(pool, films, None, "Accents", "Movie", "Ação|Comédia", None).await;
+
+    let all = "8: A, Ação, B, Comédia, Drama, Noir, War, Western";
+    let genres = j5_list(pool, ByNameKind::Genre, &ByNameFilter::default()).await;
+    assert_eq!(genres, all);
+    let movies = ByNameFilter {
+        include_item_types: vec!["Movie".into()],
+        ..Default::default()
+    };
+    assert_eq!(j5_list(pool, ByNameKind::Genre, &movies).await, all);
+    let years = j5_list(pool, ByNameKind::Year, &ByNameFilter::default()).await;
+    assert_eq!(years, "0: ");
+}
+
+#[tokio::test]
+async fn j5_entries_are_the_same_after_the_items_are_stored_again() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let rows = [
+        ("Alpha", "Action|Sci-Fi", 2001),
+        ("Beta", "sci-fi|Drama", 2002),
+    ];
+    for (name, genres, year) in rows {
+        j5_item(pool, films, None, name, "Movie", genres, Some(year)).await;
+    }
+    let before = j5_genre_and_year_entries(pool).await;
+    assert_eq!(before.len(), 5);
+
+    // A rescan that stores every item again, under new ids and in another order.
+    sqlx::query("DELETE FROM media_items WHERE library_id = ?")
+        .bind(films.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    for (name, genres, year) in rows.into_iter().rev() {
+        j5_item(pool, films, None, name, "Movie", genres, Some(year)).await;
+    }
+    assert_eq!(j5_genre_and_year_entries(pool).await, before);
+}
+
+/// Every genre entry, then every year entry.
+async fn j5_genre_and_year_entries(pool: &SqlitePool) -> Vec<ByNameEntry> {
+    let mut all = Vec::new();
+    for kind in [ByNameKind::Genre, ByNameKind::Year] {
+        let page = repo_by_name::list(pool, kind, &ByNameFilter::default())
+            .await
+            .unwrap();
+        all.extend(page.items);
+    }
+    all
+}
+
+#[tokio::test]
+async fn j5_an_entry_keeps_its_name_under_every_scope_and_type_filter() {
+    let db = test_pool().await;
+    let pool = &db.pool;
+    let films = j5_library(pool, "J5 Films", LibraryContentType::Movies).await;
+    let docs = j5_library(pool, "J5 Docs", LibraryContentType::Movies).await;
+    let tunes = j5_library(pool, "J5 Tunes", LibraryContentType::Music).await;
+    j5_item(pool, films, None, "Alpha", "Movie", "Action", None).await;
+    j5_item(pool, docs, None, "Bravo", "Movie", " action |Drama", None).await;
+    let album = j5_item(pool, tunes, None, "Blue", "MusicAlbum", "Rock|Jazz", None).await;
+    j5_item(pool, tunes, Some(album), "One", "Audio", "rock", None).await;
+
+    // Only Bravo counts in J5 Docs, but its genre keeps the name it has in every other list.
+    let in_docs = ByNameFilter {
+        parent_id: Some(docs),
+        ..Default::default()
+    };
+    let page = repo_by_name::list(pool, ByNameKind::Genre, &in_docs)
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&page.items), ["Action", "Drama"]);
+    assert_eq!(page.items[0].counts.items, 1);
+    assert_eq!(
+        page.items[0].id.to_string(),
+        "195d1858-f1fc-5450-9330-73e695447ff1"
+    );
+
+    // The same under a type filter. Only the song counts, so Jazz, which only the album has, is left out.
+    let songs = ByNameFilter {
+        include_item_types: vec!["Audio".to_string()],
+        ..Default::default()
+    };
+    let page = repo_by_name::list(pool, ByNameKind::MusicGenre, &songs)
+        .await
+        .unwrap();
+    assert_eq!(j5_names(&page.items), ["Rock"]);
+    let rock = &page.items[0];
+    assert_eq!(
+        (rock.counts.items, rock.counts.albums, rock.counts.songs),
+        (1, 0, 1)
+    );
+    let found = repo_by_name::get_by_id(pool, rock.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (found.kind, found.name.as_str()),
+        (ByNameKind::MusicGenre, "Rock")
+    );
+}
+
 // ── Media Item Repository Tests ──
 
 fn make_movie(library_id: Uuid, name: &str) -> MediaItem {

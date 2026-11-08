@@ -1,0 +1,402 @@
+use std::collections::{BTreeMap, HashSet};
+use std::str::FromStr;
+
+use rustyfin_model::media::MediaType;
+use sha1::{Digest, Sha1};
+use sqlx::SqlitePool;
+use uuid::Uuid;
+
+/// The four lists that are read by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ByNameKind {
+    /// Genres of the items that are not music.
+    Genre,
+    /// Genres of the audio items and music albums.
+    MusicGenre,
+    /// Studio names.
+    Studio,
+    /// Production years, named by their number.
+    Year,
+}
+
+impl ByNameKind {
+    /// The kind as Jellyfin names it. The entry ids are built from this name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ByNameKind::Genre => "Genre",
+            ByNameKind::MusicGenre => "MusicGenre",
+            ByNameKind::Studio => "Studio",
+            ByNameKind::Year => "Year",
+        }
+    }
+}
+
+/// The namespace of the entry ids, `bba0cef5-b539-4903-ad04-cdc4497f4ca3`.
+pub const BY_NAME_NAMESPACE: Uuid = Uuid::from_u128(0xbba0cef5b5394903ad04cdc4497f4ca3);
+
+/// Folds a name for comparison and ids: trimmed, then lowercased.
+pub fn fold_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// The id of the entry `name` of `kind`: a UUIDv5 of `<kind>:<folded name>` in `BY_NAME_NAMESPACE`.
+pub fn by_name_id(kind: ByNameKind, name: &str) -> Uuid {
+    // The uuid crate's v5 feature is off (its dependencies are not cached), so the SHA-1 is taken here.
+    let mut hasher = Sha1::new();
+    hasher.update(BY_NAME_NAMESPACE.as_bytes());
+    hasher.update(format!("{}:{}", kind.as_str(), fold_name(name)).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_sha1_bytes(bytes).into_uuid()
+}
+
+/// Splits a `genres` value into names. The value is `|`-separated, or a JSON array of strings from
+/// before migration 014. Names are trimmed, empty names are dropped, and a name that folds like an
+/// earlier one is dropped too.
+pub fn split_genres(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    // Only a JSON array of strings parses here; any other text is split on `|`.
+    let names: Vec<String> =
+        serde_json::from_str(raw).unwrap_or_else(|_| raw.split('|').map(str::to_string).collect());
+    let mut seen = HashSet::new();
+    names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty() && seen.insert(fold_name(name)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The counts of the items behind an entry, by type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ByNameCounts {
+    /// Distinct items with the name.
+    pub items: i64,
+    /// Movies with the name.
+    pub movies: i64,
+    /// Series with the name.
+    pub series: i64,
+    /// Episodes with the name.
+    pub episodes: i64,
+    /// Music albums with the name.
+    pub albums: i64,
+    /// Audio items with the name.
+    pub songs: i64,
+}
+
+/// One entry of a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByNameEntry {
+    /// The list the entry is in.
+    pub kind: ByNameKind,
+    /// The id from `by_name_id`.
+    pub id: Uuid,
+    /// The smallest spelling among the rows that were counted.
+    pub name: String,
+    /// The counts of the items behind the entry.
+    pub counts: ByNameCounts,
+}
+
+/// The filter of a list. Unset and empty fields filter nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ByNameFilter {
+    /// Only items of this library, or below this item.
+    pub parent_id: Option<Uuid>,
+    /// Keep only items of these types, such as `Movie` or `Series`.
+    pub include_item_types: Vec<String>,
+    /// Drop items of these types.
+    pub exclude_item_types: Vec<String>,
+    /// Keep only items of these media kinds, such as `Video` or `Audio`.
+    pub media_types: Vec<String>,
+    /// Keep names that contain this text.
+    pub search_term: Option<String>,
+    /// Keep names that start with this text.
+    pub name_starts_with: Option<String>,
+    /// Keep names that sort at or after this text.
+    pub name_starts_with_or_greater: Option<String>,
+    /// Keep names that sort before this text.
+    pub name_less_than: Option<String>,
+    /// Sort in reverse order.
+    pub descending: bool,
+    /// The number of entries to skip after sorting.
+    pub start_index: usize,
+    /// The number of entries to return; `None` returns all of them.
+    pub limit: Option<usize>,
+}
+
+/// One page of a list.
+#[derive(Debug, Clone, Default)]
+pub struct ByNamePage {
+    /// The entries of the page, in order.
+    pub items: Vec<ByNameEntry>,
+    /// The number of entries that pass the filters, before paging.
+    pub total: usize,
+}
+
+/// Lists the entries of `kind` that pass `filter`, sorted and paged. An entry is named the same
+/// in every list, whatever the filter.
+pub async fn list(
+    pool: &SqlitePool,
+    kind: ByNameKind,
+    filter: &ByNameFilter,
+) -> Result<ByNamePage, sqlx::Error> {
+    // Every row of the kind takes part in naming its entry, so a scope or type filter can't
+    // change the name. Only the rows in scope that pass the type filters are counted, and an
+    // entry without such a row is left out.
+    let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+    for row in name_rows(pool, kind, filter.parent_id).await? {
+        if !in_kind(kind, row.media) {
+            continue;
+        }
+        let group = groups.entry(fold_name(&row.name)).or_default();
+        if row.in_scope && passes_type_filters(filter, row.media) {
+            group.items.insert(row.item, row.media);
+        }
+        if group.name.is_empty() || row.name < group.name {
+            group.name = row.name;
+        }
+    }
+
+    let mut entries: Vec<ByNameEntry> = groups
+        .into_iter()
+        .filter(|(folded, group)| !group.items.is_empty() && passes_name_filters(filter, folded))
+        .map(|(_, group)| ByNameEntry {
+            kind,
+            id: by_name_id(kind, &group.name),
+            counts: counts_of(&group.items),
+            name: group.name,
+        })
+        .collect();
+    entries.sort_by_cached_key(|entry| order_key(kind, &entry.name));
+    if filter.descending {
+        entries.reverse();
+    }
+
+    let total = entries.len();
+    let items = entries
+        .into_iter()
+        .skip(filter.start_index)
+        .take(filter.limit.unwrap_or(usize::MAX))
+        .collect();
+    Ok(ByNamePage { items, total })
+}
+
+/// The entry of `kind` named `name`, or `None`. The name is folded before the lookup. When nothing
+/// matches and the name has a `-`, that `-` may stand for `&`, `/` or `?`, as Jellyfin's slugs write it.
+pub async fn get_by_name(
+    pool: &SqlitePool,
+    kind: ByNameKind,
+    name: &str,
+) -> Result<Option<ByNameEntry>, sqlx::Error> {
+    // A year is its positive number, so `01999` finds 1999, while `0`, `-5` and `abc` find nothing.
+    let folded = match kind {
+        ByNameKind::Year => match name.trim().parse::<i64>() {
+            Ok(year) if year > 0 => year.to_string(),
+            _ => return Ok(None),
+        },
+        _ => fold_name(name),
+    };
+    let mut candidates = vec![folded.clone()];
+    if folded.contains('-') {
+        candidates.extend(["&", "/", "?"].map(|sep| folded.replace('-', sep)));
+    }
+    let page = list(pool, kind, &ByNameFilter::default()).await?;
+    for candidate in candidates {
+        if let Some(entry) = page
+            .items
+            .iter()
+            .find(|entry| fold_name(&entry.name) == candidate)
+        {
+            return Ok(Some(entry.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The entry with `id` in any of the four lists, or `None`. The lists are read unscoped.
+pub async fn get_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<ByNameEntry>, sqlx::Error> {
+    let kinds = [
+        ByNameKind::Genre,
+        ByNameKind::MusicGenre,
+        ByNameKind::Studio,
+        ByNameKind::Year,
+    ];
+    for kind in kinds {
+        let page = list(pool, kind, &ByNameFilter::default()).await?;
+        if let Some(entry) = page.items.into_iter().find(|entry| entry.id == id) {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+/// The rows behind one entry: the smallest spelling among all its rows, and each counted item
+/// with its type.
+#[derive(Default)]
+struct Group {
+    name: String,
+    items: BTreeMap<String, MediaType>,
+}
+
+/// One item and one of its names, as `name_rows` reads them.
+struct NameRow {
+    item: String,
+    media: MediaType,
+    name: String,
+    /// Whether the item is in the scope of the list.
+    in_scope: bool,
+}
+
+// The SQL below reads every item, so that the names don't depend on the scope. `?1` is the parent
+// id, or NULL for every item, and the last column is 1 for an item in scope. Items below the
+// parent come from the recursive `sub` table; the parent itself is never in scope. A value of
+// another SQLite type leaves its row out through the `typeof` guards, so no row fails a query.
+
+/// The genre rows: item id, media type, raw `genres` and scope of each item.
+const GENRE_ROWS: &str = "WITH RECURSIVE sub(id) AS (
+        SELECT id FROM media_items WHERE parent_id = ?1
+        UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
+    SELECT m.id, m.media_type, m.genres,
+        CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
+            THEN 1 ELSE 0 END
+    FROM media_items m
+    WHERE typeof(m.id) = 'text' AND typeof(m.media_type) = 'text' AND typeof(m.genres) = 'text'";
+
+/// The studio rows: studio name, item id, media type and scope of each link of an item.
+const STUDIO_ROWS: &str = "WITH RECURSIVE sub(id) AS (
+        SELECT id FROM media_items WHERE parent_id = ?1
+        UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
+    SELECT s.name, m.id, m.media_type,
+        CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
+            THEN 1 ELSE 0 END
+    FROM item_studios i
+    JOIN studios s ON s.id = i.studio_id
+    JOIN media_items m ON m.id = i.item_id
+    WHERE typeof(s.name) = 'text' AND typeof(m.id) = 'text' AND typeof(m.media_type) = 'text'";
+
+/// The year rows: item id, media type, production year and scope of each item with a year above 0.
+const YEAR_ROWS: &str = "WITH RECURSIVE sub(id) AS (
+        SELECT id FROM media_items WHERE parent_id = ?1
+        UNION SELECT c.id FROM media_items c JOIN sub ON c.parent_id = sub.id)
+    SELECT m.id, m.media_type, m.production_year,
+        CASE WHEN ?1 IS NULL OR (m.id <> ?1 AND (m.library_id = ?1 OR m.id IN (SELECT id FROM sub)))
+            THEN 1 ELSE 0 END
+    FROM media_items m
+    WHERE typeof(m.id) = 'text' AND typeof(m.media_type) = 'text'
+      AND typeof(m.production_year) = 'integer' AND m.production_year > 0";
+
+/// The rows that feed `kind`, one per item and name.
+async fn name_rows(
+    pool: &SqlitePool,
+    kind: ByNameKind,
+    parent_id: Option<Uuid>,
+) -> Result<Vec<NameRow>, sqlx::Error> {
+    let parent = parent_id.map(|id| id.to_string());
+    let row = |item: String, media: &str, name: String, scope: i64| NameRow {
+        item,
+        media: stored_media_type(media),
+        name,
+        in_scope: scope != 0,
+    };
+    let mut rows = Vec::new();
+    match kind {
+        ByNameKind::Genre | ByNameKind::MusicGenre => {
+            let found = sqlx::query_as::<_, (String, String, String, i64)>(GENRE_ROWS)
+                .bind(parent)
+                .fetch_all(pool)
+                .await?;
+            for (item, media, genres, scope) in found {
+                for name in split_genres(&genres) {
+                    rows.push(row(item.clone(), &media, name, scope));
+                }
+            }
+        }
+        ByNameKind::Studio => {
+            let found = sqlx::query_as::<_, (String, String, String, i64)>(STUDIO_ROWS)
+                .bind(parent)
+                .fetch_all(pool)
+                .await?;
+            for (name, item, media, scope) in found {
+                let name = name.trim();
+                if !name.is_empty() {
+                    rows.push(row(item, &media, name.to_string(), scope));
+                }
+            }
+        }
+        ByNameKind::Year => {
+            let found = sqlx::query_as::<_, (String, String, i64, i64)>(YEAR_ROWS)
+                .bind(parent)
+                .fetch_all(pool)
+                .await?;
+            for (item, media, year, scope) in found {
+                rows.push(row(item, &media, year.to_string(), scope));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// The type of a stored `media_type`. The pre-014 JSON form, such as `"Movie"`, reads as `Movie`.
+fn stored_media_type(stored: &str) -> MediaType {
+    MediaType::from_str(stored.trim_matches('"')).unwrap_or(MediaType::Unknown)
+}
+
+/// Whether an item of type `media` feeds `kind`. Genres skip music, music genres take only audio and
+/// albums, and studios and years take every item.
+fn in_kind(kind: ByNameKind, media: MediaType) -> bool {
+    let music = matches!(media, MediaType::Audio | MediaType::MusicAlbum);
+    match kind {
+        ByNameKind::Genre => !music,
+        ByNameKind::MusicGenre => music,
+        ByNameKind::Studio | ByNameKind::Year => true,
+    }
+}
+
+/// Whether an item of type `media` passes the item type and media kind filters. Names compare
+/// case-insensitively, and an empty list filters nothing.
+fn passes_type_filters(filter: &ByNameFilter, media: MediaType) -> bool {
+    let listed =
+        |names: &[String], value: &str| names.iter().any(|name| name.eq_ignore_ascii_case(value));
+    let item_kind = media.item_kind();
+    (filter.include_item_types.is_empty() || listed(&filter.include_item_types, item_kind))
+        && !listed(&filter.exclude_item_types, item_kind)
+        && (filter.media_types.is_empty() || listed(&filter.media_types, media.media_kind()))
+}
+
+/// Whether a folded name passes the name filters. A blank filter value filters nothing.
+fn passes_name_filters(filter: &ByNameFilter, folded: &str) -> bool {
+    // The filter text, folded. `None` when the text is blank.
+    let text = |value: &Option<String>| value.as_deref().map(fold_name).filter(|t| !t.is_empty());
+    text(&filter.search_term).is_none_or(|t| folded.contains(t.as_str()))
+        && text(&filter.name_starts_with).is_none_or(|t| folded.starts_with(t.as_str()))
+        && text(&filter.name_starts_with_or_greater).is_none_or(|t| folded >= t.as_str())
+        && text(&filter.name_less_than).is_none_or(|t| folded < t.as_str())
+}
+
+/// The sort key of an entry: years by their number, and the other kinds by folded name.
+fn order_key(kind: ByNameKind, name: &str) -> (i64, String) {
+    match kind {
+        ByNameKind::Year => (name.parse().unwrap_or(0), String::new()),
+        _ => (0, fold_name(name)),
+    }
+}
+
+/// The counts of an entry from its items and their types.
+fn counts_of(items: &BTreeMap<String, MediaType>) -> ByNameCounts {
+    let mut counts = ByNameCounts {
+        items: items.len() as i64,
+        ..ByNameCounts::default()
+    };
+    for media in items.values() {
+        match media {
+            MediaType::Movie => counts.movies += 1,
+            MediaType::Series => counts.series += 1,
+            MediaType::Episode => counts.episodes += 1,
+            MediaType::MusicAlbum => counts.albums += 1,
+            MediaType::Audio => counts.songs += 1,
+            _ => {}
+        }
+    }
+    counts
+}

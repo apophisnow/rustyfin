@@ -2774,6 +2774,770 @@ async fn test_persons_empty() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ── J5: genres, studios, years ──
+
+/// Ids of by-name items: UUIDv5 in the J5 namespace of `"<Type>:<folded name>"`.
+const J5_ACTION: &str = "195d1858-f1fc-5450-9330-73e695447ff1";
+const J5_SCI_FI: &str = "a3577062-d445-5df8-a91e-9f6fdcc7770f";
+const J5_MUSIC_ROCK: &str = "5682964f-dff2-51db-8651-c91285edb0a9";
+const J5_PIXAR: &str = "01aa62ee-902a-5a32-9c32-aca3fdee5582";
+const J5_YEAR_1999: &str = "3b638efc-32dc-5eee-8ba2-c24d7c3bf319";
+const J5_ACAO: &str = "a5215451-4864-524e-b61c-aa09421c2f8a";
+
+/// The keys of a genre, studio or year item without counts, sorted.
+const J5_DTO_KEYS: &[&str] = &[
+    "BackdropImageTags",
+    "ChannelId",
+    "Id",
+    "ImageBlurHashes",
+    "ImageTags",
+    "LocationType",
+    "MediaType",
+    "Name",
+    "ServerId",
+    "Type",
+];
+
+/// The count keys an item gets when the request names item types, sorted.
+const J5_COUNT_KEYS: &[&str] = &[
+    "AlbumCount",
+    "ArtistCount",
+    "ChildCount",
+    "EpisodeCount",
+    "MovieCount",
+    "MusicVideoCount",
+    "ProgramCount",
+    "SeriesCount",
+    "SongCount",
+    "TrailerCount",
+];
+
+/// A server with three libraries:
+/// - J5 Films: the movies Alpha (`Action|Sci-Fi`, 1999, Pixar), Bravo (` action | Animation `,
+///   2009, Pixar), Charlie (no genres, no year) and Delta (`Action & Adventure|Music`, 2009).
+/// - J5 Shows: the series Echo (`Drama|Comedy`, 2011, HBO), its Season 1 (no genres) and the
+///   episode Echo 1 in that season (`Drama`, 2011).
+/// - J5 Music: the album Blue (`Rock|Jazz`) with the songs One (`rock`) and Two (`Música`), all 2017.
+struct J5Server {
+    state: AppState,
+    app: axum::Router,
+    token: String,
+    admin: uuid::Uuid,
+    films: uuid::Uuid,
+    music: uuid::Uuid,
+    echo: uuid::Uuid,
+}
+
+impl J5Server {
+    async fn new() -> Self {
+        use rustyfin_model::library::LibraryContentType;
+        let state = test_state().await;
+        let app = app(state.clone());
+        let (token, admin) = admin_session(&state).await;
+        let films = j5_library(&state, "J5 Films", LibraryContentType::Movies).await;
+        let shows = j5_library(&state, "J5 Shows", LibraryContentType::TvShows).await;
+        let music = j5_library(&state, "J5 Music", LibraryContentType::Music).await;
+        let s = &state;
+        let alpha = j5_item(
+            s,
+            films,
+            None,
+            "Alpha",
+            "Movie",
+            "Action|Sci-Fi",
+            Some(1999),
+        )
+        .await;
+        let bravo = j5_item(
+            s,
+            films,
+            None,
+            "Bravo",
+            "Movie",
+            " action | Animation ",
+            Some(2009),
+        )
+        .await;
+        j5_item(s, films, None, "Charlie", "Movie", "", None).await;
+        j5_item(
+            s,
+            films,
+            None,
+            "Delta",
+            "Movie",
+            "Action & Adventure|Music",
+            Some(2009),
+        )
+        .await;
+        let echo = j5_item(s, shows, None, "Echo", "Series", "Drama|Comedy", Some(2011)).await;
+        let season = j5_item(s, shows, Some(echo), "Season 1", "Season", "", None).await;
+        j5_item(
+            s,
+            shows,
+            Some(season),
+            "Echo 1",
+            "Episode",
+            "Drama",
+            Some(2011),
+        )
+        .await;
+        let blue = j5_item(
+            s,
+            music,
+            None,
+            "Blue",
+            "MusicAlbum",
+            "Rock|Jazz",
+            Some(2017),
+        )
+        .await;
+        j5_item(s, music, Some(blue), "One", "Audio", "rock", Some(2017)).await;
+        j5_item(s, music, Some(blue), "Two", "Audio", "Música", Some(2017)).await;
+        for (item, studio) in [(alpha, "Pixar"), (bravo, "Pixar"), (echo, "HBO")] {
+            j5_studio(s, item, studio).await;
+        }
+        J5Server {
+            state,
+            app,
+            token,
+            admin,
+            films,
+            music,
+            echo,
+        }
+    }
+
+    async fn get(&self, uri: &str) -> (StatusCode, serde_json::Value) {
+        send_authed(&self.app, "GET", uri, &self.token, None).await
+    }
+}
+
+/// Adds a library straight to the database, with no folder behind it.
+async fn j5_library(
+    state: &AppState,
+    name: &str,
+    content_type: rustyfin_model::library::LibraryContentType,
+) -> uuid::Uuid {
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: name.to_string(),
+        content_type,
+        paths: vec![format!("/nonexistent/{name}")],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    lib.id
+}
+
+/// Inserts an item with the column values a scan stores and returns its id.
+async fn j5_item(
+    state: &AppState,
+    library_id: uuid::Uuid,
+    parent_id: Option<uuid::Uuid>,
+    name: &str,
+    media_type: &str,
+    genres: &str,
+    year: Option<i64>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, parent_id, name, media_type, path, genres, production_year) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(library_id.to_string())
+    .bind(parent_id.map(|p| p.to_string()))
+    .bind(name)
+    .bind(media_type)
+    .bind(format!("/nonexistent/j5/{id}"))
+    .bind(genres)
+    .bind(year)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Links an item to a studio, adding the studio if it is new.
+async fn j5_studio(state: &AppState, item_id: uuid::Uuid, studio: &str) {
+    let studio_id = format!("studio-{}", studio.to_lowercase());
+    sqlx::query("INSERT OR IGNORE INTO studios (id, name) VALUES (?, ?)")
+        .bind(&studio_id)
+        .bind(studio)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_studios (item_id, studio_id) VALUES (?, ?)")
+        .bind(item_id.to_string())
+        .bind(&studio_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// The `Items` of a list body.
+fn j5_items(body: &serde_json::Value) -> &Vec<serde_json::Value> {
+    body["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("not a QueryResult: {body}"))
+}
+
+/// The `Name` of each item in a list body, in order.
+fn j5_names(body: &serde_json::Value) -> Vec<String> {
+    j5_items(body)
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The item named `name` in a list body.
+fn j5_named<'a>(body: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    j5_items(body)
+        .iter()
+        .find(|item| item["Name"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {body}"))
+}
+
+/// The `Id` of the item named `name` in a list body.
+fn j5_id(body: &serde_json::Value, name: &str) -> String {
+    j5_named(body, name)["Id"].as_str().unwrap().to_string()
+}
+
+/// The keys of a JSON object, sorted.
+fn j5_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// The keys of an item with its counts, sorted.
+fn j5_keys_with_counts() -> Vec<String> {
+    let mut keys: Vec<String> = J5_DTO_KEYS
+        .iter()
+        .chain(J5_COUNT_KEYS)
+        .map(|k| k.to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// `[ChildCount, MovieCount, SeriesCount, EpisodeCount, AlbumCount, SongCount]` of an item.
+fn j5_counts(item: &serde_json::Value) -> [Option<i64>; 6] {
+    [
+        "ChildCount",
+        "MovieCount",
+        "SeriesCount",
+        "EpisodeCount",
+        "AlbumCount",
+        "SongCount",
+    ]
+    .map(|key| item[key].as_i64())
+}
+
+#[tokio::test]
+async fn j5_genres_are_a_query_result_of_genre_items_with_name_based_ids() {
+    let server = J5Server::new().await;
+    let (status, body) = server.get("/Genres").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        j5_keys(&body),
+        ["Items", "StartIndex", "TotalRecordCount"],
+        "{body}"
+    );
+    let all = [
+        "Action",
+        "Action & Adventure",
+        "Animation",
+        "Comedy",
+        "Drama",
+        "Music",
+        "Sci-Fi",
+    ];
+    assert_eq!(j5_names(&body), all);
+    assert_eq!(body["TotalRecordCount"], 7);
+    assert_eq!(body["StartIndex"], 0);
+    let mut ids = std::collections::HashSet::new();
+    for item in j5_items(&body) {
+        assert_eq!(j5_keys(item), J5_DTO_KEYS, "{item}");
+        assert_eq!(item["Type"], "Genre", "{item}");
+        assert_eq!(item["ServerId"], "test-server-id", "{item}");
+        assert_eq!(item["ChannelId"], serde_json::Value::Null, "{item}");
+        assert_eq!(item["ImageTags"], serde_json::json!({}), "{item}");
+        assert_eq!(item["BackdropImageTags"], serde_json::json!([]), "{item}");
+        assert_eq!(item["ImageBlurHashes"], serde_json::json!({}), "{item}");
+        assert_eq!(item["LocationType"], "FileSystem", "{item}");
+        assert_eq!(item["MediaType"], "Unknown", "{item}");
+        let id: uuid::Uuid = item["Id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(id.get_version_num(), 5, "{item}");
+        ids.insert(id);
+    }
+    assert_eq!(ids.len(), all.len());
+    assert_eq!(j5_id(&body, "Action"), J5_ACTION);
+    assert_eq!(j5_id(&body, "Sci-Fi"), J5_SCI_FI);
+    let (_, again) = server.get("/Genres").await;
+    assert_eq!(again, body);
+}
+
+#[tokio::test]
+async fn j5_genre_lists_honour_parent_types_search_order_and_paging() {
+    let server = J5Server::new().await;
+    let films = server.films;
+    let echo = server.echo;
+    let unknown = uuid::Uuid::new_v4();
+    let movies = [
+        "Action",
+        "Action & Adventure",
+        "Animation",
+        "Music",
+        "Sci-Fi",
+    ];
+    let cases: Vec<(String, Vec<&str>, i64)> = vec![
+        (format!("/Genres?ParentId={films}"), movies.to_vec(), 5),
+        // Items below the series, two levels down; the series itself doesn't count.
+        (format!("/Genres?parentid={echo}"), vec!["Drama"], 1),
+        (format!("/Genres?ParentId={unknown}"), vec![], 0),
+        (
+            "/Genres?IncludeItemTypes=Series".into(),
+            vec!["Comedy", "Drama"],
+            2,
+        ),
+        (
+            "/Genres?includeItemTypes=movie,%20Episode".into(),
+            vec![
+                "Action",
+                "Action & Adventure",
+                "Animation",
+                "Drama",
+                "Music",
+                "Sci-Fi",
+            ],
+            6,
+        ),
+        (
+            "/Genres?ExcludeItemTypes=Movie".into(),
+            vec!["Comedy", "Drama"],
+            2,
+        ),
+        (
+            "/Genres?SearchTerm=ACT".into(),
+            vec!["Action", "Action & Adventure"],
+            2,
+        ),
+        (
+            "/Genres?StartIndex=1&Limit=2".into(),
+            vec!["Action & Adventure", "Animation"],
+            7,
+        ),
+        (
+            "/Genres?SortBy=SortName&SortOrder=Descending&Limit=3".into(),
+            vec!["Sci-Fi", "Music", "Drama"],
+            7,
+        ),
+    ];
+    for (uri, names, total) in cases {
+        let (status, body) = server.get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(j5_names(&body), names, "{uri}");
+        assert_eq!(body["TotalRecordCount"], total, "{uri}");
+    }
+
+    // jellyfin-web's genre tab: item types, so counts, and no total.
+    let uri = format!(
+        "/Genres?SortBy=SortName&SortOrder=Ascending&IncludeItemTypes=Movie&Recursive=true\
+         &EnableTotalRecordCount=false&ParentId={films}&userId={}",
+        server.admin
+    );
+    let (status, body) = server.get(&uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), movies);
+    assert_eq!(body["TotalRecordCount"], 0);
+    let action = j5_named(&body, "Action");
+    assert_eq!(j5_keys(action), j5_keys_with_counts(), "{action}");
+    assert_eq!(j5_counts(action), [2, 2, 0, 0, 0, 0].map(Some));
+    let (_, body) = server.get("/Genres?IncludeItemTypes=Series,Episode").await;
+    assert_eq!(
+        j5_counts(j5_named(&body, "Drama")),
+        [2, 0, 1, 1, 0, 0].map(Some)
+    );
+    assert_eq!(
+        j5_counts(j5_named(&body, "Comedy")),
+        [1, 0, 1, 0, 0, 0].map(Some)
+    );
+
+    // Fields=ItemCounts turns the counts on; the image and DTO options are accepted.
+    let uri = "/Genres?Fields=PrimaryImageAspectRatio,ItemCounts&EnableImages=true&ImageTypeLimit=1\
+               &EnableImageTypes=Primary,Backdrop,Thumb&Recursive=true&EnableUserData=false";
+    let (status, body) = server.get(uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body).len(), 7);
+    assert_eq!(
+        j5_counts(j5_named(&body, "Drama")),
+        [2, 0, 1, 1, 0, 0].map(Some)
+    );
+    let (_, body) = server.get("/Genres?Fields=PrimaryImageAspectRatio").await;
+    assert_eq!(j5_keys(j5_named(&body, "Drama")), J5_DTO_KEYS);
+}
+
+#[tokio::test]
+async fn j5_studio_year_and_music_genre_lists_come_from_their_own_items() {
+    let server = J5Server::new().await;
+    let (status, body) = server.get("/Studios").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["HBO", "Pixar"]);
+    assert_eq!(body["TotalRecordCount"], 2);
+    assert!(
+        j5_items(&body).iter().all(|item| item["Type"] == "Studio"),
+        "{body}"
+    );
+    assert_eq!(j5_id(&body, "Pixar"), J5_PIXAR);
+    let (_, body) = server.get("/Studios?IncludeItemTypes=Movie").await;
+    assert_eq!(j5_names(&body), ["Pixar"]);
+    assert_eq!(
+        j5_counts(j5_named(&body, "Pixar")),
+        [2, 2, 0, 0, 0, 0].map(Some)
+    );
+
+    let (status, body) = server.get("/Years").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["1999", "2009", "2011", "2017"]);
+    assert_eq!(body["TotalRecordCount"], 4);
+    assert!(
+        j5_items(&body).iter().all(|item| item["Type"] == "Year"),
+        "{body}"
+    );
+    assert_eq!(j5_id(&body, "1999"), J5_YEAR_1999);
+    let (_, body) = server.get("/Years?SortOrder=Descending").await;
+    assert_eq!(j5_names(&body), ["2017", "2011", "2009", "1999"]);
+    let (_, body) = server
+        .get(&format!("/Years?ParentId={}", server.films))
+        .await;
+    assert_eq!(j5_names(&body), ["1999", "2009"]);
+
+    let (status, music) = server.get("/MusicGenres").await;
+    assert_eq!(status, StatusCode::OK, "{music}");
+    assert_eq!(j5_names(&music), ["Jazz", "Música", "Rock"]);
+    assert!(
+        j5_items(&music)
+            .iter()
+            .all(|item| item["Type"] == "MusicGenre"),
+        "{music}"
+    );
+    assert_eq!(j5_id(&music, "Rock"), J5_MUSIC_ROCK);
+    let (_, songs) = server.get("/MusicGenres?IncludeItemTypes=Audio").await;
+    assert_eq!(j5_names(&songs), ["Música", "Rock"]);
+    assert_eq!(
+        j5_counts(j5_named(&songs, "Rock")),
+        [1, 0, 0, 0, 0, 1].map(Some)
+    );
+    // A music library as the parent turns /Genres into the music-genre list, as in Jellyfin.
+    let (status, body) = server
+        .get(&format!("/Genres?ParentId={}", server.music))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, music);
+}
+
+#[tokio::test]
+async fn j5_single_routes_return_one_item_or_404() {
+    let server = J5Server::new().await;
+    let cases: [(&str, &str, &str, [i64; 6]); 8] = [
+        (
+            "/Genres/Animation",
+            "Animation",
+            "Genre",
+            [1, 1, 0, 0, 0, 0],
+        ),
+        ("/Genres/ACTION", "Action", "Genre", [2, 2, 0, 0, 0, 0]),
+        ("/Genres/Music", "Music", "Genre", [1, 1, 0, 0, 0, 0]),
+        ("/Genres/Sci-Fi", "Sci-Fi", "Genre", [1, 1, 0, 0, 0, 0]),
+        // jellyfin-web's slug for a name with `&`.
+        (
+            "/Genres/Action%20-%20Adventure",
+            "Action & Adventure",
+            "Genre",
+            [1, 1, 0, 0, 0, 0],
+        ),
+        (
+            "/MusicGenres/rock",
+            "Rock",
+            "MusicGenre",
+            [2, 0, 0, 0, 1, 1],
+        ),
+        ("/Studios/pixar", "Pixar", "Studio", [2, 2, 0, 0, 0, 0]),
+        ("/Years/2009", "2009", "Year", [2, 2, 0, 0, 0, 0]),
+    ];
+    for (uri, name, kind, counts) in cases {
+        let (status, body) = server.get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["Name"], name, "{uri}");
+        assert_eq!(body["Type"], kind, "{uri}");
+        assert_eq!(j5_keys(&body), j5_keys_with_counts(), "{uri}");
+        assert_eq!(j5_counts(&body), counts.map(Some), "{uri}");
+    }
+    let (_, list) = server.get("/Genres").await;
+    for name in ["Action", "Animation", "Sci-Fi"] {
+        let (_, body) = server.get(&format!("/Genres/{name}")).await;
+        assert_eq!(body["Id"], j5_id(&list, name).as_str(), "{name}");
+    }
+    assert_eq!(server.get("/Genres/action").await.1["Id"], J5_ACTION);
+    assert_eq!(server.get("/MusicGenres/Rock").await.1["Id"], J5_MUSIC_ROCK);
+    assert_eq!(server.get("/Studios/Pixar").await.1["Id"], J5_PIXAR);
+    for uri in [
+        "/Genres/Nope",
+        "/Genres/Rock",
+        "/MusicGenres/Drama",
+        "/Studios/Nope",
+        "/Years/1800",
+    ] {
+        let (status, body) = server.get(uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    for uri in ["/Years/abc", "/Years/0", "/Years/-1"] {
+        let (status, body) = server.get(uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+/// The ids of the movies in the database.
+async fn j5_movie_ids(state: &AppState) -> Vec<String> {
+    sqlx::query_scalar("SELECT id FROM media_items WHERE media_type = 'Movie'")
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn j5_genre_ids_survive_a_rescan_that_replaces_the_items() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let root = std::path::PathBuf::from(media_folder(&state, "j5 rescan"));
+    let film = root.join("Alpha (2001)");
+    std::fs::create_dir_all(&film).unwrap();
+    std::fs::write(film.join("Alpha (2001).mkv"), b"").unwrap();
+    let nfo = "<movie><title>Alpha</title><year>2001</year>\
+               <genre>Action</genre><genre>Sci-Fi</genre></movie>";
+    std::fs::write(film.join("movie.nfo"), nfo).unwrap();
+    let lib = rustyfin_model::library::Library {
+        id: uuid::Uuid::new_v4(),
+        name: "J5 Rescan".to_string(),
+        content_type: rustyfin_model::library::LibraryContentType::Movies,
+        paths: vec![root.to_str().unwrap().to_string()],
+    };
+    rustyfin_db::repo_library::create_library(&state.db, &lib)
+        .await
+        .unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let before = j5_movie_ids(&state).await;
+    assert_eq!(before.len(), 1);
+    let (status, genres) = send_authed(&app, "GET", "/Genres", &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{genres}");
+    assert_eq!(j5_names(&genres), ["Action", "Sci-Fi"]);
+    assert_eq!(j5_id(&genres, "Action"), J5_ACTION);
+    assert_eq!(j5_id(&genres, "Sci-Fi"), J5_SCI_FI);
+    let (_, years) = send_authed(&app, "GET", "/Years", &token, None).await;
+    assert_eq!(j5_names(&years), ["2001"]);
+
+    // After a rename the scan removes the movie and adds it again with a new id.
+    std::fs::rename(&film, root.join("Alpha Redux (2001)")).unwrap();
+    rustyfin_core::scanner::scan_library(&state.db, &lib)
+        .await
+        .unwrap();
+    let after = j5_movie_ids(&state).await;
+    assert_eq!(after.len(), 1);
+    assert_ne!(after, before, "the rescan kept the old item");
+    let (_, again) = send_authed(&app, "GET", "/Genres", &token, None).await;
+    assert_eq!(again, genres);
+    let (_, again) = send_authed(&app, "GET", "/Years", &token, None).await;
+    assert_eq!(again, years);
+}
+
+#[tokio::test]
+async fn j5_odd_values_list_without_error_and_bad_parameters_give_400() {
+    use rustyfin_model::library::LibraryContentType;
+    let state = test_state().await;
+    let app = app(state.clone());
+    let (token, _) = admin_session(&state).await;
+    let films = j5_library(&state, "J5 Odd", LibraryContentType::Movies).await;
+    let s = &state;
+    j5_item(s, films, None, "Pipes", "Movie", "A||B", None).await;
+    j5_item(
+        s,
+        films,
+        None,
+        "Spaces",
+        "Movie",
+        "  Drama  | |War ",
+        Some(0),
+    )
+    .await;
+    // Rows from before migration 014 keep JSON in both columns.
+    j5_item(
+        s,
+        films,
+        None,
+        "Old",
+        "\"Movie\"",
+        r#"["Western", "Noir"]"#,
+        None,
+    )
+    .await;
+    j5_item(s, films, None, "Empty", "Movie", "[]", Some(-5)).await;
+    j5_item(
+        s,
+        films,
+        None,
+        "Accents",
+        "Movie",
+        "Ação|Comédia|ação",
+        None,
+    )
+    .await;
+    let all = [
+        "A", "Ação", "B", "Comédia", "Drama", "Noir", "War", "Western",
+    ];
+    let get = |uri: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move { send_authed(&app, "GET", &uri, &token, None).await }
+    };
+
+    let nil = uuid::Uuid::nil();
+    let unknown = uuid::Uuid::new_v4();
+    let cases: Vec<(String, Vec<&str>, i64)> = vec![
+        ("/Genres".into(), all.to_vec(), 8),
+        ("/Genres?IncludeItemTypes=Movie".into(), all.to_vec(), 8),
+        (format!("/Genres?ParentId={nil}"), all.to_vec(), 8),
+        ("/Genres?ParentId=".into(), all.to_vec(), 8),
+        (format!("/Genres?ParentId={unknown}"), vec![], 0),
+        ("/Genres?SearchTerm=%C3%A7".into(), vec!["Ação"], 1),
+        ("/Genres?StartIndex=1000".into(), vec![], 8),
+        ("/Genres?Limit=0".into(), vec![], 8),
+        ("/Genres?Limit=1000000".into(), all.to_vec(), 8),
+        ("/Years".into(), vec![], 0),
+    ];
+    for (uri, names, total) in cases {
+        let (status, body) = get(uri.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(j5_names(&body), names, "{uri}");
+        assert_eq!(body["TotalRecordCount"], total, "{uri}");
+    }
+    let (_, body) = get("/Genres?StartIndex=1000".into()).await;
+    assert_eq!(body["StartIndex"], 1000);
+    let (_, body) = get("/Genres".into()).await;
+    assert_eq!(j5_id(&body, "Ação"), J5_ACAO);
+
+    for (uri, name) in [
+        ("/Genres/A%C3%A7%C3%A3o", "Ação"),
+        ("/Genres/%20western%20", "Western"),
+        ("/Genres/war", "War"),
+    ] {
+        let (status, body) = get(uri.into()).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["Name"], name, "{uri}");
+    }
+    for uri in [
+        "/Genres?ParentId=bogus",
+        "/Genres?StartIndex=-1",
+        "/Genres?Limit=abc",
+        "/Genres?Limit=99999999999999999999999",
+        "/Genres?EnableTotalRecordCount=maybe",
+        "/Genres?userId=nope",
+        "/Studios?ParentId=bogus",
+        "/Years?Limit=-1",
+        "/MusicGenres?StartIndex=x",
+    ] {
+        let (status, body) = get(uri.into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn j5_user_id_is_checked_and_does_not_change_the_lists() {
+    let server = J5Server::new().await;
+    let viewer = add_user(&server.state, "j5viewer", "viewer", false).await;
+    let (viewer_token, _) = login(&server.app, "j5viewer", "viewer").await.unwrap();
+    let admin = server.admin;
+    let unknown = uuid::Uuid::new_v4();
+    let cases = [
+        (
+            &server.token,
+            format!("/Genres?userId={admin}"),
+            StatusCode::OK,
+        ),
+        (
+            &server.token,
+            format!("/Studios?UserId={viewer}"),
+            StatusCode::OK,
+        ),
+        (
+            &server.token,
+            format!("/Years?userId={unknown}"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            &viewer_token,
+            format!("/Genres?userId={admin}"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &viewer_token,
+            format!("/MusicGenres?userId={viewer}"),
+            StatusCode::OK,
+        ),
+        (
+            &viewer_token,
+            format!("/Genres/Action?userId={admin}"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &viewer_token,
+            format!("/Genres/Action?userId={viewer}"),
+            StatusCode::OK,
+        ),
+    ];
+    for (token, uri, expected) in cases {
+        let (status, body) = send_authed(&server.app, "GET", &uri, token, None).await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (status, theirs) = send_authed(&server.app, "GET", "/Genres", &viewer_token, None).await;
+    assert_eq!(status, StatusCode::OK, "{theirs}");
+    assert_eq!(theirs, server.get("/Genres").await.1);
+}
+
+#[tokio::test]
+#[ignore = "J5 proposal: /Artists lists nothing since migration 014 stopped quoting media_type"]
+async fn j5_proposal_artists_list_the_music_library() {
+    let server = J5Server::new().await;
+    let (status, body) = server.get("/Artists").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body.get("Items").unwrap_or(&body);
+    assert!(
+        items.as_array().is_some_and(|items| !items.is_empty()),
+        "no artists in a library with an album: {body}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "J5 proposal: /Persons answers a bare array, not a QueryResult of Person items"]
+async fn j5_proposal_persons_are_a_query_result() {
+    let server = J5Server::new().await;
+    sqlx::query("INSERT INTO people (id, name) VALUES ('person-j5', 'J5 Actor')")
+        .execute(&server.state.db)
+        .await
+        .unwrap();
+    let (status, body) = server.get("/Persons").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(j5_names(&body), ["J5 Actor"]);
+    assert_eq!(body["Items"][0]["Type"], "Person", "{body}");
+}
+
 // ── Shows Tests ──
 
 #[tokio::test]
