@@ -3065,6 +3065,48 @@ mod kernel {
         );
         watcher.stop();
     }
+
+    /// A guard for fix round 2, item D: a few changes in a row are still read one by one, so a
+    /// share unmounted and mounted again right after another mount change is seen. Linux gives the
+    /// new mount the id and device number that the old one freed: read together, the two changes
+    /// would look like none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mounts tmpfs; mount_changes_in_a_namespace runs it under `unshare -rm`"]
+    async fn mount_ns_a_share_mounted_again_right_after_another_mount_change_is_seen() {
+        if !in_mount_namespace() {
+            return;
+        }
+        let _logs = captured_logs();
+        let tree = Tree::new();
+        movie_tree(&tree);
+        let target = tree.outside("mnt");
+        let mut share = Share::mount(&target);
+        symlink(&target, tree.at("Alpha (2001)")).unwrap();
+        let (pool, changes, recorder) = kernel_fixture(&tree).await;
+        let lib = add_library(&pool, "Mount L Films", &[tree.root()]).await;
+        let watcher = kernel_watcher(&pool, &changes, tree.outside("data"));
+        wait_watched(&watcher, &tree.root(), 5).await;
+
+        let readings = watcher.mount_readings();
+        let _other = Share::mount(&tree.outside("other"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while watcher.mount_readings() == readings {
+            assert!(
+                Instant::now() < deadline,
+                "the other mount is not read within 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        share.unmount();
+        wait_watched(&watcher, &tree.root(), 4).await;
+        let _share = Share::mount(&target);
+        wait_watched(&watcher, &tree.root(), 5).await;
+        write(&target.join("Alpha (2001).mkv"), 10);
+        recorder
+            .wait_for(&folder_unit(&lib, tree.at("Alpha (2001)")), 1)
+            .await;
+        watcher.stop();
+    }
 }
 
 /// Measures polling a real library, which it only reads:
