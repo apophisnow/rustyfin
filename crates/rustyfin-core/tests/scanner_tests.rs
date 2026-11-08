@@ -3192,6 +3192,311 @@ async fn b28_saving_an_item_read_before_the_backfill_keeps_its_new_date() {
     assert_eq!(stored.date_created, b28_at(1_100_000_000));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_new_date_fires_no_trigger() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let movie = "Alpha/Alpha.mkv";
+    touch(&root_of(&film), movie);
+    scan(&fx.pool, &film).await;
+    let id = item_at(&fx.pool, &film, movie).await.to_string();
+    // A year and a rating, which the filter tables count.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET production_year = 1999, official_rating = 'PG' WHERE id = ?1",
+        &[id.as_str()],
+    )
+    .await;
+    // Each item the backfill moves is one UPDATE of date_created. Before migration 061 that also
+    // fired the filter trigger, which recounted the item's year and rating over the whole table,
+    // and the search trigger, which rewrote the item's search entry.
+    let mut conn = fx.pool.acquire().await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_items SET date_created = ?1 WHERE id = ?2")
+        .bind(b28_at(1_000_000_000).to_rfc3339())
+        .bind(&id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    // The item's own row, and no row written by a trigger.
+    assert_eq!(after - before, 1);
+}
+
+/// The rows of the rating filter table, as (rating, item count), by rating.
+#[cfg(target_os = "linux")]
+async fn b28_filter_ratings(pool: &SqlitePool) -> Vec<(String, i64)> {
+    sqlx::query_as("SELECT rating, item_count FROM filter_rating_index ORDER BY rating")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_new_year_or_rating_still_moves_the_filter_counts() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let films = ["Alpha/Alpha.mkv", "Bravo/Bravo.mkv", "Charlie/Charlie.mkv"];
+    for rel in films {
+        touch(&root_of(&film), rel);
+    }
+    scan(&fx.pool, &film).await;
+    let mut ids = Vec::new();
+    for rel in films {
+        ids.push(item_at(&fx.pool, &film, rel).await.to_string());
+    }
+    let year = "UPDATE media_items SET production_year = ?1 WHERE id = ?2";
+    let rating = "UPDATE media_items SET official_rating = ?1 WHERE id = ?2";
+    for id in &ids {
+        exec(&fx.pool, year, &["1999", id.as_str()]).await;
+        exec(&fx.pool, rating, &["PG", id.as_str()]).await;
+    }
+    // No year or rating loses its last item here. When one does, the trigger keeps that value's
+    // old count until the filter tables are rebuilt.
+    assert_eq!(b18_filter_years(&fx.pool).await, [(1999, 3)]);
+    assert_eq!(b28_filter_ratings(&fx.pool).await, [("PG".to_string(), 3)]);
+    exec(&fx.pool, year, &["2001", ids[0].as_str()]).await;
+    assert_eq!(b18_filter_years(&fx.pool).await, [(1999, 2), (2001, 1)]);
+    exec(&fx.pool, year, &["2001", ids[1].as_str()]).await;
+    assert_eq!(b18_filter_years(&fx.pool).await, [(1999, 1), (2001, 2)]);
+    exec(&fx.pool, rating, &["R", ids[0].as_str()]).await;
+    assert_eq!(
+        b28_filter_ratings(&fx.pool).await,
+        [("PG".to_string(), 2), ("R".to_string(), 1)]
+    );
+    exec(&fx.pool, rating, &["R", ids[1].as_str()]).await;
+    assert_eq!(
+        b28_filter_ratings(&fx.pool).await,
+        [("PG".to_string(), 1), ("R".to_string(), 2)]
+    );
+}
+
+/// The ids of the items a search for `query` finds.
+#[cfg(target_os = "linux")]
+async fn b28_found(pool: &SqlitePool, query: &str) -> Vec<Uuid> {
+    rustyfin_db::repo_search::search_hints(pool, query, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hint| hint.id)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn b28_a_new_name_still_changes_what_search_finds() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let movie = "Alpha/Alpha.mkv";
+    touch(&root_of(&film), movie);
+    scan(&fx.pool, &film).await;
+    let id = item_at(&fx.pool, &film, movie).await;
+    assert_eq!(b28_found(&fx.pool, "Alpha").await, [id]);
+    let id_text = id.to_string();
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = ?1 WHERE id = ?2",
+        &["Zulu", id_text.as_str()],
+    )
+    .await;
+    assert_eq!(b28_found(&fx.pool, "Zulu").await, [id]);
+    assert_eq!(b28_found(&fx.pool, "Alpha").await, Vec::<Uuid>::new());
+}
+
+/// The backfill over `count` generated films, each stored with a date a day after its file's, as
+/// by a scan before B23, so that every one moves. Prints the time of the first batch (and of its
+/// read and its write transaction alone) and of the whole run, the UPDATE triggers on media_items,
+/// and the query plans of the statements each moved item runs, its triggers' included.
+#[cfg(target_os = "linux")]
+async fn b28_bench(count: u32) {
+    use rustyfin_core::date_backfill::{BATCH_SIZE, run_some};
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let root = root_of(&film);
+    for n in 0..count {
+        let folder = root.join(format!("{:03}", n / 1000));
+        if n % 1000 == 0 {
+            std::fs::create_dir_all(&folder).unwrap();
+        }
+        std::fs::File::create(folder.join(format!("Film {n}.mkv"))).unwrap();
+    }
+    // The rows go in without the INSERT triggers, which recount a year and a rating over the whole
+    // table for each row. The search index and the filter tables are then built once.
+    let inserts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' \
+         AND name IN ('trg_media_items_insert', 'media_items_ai')",
+    )
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(inserts.len(), 2);
+    for (name, _) in &inserts {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER {name}")))
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    }
+    let scanned = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?1) \
+         INSERT INTO media_items (id, name, media_type, path, library_id, production_year, \
+         official_rating, genres, date_created) \
+         SELECT printf('%08x-0000-4000-8000-000000000000', i), 'Film ' || i, 'Movie', \
+         printf('%s/%03d/Film %d.mkv', ?2, i / 1000, i), ?3, 1950 + i % 75, \
+         CASE i % 5 WHEN 0 THEN NULL WHEN 1 THEN 'PG' WHEN 2 THEN 'PG-13' WHEN 3 THEN 'R' \
+         ELSE 'TV-MA' END, 'Drama|Thriller', ?4 FROM n",
+    )
+    .bind(i64::from(count))
+    .bind(root.to_str().unwrap())
+    .bind(film.id.to_string())
+    .bind(&scanned)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    for (_, sql) in &inserts {
+        sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    }
+    exec(
+        &fx.pool,
+        "INSERT INTO media_items_fts(media_items_fts) VALUES ('rebuild')",
+        &[],
+    )
+    .await;
+    rustyfin_db::repo_media::rebuild_filter_indexes(&fx.pool)
+        .await
+        .unwrap();
+    // The setup's writes leave the WAL first, so no commit timed below copies them back.
+    exec(&fx.pool, "PRAGMA wal_checkpoint(TRUNCATE)", &[]).await;
+
+    // The first batch's read alone, then its write transaction alone: each row's guarded UPDATE
+    // sets the date it already has, which fires what a move fires.
+    let batch_sql = "SELECT id, path, date_created FROM media_items WHERE id > ?1 AND media_type IN \
+         ('Movie','Series','Season','Episode','Audio','MusicAlbum','Photo') ORDER BY id LIMIT ?2";
+    let started = std::time::Instant::now();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(batch_sql)
+        .bind("")
+        .bind(i64::from(BATCH_SIZE))
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+    let read = started.elapsed();
+    let started = std::time::Instant::now();
+    let mut tx = fx.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    for (id, path, stored) in &rows {
+        sqlx::query(
+            "UPDATE media_items SET date_created = ?1 \
+             WHERE id = ?2 AND path = ?3 AND date_created = ?4",
+        )
+        .bind(stored)
+        .bind(id)
+        .bind(path)
+        .bind(stored)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let write = started.elapsed();
+
+    let started = std::time::Instant::now();
+    let first = run_some(&fx.pool, BATCH_SIZE, 1)
+        .await
+        .unwrap()
+        .expect("a pending backfill");
+    let batch = started.elapsed();
+    let rest = b28_run(&fx.pool).await;
+    let run = started.elapsed();
+    assert_eq!(first.moved, u64::from(BATCH_SIZE));
+    assert_eq!(first.moved + rest.moved, u64::from(count));
+    println!(
+        "b28 bench, {count} items: the first batch of {BATCH_SIZE} in {batch:.2?} (its read alone \
+         in {read:.2?}, its write transaction alone in {write:.2?}), the whole run in {run:.2?}"
+    );
+    let triggers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' \
+         AND tbl_name = 'media_items' AND sql LIKE '%AFTER UPDATE%' ORDER BY name",
+    )
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    for (name, sql) in triggers {
+        let head = sql.split("BEGIN").next().unwrap_or_default();
+        println!(
+            "  trigger {name}: {}",
+            head.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+    // The backfill's statements, and those the filter trigger runs for the old and the new year
+    // and rating of each item it fires for.
+    let statements = [
+        ("batch", batch_sql, 2),
+        (
+            "move",
+            "UPDATE media_items SET date_created = ?1 \
+             WHERE id = ?2 AND path = ?3 AND date_created = ?4",
+            4,
+        ),
+        (
+            "year recount",
+            "INSERT OR REPLACE INTO filter_year_index (year, item_count) \
+             SELECT ?1, COUNT(*) FROM media_items WHERE production_year = ?1 GROUP BY ?1",
+            1,
+        ),
+        (
+            "year delete",
+            "DELETE FROM filter_year_index WHERE year = ?1 AND item_count = 0",
+            1,
+        ),
+        (
+            "rating recount",
+            "INSERT OR REPLACE INTO filter_rating_index (rating, item_count) \
+             SELECT ?1, COUNT(*) FROM media_items WHERE official_rating = ?1 GROUP BY ?1",
+            1,
+        ),
+        (
+            "rating delete",
+            "DELETE FROM filter_rating_index WHERE rating = ?1 AND item_count = 0",
+            1,
+        ),
+    ];
+    for (what, sql, params) in statements {
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {sql}"
+        )));
+        for _ in 0..params {
+            query = query.bind("PG");
+        }
+        let plan = query.fetch_all(&fx.pool).await.unwrap();
+        let steps: Vec<&str> = plan.iter().map(|step| step.3.as_str()).collect();
+        println!("  plan, {what}: {}", steps.join("; "));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "a bench: run it by name, with --ignored --nocapture"]
+async fn b28_bench_10k_items() {
+    b28_bench(10_000).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "a bench: run it by name, with --ignored --nocapture"]
+async fn b28_bench_50k_items() {
+    b28_bench(50_000).await;
+}
+
 // B17: scan progress. A library's scan is listed from the moment it is queued until it ends, and
 // its updates go 0, then up to at most 99, then 100 once its probes have finished. B18 adds the
 // state to each update: Queued, Active from the start, and Idle with the 100.
