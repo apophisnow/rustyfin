@@ -2200,6 +2200,68 @@ async fn b27_search_pages_each_get_their_own_items() {
     assert_eq!(pages, both);
 }
 
+/// The answer to a request, which must be 200.
+async fn b27_answer(app: &axum::Router, uri: &str, token: &str) -> serde_json::Value {
+    let (status, body) = send_authed(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body
+}
+
+/// Name, Type and IsFolder of each item in a `/Search` answer.
+fn b27_kinds(answer: &serde_json::Value) -> Vec<(&str, &str, bool)> {
+    answer["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {answer}"))
+        .iter()
+        .map(|item| {
+            (
+                item["Name"].as_str().unwrap_or("?"),
+                item["Type"].as_str().unwrap_or("?"),
+                item["IsFolder"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn b27_a_repeated_search_gets_the_first_answer_again() {
+    let state = b27_restarted(&test_state().await).await;
+    let (token, _) = b27_seed(&state).await;
+    sqlx::query("UPDATE media_items SET runtime_ticks = 27000000000 WHERE name = 'Comet Hunters'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let series = "/Search?Term=comet&IncludeItemTypes=Series";
+    let movie = "/Search?Term=comet&IncludeItemTypes=Movie";
+
+    let app_before = app(state.clone());
+    let first_series = b27_answer(&app_before, series, &token).await;
+    assert_eq!(
+        b27_kinds(&first_series),
+        [("Comet Hunters", "Series", true)]
+    );
+    assert_eq!(first_series["Items"][0]["RunTimeTicks"], 27_000_000_000i64);
+    let first_movie = b27_answer(&app_before, movie, &token).await;
+    assert_eq!(b27_kinds(&first_movie), [("Comet Night", "Movie", false)]);
+
+    // Asked again, the cache gives back the same answers.
+    let again = b27_answer(&app_before, series, &token).await;
+    assert_eq!(b27_kinds(&again), [("Comet Hunters", "Series", true)]);
+    assert_eq!(again, first_series);
+    assert_eq!(b27_answer(&app_before, movie, &token).await, first_movie);
+    assert_eq!(b27_cached_answers(&state), 2);
+
+    // So does the L2 copy after a restart.
+    b27_wait_for_l2_rows(&state, 2).await;
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), 2);
+    let app_after = app(state);
+    let again = b27_answer(&app_after, series, &token).await;
+    assert_eq!(b27_kinds(&again), [("Comet Hunters", "Series", true)]);
+    assert_eq!(again, first_series);
+    assert_eq!(b27_answer(&app_after, movie, &token).await, first_movie);
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]

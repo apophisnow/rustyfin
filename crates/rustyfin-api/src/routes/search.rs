@@ -146,17 +146,25 @@ async fn search_hints(
     Ok(Json(result))
 }
 
+/// Serializes a `/Search` answer once. The reply, the cache and L2 all hold this value, so a
+/// repeated search gets back exactly what the first one did.
+fn search_answer(result: &QueryResult) -> Result<serde_json::Value, ApiError> {
+    serde_json::to_value(result)
+        .map_err(|e| ApiError::Internal(format!("could not serialize the search answer: {e}")))
+}
+
 async fn full_search(
     State(state): State<AppState>,
     Query(query): Query<FullSearchQuery>,
-) -> Result<Json<QueryResult>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let term = query.term.unwrap_or_default();
     if term.is_empty() {
-        return Ok(Json(QueryResult {
+        let empty = QueryResult {
             items: vec![],
             total_record_count: 0,
             start_index: query.start_index.unwrap_or(0),
-        }));
+        };
+        return Ok(Json(search_answer(&empty)?));
     }
 
     let start_index = query.start_index.unwrap_or(0) as usize;
@@ -190,12 +198,10 @@ async fn full_search(
         ]
     };
 
-    // Check cache first
+    // Check cache first. The cached value is the reply as it was first serialized.
     let cache_key = full_search_cache_key(&term, &item_types, start_index, limit);
-    if let Some(cached) = state.cache.search_results.get(&cache_key)
-        && let Ok(result) = serde_json::from_value(cached.clone())
-    {
-        return Ok(Json(result));
+    if let Some(cached) = state.cache.search_results.get(&cache_key) {
+        return Ok(Json(cached));
     }
 
     let items = rustyfin_db::repo_search::search_items(
@@ -219,19 +225,18 @@ async fn full_search(
         total_record_count: total,
         start_index: start_index as i64,
     };
+    let value = search_answer(&result)?;
     // Cache the result
-    if let Ok(json) = serde_json::to_value(&result) {
-        state
-            .cache
-            .search_results
-            .insert(cache_key.clone(), json.clone());
-        // Persist to L2 cache for survival across restarts (fire-and-forget)
-        let cache = state.cache.clone();
-        let key = cache_key.clone();
-        let value = json.clone();
-        tokio::spawn(async move {
-            cache.save_search_to_l2(&key, &value).await;
-        });
-    }
-    Ok(Json(result))
+    state
+        .cache
+        .search_results
+        .insert(cache_key.clone(), value.clone());
+    // Persist to L2 cache for survival across restarts (fire-and-forget)
+    let cache = state.cache.clone();
+    let key = cache_key.clone();
+    let l2_value = value.clone();
+    tokio::spawn(async move {
+        cache.save_search_to_l2(&key, &l2_value).await;
+    });
+    Ok(Json(value))
 }
