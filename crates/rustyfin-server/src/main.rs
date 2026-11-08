@@ -367,6 +367,7 @@ async fn main() {
                         watcher.set_poll_interval(std::time::Duration::from_secs(u64::from(
                             cfg.library_monitor_poll_interval.max(1),
                         )));
+                        watcher.libraries_changed();
                         tracing::info!("configuration reloaded");
                     }
                 }
