@@ -52,6 +52,22 @@ async fn populate_media_source_single(
     Ok(())
 }
 
+/// Sets a user's watch data on an item, with its CompletionPercentage if the runtime is known.
+fn apply_user_data(item: &mut MediaItem, user_data: rustyfin_model::playback::UserItemDataDto) {
+    if let Some(runtime) = item.runtime_ticks
+        && runtime > 0
+    {
+        let pos = user_data.playback_position_ticks.max(0) as f64;
+        let run = runtime as f64;
+        if user_data.played {
+            item.completion_percentage = Some(100.0);
+        } else {
+            item.completion_percentage = Some((pos / run * 100.0).min(100.0));
+        }
+    }
+    item.user_data = Some(user_data);
+}
+
 /// Enrich a single MediaItem with all response fields: server_id, provider_ids, chapters,
 /// trickplay screenshots, etag, completion_percentage, external_urls, type flags,
 /// album/artist info, folder counts, inherited images, episode numbers, series branding,
@@ -229,18 +245,7 @@ async fn enrich_item(
 
     // CompletionPercentage from user_item_data
     if let Ok(user_data) = user_data_result {
-        item.user_data = Some(user_data.clone());
-        if let Some(runtime) = item.runtime_ticks
-            && runtime > 0
-        {
-            let pos = user_data.playback_position_ticks.max(0) as f64;
-            let run = runtime as f64;
-            if user_data.played {
-                item.completion_percentage = Some(100.0);
-            } else {
-                item.completion_percentage = Some((pos / run * 100.0).min(100.0));
-            }
-        }
+        apply_user_data(item, user_data);
     }
 
     // Media source count and streams
@@ -1705,50 +1710,57 @@ async fn get_item(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<MediaItem>, ApiError> {
     let id_str = id.to_string();
-    // Check cache first
-    if let Some(cached) = state.cache.item_details.get(&id_str)
-        && let Ok(item) = serde_json::from_value::<MediaItem>(cached.clone())
-    {
-        let mut cached_ids: Vec<String> = item.media_sources.iter().map(|s| s.id.clone()).collect();
-        cached_ids.sort();
-        // A scan that reads a file again replaces the item's sources, with new ids. Serve the
-        // cached copy only while its source ids are still the stored ones.
-        let stored = rustyfin_db::repo_media_source::get_media_source_ids(&state.db_ro, &id).await;
-        if stored.is_ok_and(|ids| ids == cached_ids) {
-            return Ok(Json(item));
+    // The details every user sees; the requester's watch data is added below. A scan that reads
+    // a file again replaces the item's sources, with new ids, so a cached copy is served only
+    // while its source ids are still the stored ones.
+    let cached = match state.cache.item_details.get(&id_str) {
+        Some(cached) => {
+            let mut cached_ids: Vec<String> =
+                cached.media_sources.iter().map(|s| s.id.clone()).collect();
+            cached_ids.sort();
+            let stored =
+                rustyfin_db::repo_media_source::get_media_source_ids(&state.db_ro, &id).await;
+            stored.is_ok_and(|ids| ids == cached_ids).then_some(cached)
         }
-    }
-    let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
-        .await?
-        .ok_or(ApiError::NotFound("item not found".into()))?;
-    let _ = populate_media_source_single(&state.db_ro, &mut item).await;
-    // Enrich with all response fields
-    let config = state.config.read().await;
-    let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
-    enrich_item(
-        &state.db_ro,
-        &state.server_id,
-        Some(claims.sub),
-        &mut item,
-        &state.http_client,
-        tmdb.as_ref(),
-        &state.data_dir,
-    )
-    .await;
-    drop(config);
-    // Cache the result
-    if let Ok(json) = serde_json::to_value(&item) {
-        state
-            .cache
-            .item_details
-            .insert(id_str.clone(), json.clone());
-        // Persist to L2 cache for survival across restarts (fire-and-forget)
-        let cache = state.cache.clone();
-        let item_id = id_str.clone();
-        let item_json = json.clone();
-        tokio::spawn(async move {
-            cache.save_item_to_l2(&item_id, &item_json).await;
-        });
+        None => None,
+    };
+    let mut item = match cached {
+        Some(cached) => cached,
+        None => {
+            let mut item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
+                .await?
+                .ok_or(ApiError::NotFound("item not found".into()))?;
+            let _ = populate_media_source_single(&state.db_ro, &mut item).await;
+            // Enrich with all response fields, without any user's watch data
+            let config = state.config.read().await;
+            let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
+            enrich_item(
+                &state.db_ro,
+                &state.server_id,
+                None,
+                &mut item,
+                &state.http_client,
+                tmdb.as_ref(),
+                &state.data_dir,
+            )
+            .await;
+            drop(config);
+            // Movies and episodes are not cached: their sources, streams, chapters and
+            // trickplay change on rescans, re-probes and extraction, and none of those
+            // clear this cache.
+            if !matches!(
+                item.media_type,
+                rustyfin_model::media::MediaType::Movie | rustyfin_model::media::MediaType::Episode
+            ) {
+                state.cache.item_details.insert(id_str, item.clone());
+            }
+            item
+        }
+    };
+    if let Ok(user_data) =
+        rustyfin_db::repo_playback::get_user_item_data(&state.db_ro, claims.sub, id).await
+    {
+        apply_user_data(&mut item, user_data);
     }
     Ok(Json(item))
 }
