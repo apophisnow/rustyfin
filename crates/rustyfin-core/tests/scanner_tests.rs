@@ -3004,6 +3004,25 @@ async fn b28_an_earlier_or_equal_stored_date_is_kept() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn b28_a_stored_date_with_an_offset_is_compared_as_a_time() {
+    let fx = Fixture::new().await;
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    let rel = "Old Film (1999)/Old Film (1999).mkv";
+    touch(&root_of(&film), rel);
+    b23_set_mtime(&root_of(&film).join(rel), 1_000_000_000);
+    scan(&fx.pool, &film).await;
+    // An hour before the file's date, written with +02:00: earlier as a time, later as text.
+    let stored = "2001-09-09T02:46:40+02:00";
+    assert!(stored > b28_at(1_000_000_000).to_rfc3339().as_str());
+    b28_set_date(&fx.pool, &film, rel, stored).await;
+
+    let run = b28_run(&fx.pool).await;
+    assert_eq!(b28_counts(run), (1, 0, 0, true));
+    assert_eq!(b28_stored(&fx.pool, &film, rel).await, stored);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn b28_a_path_that_cant_be_read_keeps_its_date() {
     let fx = Fixture::new().await;
     let film = fx.library("film", LibraryContentType::Movies).await;
