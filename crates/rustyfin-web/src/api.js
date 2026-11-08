@@ -367,9 +367,11 @@ const API = {
         return data;
     },
 
-    // Stops the transcode of one play session
-    stopActiveEncodings(playSessionId) {
-        return this.del(`/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playSessionId)}`);
+    // Stops the transcode of one play session; keepalive lets the request outlive the page
+    async stopActiveEncodings(playSessionId) {
+        const path = `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playSessionId)}`;
+        const res = await fetch(this.base + path, { method: 'DELETE', headers: this.headers(), keepalive: true });
+        if (!res.ok) throw await this._requestError('DELETE', path, res);
     },
 
     // Search

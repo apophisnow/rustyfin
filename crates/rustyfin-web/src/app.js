@@ -2134,6 +2134,7 @@ async function playItem(itemId, streamType = 'Videos', title = '', { fromStart =
                 hlsInstance.destroy();
                 hlsInstance = null;
             }
+            if (session.isHls && session.playSessionId) API.stopActiveEncodings(session.playSessionId).catch(e => console.warn('Stopping the transcode failed:', e));
             video.removeAttribute('src');
             video.load();
             clearTextSubtitle();
@@ -3538,6 +3539,7 @@ window.addEventListener('hashchange', handleHash);
 document.addEventListener('DOMContentLoaded', async () => {
     // Every way of closing the player goes through here, so the session is stopped and its position reported once
     $('player-modal')?.addEventListener('close', () => stopPlayback());
+    window.addEventListener('pagehide', () => stopPlayback());
     updateAuthUI();
     const wizardActive = await checkSetupWizard();
     if (!wizardActive) {
