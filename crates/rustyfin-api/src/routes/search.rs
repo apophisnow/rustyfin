@@ -1,7 +1,6 @@
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
@@ -10,7 +9,7 @@ use uuid::Uuid;
 use rustyfin_db::repo_search::{HintAncestor, HintCandidate};
 use rustyfin_model::auth::Claims;
 use rustyfin_model::image::{ImageType, ItemImage};
-use rustyfin_model::media::{MediaItem, MediaType, QueryResult};
+use rustyfin_model::media::{MediaItem, QueryResult};
 use rustyfin_model::search::{SearchHint, SearchHintResult};
 
 use crate::error::ApiError;
@@ -23,72 +22,14 @@ pub fn routes() -> Router<AppState> {
         .route("/Search", get(full_search))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-#[allow(dead_code)]
-pub struct FullSearchQuery {
-    pub term: Option<String>,
-    #[serde(default)]
-    pub search_filter: Option<String>,
-    #[serde(default)]
-    pub include_item_types: Option<String>,
-    #[serde(default = "default_search_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub start_index: Option<i64>,
-    #[serde(default)]
-    pub genre_ids: Option<String>,
-    #[serde(default)]
-    pub artist_ids: Option<String>,
-    #[serde(default)]
-    pub album_artist_ids: Option<String>,
-    #[serde(default)]
-    pub album_ids: Option<String>,
-    #[serde(default)]
-    pub studio_ids: Option<String>,
-    #[serde(default)]
-    pub tag: Option<String>,
-    #[serde(default)]
-    pub featured: Option<bool>,
-    #[serde(default)]
-    pub is_favorite: Option<bool>,
-    #[serde(default)]
-    pub is_unplayed: Option<bool>,
-    #[serde(default)]
-    pub is_played: Option<bool>,
-    #[serde(default)]
-    pub is_movie: Option<bool>,
-    #[serde(default)]
-    pub is_series: Option<bool>,
-    #[serde(default)]
-    pub is_episode: Option<bool>,
-    #[serde(default)]
-    pub start_date: Option<String>,
-    #[serde(default)]
-    pub end_date: Option<String>,
-}
-
-fn default_search_limit() -> i64 {
-    100
-}
-
-/// The key of a `/Search` answer. It holds every input `full_search` applies: the term exactly as
-/// sent, the parsed item types as a set (sorted, deduplicated `item_kind()` names), the start index
-/// and the limit. `full_search` applies no other `FullSearchQuery` field (`IsFavorite`, `IsPlayed`,
-/// ... are ignored) and nothing that depends on the user, so a filter that does needs the user in
-/// this key. The `search2:` tag keeps rows that the L2 table saved under the old format from ever
-/// matching, and the free-text term comes last so that no term can make one key look like another.
-fn full_search_cache_key(
-    term: &str,
-    item_types: &[MediaType],
-    start_index: usize,
-    limit: usize,
-) -> String {
-    let mut kinds: Vec<&str> = item_types.iter().map(|t| t.item_kind()).collect();
-    kinds.sort_unstable();
-    kinds.dedup();
-    let kinds = kinds.join(",");
-    format!("search2:{kinds}:{start_index}:{limit}:{term}")
+/// The key of a `/Search` answer. It holds every input that `full_search` applies: the trimmed
+/// term, the item kinds as a sorted set, the start index and the limit. Nothing else is applied,
+/// and nothing depends on the user, so a parameter that did would need the user in this key. The
+/// term comes last, so that no term can make one key look like another. The `search3:` tag keeps
+/// the rows that L2 saved under `search2:` (kinds parsed the old way, term not trimmed) from ever
+/// matching.
+fn full_search_cache_key(term: &str, kinds: &[&str], start_index: usize, limit: usize) -> String {
+    format!("search3:{}:{start_index}:{limit}:{term}", kinds.join(","))
 }
 
 /// A parsed `/Search/Hints` request. Its lists are sorted sets, so the order and the case of the
@@ -601,86 +542,62 @@ fn search_answer(result: &QueryResult) -> Result<serde_json::Value, ApiError> {
         .map_err(|e| ApiError::Internal(format!("could not serialize the search answer: {e}")))
 }
 
-/// The item types that `/Search` looks in: those named in `IncludeItemTypes`, matched without
-/// ASCII case and with spaces trimmed as Jellyfin's binder does, and each bound once however
-/// often it is named, sorted by name. Unknown names are skipped. Without the parameter, movies,
-/// series, episodes and audio.
-fn parse_item_types(include_item_types: Option<&str>) -> Vec<MediaType> {
-    if let Some(types) = include_item_types {
-        let mut item_types: Vec<MediaType> = types
-            .split(',')
-            .filter_map(|t| {
-                let t = t.trim();
-                [
-                    ("Movie", MediaType::Movie),
-                    ("Series", MediaType::Series),
-                    ("Episode", MediaType::Episode),
-                    ("Audio", MediaType::Audio),
-                    ("Photo", MediaType::Photo),
-                ]
-                .into_iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(t))
-                .map(|(_, kind)| kind)
-            })
-            .collect();
-        item_types.sort_unstable_by_key(|t| t.item_kind());
-        item_types.dedup_by_key(|t| t.item_kind());
-        item_types
+/// The item kinds that `/Search` looks in: the `IncludeItemTypes` names that `item_kinds` reads
+/// with Jellyfin's binder rules, sorted, each once. Folder, Year and CollectionFolder are never
+/// searched. A list that parses to nothing is a missing list, which searches movies, series,
+/// episodes and audio.
+pub(crate) fn search_kinds(params: &[(String, String)]) -> Vec<&'static str> {
+    let kinds: Vec<&'static str> = query::item_kinds(params, "IncludeItemTypes")
+        .into_iter()
+        .filter(|kind| !matches!(*kind, "Folder" | "Year" | "CollectionFolder"))
+        .collect();
+    let kinds = sorted_set(kinds);
+    if kinds.is_empty() {
+        vec!["Audio", "Episode", "Movie", "Series"]
     } else {
-        vec![
-            MediaType::Movie,
-            MediaType::Series,
-            MediaType::Episode,
-            MediaType::Audio,
-        ]
+        kinds
     }
 }
 
+/// Answers `/Search`. The counts are read before the term, so a bad count is a 400 even when the
+/// term is blank. A blank term gets the empty answer, which is not cached.
 async fn full_search(
     State(state): State<AppState>,
-    Query(query): Query<FullSearchQuery>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let term = query.term.unwrap_or_default();
-    if term.is_empty() {
+    let start = query::count_param(&params, "StartIndex")?.unwrap_or(0);
+    let limit = query::count_param(&params, "Limit")?.unwrap_or(100);
+
+    let Some(term) =
+        query::first_value(&params, "Term").or_else(|| query::first_value(&params, "SearchTerm"))
+    else {
         let empty = QueryResult {
             items: vec![],
             total_record_count: 0,
-            start_index: query.start_index.unwrap_or(0),
+            start_index: start as i64,
         };
         return Ok(Json(search_answer(&empty)?));
-    }
+    };
 
-    let start_index = query.start_index.unwrap_or(0) as usize;
-    let limit = query.limit as usize;
-
-    let item_types = parse_item_types(query.include_item_types.as_deref());
+    let kinds = search_kinds(&params);
 
     // Check cache first. The cached value is the reply as it was first serialized.
-    let cache_key = full_search_cache_key(&term, &item_types, start_index, limit);
+    let cache_key = full_search_cache_key(term, &kinds, start, limit);
     if let Some(cached) = state.cache.search_results.get(&cache_key) {
         return Ok(Json(cached));
     }
 
-    let items = rustyfin_db::repo_search::search_items(
-        &state.db_ro,
-        &term,
-        &item_types,
-        (start_index + limit) as i64,
-    )
-    .await?;
+    // The first `start + limit` matches; the page is cut from them below.
+    let fetch = i64::try_from(start.saturating_add(limit)).unwrap_or(i64::MAX);
+    let items = rustyfin_db::repo_search::search_items(&state.db_ro, term, &kinds, fetch).await?;
 
     let total = items.len() as i64;
-    let end = start_index.saturating_add(limit).min(items.len());
-    let page: Vec<MediaItem> = if start_index < items.len() {
-        items[start_index..end].to_vec()
-    } else {
-        Vec::new()
-    };
+    let page: Vec<MediaItem> = items.into_iter().skip(start).take(limit).collect();
 
     let result = QueryResult {
         items: page,
         total_record_count: total,
-        start_index: start_index as i64,
+        start_index: start as i64,
     };
     let value = search_answer(&result)?;
     // Cache the result
@@ -707,8 +624,11 @@ mod tests {
     #[test]
     fn b27_each_named_type_is_searched_once_in_any_case() {
         assert_eq!(
-            parse_item_types(Some("Series,movie, MOVIE ,Movie,Bogus")),
-            [MediaType::Movie, MediaType::Series]
+            search_kinds(&j6_params(&[(
+                "IncludeItemTypes",
+                "Series,movie, MOVIE ,Movie,Bogus"
+            )])),
+            ["Movie", "Series"]
         );
     }
 
@@ -716,20 +636,15 @@ mod tests {
     #[test]
     fn b27_forty_thousand_movie_names_are_one_type() {
         let names = "Movie,".repeat(40_000);
-        assert_eq!(parse_item_types(Some(&names)), [MediaType::Movie]);
+        assert_eq!(
+            search_kinds(&j6_params(&[("IncludeItemTypes", names.as_str())])),
+            ["Movie"]
+        );
     }
 
     #[test]
     fn b27_without_names_search_looks_in_movies_series_episodes_and_audio() {
-        assert_eq!(
-            parse_item_types(None),
-            [
-                MediaType::Movie,
-                MediaType::Series,
-                MediaType::Episode,
-                MediaType::Audio
-            ]
-        );
+        assert_eq!(search_kinds(&[]), ["Audio", "Episode", "Movie", "Series"]);
     }
 
     // J6: search parity
@@ -1095,5 +1010,73 @@ mod tests {
             let pairs = [("searchTerm", "comet"), (name, value)];
             assert_eq!(j6_rejection(&pairs), message, "{name}={value}");
         }
+    }
+
+    #[test]
+    fn j6_search_kinds_parse_every_stored_kind() {
+        // Every kind Rustyfin stores, Unknown aside, in any case and with any name case.
+        for (name, kind) in [
+            ("movie", "Movie"),
+            ("SERIES", "Series"),
+            ("season", "Season"),
+            ("Episode", "Episode"),
+            ("audio", "Audio"),
+            ("musicalbum", "MusicAlbum"),
+            ("PHOTO", "Photo"),
+            ("genre", "Genre"),
+        ] {
+            for key in ["IncludeItemTypes", "includeItemTypes", "INCLUDEITEMTYPES"] {
+                assert_eq!(
+                    search_kinds(&j6_params(&[(key, name)])),
+                    [kind],
+                    "{key}={name}"
+                );
+            }
+        }
+        // Any other BaseItemKind parses too; Rustyfin stores none of them, so it finds nothing.
+        assert_eq!(
+            search_kinds(&j6_params(&[("IncludeItemTypes", "boxset")])),
+            ["BoxSet"]
+        );
+        // Folder, Year and CollectionFolder are never searched.
+        assert_eq!(
+            search_kinds(&j6_params(&[(
+                "IncludeItemTypes",
+                "Folder,Movie,Year,CollectionFolder"
+            )])),
+            ["Movie"]
+        );
+        // A list that names nothing else is a missing list.
+        for list in [
+            "",
+            " , ",
+            "Bogus",
+            "Unknown",
+            "1",
+            "Folder",
+            "Year,CollectionFolder",
+            "Folder,Bogus",
+        ] {
+            assert_eq!(
+                search_kinds(&j6_params(&[("IncludeItemTypes", list)])),
+                ["Audio", "Episode", "Movie", "Series"],
+                "{list:?}"
+            );
+        }
+        // A repeated key is not split: each value is one entry.
+        assert_eq!(
+            search_kinds(&j6_params(&[
+                ("IncludeItemTypes", "Series"),
+                ("includeItemTypes", "Movie"),
+            ])),
+            ["Movie", "Series"]
+        );
+        assert_eq!(
+            search_kinds(&j6_params(&[
+                ("IncludeItemTypes", "Movie,Series"),
+                ("IncludeItemTypes", "Audio"),
+            ])),
+            ["Audio"]
+        );
     }
 }

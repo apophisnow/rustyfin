@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rustyfin_model::media::{MediaItem, MediaType};
+use rustyfin_model::media::MediaItem;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -207,21 +207,19 @@ fn split_tags(tags: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Full search returning MediaItem results
+/// Full search returning MediaItem results. `item_types` are the stored kind names to match, bound
+/// as they are; an empty list matches every kind.
 /// Uses FTS5 for full-text search across name, overview, and genres,
 /// with LIKE prefix matching as fallback.
 pub async fn search_items(
     pool: &SqlitePool,
     query: &str,
-    item_types: &[MediaType],
+    item_types: &[&str],
     limit: i64,
 ) -> Result<Vec<MediaItem>, sqlx::Error> {
-    // Build media type filter
-    let type_filters: Vec<&'static str> = item_types.iter().map(|t| t.item_kind()).collect();
-
     // Try FTS5 first for full-text search
     let fts_query = normalize_fts_query(query);
-    let rows = if type_filters.is_empty() {
+    let rows = if item_types.is_empty() {
         // Search all types via FTS5
         sqlx::query_as::<_, super::repo_media::MediaItemRow>(
             "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
@@ -241,7 +239,7 @@ pub async fn search_items(
     } else {
         // Search with media type filter via FTS5. All placeholders are bare `?`, bound in
         // order: mixing `?N` with `?` makes SQLite reuse ?2 for LIMIT.
-        let placeholders: Vec<&str> = type_filters.iter().map(|_| "?").collect();
+        let placeholders: Vec<&str> = item_types.iter().map(|_| "?").collect();
         let sql = format!(
             "SELECT m.id, m.name, m.sort_name, m.overview, m.media_type, m.path, m.parent_id, m.library_id, \
              m.production_year, m.community_rating, m.official_rating, m.genres, m.date_created, \
@@ -256,7 +254,7 @@ pub async fn search_items(
         );
         let mut q = sqlx::query_as::<_, super::repo_media::MediaItemRow>(sqlx::AssertSqlSafe(sql));
         q = q.bind(&fts_query);
-        for t in &type_filters {
+        for t in item_types {
             q = q.bind(t);
         }
         q = q.bind(limit);
@@ -271,7 +269,7 @@ pub async fn search_items(
             // Using `query%` instead of `%query%` enables B-tree index scan
             let like_prefix = format!("{}%", query);
 
-            if type_filters.is_empty() {
+            if item_types.is_empty() {
                 let rows = sqlx::query_as::<_, super::repo_media::MediaItemRow>(
                     "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
                      production_year, community_rating, official_rating, genres, date_created, \
@@ -286,7 +284,7 @@ pub async fn search_items(
                 .await?;
                 Ok(rows.into_iter().map(Into::into).collect())
             } else {
-                let placeholders: Vec<&str> = type_filters.iter().map(|_| "?").collect();
+                let placeholders: Vec<&str> = item_types.iter().map(|_| "?").collect();
                 let sql = format!(
                     "SELECT id, name, sort_name, overview, media_type, path, parent_id, library_id, \
                      production_year, community_rating, official_rating, genres, date_created, \
@@ -299,7 +297,7 @@ pub async fn search_items(
                 let mut q =
                     sqlx::query_as::<_, super::repo_media::MediaItemRow>(sqlx::AssertSqlSafe(sql));
                 q = q.bind(&like_prefix);
-                for t in &type_filters {
+                for t in item_types {
                     q = q.bind(t);
                 }
                 q = q.bind(limit);

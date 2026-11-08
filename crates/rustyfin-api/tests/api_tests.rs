@@ -3648,6 +3648,312 @@ async fn j6_hint_fields_parse_as_the_kotlin_sdk_reads_them() {
     }
 }
 
+/// What `/Search?Term=comet` finds in the J6 library without a list of item types: its movies,
+/// series, episodes and audio, sorted.
+const J6_SEARCH_COMETS: [&str; 4] = [
+    "Comet Hunters (Series)",
+    "Comet Hunters S01E01 (Episode)",
+    "Comet Night (Movie)",
+    "Comet Song (Audio)",
+];
+
+#[tokio::test]
+async fn j6_search_reads_names_and_values_in_any_case() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state);
+
+    // Term, else SearchTerm, each in any case and trimmed.
+    for query in [
+        "Term=comet",
+        "term=comet",
+        "TERM=comet",
+        "SearchTerm=comet",
+        "searchTerm=comet",
+        "SEARCHTERM=comet",
+        "searchterm=%20comet%20",
+        "Term=&searchTerm=comet",
+    ] {
+        let uri = format!("/Search?{query}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            J6_SEARCH_COMETS,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        b27_found(&app, "/Search?term=night&SearchTerm=hunters", &lib.token).await,
+        ["Comet Night (Movie)"]
+    );
+    for (query, expected) in [
+        ("includeitemtypes=MOVIE", vec!["Comet Night (Movie)"]),
+        (
+            "INCLUDEITEMTYPES=musicalbum",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+    ] {
+        let uri = format!("/Search?term=comet&{query}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    for query in ["limit=1", "LIMIT=1", "startindex=3", "STARTINDEX=3&Limit=5"] {
+        let uri = format!("/Search?Term=comet&{query}");
+        let body = b27_answer(&app, &uri, &lib.token).await;
+        assert_eq!(
+            body["Items"].as_array().map(Vec::len),
+            Some(1),
+            "{uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn j6_search_parses_every_stored_kind() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Comet Photo", "Photo").await;
+    j6_add_item(&state, lib.library, None, "Comet Genre", "Genre").await;
+    j6_add_item(&state, lib.library, None, "Comet Unknown", "Unknown").await;
+    let app = app(state);
+
+    for (types, expected) in [
+        ("movie", vec!["Comet Night (Movie)"]),
+        ("SERIES", vec!["Comet Hunters (Series)"]),
+        ("season", vec!["Comet Hunters Season 1 (Season)"]),
+        ("Episode", vec!["Comet Hunters S01E01 (Episode)"]),
+        ("AUDIO", vec!["Comet Song (Audio)"]),
+        (
+            "MusicAlbum",
+            vec!["Comet Band (MusicAlbum)", "Comet Songs (MusicAlbum)"],
+        ),
+        ("photo", vec!["Comet Photo (Photo)"]),
+        ("Genre", vec!["Comet Genre (Genre)"]),
+        ("BoxSet", vec![]),
+        ("Folder,Movie", vec!["Comet Night (Movie)"]),
+        (
+            "Season,%20Episode",
+            vec![
+                "Comet Hunters S01E01 (Episode)",
+                "Comet Hunters Season 1 (Season)",
+            ],
+        ),
+    ] {
+        let uri = format!("/Search?Term=comet&IncludeItemTypes={types}");
+        assert_eq!(b27_found(&app, &uri, &lib.token).await, expected, "{uri}");
+    }
+    // A list that parses to nothing answers like a missing list, which never finds a folder, a
+    // year, a collection folder or an item of unknown kind.
+    for types in [
+        "Bogus",
+        "",
+        "%20,%20",
+        "Unknown",
+        "1",
+        "Folder",
+        "Year,CollectionFolder",
+    ] {
+        let uri = format!("/Search?Term=comet&IncludeItemTypes={types}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            J6_SEARCH_COMETS,
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn j6_search_answers_bad_counts_with_400() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let app = app(state);
+
+    // The counts are checked before a blank term gets its empty answer.
+    for query in [
+        "Term=comet&StartIndex=-1",
+        "Term=comet&startIndex=ten",
+        "Term=comet&Limit=-1",
+        "Term=comet&limit=2147483648",
+        "Term=comet&LIMIT=99999999999999999999",
+        "Term=&Limit=-1",
+        "StartIndex=-5",
+    ] {
+        let uri = format!("/Search?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn j6_search_survives_odd_terms_and_huge_counts() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    j6_add_item(&state, lib.library, None, "Amélie", "Movie").await;
+    let app = app(state);
+
+    for query in [
+        "Term=A,,B",
+        "Term=%22",
+        "Term=*",
+        "Term=comet%22",
+        "Term=comet*",
+        "Term=%E2%80%9Ccomet%E2%80%9D",
+        "Term=%F0%9F%9A%80",
+        "Term=%E6%9D%B1%E4%BA%AC",
+        "Term=comet&Limit=0",
+    ] {
+        let uri = format!("/Search?{query}");
+        let (status, body) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body["Items"].is_array(), "{uri}: {body}");
+    }
+    // FTS folds case and diacritics, so the term is searched as sent.
+    for term in ["amelie", "AM%C3%89LIE"] {
+        let uri = format!("/Search?term={term}");
+        assert_eq!(
+            b27_found(&app, &uri, &lib.token).await,
+            ["Amélie (Movie)"],
+            "{uri}"
+        );
+    }
+    // The largest counts: every match, and a page past the end.
+    assert_eq!(
+        b27_found(&app, "/Search?term=comet&limit=2147483647", &lib.token).await,
+        J6_SEARCH_COMETS
+    );
+    let body = b27_answer(
+        &app,
+        "/Search?term=comet&startIndex=2147483647&limit=2147483647",
+        &lib.token,
+    )
+    .await;
+    assert_eq!(body["Items"], serde_json::json!([]), "{body}");
+}
+
+#[tokio::test]
+async fn j6_search_shares_one_entry_per_trimmed_term() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+
+    let first = b27_answer(&app, "/Search?Term=comet", &lib.token).await;
+    assert_eq!(first["TotalRecordCount"], 4, "{first}");
+    assert_eq!(b27_cached_answers(&state), 1);
+    // The term is trimmed before the key, names match in any case, a list that parses to nothing
+    // is the missing list, a list is a set, and the default counts are the defaults.
+    for query in [
+        "Term=%20comet%20",
+        "term=comet%09",
+        "SearchTerm=comet",
+        "Term=comet&IncludeItemTypes=Bogus",
+        "Term=comet&IncludeItemTypes=series,Audio,MOVIE,episode,Movie",
+        "Term=comet&StartIndex=0&Limit=100",
+    ] {
+        let uri = format!("/Search?{query}");
+        assert_eq!(b27_answer(&app, &uri, &lib.token).await, first, "{uri}");
+    }
+    assert_eq!(b27_cached_answers(&state), 1);
+}
+
+#[tokio::test]
+async fn j6_search_answers_differ_by_kinds_also_from_l2() {
+    let state = b27_restarted(&test_state().await).await;
+    let lib = j6_seed(&state).await;
+    let base = "/Search?Term=comet";
+    let app_before = app(state.clone());
+
+    // Each request differs from the first in one parameter.
+    let requests = [
+        (base.to_string(), Some(j6_names(&J6_SEARCH_COMETS))),
+        (
+            "/Search?Term=hunters".to_string(),
+            Some(j6_names(&[
+                "Comet Hunters (Series)",
+                "Comet Hunters S01E01 (Episode)",
+            ])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=Movie"),
+            Some(j6_names(&["Comet Night (Movie)"])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=Season"),
+            Some(j6_names(&["Comet Hunters Season 1 (Season)"])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=MusicAlbum"),
+            Some(j6_names(&[
+                "Comet Band (MusicAlbum)",
+                "Comet Songs (MusicAlbum)",
+            ])),
+        ),
+        (
+            format!("{base}&IncludeItemTypes=Movie,Season"),
+            Some(j6_names(&[
+                "Comet Hunters Season 1 (Season)",
+                "Comet Night (Movie)",
+            ])),
+        ),
+        // The order of a page is not defined, so these check only its length.
+        (format!("{base}&StartIndex=1"), None),
+        (format!("{base}&Limit=1"), None),
+    ];
+    let mut answers = Vec::new();
+    for (uri, expected) in &requests {
+        let answer = b27_answer(&app_before, uri, &lib.token).await;
+        match expected {
+            Some(expected) => {
+                assert_eq!(
+                    &b27_found(&app_before, uri, &lib.token).await,
+                    expected,
+                    "{uri}"
+                )
+            }
+            None => {
+                let length = if uri.ends_with("Limit=1") { 1 } else { 3 };
+                assert_eq!(
+                    answer["Items"].as_array().map(Vec::len),
+                    Some(length),
+                    "{uri}: {answer}"
+                );
+            }
+        }
+        answers.push(answer);
+    }
+    // One answer each: no two requests shared a key.
+    let count = requests.len();
+    assert_eq!(b27_cached_answers(&state), count as u64);
+
+    // Rows that master saved under its key format, with answers that found nothing.
+    b27_wait_for_l2_rows(&state, count as i64).await;
+    for key in [
+        "search:search2:Movie:0:100:comet",
+        "search:search2:Audio,Episode,Movie,Series:0:100:comet",
+    ] {
+        sqlx::query(
+            "INSERT OR REPLACE INTO api_cache (cache_key, cache_value, expires_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(key)
+        .bind(r#"{"Items":[],"TotalRecordCount":0,"StartIndex":0}"#)
+        .bind("2999-01-01T00:00:00+00:00")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    // After a restart the L2 copy gives each request its own answer, and never master's rows.
+    let state = b27_restarted(&state).await;
+    assert_eq!(b27_cached_answers(&state), count as u64 + 2);
+    let app_after = app(state.clone());
+    for ((uri, _), answer) in requests.iter().zip(&answers) {
+        assert_eq!(
+            &b27_answer(&app_after, uri, &lib.token).await,
+            answer,
+            "{uri}"
+        );
+    }
+    assert_eq!(b27_cached_answers(&state), count as u64 + 2);
+}
+
 // ── System Endpoint Tests ──
 
 #[tokio::test]
