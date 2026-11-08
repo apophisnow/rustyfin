@@ -19688,6 +19688,20 @@ async fn b20_import_metadata_fills_empty_fields() {
     }
 }
 
+/// Fix round 9 (re-check 8, N1): a run that writes metadata clears the cached item details and
+/// search answers. The Show's details, read before the run, show the imported overview right after
+/// it; at 60efa3f the cached copy without it was served for up to 300 s. Movie and episode details
+/// are never cached, so a Series shows it.
+#[tokio::test]
+async fn b20_import_metadata_clears_cached_details() {
+    let (w, m) = b20_meta_world("cached", jf::Layout::New).await;
+    let before = b20_get_item(&w, m.show).await;
+    assert_ne!(before["Overview"], "A show.", "{before}");
+    b20_run(&w, serde_json::json!({ "SourcePath": m.install })).await;
+    let after = b20_get_item(&w, m.show).await;
+    assert_eq!(after["Overview"], "A show.", "{after}");
+}
+
 #[tokio::test]
 async fn b20_import_metadata_copies_images() {
     for (name, layout) in [("new", jf::Layout::New), ("old", jf::Layout::Old)] {

@@ -69,6 +69,8 @@ async fn run_route(
         (*state.data_dir).clone(),
         move || {
             cache_state.cache.invalidate_on_scan();
+            cache_state.cache.item_details.invalidate_all();
+            cache_state.cache.search_results.invalidate_all();
             cache_state.image_cache.invalidate_all();
         },
     ));
