@@ -3107,22 +3107,46 @@ fn b21_qc_sign_in(secret: Option<&str>) -> Request<Body> {
 /// Asks for a password reset and reads the PIN from the PIN file; None when none was written within
 /// 2 s. The reset work may finish after the 250 ms answer under load, so the file is awaited.
 async fn b21_reset_pin(app: &axum::Router, name: &str) -> Option<String> {
-    let body = serde_json::json!({ "EnteredUsername": name });
-    let req = request("POST", "/Users/ForgotPassword", None, Some(body));
-    let (status, answer) = send(app, req).await;
-    assert_eq!(status, StatusCode::OK);
-    let path = answer["PinFile"].as_str()?.to_string();
+    b21_reset_pin_at(app, name).await.1
+}
+
+/// `b21_reset_pin`, with the answer's `PinFile` path.
+async fn b21_reset_pin_at(app: &axum::Router, name: &str) -> (String, Option<String>) {
+    let path = b21_pin_file(app, name).await;
     for _ in 0..20 {
         // The file is created before it is written, so an empty or partial file is read again.
         let file = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
         if let Some(file) = file {
-            return file["Pin"].as_str().map(str::to_string);
+            let pin = file["Pin"].as_str().map(str::to_string);
+            return (path, pin);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    None
+    (path, None)
+}
+
+/// Asks for a password reset and returns the answer's `PinFile` path without waiting for the file.
+async fn b21_pin_file(app: &axum::Router, name: &str) -> String {
+    let body = serde_json::json!({ "EnteredUsername": name });
+    let req = request("POST", "/Users/ForgotPassword", None, Some(body));
+    let (status, answer) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    answer["PinFile"]
+        .as_str()
+        .expect("a PinFile path")
+        .to_string()
+}
+
+/// Redeems a reset PIN through `POST /Users/ForgotPassword/Pin`.
+async fn b21_redeem_pin(app: &axum::Router, pin: &str) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "Pin": pin });
+    send(
+        app,
+        request("POST", "/Users/ForgotPassword/Pin", None, Some(body)),
+    )
+    .await
 }
 
 /// Password sign-in. Returns the status and the Detail.
@@ -6409,6 +6433,234 @@ async fn b21_startup_user_refuses_case_variants() {
         );
     }
     assert_eq!(t.user_count().await, 1);
+}
+
+/// Names over the limit of 255 UTF-16 code units (AC60): 256 units, 128 surrogate pairs, and 1.8 MB
+/// of U+FDFA, which NFKC grows 18-fold.
+fn b21_over_long_names() -> [String; 3] {
+    [
+        "a".repeat(256),
+        "\u{1F600}".repeat(128),
+        "\u{FDFA}".repeat(600_000),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "B21 round 5 fix 1"]
+async fn b21_new_users_refuse_over_long_names() {
+    let t = b21().await;
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
+    }
+    assert_eq!(t.user_count().await, 1, "no new account");
+    // 255 units: bytes don't count, a surrogate pair counts twice.
+    let fits = [
+        "a".repeat(255),
+        "\u{e9}".repeat(255),
+        format!("{}a", "\u{1F600}".repeat(127)),
+    ];
+    for name in fits {
+        let (status, body) = b21_new_user(&t.app, &t.admin, &name).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["Name"], name.as_str());
+    }
+}
+
+#[tokio::test]
+#[ignore = "B21 round 5 fix 1"]
+async fn b21_renames_refuse_over_long_names() {
+    let t = b21().await;
+    let carol_id = add_user(&t.state, "carol", "pw-carol", false)
+        .await
+        .to_string();
+    let (carol, _) = login(&t.app, "carol", "pw-carol").await.unwrap();
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        let (status, _) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units: own rename");
+        let (status, _) = b21_rename(&t.app, &t.admin, &carol_id, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{units} units: admin's rename"
+        );
+    }
+    assert!(user_flags(&t.state, "carol").await.is_some(), "still carol");
+    let name = "a".repeat(255);
+    let (status, body) = b21_rename(&t.app, &carol, &carol_id, &name).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(user_flags(&t.state, &name).await.is_some(), "255 units fit");
+}
+
+#[tokio::test]
+#[ignore = "B21 round 5 fix 1"]
+async fn b21_startup_user_refuses_an_over_long_name() {
+    let state = test_state().await;
+    let app = app(state.clone());
+    for name in b21_over_long_names() {
+        let units = name.encode_utf16().count();
+        assert_eq!(
+            post_startup_user(&app, None, &name, "pw").await,
+            StatusCode::BAD_REQUEST,
+            "{units} units"
+        );
+    }
+    let users = rustyfin_db::repo_user::get_all_users(&state.db)
+        .await
+        .unwrap();
+    assert!(users.is_empty(), "no owner");
+    assert_eq!(
+        post_startup_user(&app, None, &"a".repeat(255), "pw").await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+#[ignore = "B21 round 5 fix 1"]
+async fn b21_over_long_names_sign_in_only_exactly() {
+    let t = b21().await;
+    // An account an older server let through (AC62): 128 decomposed "é", 256 units.
+    let legacy = "e\u{301}".repeat(128);
+    add_user(&t.state, &legacy, "pw-legacy", false).await;
+    let within = "\u{f6}".repeat(200);
+    add_user(&t.state, &within, "pw-within", false).await;
+    let unknown = b21_password_answer(&t.app, "nobody", "pw-x").await;
+    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = b21_password_answer(&t.app, &legacy, "pw-legacy").await;
+    assert_eq!(status, StatusCode::OK, "the exact over-long name");
+    assert_eq!(body["User"]["Name"], legacy.as_str());
+    let (status, body) = b21_password_answer(&t.app, &"\u{d6}".repeat(200), "pw-within").await;
+    assert_eq!(status, StatusCode::OK, "within the limit, names still fold");
+    assert_eq!(body["User"]["Name"], within.as_str());
+
+    let refused = [
+        (
+            "E\u{301}".repeat(128),
+            "pw-legacy",
+            "an over-long name is not folded",
+        ),
+        (
+            "\u{e9}".repeat(128),
+            "pw-legacy",
+            "an over-long account is not folded",
+        ),
+        (
+            "o\u{308}".repeat(200),
+            "pw-within",
+            "400 units match only exactly",
+        ),
+    ];
+    for (name, password, why) in refused {
+        let (status, body) = b21_password_answer(&t.app, &name, password).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}");
+        assert_eq!(body, unknown.1, "{why}");
+    }
+
+    // ForgotPassword finds over-long names only exactly too (AC61).
+    assert!(b21_reset_pin(&t.app, &legacy).await.is_some(), "exact");
+    assert_eq!(
+        b21_reset_pin(&t.app, &"E\u{301}".repeat(128)).await,
+        None,
+        "no PIN for a folded match"
+    );
+
+    let huge = "\u{FDFA}".repeat(600_000);
+    let (status, body) = b21_password_answer(&t.app, &huge, "pw-x").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a 1.8 MB name");
+    assert_eq!(body, unknown.1, "a 1.8 MB name");
+    b21_pin_file(&t.app, &huge).await;
+}
+
+#[tokio::test]
+#[ignore = "B21 round 5 fix 1"]
+async fn b21_sign_in_refuses_an_over_long_username() {
+    let t = b21_on(serde_json::json!({})).await;
+    let count = t.user_count().await;
+    // The limit applies to the claim after trimming (AC64).
+    let long = "a".repeat(256);
+    for name in [long.clone(), format!(" {long} ")] {
+        let result = t.sign_in(b21_user("long-sub", &name)).await;
+        assert_eq!(result.err().as_deref(), Some("no_username"));
+    }
+    assert_eq!(t.user_count().await, count, "no new user");
+    assert_eq!(t.link_count().await, 0, "no link");
+
+    let fits = "a".repeat(255);
+    let result = t
+        .sign_in(b21_user("long-sub", &format!("  {fits} ")))
+        .await
+        .expect("255 units after trimming sign in");
+    assert_eq!(result["User"]["Name"], fits.as_str());
+}
+
+#[tokio::test]
+#[ignore = "B21 round 5 fix 2"]
+async fn b21_a_redeemed_reset_leaves_no_pin_file() {
+    let t = b21().await;
+    let before = b21_pin_file(&t.app, "ＡＬＩＣＥ").await;
+    // Fullwidth, a Kelvin sign and a decomposed spelling; dee's PIN is refused below.
+    let spellings = [
+        ("alice", "ＡＬＩＣＥ"),
+        ("kim", "\u{212A}IM"),
+        ("jos\u{e9}", "JOSE\u{301}"),
+        ("dee", "ＤＥＥ"),
+    ];
+    let mut resets = Vec::new();
+    for (name, spelling) in spellings {
+        add_user(&t.state, name, "pw-old", false).await;
+        let (path, pin) = b21_reset_pin_at(&t.app, spelling).await;
+        let pin = pin.unwrap_or_else(|| panic!("a PIN for {spelling:?}"));
+        resets.push((name, spelling, path, pin));
+    }
+    assert_eq!(
+        resets[0].2, before,
+        "the path doesn't depend on the account"
+    );
+
+    let (_, dee_spelling, dee_path, dee_pin) = resets.pop().unwrap();
+    for (name, spelling, path, pin) in resets {
+        let (status, answer) = b21_redeem_pin(&t.app, &pin).await;
+        assert_eq!(status, StatusCode::OK, "{spelling:?}");
+        assert_eq!(answer["UsersReset"][0], name);
+        let gone = !std::path::Path::new(&path).exists();
+        assert!(gone, "{spelling:?}: the PIN file is gone");
+    }
+
+    // A PIN the switch refuses is spent, and its file goes too.
+    let (status, _) = t
+        .save(serde_json::json!({ "AllowPasswordSignIn": false }))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = b21_redeem_pin(&t.app, &dee_pin).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "refused");
+    let gone = !std::path::Path::new(&dee_path).exists();
+    assert!(gone, "{dee_spelling:?}: the refused PIN's file is gone");
+}
+
+#[tokio::test]
+async fn b21_a_redeemed_reset_removes_an_older_pin_file() {
+    use sha2::Digest;
+    let t = b21().await;
+    add_user(&t.state, "alice", "pw-alice", false).await;
+    let (path, pin) = b21_reset_pin_at(&t.app, "alice").await;
+    let pin = pin.expect("a PIN for alice");
+    // Before round 5 the file was named after the uppercased name; an older server wrote it so.
+    let hex: String = sha2::Sha256::digest("ALICE".as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = std::path::PathBuf::from(path);
+    let old = path.with_file_name(format!("passwordreset-{hex}.json"));
+    if old != path {
+        std::fs::rename(&path, &old).unwrap();
+    }
+    let (status, _) = b21_redeem_pin(&t.app, &pin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!old.exists(), "the older file is gone");
+    assert!(!path.exists());
 }
 
 #[test]
