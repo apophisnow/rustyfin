@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rustyfin_db::repo_jellyfin_import::{
     ExtrasWrite, ImageRow, ImageWrite, ImportTarget, ItemMetadata, ItemWrite, LinkWrite,
@@ -262,7 +263,7 @@ fn plan_writes(input: &MetadataInput<'_>, state: &MetadataState) -> Plan {
         person_ids.entry(name.clone()).or_insert_with(|| id.clone());
     }
     let empty = JfItemMeta::default();
-    let mut person_names: Vec<String> = Vec::new();
+    let mut person_names: Vec<Arc<str>> = Vec::new();
     for (jf, id) in sources(&input.snapshot.items, input.matched, input.by_path) {
         let Some(&row) = rows.get(&id) else {
             continue;
@@ -300,7 +301,7 @@ fn plan_writes(input: &MetadataInput<'_>, state: &MetadataState) -> Plan {
         );
         let cast_open = unlocked("Cast");
         if cast_open {
-            person_names.extend(planned.iter().map(|link| link.name.clone()));
+            person_names.extend(planned.iter().map(|link| Arc::clone(&link.name)));
         }
         let stored: &[&StoredLink] = links_of
             .get(row.id.as_str())
@@ -337,7 +338,8 @@ fn plan_writes(input: &MetadataInput<'_>, state: &MetadataState) -> Plan {
     // Person images for the names that exist after this run's link writes, each name once (5.9).
     let mut done: HashSet<&str> = HashSet::new();
     for name in &person_names {
-        if !done.insert(name.as_str()) {
+        let name: &str = name;
+        if !done.insert(name) {
             continue;
         }
         let Some(raw) = person_ids.get(name) else {
@@ -672,7 +674,7 @@ fn studio_rows(value: Option<&str>) -> Vec<(String, String)> {
 
 /// A person of an item, planned (spec 5.7).
 struct PlannedLink {
-    name: String,
+    name: Arc<str>,
     kind: String,
     role: Option<String>,
 }
@@ -686,12 +688,18 @@ fn planned_credits(credits: &[JfCredit]) -> Vec<PlannedLink> {
     });
     let mut planned: Vec<PlannedLink> = Vec::new();
     for credit in sorted {
-        let name = credit.name.trim();
-        if name.is_empty() || planned.iter().any(|link| link.name == name) {
+        let trimmed = credit.name.trim();
+        if trimmed.is_empty() || planned.iter().any(|link| link.name.as_ref() == trimmed) {
             continue;
         }
+        // Credits of one person share a name; only a name that trimming changed is copied.
+        let name = if trimmed.len() == credit.name.len() {
+            Arc::clone(&credit.name)
+        } else {
+            Arc::from(trimmed)
+        };
         planned.push(PlannedLink {
-            name: name.to_string(),
+            name,
             kind: text(credit.kind.as_deref()).unwrap_or_else(|| "Unknown".to_string()),
             role: text(credit.role.as_deref()),
         });
@@ -712,7 +720,7 @@ fn same_links(stored: &[&StoredLink], planned: &[PlannedLink]) -> bool {
             .zip(planned)
             .enumerate()
             .all(|(position, (link, planned_link))| {
-                link.name == planned_link.name
+                link.name.as_str() == planned_link.name.as_ref()
                     && link.kind == planned_link.kind
                     && link.role == planned_link.role
                     && link.sort_order == Some(position as i64)
@@ -726,14 +734,14 @@ fn person_for(
     new_people: &mut Vec<NewPerson>,
     link: &PlannedLink,
 ) -> String {
-    if let Some(id) = ids.get(&link.name) {
+    if let Some(id) = ids.get(&*link.name) {
         return id.clone();
     }
     let id = Uuid::new_v4();
-    ids.insert(link.name.clone(), id.to_string());
+    ids.insert(link.name.to_string(), id.to_string());
     new_people.push(NewPerson {
         id,
-        name: link.name.clone(),
+        name: link.name.to_string(),
         kind: link.kind.clone(),
     });
     id.to_string()

@@ -1926,7 +1926,7 @@ async fn b20_credits_take_the_first_person_of_an_id() {
         .iter()
         .map(|credit| {
             (
-                credit.name.as_str(),
+                &*credit.name,
                 credit.kind.as_deref(),
                 credit.role.as_deref(),
                 credit.list_order,
@@ -2013,4 +2013,98 @@ fn b20_image_copy_takes_only_the_checked_file() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names, ["kept.jpg"]);
+}
+
+// Fix round 3, 1: a person's name and type are held once, however many credits name them, and both
+// have caps, so a long name can't be multiplied by its links.
+
+#[tokio::test]
+async fn b20_credits_of_a_person_share_one_name() {
+    // Ann, padded, is credited on three films.
+    const CREDITS: &str = "\
+        INSERT INTO BaseItems (Id, Type, Name, Path) \
+            SELECT printf('00000000-0000-0000-0000-0000000000F%d', x), \
+            'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', printf('/media/film%d.mkv', x) \
+            FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3); \
+        INSERT INTO Peoples (Id, Name, PersonType) VALUES ('p1', '  Ann  ', ' Actor '); \
+        INSERT INTO PeopleBaseItemMap (ItemId, PeopleId, Role, ListOrder, SortOrder) \
+            SELECT Id, 'p1', 'Lead', 0, 0 FROM BaseItems;";
+    let tmp = TempDir::new();
+    write_db(
+        &tmp.0.join("jellyfin.db"),
+        &[USERS_DDL, NEW_LIBRARY_DDL, CREDITS],
+    )
+    .await;
+    let data = TempDir::new();
+    let location = locate(&tmp.0).unwrap();
+    let snapshot = read_snapshot(&location, LayoutChoice::Auto, &data.0)
+        .await
+        .unwrap();
+    let credits: Vec<_> = snapshot.metadata.credits.values().flatten().collect();
+    assert_eq!(credits.len(), 3);
+    let names: std::collections::HashSet<_> =
+        credits.iter().map(|credit| credit.name.as_ptr()).collect();
+    let kinds: std::collections::HashSet<_> = credits
+        .iter()
+        .map(|credit| credit.kind.as_deref().map(str::as_ptr))
+        .collect();
+    assert_eq!(names.len(), 1, "each credit holds its own copy of the name");
+    assert_eq!(kinds.len(), 1, "each credit holds its own copy of the type");
+    for credit in credits {
+        assert_eq!(
+            (&*credit.name, credit.kind.as_deref()),
+            ("Ann", Some("Actor"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn b20_person_names_and_types_have_caps() {
+    // In both layouts: a name of 1024 bytes and a type of 64 are kept, a name of 1025 bytes drops
+    // its credit, and a type of 65 bytes is none.
+    const NEW: &str = "\
+        INSERT INTO BaseItems (Id, Type, Name, Path) VALUES \
+            ('00000000-0000-0000-0000-0000000000F1', \
+            'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', '/media/film.mkv'); \
+        INSERT INTO Peoples (Id, Name, PersonType) VALUES \
+            ('p1', replace(hex(zeroblob(512)), '0', 'n'), replace(hex(zeroblob(32)), '0', 'k')), \
+            ('p2', replace(hex(zeroblob(512)), '0', 'n') || 'n', 'Actor'), \
+            ('p3', 'Bob', replace(hex(zeroblob(32)), '0', 'k') || 'k'); \
+        INSERT INTO PeopleBaseItemMap (ItemId, PeopleId, Role, ListOrder, SortOrder) VALUES \
+            ('00000000-0000-0000-0000-0000000000F1', 'p1', NULL, 0, 0), \
+            ('00000000-0000-0000-0000-0000000000F1', 'p2', NULL, 1, 1), \
+            ('00000000-0000-0000-0000-0000000000F1', 'p3', NULL, 2, 2);";
+    const OLD: &str = "\
+        INSERT INTO TypedBaseItems (guid, type, Name, Path) VALUES \
+            ('00000000-0000-0000-0000-0000000000F1', \
+            'MediaBrowser.Controller.Entities.Movies.Movie', 'Film', '/media/film.mkv'); \
+        INSERT INTO People (ItemId, Name, PersonType, ListOrder, SortOrder) VALUES \
+            ('00000000-0000-0000-0000-0000000000F1', replace(hex(zeroblob(512)), '0', 'n'), \
+                replace(hex(zeroblob(32)), '0', 'k'), 0, 0), \
+            ('00000000-0000-0000-0000-0000000000F1', \
+                replace(hex(zeroblob(512)), '0', 'n') || 'n', 'Actor', 1, 1), \
+            ('00000000-0000-0000-0000-0000000000F1', 'Bob', \
+                replace(hex(zeroblob(32)), '0', 'k') || 'k', 2, 2);";
+    let tmp = TempDir::new();
+    let (new, old) = (tmp.0.join("new_layout"), tmp.0.join("old_layout"));
+    for dir in [&new, &old] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    write_db(&new.join("jellyfin.db"), &[USERS_DDL, NEW_LIBRARY_DDL, NEW]).await;
+    write_db(&old.join("jellyfin.db"), &[USERS_DDL]).await;
+    write_db(&old.join("library.db"), &[OLD_LIBRARY_DDL, OLD]).await;
+    let (name, kind) = ("n".repeat(1024), "k".repeat(64));
+    let want = [(name.as_str(), Some(kind.as_str())), ("Bob", None)];
+    let data = TempDir::new();
+    for dir in [&new, &old] {
+        let location = locate(dir).unwrap();
+        let snapshot = read_snapshot(&location, LayoutChoice::Auto, &data.0)
+            .await
+            .unwrap();
+        let credits: Vec<_> = snapshot.metadata.credits[&Uuid::from_u128(0xF1)]
+            .iter()
+            .map(|credit| (&*credit.name, credit.kind.as_deref()))
+            .collect();
+        assert_eq!(credits, want, "{}", dir.display());
+    }
 }

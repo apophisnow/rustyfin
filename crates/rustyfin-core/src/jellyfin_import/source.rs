@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -248,13 +249,15 @@ pub struct JfImage {
     pub blurhash: Option<String>,
 }
 
-/// A credit of an item (spec 5.7): the raw values, in source row order.
+/// A credit of an item (spec 5.7), in source row order. Its name and kind come from `person_of`, so
+/// the credits of one person share their allocations (B20 round 3, 1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct JfCredit {
-    /// The person's name; "" when the source has none.
-    pub name: String,
-    /// The person's `PersonType`.
-    pub kind: Option<String>,
+    /// The person's name, trimmed; "" when the source has none.
+    pub name: Arc<str>,
+    /// The person's `PersonType`, trimmed; None when it is missing, empty or over
+    /// `MAX_PERSON_KIND`.
+    pub kind: Option<Arc<str>>,
     pub role: Option<String>,
     pub list_order: Option<i64>,
     pub sort_order: Option<i64>,
@@ -416,8 +419,17 @@ type ImageDbRow = (
     Option<i64>,
     Option<Vec<u8>>,
 );
-/// A credit: ItemId, Name, PersonType, Role, ListOrder, SortOrder.
+/// A credit: ItemId, the person's name and kind from `person_of`, Role, ListOrder, SortOrder.
 type CreditDbRow = (
+    Option<Vec<u8>>,
+    Arc<str>,
+    Option<Arc<str>>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+/// An old-layout credit, `People`: ItemId, Name, PersonType, Role, ListOrder, SortOrder.
+type OldCreditDbRow = (
     Option<Vec<u8>>,
     Option<String>,
     Option<String>,
@@ -425,6 +437,8 @@ type CreditDbRow = (
     Option<i64>,
     Option<i64>,
 );
+/// A person's name and kind, as `person_of` gives them.
+type NameAndKind = (Arc<str>, Option<Arc<str>>);
 /// A credit link, `PeopleBaseItemMap`: ItemId, PeopleId, Role, ListOrder, SortOrder.
 type CreditLinkDbRow = (
     Option<Vec<u8>>,
@@ -849,9 +863,32 @@ pub fn parse_old_images(text: &str) -> Vec<JfImage> {
         .collect()
 }
 
+/// The longest person name kept, in bytes, after trimming. The longest real values are 334 bytes
+/// (names) and 11 bytes (types); the caps bound the work each credit costs (B20 round 3, 1).
+const MAX_PERSON_NAME: usize = 1024;
+/// The longest person type kept, in bytes, after trimming (see `MAX_PERSON_NAME`).
+const MAX_PERSON_KIND: usize = 64;
+
+/// A person's name and kind as a credit holds them (spec 5.7): the name trimmed, "" when NULL, and
+/// None when it is over `MAX_PERSON_NAME`; the kind trimmed, and None when it is empty or over
+/// `MAX_PERSON_KIND`.
+fn person_of(name: Option<String>, kind: Option<String>) -> Option<(Arc<str>, Option<Arc<str>>)> {
+    let name = name.as_deref().map(str::trim).unwrap_or_default();
+    if name.len() > MAX_PERSON_NAME {
+        return None;
+    }
+    let kind: Option<Arc<str>> = kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty() && kind.len() <= MAX_PERSON_KIND)
+        .map(Arc::from);
+    Some((Arc::from(name), kind))
+}
+
 /// The new layout's metadata rows: items, image rows and credits (spec 5.4, 5.7, 5.8). Credits are
 /// two plain scans joined here on the person's id, so a repeated id can't multiply them: the first
-/// `Peoples` row of an id wins, and a link to no known person gives no credit.
+/// `Peoples` row of an id decides (`person_of` may refuse it, and then the id has no credits), and
+/// a link to no known person gives no credit.
 async fn read_new_metadata(conn: &mut SqliteConnection) -> Result<MetadataRows, sqlx::Error> {
     let items: Vec<MetaDbRow> = sqlx::query_as(
         "SELECT Id AS id, Type AS type_name, Name AS name, ForcedSortName AS forced_sort_name, \
@@ -879,20 +916,22 @@ async fn read_new_metadata(conn: &mut SqliteConnection) -> Result<MetadataRows, 
         sqlx::query_as("SELECT Id, Name, PersonType FROM Peoples ORDER BY rowid")
             .fetch_all(&mut *conn)
             .await?;
-    let mut people: HashMap<Vec<u8>, (Option<String>, Option<String>)> = HashMap::new();
+    let mut people: HashMap<Vec<u8>, Option<NameAndKind>> = HashMap::new();
     for (id, name, person_type) in person_rows {
         if let Some(id) = id {
-            people.entry(id).or_insert((name, person_type));
+            people
+                .entry(id)
+                .or_insert_with(|| person_of(name, person_type));
         }
     }
     let credits: Vec<CreditDbRow> = links
         .into_iter()
         .filter_map(|(item, person, role, list_order, sort_order)| {
-            let (name, person_type) = people.get(&person?)?;
+            let (name, kind) = people.get(&person?)?.as_ref()?;
             Some((
                 item,
-                name.clone(),
-                person_type.clone(),
+                Arc::clone(name),
+                kind.clone(),
                 role,
                 list_order,
                 sort_order,
@@ -915,11 +954,19 @@ async fn read_library_metadata(conn: &mut SqliteConnection) -> Result<MetadataRo
     )
     .fetch_all(&mut *conn)
     .await?;
-    let credits: Vec<CreditDbRow> = sqlx::query_as(
+    let rows: Vec<OldCreditDbRow> = sqlx::query_as(
         "SELECT ItemId, Name, PersonType, Role, ListOrder, SortOrder FROM People ORDER BY rowid",
     )
     .fetch_all(&mut *conn)
     .await?;
+    // Each row holds its own name, so `person_of` runs once per row, which the file bounds.
+    let credits: Vec<CreditDbRow> = rows
+        .into_iter()
+        .filter_map(|(item, name, kind, role, list_order, sort_order)| {
+            let (name, kind) = person_of(name, kind)?;
+            Some((item, name, kind, role, list_order, sort_order))
+        })
+        .collect();
     Ok((items, Vec::new(), credits))
 }
 
@@ -1030,7 +1077,7 @@ fn metadata_of(rows: MetadataRows, layout: Layout) -> JfMetadata {
         };
         if items.contains_key(&item) {
             credits.entry(item).or_default().push(JfCredit {
-                name: name.unwrap_or_default(),
+                name,
                 kind,
                 role,
                 list_order,
