@@ -3367,17 +3367,25 @@ function jiForget() {
     hide('ji-preview');
 }
 
+// A row's action as Run will see it, from both of its boxes: an unpicked row is skipped, a name
+// match goes in only when ticked, and other rows keep the last Preview's text.
+function jiRowText(row) {
+    const action = row.querySelector('.ji-action');
+    const confirm = row.querySelector('.ji-confirm');
+    if (!row.querySelector('.ji-user').checked) action.textContent = jiActionText({ Action: 'Skip', Reason: 'NotSelected' });
+    else if (!confirm) action.textContent = action.dataset.text;
+    else action.textContent = jiActionText(confirm.checked ? { Action: 'Match' } : { Action: 'Skip', Reason: 'NotConfirmed' });
+}
+
 function jiSetChoice(el) {
     jiChoice.set(el.value, el.checked);
+    jiRowText(el.closest('div'));
 }
 
 function jiSetConfirm(el) {
     if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
     else jiConfirm.delete(el.value);
-    const action = el.closest('div').querySelector('.ji-action');
-    action.textContent = el.checked
-        ? t('jellyfin_import.action_match')
-        : `${t('jellyfin_import.action_skip')}: ${t('jellyfin_import.reason_not_confirmed')}`;
+    jiRowText(el.closest('div'));
 }
 
 async function jiPreview() {
@@ -3416,10 +3424,15 @@ function jiUsersHtml(users) {
                 <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
                 <span class="font-semibold">${escapeHtml(u.Name)}</span>
                 ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
-                <span class="ji-action text-xs text-white/50">${jiActionText(u)}</span>
+                <span class="ji-action text-xs text-white/50" data-text="${escapeHtml(jiActionText(u))}">${jiActionText(u)}</span>
             </label>${jiConfirmHtml(u)}
         </div>`;
     }).join('');
+}
+
+// The import page's one date style, with the time, escaped.
+function jiDate(iso) {
+    return escapeHtml(new Date(iso).toLocaleString(uiLocale(), { dateStyle: 'medium', timeStyle: 'short' }));
 }
 
 // A name match goes into the existing account only when its box is ticked. It starts unticked, and
@@ -3428,11 +3441,10 @@ function jiConfirmHtml(u) {
     const s = u.SuggestedMatch;
     if (!s) return '';
     const checked = jiConfirm.get(u.JellyfinId) === s.UserId;
-    const date = iso => escapeHtml(new Date(iso).toLocaleDateString(uiLocale()));
     const facts = [
         s.IsAdministrator ? t('jellyfin_import.match_admin') : '',
-        t('jellyfin_import.match_created', { date: date(s.CreatedAt) }),
-        s.LastLoginDate ? t('jellyfin_import.match_last_login', { date: date(s.LastLoginDate) }) : t('jellyfin_import.match_never_signed_in'),
+        t('jellyfin_import.match_created', { date: jiDate(s.CreatedAt) }),
+        s.LastLoginDate ? t('jellyfin_import.match_last_login', { date: jiDate(s.LastLoginDate) }) : t('jellyfin_import.match_never_signed_in'),
         s.SetupCodePending ? t('jellyfin_import.match_setup_pending') : '',
     ].filter(Boolean).join(' · ');
     const others = s.OtherCaseNames || [];
@@ -3461,6 +3473,7 @@ function jiCountsHtml(r) {
         metadata = `<p>${t('jellyfin_import.metadata_summary', { mode: t(jiMetadataModeKeys[m.Mode]), items: m.Items, fields: m.Fields, people: m.People, images: m.Images, missing: m.ImagesMissing, locked: m.Locked })}</p>`;
     }
     return `
+        <p class="text-white/40">${t('jellyfin_import.counts_from_preview')}</p>
         <p>${t('jellyfin_import.items_summary', { total: i.Total, by_path: i.MatchedByPath, by_id: i.MatchedById, unmatched: i.Unmatched })}</p>
         <p>${t('jellyfin_import.watch_summary', { rows: w.Rows, imported: w.Imported, unchanged: w.Unchanged, unmatched: w.Unmatched })}</p>
         <p>${t('jellyfin_import.tracks_summary', { audio: k.Audio, subtitle: k.Subtitle, off: k.SubtitleOff, unmapped: k.Unmapped })}</p>${metadata}`;
@@ -3613,7 +3626,7 @@ function jiPendingRowHtml(u) {
         <div class="ji-pending-row flex flex-wrap items-center justify-between gap-3 py-3 border-b border-white/5">
             <div>
                 <p class="text-sm font-semibold text-white">${escapeHtml(u.Name)}</p>
-                <p class="text-xs text-white/40">${t('jellyfin_import.pending_since', { date: escapeHtml(new Date(u.CreatedAt).toLocaleString()) })}</p>
+                <p class="text-xs text-white/40">${t('jellyfin_import.pending_since', { date: jiDate(u.CreatedAt) })}</p>
             </div>
             <div class="ji-row-action">${action}</div>
         </div>`;
