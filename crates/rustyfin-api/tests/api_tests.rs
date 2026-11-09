@@ -23914,12 +23914,10 @@ async fn b36_import_flags_case_variant_accounts() {
     assert_eq!(alice, (w.alice, false, false, false, vec![]), "{preview}");
 
     let db = &w.state.db;
-    rustyfin_db::repo_user::update_user_name(db, mallory, "mallory")
-        .await
-        .unwrap();
-    rustyfin_db::repo_user::update_user_name(db, shouting, "robert")
-        .await
-        .unwrap();
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, mallory, "mallory").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
+    let renamed = rustyfin_db::repo_user::rename_user_unless_taken(db, shouting, "robert").await;
+    assert_eq!(renamed.unwrap(), rustyfin_db::repo_user::Renamed::Done);
     let preview = b20_preview(&w, body).await;
     assert_eq!(
         b36_facts(&preview, "bob", since),
