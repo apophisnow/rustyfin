@@ -13663,6 +13663,498 @@ async fn test_owner_cannot_be_deleted_or_demoted() {
     assert_eq!(user_flags(&state, "bob").await, None);
 }
 
+// B103: user roles
+
+/// A server with the owner "karl", the administrator "ada" and the user "bob", each signed in.
+struct B103 {
+    state: AppState,
+    app: axum::Router,
+    owner: String,
+    owner_id: String,
+    ada: String,
+    ada_id: String,
+    bob: String,
+    bob_id: String,
+}
+
+async fn b103() -> B103 {
+    let state = test_state().await;
+    let app = app(state.clone());
+    assert_eq!(
+        post_startup_user(&app, None, "karl", "pw-karl").await,
+        StatusCode::NO_CONTENT
+    );
+    let (owner, owner_id) = login(&app, "karl", "pw-karl").await.unwrap();
+    add_user(&state, "ada", "pw-ada", true).await;
+    let (ada, ada_id) = login(&app, "ada", "pw-ada").await.unwrap();
+    add_user(&state, "bob", "pw-bob", false).await;
+    let (bob, bob_id) = login(&app, "bob", "pw-bob").await.unwrap();
+    B103 {
+        state,
+        app,
+        owner,
+        owner_id,
+        ada,
+        ada_id,
+        bob,
+        bob_id,
+    }
+}
+
+impl B103 {
+    /// Sends `body` to `POST /Users/{id}/Policy` with `token`.
+    async fn policy(
+        &self,
+        token: &str,
+        id: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let uri = format!("/Users/{id}/Policy");
+        send(&self.app, request("POST", &uri, Some(token), Some(body))).await
+    }
+
+    /// The status of an administrator-only request made with `token`.
+    async fn admin_status(&self, token: &str) -> StatusCode {
+        let req = request("GET", "/Auth/Providers", Some(token), None);
+        send(&self.app, req).await.0
+    }
+
+    /// The status of `GET /Users/Me` with `token`.
+    async fn me_status(&self, token: &str) -> StatusCode {
+        send(&self.app, request("GET", "/Users/Me", Some(token), None))
+            .await
+            .0
+    }
+}
+
+/// Broadcasts a server log line and then the "g1c-end" marker, and says whether `socket` got the
+/// log line.
+async fn b103_log_reaches(state: &AppState, socket: &mut G1cSocket) -> bool {
+    let log = rustyfin_model::ws_event::LogMessageData {
+        timestamp: String::new(),
+        level: "INFO".to_string(),
+        message: "b103: a server log line".to_string(),
+        target: None,
+    };
+    state
+        .ws_broadcast
+        .send(WsEvent::LogMessage { data: log })
+        .unwrap();
+    state
+        .ws_broadcast
+        .send(WsEvent::LibraryChanged {
+            data: serde_json::json!({ "LibraryName": "g1c-end" }),
+        })
+        .unwrap();
+    socket
+        .until_end()
+        .await
+        .iter()
+        .any(|frame| frame == "LogMessage")
+}
+
+#[tokio::test]
+async fn b103_promote_and_demote_take_effect_on_the_next_request() {
+    let t = b103().await;
+    assert_eq!(t.admin_status(&t.bob).await, StatusCode::FORBIDDEN);
+
+    let promote = serde_json::json!({ "IsAdministrator": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, promote).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        t.admin_status(&t.bob).await,
+        StatusCode::OK,
+        "bob's token has the new rights on its next request"
+    );
+    let (_, me) = send(&t.app, request("GET", "/Users/Me", Some(&t.bob), None)).await;
+    assert_eq!(me["IsAdministrator"], true);
+
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, demote).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        t.admin_status(&t.bob).await,
+        StatusCode::FORBIDDEN,
+        "and loses them on the next one"
+    );
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, false))
+    );
+}
+
+#[tokio::test]
+async fn b103_disable_blocks_sign_in_and_ends_sessions() {
+    let t = b103().await;
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, true))
+    );
+    assert_eq!(
+        t.me_status(&t.bob).await,
+        StatusCode::UNAUTHORIZED,
+        "bob's session ends"
+    );
+    assert!(
+        login(&t.app, "bob", "pw-bob").await.is_none(),
+        "bob can't sign in"
+    );
+    let bob_uuid = uuid::Uuid::parse_str(&t.bob_id).unwrap().to_string();
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_tokens WHERE user_id = ?")
+        .bind(&bob_uuid)
+        .fetch_one(&t.state.db)
+        .await
+        .unwrap();
+    assert_eq!(tokens, 0, "disabling deletes bob's tokens");
+    assert_eq!(t.me_status(&t.owner).await, StatusCode::OK, "others stay");
+
+    let enable = serde_json::json!({ "IsDisabled": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, enable).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, false))
+    );
+    assert_eq!(
+        t.me_status(&t.bob).await,
+        StatusCode::UNAUTHORIZED,
+        "enabling bob again doesn't revive the old session"
+    );
+    let (fresh, _) = login(&t.app, "bob", "pw-bob")
+        .await
+        .expect("bob signs in again");
+    assert_eq!(t.me_status(&fresh).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn b103_the_owners_role_and_state_are_locked() {
+    let t = b103().await;
+    let changes = [
+        serde_json::json!({ "IsAdministrator": false }),
+        serde_json::json!({ "IsDisabled": true }),
+        serde_json::json!({ "IsAdministrator": false, "IsDisabled": true }),
+    ];
+    for (who, token) in [
+        ("ada", t.ada.as_str()),
+        ("the owner", t.owner.as_str()),
+        ("the API key", "test-api-key"),
+    ] {
+        for body in &changes {
+            let (status, json) = t.policy(token, &t.owner_id, body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{who} sends {body}");
+            assert!(
+                !json["Detail"].as_str().unwrap_or_default().is_empty(),
+                "{who} sends {body}: the answer says why"
+            );
+        }
+    }
+    let (_, json) = t
+        .policy(
+            &t.ada,
+            &t.owner_id,
+            serde_json::json!({ "IsDisabled": true }),
+        )
+        .await;
+    assert_eq!(json["Detail"], "The server owner cannot be disabled.");
+
+    // A client that sends the owner's whole policy back unchanged is not refused.
+    let unchanged = serde_json::json!({ "IsAdministrator": true, "IsDisabled": false, "EnableAllFolders": true });
+    assert_eq!(
+        t.policy(&t.ada, &t.owner_id, unchanged).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_flags(&t.state, "karl").await,
+        Some((true, true, false))
+    );
+    assert!(login(&t.app, "karl", "pw-karl").await.is_some());
+}
+
+#[tokio::test]
+async fn b103_an_administrator_cannot_demote_or_disable_themself() {
+    let t = b103().await;
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    let (status, json) = t.policy(&t.ada, &t.ada_id, demote).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        json["Detail"],
+        "You cannot remove your own administrator rights."
+    );
+    let disable = serde_json::json!({ "IsDisabled": true });
+    let (status, json) = t.policy(&t.ada, &t.ada_id, disable).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["Detail"], "You cannot disable your own account.");
+
+    // Sending the same rights back changes nothing and passes.
+    let same = serde_json::json!({ "IsAdministrator": true, "IsDisabled": false });
+    assert_eq!(t.policy(&t.ada, &t.ada_id, same).await.0, StatusCode::OK);
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((true, false, false))
+    );
+    assert_eq!(t.admin_status(&t.ada).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn b103_administrators_cannot_be_disabled() {
+    let t = b103().await;
+    let disable = serde_json::json!({ "IsDisabled": true });
+    let (status, json) = t.policy(&t.owner, &t.ada_id, disable).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        json["Detail"],
+        "Administrators cannot be disabled. Remove the administrator rights first."
+    );
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((true, false, false))
+    );
+
+    // Both in one request: the result is a disabled user, not a disabled administrator.
+    let both = serde_json::json!({ "IsAdministrator": false, "IsDisabled": true });
+    assert_eq!(t.policy(&t.owner, &t.ada_id, both).await.0, StatusCode::OK);
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((false, false, true))
+    );
+
+    // A disabled user is promoted only together with being enabled.
+    let promote = serde_json::json!({ "IsAdministrator": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, promote).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((false, false, true))
+    );
+    let promote_enabled = serde_json::json!({ "IsAdministrator": true, "IsDisabled": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, promote_enabled).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((true, false, false))
+    );
+}
+
+#[tokio::test]
+async fn b103_the_last_enabled_administrator_stays() {
+    // A server from before owners existed, where ada is a disabled administrator.
+    let t = b103().await;
+    sqlx::query("UPDATE users SET is_owner = 0")
+        .execute(&t.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET is_disabled = 1 WHERE name = 'ada'")
+        .execute(&t.state.db)
+        .await
+        .unwrap();
+
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    let (status, json) = t.policy("test-api-key", &t.owner_id, demote.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "karl is the last enabled one"
+    );
+    assert_eq!(
+        json["Detail"],
+        "There must be at least one enabled administrator."
+    );
+    assert_eq!(
+        user_flags(&t.state, "karl").await,
+        Some((true, false, false))
+    );
+
+    let enable = serde_json::json!({ "IsDisabled": false });
+    assert_eq!(
+        t.policy("test-api-key", &t.ada_id, enable).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        t.policy("test-api-key", &t.owner_id, demote).await.0,
+        StatusCode::OK,
+        "with ada enabled, karl's rights may go"
+    );
+    assert_eq!(
+        user_flags(&t.state, "karl").await,
+        Some((false, false, false))
+    );
+}
+
+#[tokio::test]
+async fn b103_a_user_who_is_not_an_administrator_gets_403() {
+    let t = b103().await;
+    let attempts = [
+        (&t.bob_id, serde_json::json!({ "IsAdministrator": true })),
+        (&t.ada_id, serde_json::json!({ "IsAdministrator": false })),
+        (&t.ada_id, serde_json::json!({ "IsDisabled": true })),
+    ];
+    for (id, body) in attempts {
+        assert_eq!(
+            t.policy(&t.bob, id, body.clone()).await.0,
+            StatusCode::FORBIDDEN,
+            "bob sends {body}"
+        );
+    }
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, false))
+    );
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((true, false, false))
+    );
+
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for body in [
+        serde_json::json!({ "IsDisabled": true }),
+        serde_json::json!({}),
+    ] {
+        assert_eq!(
+            t.policy(&t.owner, &unknown, body.clone()).await.0,
+            StatusCode::NOT_FOUND,
+            "an unknown user, {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn b103_user_answers_carry_the_owner_and_disabled_flags() {
+    let t = b103().await;
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+
+    let (status, users) = send(&t.app, request("GET", "/Users", Some(&t.ada), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let flags: HashMap<String, (bool, bool, bool)> = users
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|u| {
+            (
+                u["Name"].as_str().unwrap().to_string(),
+                (
+                    u["IsAdministrator"].as_bool().unwrap(),
+                    u["IsOwner"].as_bool().expect("IsOwner"),
+                    u["IsDisabled"].as_bool().expect("IsDisabled"),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(flags["karl"], (true, true, false));
+    assert_eq!(flags["ada"], (true, false, false));
+    assert_eq!(flags["bob"], (false, false, true));
+
+    let (_, me) = send(&t.app, request("GET", "/Users/Me", Some(&t.owner), None)).await;
+    assert_eq!(
+        (&me["IsOwner"], &me["IsDisabled"]),
+        (&serde_json::json!(true), &serde_json::json!(false))
+    );
+    let uri = format!("/Users/{}", t.bob_id);
+    let (_, bob) = send(&t.app, request("GET", &uri, Some(&t.owner), None)).await;
+    assert_eq!(
+        (&bob["IsOwner"], &bob["IsDisabled"]),
+        (&serde_json::json!(false), &serde_json::json!(true))
+    );
+
+    let body = serde_json::json!({ "Username": "karl", "Pw": "pw-karl" });
+    let req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    let (status, result) = send(&t.app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["User"]["IsOwner"], true);
+    assert_eq!(result["User"]["IsDisabled"], false);
+
+    let body = serde_json::json!({ "Name": "cleo", "Password": "pw-cleo" });
+    let (status, cleo) = send(
+        &t.app,
+        request("POST", "/Users/New", Some(&t.owner), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (&cleo["IsOwner"], &cleo["IsDisabled"]),
+        (&serde_json::json!(false), &serde_json::json!(false))
+    );
+}
+
+#[tokio::test]
+async fn b103_a_demoted_administrators_socket_stops_getting_log_lines() {
+    let t = b103().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = t.app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    let mut socket = G1cSocket::open(addr, &t.ada).await;
+    assert!(
+        b103_log_reaches(&t.state, &mut socket).await,
+        "an administrator's socket gets server log lines"
+    );
+
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, demote).await.0,
+        StatusCode::OK
+    );
+    // The socket rechecks its token every 5 s; allow three rounds.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while b103_log_reaches(&t.state, &mut socket).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ada's socket still gets server log lines 15 s after her demotion"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+#[tokio::test]
+async fn b103_a_hand_change_meets_the_admin_group_at_the_next_sign_in() {
+    let t = b21_on(serde_json::json!({ "AdminGroup": "admins" })).await;
+    let result = t
+        .sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    let uri = format!("/Users/{}/Policy", result["User"]["Id"].as_str().unwrap());
+    assert!(t.admin_from_group("gus").await);
+
+    // A demote by hand lasts until gus signs in again while in the group.
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    let req = request("POST", &uri, Some(&t.admin), Some(demote.clone()));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::OK);
+    assert!(!t.is_admin("gus").await);
+    t.sign_in(b21_gus(serde_json::json!(["admins"])))
+        .await
+        .unwrap();
+    assert!(t.is_admin("gus").await, "the group gives the rights back");
+    assert!(t.admin_from_group("gus").await);
+
+    // Rights given by hand stay through a sign-in outside the group.
+    let req = request("POST", &uri, Some(&t.admin), Some(demote));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::OK);
+    let promote = serde_json::json!({ "IsAdministrator": true });
+    let req = request("POST", &uri, Some(&t.admin), Some(promote));
+    assert_eq!(send(&t.app, req).await.0, StatusCode::OK);
+    assert!(!t.admin_from_group("gus").await);
+    t.sign_in(b21_gus(serde_json::json!([]))).await.unwrap();
+    assert!(t.is_admin("gus").await, "hand-given rights stay");
+}
+
 #[tokio::test]
 async fn test_startup_routes_require_admin_after_setup() {
     let state = test_state().await;

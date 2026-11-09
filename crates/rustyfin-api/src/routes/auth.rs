@@ -161,8 +161,12 @@ pub(crate) async fn start_session(
         capabilities: serde_json::json!({}),
     };
 
+    let flags = rustyfin_db::repo_user::user_flags(&state.db, user.id)
+        .await
+        .unwrap_or_default();
+
     AuthResponse {
-        user: UserDto::from(user),
+        user: UserDto::new(user, flags),
         session_info,
         access_token: token,
         server_id: state.server_id.to_string(),

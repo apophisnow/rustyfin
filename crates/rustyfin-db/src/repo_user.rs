@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rustyfin_model::user::{NameMatch, User, UserPreferences, name_too_long};
+use rustyfin_model::user::{NameMatch, User, UserFlags, UserPreferences, name_too_long};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -144,6 +144,46 @@ pub async fn is_disabled(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Erro
             .await?;
 
     Ok(disabled)
+}
+
+/// Reads the owner and disabled flags for one user. An unknown id gives the default flags.
+pub async fn user_flags(pool: &SqlitePool, id: Uuid) -> Result<UserFlags, sqlx::Error> {
+    let row: Option<(bool, bool)> =
+        sqlx::query_as("SELECT is_owner, is_disabled FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row
+        .map(|(is_owner, is_disabled)| UserFlags {
+            is_owner,
+            is_disabled,
+        })
+        .unwrap_or_default())
+}
+
+/// Reads the owner and disabled flags for every user, keyed by id. Rows whose id doesn't parse are skipped.
+pub async fn all_user_flags(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<Uuid, UserFlags>, sqlx::Error> {
+    let rows: Vec<(String, bool, bool)> =
+        sqlx::query_as("SELECT id, is_owner, is_disabled FROM users")
+            .fetch_all(pool)
+            .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, is_owner, is_disabled)| {
+            let id = Uuid::parse_str(&id).ok()?;
+            Some((
+                id,
+                UserFlags {
+                    is_owner,
+                    is_disabled,
+                },
+            ))
+        })
+        .collect())
 }
 
 /// Makes the earliest-created enabled administrator the server owner, if no owner exists.
@@ -308,6 +348,75 @@ pub async fn update_policy(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Outcome of `set_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyChange {
+    /// The policy was changed.
+    Done,
+    /// No user has that id. Nothing changed.
+    NotFound,
+    /// The change would leave an administrator disabled. Nothing changed.
+    AdminDisabled,
+    /// The change would leave no enabled administrator. Nothing changed.
+    LastAdmin,
+}
+
+/// Sets the administrator and disabled flags. `None` leaves a flag as it is. The checks and the update
+/// run in one IMMEDIATE transaction, so two callers cannot both demote the last enabled administrator.
+pub async fn set_policy(
+    pool: &SqlitePool,
+    id: Uuid,
+    is_administrator: Option<bool>,
+    is_disabled: Option<bool>,
+) -> Result<PolicyChange, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let current: Option<(bool, bool)> =
+        sqlx::query_as("SELECT is_administrator, is_disabled FROM users WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((cur_admin, cur_disabled)) = current else {
+        tx.rollback().await?;
+        return Ok(PolicyChange::NotFound);
+    };
+
+    let new_admin = is_administrator.unwrap_or(cur_admin);
+    let new_disabled = is_disabled.unwrap_or(cur_disabled);
+
+    if new_admin && new_disabled && (new_admin != cur_admin || new_disabled != cur_disabled) {
+        tx.rollback().await?;
+        return Ok(PolicyChange::AdminDisabled);
+    }
+
+    if cur_admin && !cur_disabled && !(new_admin && !new_disabled) {
+        let others: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE is_administrator = 1 AND is_disabled = 0 AND id <> ?)",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !others {
+            tx.rollback().await?;
+            return Ok(PolicyChange::LastAdmin);
+        }
+    }
+
+    sqlx::query(
+        "UPDATE users SET admin_from_group = \
+         CASE WHEN is_administrator = ?1 THEN admin_from_group ELSE 0 END, \
+         is_administrator = ?1, is_disabled = ?2 WHERE id = ?3",
+    )
+    .bind(new_admin as i32)
+    .bind(new_disabled as i32)
+    .bind(id.to_string())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(PolicyChange::Done)
 }
 
 /// Makes the user an administrator through the admin group (AC17). The flag records that the group
