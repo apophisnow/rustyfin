@@ -3264,6 +3264,7 @@ let jiRunning = false;   // the last status read said Running
 let jiTimer = null;      // the one status poll loop
 const jiChoice = new Map();     // JellyfinId -> checked; kept across previews of the same folder and layout
 const jiConfirm = new Map();    // JellyfinId -> UserId of a ticked suggested match; kept like jiChoice
+let jiMine = '';                // JellyfinId picked for "Import into my account"; '' = no one
 let jiPendingNames = new Map(); // UserId -> Name of the pending users (names stay out of onclick attributes)
 const jiShownCodes = new Map(); // UserId -> { name, code } of a new code shown in the pending list
 const jiLayoutKeys = { New: 'jellyfin_import.layout_new', Old: 'jellyfin_import.layout_old' };
@@ -3284,7 +3285,8 @@ const jiReasonKeys = {
     Ambiguous: 'jellyfin_import.reason_ambiguous',
     NotSelected: 'jellyfin_import.reason_not_selected',
     NotConfirmed: 'jellyfin_import.reason_not_confirmed',
-    ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other'
+    ConfirmedOtherAccount: 'jellyfin_import.reason_confirmed_other',
+    AccountTakenByIntoMyAccount: 'jellyfin_import.reason_taken_by_mine'
 };
 
 function jiPanelHtml() {
@@ -3391,14 +3393,15 @@ function jiPairs() {
         .filter(p => p.From && p.To);
 }
 
-// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs, checked users and ticked matches.
+// Preview and Run send the folder, layout and metadata mode; once a preview is on screen they also send the pairs, the checked users, the ticked matches and the "Import into my account" pick (IntoMyAccount).
 function jiRequest() {
     const req = { SourcePath: $('ji-source').value.trim(), Layout: $('ji-layout').value, MetadataMode: $('ji-metadata').value };
     if (jiPreviewed) {
         req.PathMappings = jiPairs();
         req.UserIds = [...document.querySelectorAll('#ji-users .ji-user:checked:not(:disabled)')].map(el => el.value);
-        req.ConfirmedMatches = [...document.querySelectorAll('#ji-users .ji-confirm:checked')]
+        req.ConfirmedMatches = [...document.querySelectorAll('#ji-users .ji-confirm:checked:not(:disabled)')]
             .map(el => ({ JellyfinId: el.value, UserId: el.dataset.userId }));
+        if (jiMine) req.IntoMyAccount = jiMine;
     }
     return req;
 }
@@ -3417,30 +3420,61 @@ function jiForget() {
     jiPreviewed = false;
     jiChoice.clear();
     jiConfirm.clear();
+    jiMine = '';
     $('ji-pairs').innerHTML = '';
     $('ji-users').innerHTML = '';
     hide('ji-preview');
 }
 
-// A row's action as Run will see it, from both of its boxes: an unpicked row is skipped, a name
-// match goes in only when ticked, and other rows keep the last Preview's text.
+// Same JellyfinId, ignoring hyphens and case (user ids come both ways). Empty ids never match.
+function jiSameId(a, b) {
+    if (!a || !b) return false;
+    return a.replace(/-/g, '').toLowerCase() === b.replace(/-/g, '').toLowerCase();
+}
+
+// A row's action as Run will see it. An unpicked row is skipped; the "Import into my account" row
+// is Import into your account; a row whose name matches the caller's account is skipped while
+// jiMine is set (that account takes the other user's data); a name match goes in only when ticked;
+// other rows keep the last Preview's text.
 function jiRowText(row) {
     const action = row.querySelector('.ji-action');
+    const user = row.querySelector('.ji-user');
     const confirm = row.querySelector('.ji-confirm');
-    if (!row.querySelector('.ji-user').checked) action.textContent = jiActionText({ Action: 'Skip', Reason: 'NotSelected' });
+    if (confirm) confirm.disabled = jiSameId(user.value, jiMine);
+    if (!user.checked) action.textContent = jiActionText({ Action: 'Skip', Reason: 'NotSelected' });
+    else if (jiSameId(user.value, jiMine)) action.textContent = t('jellyfin_import.action_into_mine');
+    else if (jiMine && confirm && jiSameId(confirm.dataset.userId, API.userId)) action.textContent = jiActionText({ Action: 'Skip', Reason: 'AccountTakenByIntoMyAccount' });
     else if (!confirm) action.textContent = action.dataset.text;
     else action.textContent = jiActionText(confirm.checked ? { Action: 'Match' } : { Action: 'Skip', Reason: 'NotConfirmed' });
 }
 
+function jiRefreshRows() {
+    document.querySelectorAll('#ji-users .ji-user').forEach(el => jiRowText(el.closest('div')));
+}
+
+function jiSetMine(id) {
+    jiMine = id;
+    if (id) {
+        const box = [...document.querySelectorAll('#ji-users .ji-user')].find(el => el.value === id);
+        if (box) box.checked = true;
+        jiChoice.set(id, true);
+    }
+    jiRefreshRows();
+}
+
 function jiSetChoice(el) {
     jiChoice.set(el.value, el.checked);
-    jiRowText(el.closest('div'));
+    if (!el.checked && jiSameId(el.value, jiMine)) {
+        jiMine = '';
+        $('ji-mine').value = '';
+    }
+    jiRefreshRows();
 }
 
 function jiSetConfirm(el) {
     if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
     else jiConfirm.delete(el.value);
-    jiRowText(el.closest('div'));
+    jiRefreshRows();
 }
 
 async function jiPreview() {
@@ -3464,22 +3498,37 @@ function jiRenderPreview(r) {
     $('ji-pairs').innerHTML = (r.PathMappings || []).map(m => jiPairRowHtml(m.From, m.To)).join('');
     $('ji-unpaired').innerHTML = jiUnpairedHtml(r);
     $('ji-users').innerHTML = jiUsersHtml(r.Users || []);
+    jiRefreshRows();
     $('ji-counts').innerHTML = jiCountsHtml(r);
     $('ji-samples').innerHTML = jiSamplesHtml(r);
     show('ji-preview');
 }
 
+// The "Import into my account" picker sits above the rows; its hint shows only when no row's name
+// matches the caller's own account.
 function jiUsersHtml(users) {
-    return users.map(u => {
+    const ownNameMatched = users.some(u => u.SuggestedMatch && jiSameId(u.SuggestedMatch.UserId, API.userId));
+    const picker = `
+    <div class="flex flex-wrap items-center gap-2 text-sm text-white">
+        <label for="ji-mine" class="text-xs font-semibold text-white/70">${t('jellyfin_import.into_mine')}</label>
+        <select id="ji-mine" class="jf-input text-xs" onchange="jiSetMine(this.value)">
+            <option value="">${t('jellyfin_import.into_mine_none')}</option>
+            ${users.filter(u => u.Reason !== 'Ambiguous').map(u => `<option value="${escapeHtml(u.JellyfinId)}" ${jiSameId(u.JellyfinId, jiMine) ? 'selected' : ''}>${escapeHtml(u.Name)}</option>`).join('')}
+        </select>
+    </div>${ownNameMatched ? '' : `
+    <p class="text-xs text-white/50">${t('jellyfin_import.into_mine_hint')}</p>`}`;
+    return picker + users.map(u => {
         const ambiguous = u.Reason === 'Ambiguous';
         const checked = !ambiguous && (jiChoice.has(u.JellyfinId) ? jiChoice.get(u.JellyfinId) : true);
+        // The row's text without the choice: an "Import into my account" row without a name match is a Create.
+        const plainText = u.MatchKind === 'IntoMyAccount' && !u.SuggestedMatch ? jiActionText({ Action: 'Create' }) : jiActionText(u);
         return `
         <div>
             <label class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
                 <input type="checkbox" class="ji-user" value="${escapeHtml(u.JellyfinId)}" onchange="jiSetChoice(this)" ${checked ? 'checked' : ''} ${ambiguous ? 'disabled' : ''}>
                 <span class="font-semibold">${escapeHtml(u.Name)}</span>
                 ${u.WasAdministrator ? `<span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''}
-                <span class="ji-action text-xs text-white/50" data-text="${escapeHtml(jiActionText(u))}">${jiActionText(u)}</span>
+                <span class="ji-action text-xs text-white/50" data-text="${escapeHtml(plainText)}">${jiActionText(u)}</span>
             </label>${jiConfirmHtml(u)}
         </div>`;
     }).join('');
@@ -3514,6 +3563,7 @@ function jiConfirmHtml(u) {
 
 // "Action", or "Action: reason" when there is a reason. The translations are static text.
 function jiActionText(u) {
+    if (u.MatchKind === 'IntoMyAccount') return t('jellyfin_import.action_into_mine');
     const action = t(jiActionKeys[u.Action]);
     return u.Reason ? `${action}: ${t(jiReasonKeys[u.Reason])}` : action;
 }
@@ -3740,6 +3790,7 @@ async function loadJellyfinImport() {
         jiPreviewed = false;
         jiChoice.clear();
         jiConfirm.clear();
+        jiMine = '';
         jiShownCodes.clear();
     }
     jiLoadPending();
@@ -4428,6 +4479,7 @@ function afterSignOut() {
     jiPendingNames = new Map();
     jiChoice.clear();
     jiConfirm.clear();
+    jiMine = '';
     $('page-admin').innerHTML = ''; // the import preview (#ji-users), its codes box and the live log
     libraries = [];
     updateAuthUI();
