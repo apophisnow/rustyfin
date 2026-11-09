@@ -288,6 +288,11 @@ pub async fn prepare(
     caller: Uuid,
     data_dir: &Path,
 ) -> Result<Prepared, ImportError> {
+    if req.into_my_account.is_some() && caller.is_nil() {
+        return Err(ImportError::BadRequest(
+            "IntoMyAccount needs a signed-in administrator; the API key has no account.".into(),
+        ));
+    }
     let location = source::locate(Path::new(&req.source_path))?;
     let snapshot = source::read_snapshot(&location, req.layout, data_dir).await?;
     let folders = source::read_library_folders(&location.program_data_path)?;

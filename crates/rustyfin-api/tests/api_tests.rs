@@ -26690,6 +26690,41 @@ fn b102_add_jf_user(w: &mut B20World, n: i64, name: &str) -> uuid::Uuid {
     id
 }
 
+/// F1, F5 (a): the configured API key signs in with no account, so `IntoMyAccount` from it is a
+/// 400 naming the field and the API key on Preview and Run; nothing is written or started. Without
+/// the field, its Preview works as before.
+#[tokio::test]
+async fn b102_import_into_my_account_refuses_the_api_key() {
+    let w = b20_world().await;
+    let install = b20_install(&w, "jf", jf::Layout::New).await;
+    let alice = w.source.user("Alice").id;
+    let before = b20_db_digest(&w.state).await;
+    let body = serde_json::json!({ "SourcePath": install, "IntoMyAccount": alice }).to_string();
+    for route in ["Preview", "Run"] {
+        let uri = format!("/JellyfinImport/{route}");
+        let (status, answer) = send_authed(&w.app, "POST", &uri, "test-api-key", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {answer}");
+        let text = answer.to_string();
+        let named = text.contains("IntoMyAccount") && text.contains("API key");
+        assert!(named, "{route}: {answer}");
+    }
+    assert_eq!(
+        b20_status(&w).await["State"],
+        "Idle",
+        "a refused run started"
+    );
+    assert_eq!(
+        b20_db_digest(&w.state).await,
+        before,
+        "a refused request wrote"
+    );
+
+    let body = serde_json::json!({ "SourcePath": install }).to_string();
+    let uri = "/JellyfinImport/Preview";
+    let (status, answer) = send_authed(&w.app, "POST", uri, "test-api-key", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
 /// F5 (b): a Jellyfin user whose name is a case variant of the caller's, and matches no other
 /// account, is skipped as `AccountTakenByIntoMyAccount` too and brings the caller nothing.
 #[tokio::test]
