@@ -3428,8 +3428,7 @@ function jiForget() {
 
 // Same JellyfinId, ignoring hyphens and case (user ids come both ways). Empty ids never match.
 function jiSameId(a, b) {
-    if (!a || !b) return false;
-    return a.replace(/-/g, '').toLowerCase() === b.replace(/-/g, '').toLowerCase();
+    return !!a && !!b && oidcAccountKey(a) === oidcAccountKey(b);
 }
 
 // A row's action as Run will see it. An unpicked row is skipped; the "Import into my account" row
@@ -3448,33 +3447,43 @@ function jiRowText(row) {
     else action.textContent = jiActionText(confirm.checked ? { Action: 'Match' } : { Action: 'Skip', Reason: 'NotConfirmed' });
 }
 
-function jiRefreshRows() {
-    document.querySelectorAll('#ji-users .ji-user').forEach(el => jiRowText(el.closest('div')));
+// Re-runs the text only of rows the pick changes: the old pick's row, the new pick's row and rows
+// whose confirm box names the caller. Other rows keep the server's text.
+function jiRefreshMine(old) {
+    document.querySelectorAll('#ji-users .ji-user').forEach(el => {
+        const row = el.closest('div');
+        const confirm = row.querySelector('.ji-confirm');
+        if (jiSameId(el.value, old) || jiSameId(el.value, jiMine) || (confirm && jiSameId(confirm.dataset.userId, API.userId))) jiRowText(row);
+    });
 }
 
 function jiSetMine(id) {
+    const old = jiMine;
     jiMine = id;
     if (id) {
         const box = [...document.querySelectorAll('#ji-users .ji-user')].find(el => el.value === id);
         if (box) box.checked = true;
         jiChoice.set(id, true);
     }
-    jiRefreshRows();
+    jiRefreshMine(old);
 }
 
 function jiSetChoice(el) {
     jiChoice.set(el.value, el.checked);
     if (!el.checked && jiSameId(el.value, jiMine)) {
+        const old = jiMine;
         jiMine = '';
         $('ji-mine').value = '';
+        jiRefreshMine(old);
+    } else {
+        jiRowText(el.closest('div'));
     }
-    jiRefreshRows();
 }
 
 function jiSetConfirm(el) {
     if (el.checked) jiConfirm.set(el.value, el.dataset.userId);
     else jiConfirm.delete(el.value);
-    jiRefreshRows();
+    jiRowText(el.closest('div'));
 }
 
 async function jiPreview() {
@@ -3498,15 +3507,15 @@ function jiRenderPreview(r) {
     $('ji-pairs').innerHTML = (r.PathMappings || []).map(m => jiPairRowHtml(m.From, m.To)).join('');
     $('ji-unpaired').innerHTML = jiUnpairedHtml(r);
     $('ji-users').innerHTML = jiUsersHtml(r.Users || []);
-    jiRefreshRows();
     $('ji-counts').innerHTML = jiCountsHtml(r);
     $('ji-samples').innerHTML = jiSamplesHtml(r);
     show('ji-preview');
 }
 
-// The "Import into my account" picker sits above the rows; its hint shows only when no row's name
-// matches the caller's own account.
+// The "Import into my account" picker sits above the rows; its hint shows only when no selected row
+// is name-matched to the caller's own account.
 function jiUsersHtml(users) {
+    if (!users.length) return '';
     const ownNameMatched = users.some(u => u.SuggestedMatch && jiSameId(u.SuggestedMatch.UserId, API.userId));
     const picker = `
     <div class="flex flex-wrap items-center gap-2 text-sm text-white">
@@ -3554,7 +3563,7 @@ function jiConfirmHtml(u) {
     const others = s.OtherCaseNames || [];
     return `
             <label class="flex items-center gap-2 ml-7 mt-1 text-xs text-white/70">
-                <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''}>
+                <input type="checkbox" class="ji-confirm" value="${escapeHtml(u.JellyfinId)}" data-user-id="${escapeHtml(s.UserId)}" onchange="jiSetConfirm(this)" ${checked ? 'checked' : ''} ${jiSameId(u.JellyfinId, jiMine) ? 'disabled' : ''}>
                 <span>${t('jellyfin_import.confirm_match', { name: escapeHtml(s.Name) })}</span>
             </label>
             <p class="ml-7 text-xs text-white/40">${facts}</p>${others.length > 0 ? `
@@ -3600,11 +3609,22 @@ function jiSamplesHtml(r) {
         <ul class="text-xs text-white/60 space-y-0.5">${samples.map(s => `<li>${escapeHtml(s.Type)} · ${escapeHtml(s.Name)} · <span class="font-mono text-[11px]">${escapeHtml(s.Path)}</span></li>`).join('')}</ul>`;
 }
 
+// A finished run's action. Any administrator may read it, so another administrator's "Import into my
+// account" names the account (`name`, escaped); otherwise it is jiActionText.
+function jiResultText(u, name) {
+    if (!name) return jiActionText(u);
+    if (u.MatchKind === 'IntoMyAccount') return t('jellyfin_import.action_into_account', { name });
+    if (u.Reason === 'AccountTakenByIntoMyAccount') return `${t(jiActionKeys.Skip)}: ${t('jellyfin_import.reason_taken_by_account', { name })}`;
+    return jiActionText(u);
+}
+
 function jiUserActionsHtml(users) {
     if (!users.length) return '';
+    const pick = users.find(u => u.MatchKind === 'IntoMyAccount' && u.TargetAccount);
+    const name = pick && !jiSameId(pick.TargetAccount.UserId, API.userId) ? escapeHtml(pick.TargetAccount.Name) : '';
     return `
         <p class="font-semibold text-white/80">${t('jellyfin_import.users_title')}</p>
-        <ul class="space-y-0.5">${users.map(u => `<li><span class="text-white">${escapeHtml(u.Name)}</span>${u.WasAdministrator ? ` <span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''} · ${jiActionText(u)}</li>`).join('')}</ul>`;
+        <ul class="space-y-0.5">${users.map(u => `<li><span class="text-white">${escapeHtml(u.Name)}</span>${u.WasAdministrator ? ` <span class="jf-badge text-[10px]">${t('jellyfin_import.was_admin')}</span>` : ''} · ${jiResultText(u, name)}</li>`).join('')}</ul>`;
 }
 
 async function jiRun() {
