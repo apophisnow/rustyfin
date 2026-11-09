@@ -331,32 +331,39 @@ pub async fn prepare(
 /// with placeholder facts.
 fn fill_suggested_facts(accounts: &[User], pending: &HashSet<Uuid>, users: &mut [UserRow]) {
     for user in users.iter_mut() {
-        if let Some(suggested) = user.suggested_match.as_mut() {
-            match accounts
-                .iter()
-                .find(|account| account.id == suggested.user_id)
-            {
-                Some(account) => {
-                    suggested.is_administrator = account.is_administrator;
-                    suggested.created_at = account.created_at;
-                    suggested.last_login_date = account.last_login_date;
-                    suggested.setup_code_pending = pending.contains(&suggested.user_id);
-                }
-                None => user.suggested_match = None,
-            }
+        if user
+            .suggested_match
+            .as_mut()
+            .is_some_and(|suggested| !fill_account_facts(suggested, accounts, pending))
+        {
+            user.suggested_match = None;
         }
-        if let Some(target) = user.target_account.as_mut() {
-            match accounts.iter().find(|account| account.id == target.user_id) {
-                Some(account) => {
-                    target.is_administrator = account.is_administrator;
-                    target.created_at = account.created_at;
-                    target.last_login_date = account.last_login_date;
-                    target.setup_code_pending = pending.contains(&target.user_id);
-                }
-                None => user.target_account = None,
-            }
+        if user
+            .target_account
+            .as_mut()
+            .is_some_and(|target| !fill_account_facts(target, accounts, pending))
+        {
+            user.target_account = None;
         }
     }
+}
+
+/// Copies the account facts of the account `facts.user_id` names from `accounts`, and sets
+/// `setup_code_pending` from `pending`. Returns false, leaving `facts` unchanged, when that
+/// account isn't among `accounts`.
+fn fill_account_facts(
+    facts: &mut SuggestedMatch,
+    accounts: &[User],
+    pending: &HashSet<Uuid>,
+) -> bool {
+    let Some(account) = accounts.iter().find(|account| account.id == facts.user_id) else {
+        return false;
+    };
+    facts.is_administrator = account.is_administrator;
+    facts.created_at = account.created_at;
+    facts.last_login_date = account.last_login_date;
+    facts.setup_code_pending = pending.contains(&facts.user_id);
+    true
 }
 
 /// The planning `preview` and `run` share (spec 2.20, 2.26). A run passes its handle: it then
