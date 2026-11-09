@@ -378,6 +378,8 @@ const clickActions = {
     'refresh-item': el => API.refreshItem(el.dataset.id).then(() => toast(t('detail.metadata_refreshing'))),
     'admin-tab': el => showAdminTab(el, el.dataset.tab),
     'delete-user': el => { if (confirm(t('admin.delete_user_confirm'))) API.deleteUser(el.dataset.id).then(() => renderAdmin()); },
+    'set-user-admin': el => setUserPolicy(el, { IsAdministrator: el.checked }),
+    'set-user-disabled': el => setUserPolicy(el, { IsDisabled: el.checked }),
     'delete-library': el => deleteLibraryFromAdmin(el.dataset.id),
     'toggle-realtime-monitor': el => toggleRealtimeMonitor(el),
     'start-task': el => startTaskAction(el.dataset.id, el.dataset.name),
@@ -2933,6 +2935,7 @@ async function renderAdmin() {
                             <tr class="text-white/40 border-b border-white/10 pb-2">
                                 <th class="pb-3 font-semibold">${t('common.name')}</th>
                                 <th class="pb-3 font-semibold">${t('admin.role')}</th>
+                                <th class="pb-3 font-semibold">${escapeHtml(t('admin.disabled_column'))}</th>
                                 <th class="pb-3 font-semibold">${t('admin.last_login')}</th>
                                 <th class="pb-3 font-semibold">${escapeHtml(t('oidc.provider_column'))}</th>
                                 <th class="pb-3 font-semibold text-right">${t('admin.action')}</th>
@@ -2943,10 +2946,15 @@ async function renderAdmin() {
                                 const name = u.Name || u.name;
                                 const isAdmin = u.IsAdministrator ?? u.Policy?.IsAdministrator ?? u.policy?.is_administrator;
                                 const account = accountById.get(oidcAccountKey(u.Id || u.id));
+                                const id = u.Id || u.id;
+                                const isOwner = u.IsOwner === true;
+                                const isSelf = oidcAccountKey(id) === oidcAccountKey(API.userId);
+                                const locked = isOwner || isSelf;
                                 return `
                             <tr>
                                 <td class="py-3 font-bold text-white">${escapeHtml(name)}</td>
-                                <td class="py-3">${isAdmin ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_admin'))}</span>${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span>` : ''}` : `<span class="text-white/40">${escapeHtml(t('admin.role_user'))}</span>`}</td>
+                                <td class="py-3"><label class="inline-flex items-center gap-2 text-white/80"><input type="checkbox" data-action="set-user-admin" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.administrator_for', { name }))}" ${isAdmin ? 'checked' : ''} ${locked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"><span>${escapeHtml(t('admin.role_admin'))}</span></label>${isOwner ? `<span class="ml-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-[#00a4dc]/20 text-[#38bdf8]">${escapeHtml(t('admin.role_owner'))}</span>` : ''}${account?.AdminFromGroup ? `<span class="ml-1.5 text-[10px] text-white/40">${escapeHtml(t('oidc.from_group'))}</span><p class="text-[10px] text-white/40 mt-1">${escapeHtml(t('admin.group_admin_hint'))}</p>` : ''}${locked ? `<p class="text-[10px] text-white/40 mt-1">${escapeHtml(t(isOwner ? 'admin.owner_locked' : 'admin.self_locked'))}</p>` : ''}</td>
+                                <td class="py-3"><input type="checkbox" data-action="set-user-disabled" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(t('admin.disabled_for', { name }))}" ${u.IsDisabled ? 'checked' : ''} ${locked ? 'disabled' : ''} class="w-4 h-4 rounded bg-white/10 border-white/20 text-[#00a4dc]"></td>
                                 <td class="py-3 text-white/40">${escapeHtml(u.LastLoginDate || u.last_login_date || '–')}</td>
                                 <td class="py-3 text-white/60">${account?.Linked ? `${escapeHtml(account.ProviderUsername || '—')} <button type="button" class="ml-2 text-[#00a4dc] hover:text-[#38bdf8] font-semibold" data-action="oidc-remove-link" data-id="${escapeHtml(account.UserId)}" data-name="${escapeHtml(name)}">${escapeHtml(t('oidc.remove_link'))}</button>` : '<span class="text-white/40">—</span>'}</td>
                                 <td class="py-3 text-right">
@@ -3090,6 +3098,23 @@ function showAdminTab(btn, tabId) {
     if (tabId === 'admin-livelog') initLiveLog();
     if (tabId === 'admin-signin') loadOidcAdminTab();
     if (tabId === 'admin-import') loadJellyfinImport();
+}
+
+// An administrator changes another user's role or disabled state. The users tab is shown again after the page is rendered.
+async function setUserPolicy(el, policy) {
+    if (policy.IsDisabled && !confirm(t('admin.disable_user_confirm', { name: el.dataset.name }))) {
+        el.checked = false;
+        return;
+    }
+    try {
+        await API.updatePolicy(el.dataset.id, policy);
+        toast(t('admin.user_updated'));
+    } catch (err) {
+        toast(err.message, 'error');
+    }
+    await renderAdmin();
+    const tab = document.querySelector('[data-action="admin-tab"][data-tab="admin-users"]');
+    if (tab) showAdminTab(tab, 'admin-users');
 }
 
 // An administrator removes another user's provider link. The users tab is shown again after the page is rendered.
