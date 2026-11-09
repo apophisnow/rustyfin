@@ -112,7 +112,7 @@ async fn get_user(
 async fn get_public_users(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PublicUserDto>>, ApiError> {
-    let users = rustyfin_db::repo_user::get_all_users(&state.db_ro).await?;
+    let users = rustyfin_db::repo_user::get_public_users(&state.db_ro).await?;
     Ok(Json(users.into_iter().map(PublicUserDto::from).collect()))
 }
 
@@ -243,8 +243,8 @@ async fn change_password(
 
 /// Sets an account's administrator and disabled flags. Administrators only. Refuses, with 403, to
 /// change the owner's role or state, to remove or disable one's own administrator rights or account,
-/// to disable an administrator, and to leave no enabled administrator. Disabling an account ends its
-/// sessions.
+/// to disable an administrator, and to leave no enabled administrator. Disabling an account deletes its
+/// tokens, sessions and devices.
 async fn update_policy(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -301,17 +301,16 @@ async fn update_policy(
                 "Administrators cannot be disabled. Remove the administrator rights first.".into(),
             ));
         }
+        PolicyChange::PromoteDisabled => {
+            return Err(ApiError::Forbidden(
+                "A disabled account cannot be made an administrator. Enable it first.".into(),
+            ));
+        }
         PolicyChange::LastAdmin => {
             return Err(ApiError::Forbidden(
                 "There must be at least one enabled administrator.".into(),
             ));
         }
-    }
-
-    if req.is_disabled == Some(true) {
-        rustyfin_auth::revoke_user_tokens(&state.db, id, None)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
 
     Ok(Json(serde_json::json!({})))

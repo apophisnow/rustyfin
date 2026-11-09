@@ -13921,19 +13921,52 @@ async fn b103_administrators_cannot_be_disabled() {
         Some((true, false, false))
     );
 
-    // Both in one request: the result is a disabled user, not a disabled administrator.
+    // As in Jellyfin, which checks the current administrator flag: demote and disable in one
+    // request is refused too. The rights go first, then the account.
     let both = serde_json::json!({ "IsAdministrator": false, "IsDisabled": true });
-    assert_eq!(t.policy(&t.owner, &t.ada_id, both).await.0, StatusCode::OK);
+    let (status, json) = t.policy(&t.owner, &t.ada_id, both).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        json["Detail"],
+        "Administrators cannot be disabled. Remove the administrator rights first."
+    );
+    assert_eq!(
+        user_flags(&t.state, "ada").await,
+        Some((true, false, false))
+    );
+    let promote_and_disable = serde_json::json!({ "IsAdministrator": true, "IsDisabled": true });
+    let (status, json) = t.policy(&t.owner, &t.bob_id, promote_and_disable).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        json["Detail"],
+        "Administrators cannot be disabled. Remove the administrator rights first."
+    );
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, false))
+    );
+    let demote = serde_json::json!({ "IsAdministrator": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, demote).await.0,
+        StatusCode::OK
+    );
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.ada_id, disable).await.0,
+        StatusCode::OK
+    );
     assert_eq!(
         user_flags(&t.state, "ada").await,
         Some((false, false, true))
     );
 
-    // A disabled user is promoted only together with being enabled.
+    // A disabled user is promoted only together with being enabled, and the refusal says so.
     let promote = serde_json::json!({ "IsAdministrator": true });
+    let (status, json) = t.policy(&t.owner, &t.ada_id, promote).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
-        t.policy(&t.owner, &t.ada_id, promote).await.0,
-        StatusCode::FORBIDDEN
+        json["Detail"],
+        "A disabled account cannot be made an administrator. Enable it first."
     );
     assert_eq!(
         user_flags(&t.state, "ada").await,
@@ -14121,6 +14154,157 @@ async fn b103_a_demoted_administrators_socket_stops_getting_log_lines() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+/// How many rows of `table` belong to the user with the API id `id`.
+async fn b103_rows(state: &AppState, table: &str, id: &str) -> i64 {
+    let uid = uuid::Uuid::parse_str(id).unwrap().to_string();
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?");
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(uid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// The names `GET /Users/Public` lists.
+async fn b103_public_names(app: &axum::Router) -> Vec<String> {
+    let (status, json) = send(app, request("GET", "/Users/Public", None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    json.as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["Name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn b103_disabling_ends_sessions_and_devices() {
+    let t = b103().await;
+    let body = serde_json::json!({ "Username": "bob", "Pw": "pw-bob" });
+    let mut req = request("POST", "/Users/AuthenticateByName", None, Some(body));
+    req.headers_mut().insert(
+        "X-Emby-Authorization",
+        r#"MediaBrowser Client="B103", Device="phone", DeviceId="b103-bob-phone", Version="1.0""#
+            .parse()
+            .unwrap(),
+    );
+    let (status, json) = send(&t.app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let phone = json["AccessToken"].as_str().unwrap().to_string();
+    assert_eq!(t.me_status(&phone).await, StatusCode::OK);
+    assert!(b103_rows(&t.state, "sessions", &t.bob_id).await > 0);
+    assert!(b103_rows(&t.state, "devices", &t.bob_id).await > 0);
+    let bob = uuid::Uuid::parse_str(&t.bob_id).unwrap();
+    let (_, listed) = g1f_session_list(&t.app, Some(&t.owner)).await;
+    assert!(
+        listed.iter().any(|(_, user)| *user == bob),
+        "bob's session is listed"
+    );
+
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(b103_rows(&t.state, "access_tokens", &t.bob_id).await, 0);
+    assert_eq!(
+        b103_rows(&t.state, "sessions", &t.bob_id).await,
+        0,
+        "disabling ends bob's sessions"
+    );
+    assert_eq!(
+        b103_rows(&t.state, "devices", &t.bob_id).await,
+        0,
+        "disabling logs bob's devices out"
+    );
+    let (status, listed) = g1f_session_list(&t.app, Some(&t.owner)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !listed.iter().any(|(_, user)| *user == bob),
+        "the sessions list no longer shows bob"
+    );
+    assert!(
+        b103_rows(&t.state, "sessions", &t.owner_id).await > 0,
+        "other users' sessions stay"
+    );
+}
+
+#[tokio::test]
+async fn b103_set_policy_revokes_tokens_in_its_transaction() {
+    let t = b103().await;
+    let bob = uuid::Uuid::parse_str(&t.bob_id).unwrap();
+    let ada = uuid::Uuid::parse_str(&t.ada_id).unwrap();
+    assert!(b103_rows(&t.state, "access_tokens", &t.bob_id).await > 0);
+
+    // The repository call alone deletes the tokens, so nothing runs after its commit.
+    let change = rustyfin_db::repo_user::set_policy(&t.state.db, bob, None, Some(true))
+        .await
+        .unwrap();
+    assert_eq!(change, rustyfin_db::repo_user::PolicyChange::Done);
+    assert_eq!(b103_rows(&t.state, "access_tokens", &t.bob_id).await, 0);
+    assert_eq!(b103_rows(&t.state, "sessions", &t.bob_id).await, 0);
+    assert_eq!(t.me_status(&t.bob).await, StatusCode::UNAUTHORIZED);
+
+    // A refused change deletes nothing.
+    let change = rustyfin_db::repo_user::set_policy(&t.state.db, ada, None, Some(true))
+        .await
+        .unwrap();
+    assert_eq!(change, rustyfin_db::repo_user::PolicyChange::AdminDisabled);
+    assert!(b103_rows(&t.state, "access_tokens", &t.ada_id).await > 0);
+    assert_eq!(t.me_status(&t.ada).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn b103_a_sign_in_racing_a_disable_gets_no_token() {
+    let t = b103().await;
+    let bob = uuid::Uuid::parse_str(&t.bob_id).unwrap();
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+
+    // A sign-in that passed its disabled check just before the disable asks for its token now.
+    let issued = rustyfin_auth::issue_login_token(&t.state.db, bob, &Default::default()).await;
+    assert!(
+        matches!(issued, Err(rustyfin_auth::AuthError::InvalidCredentials)),
+        "a disabled account gets no token"
+    );
+    assert_eq!(b103_rows(&t.state, "access_tokens", &t.bob_id).await, 0);
+
+    let enable = serde_json::json!({ "IsDisabled": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, enable).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        b103_rows(&t.state, "access_tokens", &t.bob_id).await,
+        0,
+        "no token comes back with the account"
+    );
+}
+
+#[tokio::test]
+async fn b103_public_users_leave_out_disabled_accounts() {
+    let t = b103().await;
+    assert!(b103_public_names(&t.app).await.contains(&"bob".to_string()));
+
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+    let names = b103_public_names(&t.app).await;
+    assert!(!names.contains(&"bob".to_string()), "bob isn't listed");
+    assert!(names.contains(&"karl".to_string()) && names.contains(&"ada".to_string()));
+
+    let enable = serde_json::json!({ "IsDisabled": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, enable).await.0,
+        StatusCode::OK
+    );
+    assert!(b103_public_names(&t.app).await.contains(&"bob".to_string()));
 }
 
 #[tokio::test]

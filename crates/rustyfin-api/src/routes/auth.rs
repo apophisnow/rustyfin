@@ -163,7 +163,10 @@ pub(crate) async fn start_session(
 
     let flags = rustyfin_db::repo_user::user_flags(&state.db, user.id)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read the user's flags for the sign-in answer");
+            Default::default()
+        });
 
     AuthResponse {
         user: UserDto::new(user, flags),
