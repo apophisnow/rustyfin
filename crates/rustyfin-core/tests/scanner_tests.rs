@@ -7639,6 +7639,30 @@ async fn b32_scans_collect_jellyfins_video_extensions() {
     );
 }
 
+#[tokio::test]
+async fn b32_f5_bin_files_count_only_when_named_as_episodes() {
+    // Jellyfin lists every `.bin` as a video (12.4 `NamingOptions.cs:24-79`). Most are disc images or data, so
+    // a scan takes one only when its name parses as an episode, like this one, the only file of S09E10.
+    const EPISODE: &str = "Rick and Morty/Season 9/Rick.and.Morty.S09E10.1080p.WEB.H264.bin";
+    let fx = Fixture::new().await;
+    let tv = fx.library("tv", LibraryContentType::TvShows).await;
+    touch(&root_of(&tv), EPISODE);
+    touch(&root_of(&tv), "Rick and Morty/Season 9/firmware.bin");
+    let film = fx.library("film", LibraryContentType::Movies).await;
+    touch(&root_of(&film), "Imaged (2011)/Imaged (2011).bin");
+
+    scan(&fx.pool, &tv).await;
+    scan(&fx.pool, &film).await;
+
+    let numbered: Vec<(String, Option<i64>, Option<i64>)> = episodes(&fx.pool, &tv)
+        .await
+        .into_iter()
+        .map(|(path, index, season, _)| (path, index, season))
+        .collect();
+    assert_eq!(numbered, [(EPISODE.to_string(), Some(10), Some(9))]);
+    assert!(paths(&fx.pool, &film, "Movie").await.is_empty());
+}
+
 /// ffmpeg.
 #[tokio::test]
 async fn b32_an_m2ts_joins_its_movie_as_a_version() {

@@ -19,12 +19,32 @@ use crate::tmdb_client::TmdbApi;
 
 /// Jellyfin's video extensions (`NamingOptions.cs:24-79`) without `001`, `asx`, `bin`, `ifo`, `img`, `iso`,
 /// `nrg` and `strm`: split parts, playlists, disc images and links, which ffmpeg can't play as one title.
+/// `bin` counts in TV libraries only when it is named as an episode (`is_episode_file`).
 pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "3g2", "3gp",
     "amv", "asf", "bivx", "divx", "dv", "dvr-ms", "f4v", "fli", "m2t", "m2ts", "m2v", "mk3d",
     "mpe", "mts", "mxf", "nsv", "nuv", "ogm", "ogv", "pva", "qt", "rec", "rm", "rmvb", "svq3",
     "tp", "ty", "viv", "vob", "vp3", "wtv", "xvid",
 ];
+
+/// Whether `path` is an episode file in a TV library. Jellyfin lists every `.bin` (`NamingOptions.cs:24-79`);
+/// most are disc images or data, so a `.bin` counts only when its stem parses as an episode.
+pub(crate) fn is_episode_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    ext == "bin"
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| naming::parse_episode(stem).is_some())
+}
+
 pub(crate) const AUDIO_EXTENSIONS: &[&str] =
     &["mp3", "flac", "ogg", "wav", "aac", "wma", "m4a", "opus"];
 const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"];
@@ -681,14 +701,8 @@ async fn scan_tv_library(
         let mut scanned_files = 0u32;
         let mut skipped_ext = 0u32;
         for file_path_buf in files {
-            let ext = file_path_buf
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-
             scanned_files += 1;
-            if !VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+            if !is_episode_file(&file_path_buf) {
                 skipped_ext += 1;
                 continue;
             }
