@@ -14340,6 +14340,41 @@ async fn b103_a_hand_change_meets_the_admin_group_at_the_next_sign_in() {
 }
 
 #[tokio::test]
+async fn b103_a_group_grant_skips_a_disabled_account() {
+    let t = b103().await;
+    let bob = uuid::Uuid::parse_str(&t.bob_id).unwrap();
+    let disable = serde_json::json!({ "IsDisabled": true });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, disable).await.0,
+        StatusCode::OK
+    );
+
+    // An admin-group sign-in that passed its disabled check just before the disable grants nothing.
+    rustyfin_db::repo_user::grant_group_admin(&t.state.db, bob)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((false, false, true)),
+        "no disabled administrator"
+    );
+
+    let enable = serde_json::json!({ "IsDisabled": false });
+    assert_eq!(
+        t.policy(&t.owner, &t.bob_id, enable).await.0,
+        StatusCode::OK
+    );
+    rustyfin_db::repo_user::grant_group_admin(&t.state.db, bob)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_flags(&t.state, "bob").await,
+        Some((true, false, false)),
+        "an enabled account gets the group's rights"
+    );
+}
+
+#[tokio::test]
 async fn test_startup_routes_require_admin_after_setup() {
     let state = test_state().await;
     let app = app(state.clone());

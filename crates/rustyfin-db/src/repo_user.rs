@@ -457,6 +457,8 @@ pub async fn set_policy(
 
 /// Makes the user an administrator through the admin group (AC17). The flag records that the group
 /// gave the rights. An existing administrator is left as it is, flag and all.
+/// A disabled account is left as it is, so a sign-in that races a disable can't make a disabled
+/// administrator.
 /// The executor is a pool, or a transaction the caller holds.
 pub async fn grant_group_admin<'e, E>(executor: E, id: Uuid) -> Result<(), sqlx::Error>
 where
@@ -464,7 +466,7 @@ where
 {
     sqlx::query(
         "UPDATE users SET is_administrator = 1, admin_from_group = 1 \
-         WHERE id = ? AND is_administrator = 0",
+         WHERE id = ? AND is_administrator = 0 AND is_disabled = 0",
     )
     .bind(id.to_string())
     .execute(executor)
