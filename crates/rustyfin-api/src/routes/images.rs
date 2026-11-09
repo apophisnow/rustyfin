@@ -115,6 +115,31 @@ async fn serve_image(
         }
     };
 
+    // A local original too big for the memory cache is streamed from its file, not held in memory
+    let is_remote = img.path.starts_with("http://") || img.path.starts_with("https://");
+    if rendition == rustyfin_core::image_proxy::Rendition::Original
+        && !is_remote
+        && let Ok(meta) = tokio::fs::metadata(&img.path).await
+        && meta.len() > crate::cache::ImageCache::MAX_ENTRY_SIZE as u64
+    {
+        let file = match tokio::fs::File::open(&img.path).await {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %img.path, "image could not be read or resized");
+                return Err(ApiError::NotFound(format!(
+                    "image not found: failed to read local image: {}",
+                    e
+                )));
+            }
+        };
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, guess_content_type(&img.path, false))
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .header(header::CONTENT_LENGTH, meta.len().to_string())
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+            .unwrap());
+    }
+
     // Build cache key for in-memory image cache. The stamp changes with the file, so a replaced
     // picture is not served from the old one.
     let stamp = img.stamp.unwrap_or(0);

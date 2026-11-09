@@ -3060,6 +3060,63 @@ fn b30_copies(state: &AppState) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn b30_f3_a_tiff_comes_back_as_a_jpeg() {
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let tiff = state.data_dir.join("b30-poster.tiff");
+    image::RgbImage::from_pixel(60, 90, image::Rgb([255, 0, 0]))
+        .save(&tiff)
+        .unwrap();
+    b30_set_image(&state, id, Primary, &tiff.to_string_lossy(), Some(1)).await;
+    let app = app(state);
+
+    // At its own size, above it, and with no bounds.
+    for bounds in ["maxWidth=60", "maxWidth=1000&maxHeight=1000", ""] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(content_type, "image/jpeg", "{uri}");
+        assert!(bytes.starts_with(&[0xFF, 0xD8]), "{uri}: not a JPEG");
+        assert_eq!(b30_picture(&bytes), ((60, 90), "red".to_string()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn b30_f5_a_large_original_comes_back_whole() {
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    // Noise, so that the PNG is over the 1 MiB that the memory cache holds.
+    let mut seed = 0x2545_f491_u32;
+    let noise = image::RgbImage::from_fn(700, 700, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let [r, g, b, _] = seed.to_le_bytes();
+        image::Rgb([r, g, b])
+    });
+    let path = state.data_dir.join("b30-noise.png");
+    noise.save(&path).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    assert!(original.len() > 1024 * 1024, "{}", original.len());
+    b30_set_image(&state, id, Primary, &path.to_string_lossy(), Some(1)).await;
+    let app = app(state);
+
+    for bounds in ["", "maxWidth=700"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, content_type, bytes) = b30_get(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(content_type, "image/png", "{uri}");
+        assert!(bytes == original, "{uri}: not the original's bytes");
+    }
+}
+
+#[tokio::test]
 async fn b30_p1_bounds_at_or_above_the_source_return_the_original() {
     let state = test_state().await;
     let (token, _) = admin_session(&state).await;

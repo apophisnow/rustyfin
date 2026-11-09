@@ -278,7 +278,7 @@ pub struct ImageCache {
 
 impl ImageCache {
     /// Maximum size of a single cached image (1MB).
-    const MAX_ENTRY_SIZE: usize = 1024 * 1024;
+    pub const MAX_ENTRY_SIZE: usize = 1024 * 1024;
 
     pub fn new() -> Self {
         Self {

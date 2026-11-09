@@ -1,10 +1,52 @@
 use image::imageops::FilterType;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
+use std::sync::LazyLock;
 use tokio::fs;
 
 /// The largest side, in pixels, that an image is served at.
 pub const MAX_IMAGE_SIDE: u32 = 4096;
+
+/// A local original over this size is not served as is by a bounded request; it gets a copy.
+pub const ORIGINAL_MAX_BYTES: u64 = 8 << 20;
+
+/// The largest side, in pixels, of a source that is decoded.
+pub const MAX_DECODE_SIDE: u32 = 16384;
+
+/// The most memory a source's decode may allocate.
+pub const MAX_DECODE_BYTES: u64 = 256 << 20;
+
+/// The most a Lanczos3 resize may hold in its float buffer (RGBA f32 rows).
+pub const RESIZE_BUFFER_MAX_BYTES: u64 = 64 << 20;
+
+/// The most bytes read from a remote image.
+pub const REMOTE_IMAGE_MAX_BYTES: u64 = 20 << 20;
+
+/// How many copies may be decoded, resized and encoded at once.
+static RENDERS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+/// Whether a source is a remote `http://` or `https://` image.
+fn is_remote(source_path: &str) -> bool {
+    source_path.starts_with("http://") || source_path.starts_with("https://")
+}
+
+/// Whether a source's own bytes can be served as they are: its extension, lower-cased, is one that
+/// every client shows. A URL's query and fragment are not part of its extension.
+pub fn serves_as_is(path: &str) -> bool {
+    let path = if is_remote(path) {
+        path.split(['?', '#']).next().unwrap_or(path)
+    } else {
+        path
+    };
+    let Some(ext) = Path::new(path).extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+    )
+}
 
 /// The size an image of `width`x`height` is served at: it fits the bounds and is never upscaled.
 pub fn target_size(
@@ -100,22 +142,70 @@ pub async fn plan_rendition(
     max_width: Option<u32>,
     max_height: Option<u32>,
 ) -> Result<Rendition, String> {
-    if capped_bounds(max_width, max_height).is_none() {
+    let as_is = serves_as_is(source_path);
+    if as_is && capped_bounds(max_width, max_height).is_none() {
         return Ok(Rendition::Original);
     }
-    let remote = source_path.starts_with("http://") || source_path.starts_with("https://");
-    if known_size.is_some() || remote {
-        return Ok(rendition_for(known_size, max_width, max_height));
+    let remote = is_remote(source_path);
+    let size = match known_size {
+        Some(size) => Some(size),
+        None if remote => None,
+        None => {
+            let path = source_path.to_string();
+            let size = tokio::task::spawn_blocking(move || read_dimensions(&path))
+                .await
+                .map_err(|e| format!("failed to read local image: {}", e))??;
+            Some(size)
+        }
+    };
+    let rendition = rendition_for(size, max_width, max_height);
+    if as_is {
+        // F7: a local original too large for a bounded request is served as a copy at the bounds
+        if rendition == Rendition::Original
+            && !remote
+            && let Some((bw, bh)) = capped_bounds(max_width, max_height)
+            && let Ok(meta) = fs::metadata(source_path).await
+            && meta.len() > ORIGINAL_MAX_BYTES
+        {
+            return Ok(Rendition::Copy {
+                width: bw,
+                height: bh,
+            });
+        }
+        return Ok(rendition);
     }
-    let path = source_path.to_string();
-    let size = tokio::task::spawn_blocking(move || read_dimensions(&path))
-        .await
-        .map_err(|e| format!("failed to read local image: {}", e))??;
-    Ok(rendition_for(Some(size), max_width, max_height))
+    // F3: any other format is decoded and served as a JPEG copy, never as its own bytes
+    Ok(match (rendition, size) {
+        (Rendition::Original, Some((w, h))) => {
+            let (width, height) = target_size(w, h, Some(MAX_IMAGE_SIDE), Some(MAX_IMAGE_SIDE));
+            Rendition::Copy { width, height }
+        }
+        (Rendition::Original, None) => Rendition::Copy {
+            width: MAX_IMAGE_SIDE,
+            height: MAX_IMAGE_SIDE,
+        },
+        (copy, _) => copy,
+    })
+}
+
+/// Reads an image's size from the first 64 KiB of its file, which holds the header for most
+/// formats. `None` when that is not enough or the file cannot be read.
+fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut head).ok()?;
+    image::ImageReader::new(std::io::Cursor::new(head))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
 }
 
 /// Reads a local image's size from its header alone.
 fn read_dimensions(path: &str) -> Result<(u32, u32), String> {
+    if let Some(size) = header_dimensions(Path::new(path)) {
+        return Ok(size);
+    }
     image::ImageReader::open(path)
         .map_err(|e| format!("failed to read local image: {}", e))?
         .with_guessed_format()
@@ -152,10 +242,12 @@ pub fn file_stamp(meta: &std::fs::Metadata) -> i64 {
 /// as the file it points to. Fails only when the file's metadata cannot be read.
 pub fn read_image_stamp(path: &Path) -> std::io::Result<ImageStamp> {
     let meta = std::fs::metadata(path)?;
-    let size = image::ImageReader::open(path)
-        .and_then(|reader| reader.with_guessed_format())
-        .ok()
-        .and_then(|reader| reader.into_dimensions().ok());
+    let size = header_dimensions(path).or_else(|| {
+        image::ImageReader::open(path)
+            .and_then(|reader| reader.with_guessed_format())
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+    });
     Ok(ImageStamp {
         stamp: file_stamp(&meta),
         size,
@@ -208,32 +300,19 @@ pub async fn render_image(
         return Ok(bytes);
     }
 
-    // Read and resize. The target comes from the decoded size, so a stale size cannot upscale.
+    // Read, then decode, resize and encode off the async threads, two at a time. The blocking task
+    // holds the permit, so a request dropped mid-render frees it only when the work ends.
     let source_bytes = read_image_bytes(source_path, http_client).await?;
-    let img = image::load_from_memory(&source_bytes)
-        .map_err(|e| format!("failed to decode image: {}", e))?;
-    // Fitting to both bounds at once re-rounds, so try each bound alone and keep the larger.
-    let (w, h) = (img.width(), img.height());
-    let target = [
-        target_size(w, h, Some(width), None),
-        target_size(w, h, None, Some(height)),
-    ]
-    .into_iter()
-    .filter(|&(tw, th)| tw <= width && th <= height)
-    .max_by_key(|&(tw, th)| u64::from(tw) * u64::from(th))
-    .unwrap_or_else(|| target_size(w, h, Some(width), Some(height)));
-    let img = if target != (w, h) {
-        img.resize_exact(target.0, target.1, FilterType::Lanczos3)
-    } else {
-        img
-    };
-
-    // Encode as JPEG; the encoder rejects alpha, so the image goes in as RGB
-    let mut buf = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(img.to_rgb8())
-        .write_to(&mut buf, image::ImageFormat::Jpeg)
-        .map_err(|e| format!("failed to encode image: {}", e))?;
-    let bytes = buf.into_inner();
+    let permit = RENDERS
+        .acquire()
+        .await
+        .map_err(|e| format!("failed to render image: {}", e))?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        encode_copy(&source_bytes, width, height)
+    })
+    .await
+    .map_err(|e| format!("failed to render image: {}", e))??;
 
     // Cache the copy. A failure is logged, and the bytes are served all the same.
     if let Err(e) = write_copy(cache_dir, &name, &bytes).await {
@@ -246,6 +325,78 @@ pub async fn render_image(
 /// Whether a disk copy is whole: at least 4 bytes, from the JPEG start marker to the end marker.
 fn is_whole_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes.starts_with(&[0xFF, 0xD8]) && bytes.ends_with(&[0xFF, 0xD9])
+}
+
+/// How a resize is done: an optional box-filter step to `first`, then one step to the target, by
+/// Lanczos3 when `lanczos` is set, else by the box filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizePlan {
+    /// The intermediate size, when the source is first shrunk to it.
+    pub first: Option<(u32, u32)>,
+    /// Whether the last step is Lanczos3, whose float buffer must fit `RESIZE_BUFFER_MAX_BYTES`.
+    pub lanczos: bool,
+}
+
+/// Plans a resize from `source` to `target`. A shrink larger than two times goes first to twice the
+/// target, so the last step is never more than two times smaller.
+pub fn resize_plan(source: (u32, u32), target: (u32, u32)) -> ResizePlan {
+    let pre = (
+        source.0.min(target.0.saturating_mul(2)),
+        source.1.min(target.1.saturating_mul(2)),
+    );
+    let first = (pre != source).then_some(pre);
+    let lanczos = u64::from(pre.0) * u64::from(target.1) * 16 <= RESIZE_BUFFER_MAX_BYTES;
+    ResizePlan { first, lanczos }
+}
+
+/// Decodes an image, refusing one over `MAX_DECODE_SIDE` or that would allocate more than
+/// `MAX_DECODE_BYTES`.
+fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("failed to decode image: {}", e))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_SIDE);
+    limits.max_image_height = Some(MAX_DECODE_SIDE);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|e| format!("failed to decode image: {}", e))
+}
+
+/// Decodes a source and encodes it as a JPEG copy that fits within `width`x`height`. This is the
+/// CPU work of a `Copy`, run off the async threads.
+fn encode_copy(source: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut img = decode_limited(source)?;
+    // Fitting to both bounds at once re-rounds, so try each bound alone and keep the larger.
+    let (w, h) = (img.width(), img.height());
+    let target = [
+        target_size(w, h, Some(width), None),
+        target_size(w, h, None, Some(height)),
+    ]
+    .into_iter()
+    .filter(|&(tw, th)| tw <= width && th <= height)
+    .max_by_key(|&(tw, th)| u64::from(tw) * u64::from(th))
+    .unwrap_or_else(|| target_size(w, h, Some(width), Some(height)));
+    if target != (w, h) {
+        let plan = resize_plan((w, h), target);
+        if let Some((fw, fh)) = plan.first {
+            img = img.thumbnail_exact(fw, fh);
+        }
+        img = if plan.lanczos {
+            img.resize_exact(target.0, target.1, FilterType::Lanczos3)
+        } else {
+            img.thumbnail_exact(target.0, target.1)
+        };
+    }
+
+    // Encode as JPEG; the encoder rejects alpha, so the image goes in as RGB
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img.to_rgb8())
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("failed to encode image: {}", e))?;
+    Ok(buf.into_inner())
 }
 
 /// A file last modified longer ago than this is stale: a disk copy this old is marked as used when
@@ -320,11 +471,17 @@ async fn read_image_bytes(
                 .map_err(|e| format!("failed to create HTTP client: {}", e))?,
         };
 
-        let resp = client
+        let mut resp = client
             .get(source)
             .send()
             .await
             .map_err(|e| format!("failed to fetch remote image: {}", e))?;
+        let too_large = || {
+            format!(
+                "remote image is too large: over {} bytes",
+                REMOTE_IMAGE_MAX_BYTES
+            )
+        };
 
         // Check for successful HTTP status
         if !resp.status().is_success() {
@@ -347,10 +504,24 @@ async fn read_image_bytes(
             ));
         }
 
-        resp.bytes()
+        if resp
+            .content_length()
+            .is_some_and(|len| len > REMOTE_IMAGE_MAX_BYTES)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("failed to read remote image bytes: {}", e))
+            .map_err(|e| format!("failed to read remote image bytes: {}", e))?
+        {
+            if (body.len() + chunk.len()) as u64 > REMOTE_IMAGE_MAX_BYTES {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     } else {
         fs::read(source)
             .await
@@ -366,7 +537,7 @@ pub async fn compute_blurhash(
     http_client: Option<&reqwest::Client>,
 ) -> Option<String> {
     let bytes = read_image_bytes(source_path, http_client).await.ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
+    let img = decode_limited(&bytes).ok()?;
     // Downscale to a small image for faster encoding
     let small = img.resize(16, 16, FilterType::Triangle);
     let rgba = small.to_rgba8();
@@ -990,5 +1161,352 @@ mod tests {
             (report.removed, report.freed_bytes, report.kept_bytes),
             (0, 0, 0)
         );
+    }
+
+    // B30 fix round 1
+
+    #[test]
+    fn b30_f3_only_formats_every_client_shows_are_served_as_they_are() {
+        for path in [
+            "/m/poster.jpg",
+            "/m/poster.JPEG",
+            "/m/poster.png",
+            "/m/poster.gif",
+            "/m/poster.webp",
+            "/m/poster.bmp",
+            "https://image.tmdb.org/t/p/original/abc.jpg",
+            "https://example.com/a.png?size=large#top",
+        ] {
+            assert!(serves_as_is(path), "{path}");
+        }
+        for path in [
+            "/m/poster.tiff",
+            "/m/poster.TIF",
+            "/m/poster.avif",
+            "/m/poster",
+            "/m/poster.jpg.tiff",
+            "https://example.com/a.tiff?x=y.jpg",
+        ] {
+            assert!(!serves_as_is(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b30_f3_a_tiff_is_always_served_as_a_jpeg_copy() {
+        let (root, _remove) = b30_root();
+        let tiff = root.join("media").join("poster.tiff");
+        std::fs::create_dir_all(tiff.parent().unwrap()).unwrap();
+        image::RgbImage::from_pixel(60, 90, image::Rgb([255, 0, 0]))
+            .save(&tiff)
+            .unwrap();
+        let path = tiff.to_str().unwrap();
+        let full = Rendition::Copy {
+            width: 60,
+            height: 90,
+        };
+        // At or above its own size, and with no bounds at all, it is a copy at its own size.
+        for (known, max_width, max_height) in [
+            (None, None, None),
+            (Some((60, 90)), None, None),
+            (None, Some(60), None),
+            (Some((60, 90)), Some(60), None),
+            (Some((60, 90)), Some(4096), Some(4096)),
+        ] {
+            let plan = plan_rendition(path, known, max_width, max_height)
+                .await
+                .unwrap();
+            assert_eq!(plan, full, "{known:?} {max_width:?} {max_height:?}");
+        }
+        // Below it, a smaller copy as before.
+        let plan = plan_rendition(path, Some((60, 90)), Some(30), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan,
+            Rendition::Copy {
+                width: 30,
+                height: 45
+            }
+        );
+        // A large one is capped at the largest side served.
+        let plan = plan_rendition("/m/scan.tiff", Some((5000, 100)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan,
+            Rendition::Copy {
+                width: MAX_IMAGE_SIDE,
+                height: 82
+            }
+        );
+        // A remote one of unknown size gets the cap as its bounds.
+        let plan = plan_rendition("https://example.com/a.tiff", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan,
+            Rendition::Copy {
+                width: MAX_IMAGE_SIDE,
+                height: MAX_IMAGE_SIDE
+            }
+        );
+
+        let bytes = render_image(path, Some(1), full, &root.join("cache"), None)
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(&[0xFF, 0xD8]), "not a JPEG");
+        let served = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((served.width(), served.height()), (60, 90));
+
+        // A JPEG is still served as it is.
+        let jpeg = root.join("media").join("poster.jpg");
+        write_poster(&jpeg, [0, 0, 255]);
+        let jpeg = jpeg.to_str().unwrap();
+        for (known, max_width) in [(None, None), (Some((60, 90)), Some(60))] {
+            let plan = plan_rendition(jpeg, known, max_width, None).await.unwrap();
+            assert_eq!(plan, Rendition::Original, "{known:?} {max_width:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn b30_f7_a_bounded_request_for_a_large_file_gets_a_copy() {
+        let (root, _remove) = b30_root();
+        let poster = root.join("poster.jpg");
+        write_poster(&poster, [255, 0, 0]);
+        let path = poster.to_str().unwrap();
+        // Small enough: the stored size decides.
+        let plan = plan_rendition(path, Some((60, 90)), Some(60), None)
+            .await
+            .unwrap();
+        assert_eq!(plan, Rendition::Original);
+
+        // Replaced in place by a file over the limit, while the stored size is still 60x90. (A
+        // sparse tail: no data is written.)
+        std::fs::File::options()
+            .write(true)
+            .open(&poster)
+            .unwrap()
+            .set_len(ORIGINAL_MAX_BYTES + 1)
+            .unwrap();
+        let plan = plan_rendition(path, Some((60, 90)), Some(60), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan,
+            Rendition::Copy {
+                width: 60,
+                height: MAX_IMAGE_SIDE
+            },
+            "a bounded request got a file over {ORIGINAL_MAX_BYTES} bytes"
+        );
+        // A request without bounds asks for the original, and gets it.
+        let plan = plan_rendition(path, Some((60, 90)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(plan, Rendition::Original);
+    }
+
+    /// Writes a `width`x`height` grey PNG.
+    fn b30_grey_png(path: &Path, width: u32, height: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::GrayImage::from_pixel(width, height, image::Luma([128]))
+            .save(path)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn b30_f5_a_source_wider_than_the_decode_limit_is_refused() {
+        let (root, _remove) = b30_root();
+        let cache_dir = root.join("cache");
+        let copy = Rendition::Copy {
+            width: 100,
+            height: 100,
+        };
+        let wide = root.join("wide.png");
+        b30_grey_png(&wide, MAX_DECODE_SIDE + 1, 1);
+        let refused = render_image(wide.to_str().unwrap(), None, copy, &cache_dir, None).await;
+        assert!(refused.is_err(), "decoded a source over the limit");
+
+        let at_limit = root.join("at-limit.png");
+        b30_grey_png(&at_limit, MAX_DECODE_SIDE, 1);
+        let bytes = render_image(at_limit.to_str().unwrap(), None, copy, &cache_dir, None)
+            .await
+            .unwrap();
+        let served = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((served.width(), served.height()), (100, 1));
+    }
+
+    #[test]
+    fn b30_f5_resize_plans_keep_the_float_buffer_bounded() {
+        let plan = |source, target| resize_plan(source, target);
+        // A big shrink goes first to twice the target, then by Lanczos3.
+        assert_eq!(
+            plan((1000, 1500), (300, 450)),
+            ResizePlan {
+                first: Some((600, 900)),
+                lanczos: true
+            }
+        );
+        // A shrink by two or less is one Lanczos3 step.
+        assert_eq!(
+            plan((2000, 3000), (1000, 1500)),
+            ResizePlan {
+                first: None,
+                lanczos: true
+            }
+        );
+        assert_eq!(
+            plan((3840, 2160), (1920, 1080)),
+            ResizePlan {
+                first: None,
+                lanczos: true
+            }
+        );
+        // When even that buffer is too large, the last step is the box filter.
+        assert_eq!(
+            plan((23170, 23170), (4096, 4096)),
+            ResizePlan {
+                first: Some((8192, 8192)),
+                lanczos: false
+            }
+        );
+        assert_eq!(
+            plan((5000, 5000), (4096, 4096)),
+            ResizePlan {
+                first: None,
+                lanczos: false
+            }
+        );
+        // Lanczos3's buffer is the width it starts from by the target height, in RGBA f32.
+        for source in [(23170, 23170), (16384, 100), (100, 16384), (8000, 6000)] {
+            for target in [(4096, 4096), (1920, 1080), (300, 450), (1, 1)] {
+                let p = plan(source, target);
+                let (width, _) = p.first.unwrap_or(source);
+                if p.lanczos {
+                    let bytes = u64::from(width) * u64::from(target.1) * 16;
+                    assert!(
+                        bytes <= RESIZE_BUFFER_MAX_BYTES,
+                        "{source:?} -> {target:?}: {bytes}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn b30_f5_copies_are_the_planned_size_after_two_steps() {
+        let (root, _remove) = b30_root();
+        let poster = root.join("tall.png");
+        std::fs::create_dir_all(&root).unwrap();
+        image::RgbImage::from_pixel(1200, 1800, image::Rgb([255, 0, 0]))
+            .save(&poster)
+            .unwrap();
+        let path = poster.to_str().unwrap().to_string();
+        let cache_dir = root.join("cache");
+        // Several at once, more than may render together, all finish.
+        let renders = [(100, 150), (300, 450), (61, 92), (500, 750)].map(|(width, height)| {
+            let (path, cache_dir) = (path.clone(), cache_dir.clone());
+            tokio::spawn(async move {
+                let copy = Rendition::Copy { width, height };
+                let bytes = render_image(&path, Some(3), copy, &cache_dir, None)
+                    .await
+                    .unwrap();
+                (width, height, bytes)
+            })
+        });
+        for render in renders {
+            let (width, height, bytes) = render.await.unwrap();
+            let served = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((served.width(), served.height()), (width, height));
+            let [r, g, b] = mean_rgb(&bytes);
+            assert!(
+                r > 200 && g < 60 && b < 60,
+                "{width}x{height}: {:?}",
+                [r, g, b]
+            );
+        }
+    }
+
+    /// Serves one HTTP answer of `len` zero bytes labelled as a JPEG, with a Content-Length
+    /// header when `declared`, and returns its URL.
+    async fn b30_serve_zeros(len: usize, declared: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let head = if declared {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {len}\r\n\r\n"
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            };
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = vec![0u8; 64 * 1024];
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if socket.write_all(&chunk[..n]).await.is_err() {
+                    return;
+                }
+                left -= n;
+            }
+        });
+        format!("http://{addr}/poster.jpg")
+    }
+
+    #[tokio::test]
+    async fn b30_f5_a_remote_body_over_the_cap_is_refused() {
+        let (root, _remove) = b30_root();
+        let over = REMOTE_IMAGE_MAX_BYTES as usize + 1;
+        for declared in [true, false] {
+            let url = b30_serve_zeros(over, declared).await;
+            let result = render_image(&url, None, Rendition::Original, &root, None).await;
+            let error = result.expect_err("read a remote body over the cap");
+            assert!(error.contains("too large"), "{declared}: {error}");
+        }
+        // At the cap it is read.
+        let url = b30_serve_zeros(1000, true).await;
+        let bytes = render_image(&url, None, Rendition::Original, &root, None)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 1000);
+    }
+
+    #[test]
+    fn b30_f10_sizes_come_from_the_header() {
+        let (root, _remove) = b30_root();
+        std::fs::create_dir_all(&root).unwrap();
+        // A JPEG with 200 KB of APP15 segments before its frame header, past the first read.
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(70, 30, image::Rgb([9, 9, 9]))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = jpeg.into_inner();
+        let mut padded = jpeg[..2].to_vec();
+        for _ in 0..4 {
+            padded.extend_from_slice(&[0xFF, 0xEF, 0xC3, 0x50]);
+            padded.extend(std::iter::repeat_n(0u8, 0xC350 - 2));
+        }
+        padded.extend_from_slice(&jpeg[2..]);
+        let late = root.join("late.jpg");
+        std::fs::write(&late, &padded).unwrap();
+        assert_eq!(read_image_stamp(&late).unwrap().size, Some((70, 30)));
+        assert_eq!(read_dimensions(late.to_str().unwrap()), Ok((70, 30)));
+
+        let tiff = root.join("poster.tiff");
+        image::RgbImage::from_pixel(40, 20, image::Rgb([9, 9, 9]))
+            .save(&tiff)
+            .unwrap();
+        assert_eq!(read_image_stamp(&tiff).unwrap().size, Some((40, 20)));
+        let png = root.join("wide.png");
+        b30_grey_png(&png, 3000, 2);
+        assert_eq!(read_dimensions(png.to_str().unwrap()), Ok((3000, 2)));
     }
 }
