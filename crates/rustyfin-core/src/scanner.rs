@@ -208,6 +208,7 @@ pub async fn scan_with_metadata(
 /// Restamps the local images of `scope` whose files changed since they were stored, and returns how
 /// many had a stored stamp that changed. An image with no stamp yet is stamped without being counted.
 /// A failed stat or read skips its image, and a database error skips it too, so it counts nothing.
+/// A header that can't be read leaves the stored size.
 async fn restamp_local_images(pool: &SqlitePool, library: &Library, scope: &ScanScope) -> u32 {
     let images = match rustyfin_db::repo_image::get_local_images_in_scope(
         pool,
@@ -239,8 +240,10 @@ async fn restamp_local_images(pool: &SqlitePool, library: &Library, scope: &Scan
                     local_images::local_image_version(Path::new(&img.path));
                 let counted = img.stamp.is_some();
                 img.stamp = Some(stamp?);
-                img.width = width;
-                img.height = height;
+                if let (Some(w), Some(h)) = (width, height) {
+                    img.width = Some(w);
+                    img.height = Some(h);
+                }
                 Some((img, counted))
             })
             .collect::<Vec<_>>()
