@@ -3277,6 +3277,172 @@ async fn b30_p2_a_rescan_finds_a_poster_replaced_in_place() {
     );
 }
 
+/// An item's details, as the caller gets them from `/Items/{id}`.
+async fn b30_details(app: &axum::Router, token: &str, id: uuid::Uuid) -> serde_json::Value {
+    let (status, details) = send_authed(app, "GET", &format!("/Items/{id}"), token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    details
+}
+
+/// Stores a local image row for `item_id` at `path` with `stamp`.
+async fn b30_set_image(
+    state: &AppState,
+    item_id: uuid::Uuid,
+    image_type: rustyfin_model::image::ImageType,
+    path: &str,
+    stamp: Option<i64>,
+) {
+    let image = rustyfin_model::image::ItemImage {
+        item_id,
+        image_type,
+        image_index: 0,
+        path: path.to_string(),
+        provider: "local".to_string(),
+        width: None,
+        height: None,
+        blurhash: None,
+        stamp,
+    };
+    rustyfin_db::repo_image::upsert_image(&state.db, &image)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn b30_f2_hint_tags_change_with_the_image() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::Primary;
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let path = state.data_dir.join("b30-hint.jpg");
+    let path = path.to_string_lossy();
+
+    // Each search has its own paging, so neither answer comes from the search cache.
+    b30_set_image(&state, lib.movie, Primary, &path, Some(1)).await;
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet&Limit=50", &lib.token).await;
+    let first = j6_hint(&body, lib.movie)["PrimaryImageTag"].clone();
+    assert_eq!(first, image_tag(&path, Some(1)), "{body}");
+
+    // The file is replaced: a scan or an upload stores a new stamp.
+    b30_set_image(&state, lib.movie, Primary, &path, Some(2)).await;
+    let body = b27_answer(&app, "/Search/Hints?searchTerm=comet&Limit=49", &lib.token).await;
+    let second = j6_hint(&body, lib.movie)["PrimaryImageTag"].clone();
+    assert_ne!(
+        second, first,
+        "the hint's tag did not change with the image"
+    );
+    let details = b30_details(&app, &lib.token, lib.movie).await;
+    assert_eq!(second, details["ImageTags"]["Primary"], "{details}");
+}
+
+#[tokio::test]
+async fn b30_f14_an_episodes_details_carry_its_series_tags() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::{Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let primary = state.data_dir.join("b30-series-primary.jpg");
+    let primary = primary.to_string_lossy();
+    let thumb = state.data_dir.join("b30-series-thumb.jpg");
+    let thumb = thumb.to_string_lossy();
+    b30_set_image(&state, lib.series, Primary, &primary, Some(5)).await;
+    b30_set_image(&state, lib.series, Thumb, &thumb, Some(6)).await;
+
+    let episode = b30_details(&app, &lib.token, lib.episode).await;
+    assert_eq!(
+        episode["SeriesId"],
+        serde_json::json!(lib.series),
+        "{episode}"
+    );
+    assert_eq!(
+        episode["SeriesPrimaryImageTag"],
+        image_tag(&primary, Some(5)),
+        "{episode}"
+    );
+    assert_eq!(
+        episode["SeriesThumbImageTag"],
+        image_tag(&thumb, Some(6)),
+        "{episode}"
+    );
+    // The episode list gives the same tag.
+    let uri = "/Items?IncludeItemTypes=Episode&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"))
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.episode))
+        .unwrap_or_else(|| panic!("no episode in {list}"));
+    assert_eq!(
+        listed["SeriesPrimaryImageTag"], episode["SeriesPrimaryImageTag"],
+        "{list}"
+    );
+}
+
+#[tokio::test]
+async fn b30_f15_a_persons_tag_follows_the_image_path() {
+    use rustyfin_core::image_proxy::image_tag;
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let mut paths = Vec::new();
+    for (n, name) in ["B30 Actor One", "B30 Actor Two"].into_iter().enumerate() {
+        let person = uuid::Uuid::new_v4().to_string();
+        let path = state.data_dir.join(format!("people/jf-Primary-0-{n}.jpg"));
+        let path = path.to_string_lossy().to_string();
+        sqlx::query("INSERT INTO people (id, name, type) VALUES (?, ?, 'Actor')")
+            .bind(&person)
+            .bind(name)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_people (item_id, person_id, type) VALUES (?, ?, 'Actor')")
+            .bind(lib.movie.to_string())
+            .bind(&person)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO person_images (person_id, image_type, image_index, path) \
+             VALUES (?, 'Primary', 0, ?)",
+        )
+        .bind(&person)
+        .bind(&path)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        paths.push((name, path));
+    }
+
+    let details = b30_details(&app, &lib.token, lib.movie).await;
+    let uri = "/Items?IncludeItemTypes=Movie&Recursive=true&Fields=People";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items in {list}"))
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.movie))
+        .unwrap_or_else(|| panic!("no movie in {list}"));
+    for answer in [&details, listed] {
+        for (name, path) in &paths {
+            let person = answer["People"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no People in {answer}"))
+                .iter()
+                .find(|person| person["Name"] == *name)
+                .unwrap_or_else(|| panic!("no {name} in {answer}"));
+            assert_eq!(person["PrimaryImageTag"], image_tag(path, None), "{answer}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn b30_p5_search_rejects_negative_and_oversized_paging() {
     let state = test_state().await;
@@ -4639,26 +4805,51 @@ async fn j6_hint_images_follow_jellyfin() {
     let app = app(state);
 
     let body = b27_answer(&app, "/Search/Hints?searchTerm=comet", &lib.token).await;
+    // B30: a hint's tags are the image's own, as the item's details give them.
+    let movie_tags = b30_details(&app, &lib.token, lib.movie).await;
+    let primary = movie_tags["ImageTags"]["Primary"].as_str().unwrap_or("");
+    assert!(b30_is_tag(primary), "{movie_tags}");
+    let series_tags = b30_details(&app, &lib.token, lib.series).await;
     // An item's own images, the lowest index of each type; the aspect ratio of the primary image
     // when its size is known.
     let movie = j6_hint(&body, lib.movie);
-    assert_eq!(movie["PrimaryImageTag"], "Primary_0", "{movie}");
+    assert_eq!(
+        movie["PrimaryImageTag"], movie_tags["ImageTags"]["Primary"],
+        "{movie}"
+    );
     let ratio = movie["PrimaryImageAspectRatio"]
         .as_f64()
         .unwrap_or_else(|| panic!("no PrimaryImageAspectRatio in {movie}"));
     assert!((ratio - 1000.0 / 1500.0).abs() < 1e-9, "{movie}");
-    assert_eq!(movie["ThumbImageTag"], "Thumb_0", "{movie}");
+    assert_eq!(
+        movie["ThumbImageTag"], movie_tags["ImageTags"]["Thumb"],
+        "{movie}"
+    );
     assert_eq!(movie["ThumbImageItemId"], lib.movie.simple().to_string());
-    assert_eq!(movie["BackdropImageTag"], "Backdrop_1", "{movie}");
+    // Backdrops 1 and 2: the hint takes index 1, the details' first.
+    assert_eq!(
+        movie["BackdropImageTag"], movie_tags["BackdropImageTags"][0],
+        "{movie}"
+    );
     assert_eq!(movie["BackdropImageItemId"], lib.movie.simple().to_string());
     // An episode without a thumb takes its series' thumb before its season's, and the backdrop of
     // the nearest parent that has one.
     let episode = j6_hint(&body, lib.episode);
-    assert_eq!(episode["PrimaryImageTag"], "Primary_0", "{episode}");
+    assert_eq!(
+        episode["PrimaryImageTag"],
+        b30_details(&app, &lib.token, lib.episode).await["ImageTags"]["Primary"],
+        "{episode}"
+    );
     j6_assert_absent(episode, &["PrimaryImageAspectRatio"]);
-    assert_eq!(episode["ThumbImageTag"], "Thumb_0", "{episode}");
+    assert_eq!(
+        episode["ThumbImageTag"], series_tags["ImageTags"]["Thumb"],
+        "{episode}"
+    );
     assert_eq!(episode["ThumbImageItemId"], lib.series.simple().to_string());
-    assert_eq!(episode["BackdropImageTag"], "Backdrop_0", "{episode}");
+    assert_eq!(
+        episode["BackdropImageTag"], series_tags["BackdropImageTags"][0],
+        "{episode}"
+    );
     assert_eq!(
         episode["BackdropImageItemId"],
         lib.series.simple().to_string()
@@ -4680,7 +4871,10 @@ async fn j6_hint_images_follow_jellyfin() {
     // A size of zero gives a tag but no aspect ratio. Without a series thumb, an episode takes
     // the thumb of its nearest parent that has one.
     let watch_season_hint = j6_hint(&body, watch_season);
-    assert_eq!(watch_season_hint["PrimaryImageTag"], "Primary_0");
+    assert_eq!(
+        watch_season_hint["PrimaryImageTag"],
+        b30_details(&app, &lib.token, watch_season).await["ImageTags"]["Primary"]
+    );
     j6_assert_absent(watch_season_hint, &["PrimaryImageAspectRatio"]);
     let watch_episode_hint = j6_hint(&body, watch_episode);
     assert_eq!(
@@ -4698,7 +4892,11 @@ async fn j6_hint_images_follow_jellyfin() {
     );
     // A track does not take its album's primary image.
     let album = j6_hint(&body, lib.album);
-    assert_eq!(album["PrimaryImageTag"], "Primary_0", "{album}");
+    assert_eq!(
+        album["PrimaryImageTag"],
+        b30_details(&app, &lib.token, lib.album).await["ImageTags"]["Primary"],
+        "{album}"
+    );
     j6_assert_absent(
         j6_hint(&body, lib.track),
         &[
