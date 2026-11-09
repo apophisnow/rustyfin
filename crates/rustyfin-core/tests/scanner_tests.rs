@@ -7834,6 +7834,44 @@ async fn b32_rescans_make_stored_specials_folders_season_0() {
     assert_eq!(marks_of(&fx.pool, &user, alpha).await, Some(favorite));
 }
 
+#[tokio::test]
+async fn b32_f1_specials_folders_keep_the_season_of_a_file_name() {
+    // Jellyfin takes an episode's season from its file name first, and the folder's only when the name
+    // gives none (12.4 `Library/LibraryManager.cs:3400-3423`).
+    const S01E05: &str = "Golf/Specials/Golf S01E05.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    for rel in [
+        S01E05,
+        "Golf/Specials/Golf S00E01.mkv",
+        "Golf/Specials/Golf.ep02.mkv",
+    ] {
+        touch(&root_of(&lib), rel);
+    }
+
+    scan(&fx.pool, &lib).await;
+    // By path: S00E01, S01E05, then the unnumbered file.
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(1), Some(0)]
+    );
+
+    // 1a575b4 stored the folder's 0. A rescan gives the file name's 1 back, under the same id.
+    let episode = item_at(&fx.pool, &lib, S01E05).await;
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET parent_index_number = 0 WHERE id = ?1",
+        &[&episode.to_string()],
+    )
+    .await;
+    scan(&fx.pool, &lib).await;
+    assert_eq!(
+        b32_episode_seasons(&fx.pool, &lib).await,
+        [Some(0), Some(1), Some(0)]
+    );
+    assert_eq!(item_at(&fx.pool, &lib, S01E05).await, episode);
+}
+
 /// A `tvshow.nfo` with a value for each field that an NFO fills.
 const B32_TVSHOW_NFO: &str = "<tvshow><title>Hotel Series</title><year>2015</year>\
     <plot>Synthetic test show.</plot><rating>7.5</rating><mpaa>TV-14</mpaa>\

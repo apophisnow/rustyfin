@@ -952,7 +952,12 @@ async fn scan_tv_library(
                 series_id,
                 index_number: parsed.map(|n| n.episode),
                 index_number_end: parsed.and_then(|n| n.ending),
-                parent_index_number: season_number.or_else(|| parsed.and_then(|n| n.season)),
+                // In a specials folder the file name's season wins (Jellyfin 12.4 `LibraryManager.cs:3400-3423`).
+                parent_index_number: if season_number == Some(0) {
+                    parsed.and_then(|n| n.season).or(season_number)
+                } else {
+                    season_number.or_else(|| parsed.and_then(|n| n.season))
+                },
             });
         }
     }
