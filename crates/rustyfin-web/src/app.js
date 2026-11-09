@@ -257,6 +257,7 @@ async function wizComplete() {
             try {
                 await API.login(wizCredentials.name, wizCredentials.password);
                 wizProgress.loggedIn = true;
+                wizCredentials = null; // the password isn't needed after the sign-in
                 // Replace a socket or retry left from an earlier session, so the new token is used now
                 stopScanProgressWebSocket();
                 initScanProgressWebSocket();
@@ -539,10 +540,12 @@ function sectionRow(title, items, moreAction = null, options = {}) {
 
 // --- Home Page Renderer ---
 async function renderHome() {
+    const session = API.token; // stop drawing if this session ends meanwhile
     const page = $('page-home');
     if (!API.isLoggedIn()) {
         try {
             const info = await API.getPublicInfo();
+            if (API.token !== session) return;
             const sn = info.ServerName || info.server_name || 'Rustyfin';
             const ver = info.Version || info.version || serverVersion;
             page.innerHTML = `
@@ -574,6 +577,7 @@ async function renderHome() {
                 </button>
             </div>`;
         } catch {
+            if (API.token !== session) return;
             page.innerHTML = `<div class="p-10 text-center text-red-400 jf-page">${t('home.server_unreachable')}</div>`;
         }
         return;
@@ -589,6 +593,7 @@ async function renderHome() {
             (API.getLatest ? API.getLatest(20) : Promise.resolve([])).catch(() => []),
             API.getLibraries().catch(err => { libsError = err; return null; })
         ]);
+        if (API.token !== session) return;
 
         const resume = resumeData.Items || resumeData.items || [];
         const nextUp = nextUpData.Items || nextUpData.items || [];
@@ -711,12 +716,14 @@ async function renderHome() {
         c += '</div>';
         page.innerHTML = c;
     } catch (e) {
+        if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 jf-page">${t('home.load_failed', { message: escapeHtml(e.message) })}</div>`;
     }
 }
 
 // --- Favorites Page Renderer (with pagination) ---
 async function renderFavorites() {
+    const session = API.token;
     favoritesPage = 0;
     destroyInfiniteScroll();
     const page = $('page-favorites');
@@ -741,6 +748,7 @@ async function renderFavorites() {
     try {
         // Use pagination to avoid loading all favorites at once
         const data = await API.getUserItems({ IsFavorite: true, StartIndex: 0, Limit: LIBRARY_PAGE_SIZE });
+        if (API.token !== session) return;
         const items = data.Items || data.items || [];
         const total = data.TotalRecordCount || data.total_record_count || items.length;
         const hasMore = items.length >= LIBRARY_PAGE_SIZE;
@@ -781,6 +789,7 @@ async function renderFavorites() {
             setupInfiniteScroll(() => loadMoreFavoritesInfinite(total));
         }
     } catch (e) {
+        if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
@@ -912,6 +921,7 @@ function addInfiniteScrollSentinel(container) {
 
 // --- Library Explorer Page Renderer (with pagination) ---
 async function renderLibrary(libId) {
+    const session = API.token;
     currentLibraryId = libId;
     const page = $('page-library');
     
@@ -954,7 +964,7 @@ async function renderLibrary(libId) {
             fetchLibraryPage(0),
             API.getFilters().catch(() => ({ Genres: [] }))
         ]);
-        if (gen !== libraryGen) return;
+        if (gen !== libraryGen || API.token !== session) return;
         const genres = filterData.Genres || filterData.genres || [];
 
         page.innerHTML = `
@@ -1010,7 +1020,7 @@ async function renderLibrary(libId) {
         $('lib-genre')?.addEventListener('change', () => reloadLibrary(libId));
         fillLibraryGrid(items, total);
     } catch (e) {
-        if (gen !== libraryGen) return;
+        if (gen !== libraryGen || API.token !== session) return;
         page.classList.remove('jf-with-rail');
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
@@ -1270,6 +1280,7 @@ window.addEventListener('resize', scheduleRailUpdate);
 
 // --- Detail View Renderer (Movies, TV Series, Music) ---
 async function renderDetail(itemId) {
+    const session = API.token;
     currentDetailId = itemId;
     const page = $('page-detail');
     // Show skeleton for detail view
@@ -1298,6 +1309,7 @@ async function renderDetail(itemId) {
 
     try {
         const item = await API.getItem(itemId);
+        if (API.token !== session) return;
         activeItem = item;
         const name = item.Name || item.name || '';
         const overview = item.Overview || item.overview || '';
@@ -1325,6 +1337,7 @@ async function renderDetail(itemId) {
             isContainer ? API.getChildren(id).catch(() => ({ Items: [] })) : Promise.resolve({ Items: [] }),
             API.getSimilar(id).catch(() => ({ Items: [] }))
         ]);
+        if (API.token !== session) return;
 
         // Children / Seasons / Episodes
         let seasonsOrEpisodesHtml = '';
@@ -1499,6 +1512,7 @@ async function renderDetail(itemId) {
             ${similarHtml}
         </div>`;
     } catch (e) {
+        if (API.token !== session) return;
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
 }
@@ -2584,9 +2598,7 @@ async function handleSetupPassword(e) {
 }
 
 function doLogout() {
-    stopScanProgressWebSocket();
     API.logout();
-    updateAuthUI();
     navigate('home');
     toast(t('login.signed_out'));
 }
@@ -4335,6 +4347,27 @@ function followAdminLoss() {
     if (currentPage === 'admin') navigate('home');
 }
 API.onAdminLost = followAdminLoss;
+
+// Runs after every sign-out, the user's or a 401's: drops what the signed-out user left in this tab, such as the
+// import page's setup codes and the server log, so the next user can't read them.
+function afterSignOut() {
+    stopScanProgressWebSocket();
+    LiveLog.disconnect();
+    LiveLog.messages = [];
+    jiShownCodes.clear();
+    jiPendingNames = new Map();
+    jiChoice.clear();
+    jiConfirm.clear();
+    $('page-admin').innerHTML = ''; // the import preview (#ji-users), its codes box and the live log
+    libraries = [];
+    updateAuthUI();
+}
+API.onSignedOut = afterSignOut;
+
+// Another tab signed in or out: reload, so this tab drops the old session's token, cache and pages.
+window.addEventListener('storage', e => {
+    if (e.key === 'rustyfin_token') location.reload();
+});
 
 // --- Live Log Functions ---
 let liveLogInitialized = false;
