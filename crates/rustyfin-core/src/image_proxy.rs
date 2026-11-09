@@ -315,11 +315,46 @@ pub async fn render_image(
     .map_err(|e| format!("failed to render image: {}", e))??;
 
     // Cache the copy. A failure is logged, and the bytes are served all the same.
-    if let Err(e) = write_copy(cache_dir, &name, &bytes).await {
-        tracing::warn!("failed to cache image copy {}: {}", cache_path.display(), e);
+    match write_copy(cache_dir, &name, &bytes).await {
+        Ok(()) => {
+            if note_written(&WRITTEN_SINCE_SWEEP, bytes.len() as u64) {
+                // The trim runs in the background, so the request does not wait for it.
+                let dir = cache_dir.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = sweep_image_cache(&dir, IMAGE_CACHE_MAX_BYTES) {
+                        tracing::warn!("failed to sweep image cache {}: {}", dir.display(), e);
+                    }
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to cache image copy {}: {}", cache_path.display(), e);
+        }
     }
 
     Ok(bytes)
+}
+
+/// How many bytes of disk copies are written between sweeps of the cache folder.
+pub const SWEEP_AFTER_BYTES: u64 = 64 << 20;
+
+/// The bytes of disk copies written since the last sweep was asked for.
+static WRITTEN_SINCE_SWEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adds `len` to `counter`. Once the total reaches `SWEEP_AFTER_BYTES`, the counter goes back to 0
+/// and this returns true, so only one caller sees true for each step.
+fn note_written(counter: &std::sync::atomic::AtomicU64, len: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut total = counter.load(Ordering::Relaxed);
+    loop {
+        let next = total.saturating_add(len);
+        let reached = next >= SWEEP_AFTER_BYTES;
+        let stored = if reached { 0 } else { next };
+        match counter.compare_exchange_weak(total, stored, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return reached,
+            Err(actual) => total = actual,
+        }
+    }
 }
 
 /// Whether a disk copy is whole: at least 4 bytes, from the JPEG start marker to the end marker.
@@ -403,9 +438,16 @@ fn encode_copy(source: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String
 /// it is hit, and a temporary file this old was left behind by a write that did not finish.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// How long ago a file was last modified; `None` when that is unknown or in the future.
-fn file_age(meta: &std::fs::Metadata) -> Option<std::time::Duration> {
-    meta.modified().ok()?.elapsed().ok()
+/// Whether a file is stale: last modified more than `STALE_AFTER` ago, or dated in the future. A
+/// file whose modified time is unknown is not stale.
+fn is_stale(meta: &std::fs::Metadata) -> bool {
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    match modified.elapsed() {
+        Ok(age) => age > STALE_AFTER,
+        Err(_) => true,
+    }
 }
 
 /// Marks a disk copy as used, for the cap's oldest-first trim: a copy stale by `STALE_AFTER` gets
@@ -414,8 +456,7 @@ async fn mark_copy_used(path: std::path::PathBuf) {
     let _ = tokio::task::spawn_blocking(move || {
         let stale = std::fs::metadata(&path)
             .ok()
-            .and_then(|meta| file_age(&meta))
-            .is_some_and(|age| age > STALE_AFTER);
+            .is_some_and(|meta| is_stale(&meta));
         if stale {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
@@ -570,6 +611,18 @@ pub struct SweepReport {
 /// file. Then the copies are removed, least recently modified first, until they total no more than
 /// `max_bytes`. A missing `dir` sweeps nothing.
 pub fn sweep_image_cache(dir: &Path, max_bytes: u64) -> std::io::Result<SweepReport> {
+    sweep_image_cache_with(dir, max_bytes, &mut |path: &Path| {
+        std::fs::remove_file(path)
+    })
+}
+
+/// `sweep_image_cache`, removing each file with `remove`. A removal that fails, other than because
+/// the file is gone, is logged and the sweep goes on without it.
+pub fn sweep_image_cache_with(
+    dir: &Path,
+    max_bytes: u64,
+    remove: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<SweepReport> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SweepReport::default()),
@@ -593,13 +646,13 @@ pub fn sweep_image_cache(dir: &Path, max_bytes: u64) -> std::io::Result<SweepRep
         let name = entry.file_name();
         let name = name.as_encoded_bytes();
         if is_temp_name(name) {
-            if file_age(&meta).is_some_and(|age| age > STALE_AFTER) {
-                remove_counted(&path, meta.len(), &mut report)?;
+            if is_stale(&meta) {
+                remove_counted(&path, meta.len(), &mut report, remove);
             }
         } else if is_copy_name(name) {
             copies.push((meta.modified()?, path, meta.len()));
         } else {
-            remove_counted(&path, meta.len(), &mut report)?;
+            remove_counted(&path, meta.len(), &mut report, remove);
         }
     }
 
@@ -610,8 +663,10 @@ pub fn sweep_image_cache(dir: &Path, max_bytes: u64) -> std::io::Result<SweepRep
         if report.kept_bytes <= max_bytes {
             break;
         }
-        remove_counted(&path, len, &mut report)?;
-        report.kept_bytes -= len;
+        // A copy whose removal failed stays in the kept bytes, and the trim goes on to the next
+        if remove_counted(&path, len, &mut report, remove) {
+            report.kept_bytes -= len;
+        }
     }
     Ok(report)
 }
@@ -625,13 +680,30 @@ fn present<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
     }
 }
 
-/// Removes a file and counts it in `report`. A file that is already gone is skipped, not counted.
-fn remove_counted(path: &Path, len: u64, report: &mut SweepReport) -> std::io::Result<()> {
-    if present(std::fs::remove_file(path))?.is_some() {
-        report.removed += 1;
-        report.freed_bytes += len;
+/// Removes a file and counts it in `report`. A file that is already gone is not counted. Returns
+/// whether the file is gone: false when its removal failed, which is logged.
+fn remove_counted(
+    path: &Path,
+    len: u64,
+    report: &mut SweepReport,
+    remove: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> bool {
+    match remove(path) {
+        Ok(()) => {
+            report.removed += 1;
+            report.freed_bytes += len;
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(
+                "failed to remove image cache file {}: {}",
+                path.display(),
+                e
+            );
+            false
+        }
     }
-    Ok(())
 }
 
 /// Whether a file name is a temporary file's: it starts with `.` and ends with `.tmp`.
@@ -1151,6 +1223,65 @@ mod tests {
             (report.removed, report.freed_bytes, report.kept_bytes),
             (0, 0, 2000)
         );
+    }
+
+    #[test]
+    fn b30_f9_sweep_goes_on_after_a_failed_delete() {
+        let (root, _remove) = b30_root();
+        let dir = root.join("images");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = |side: u32| format!("{}_{}_{side}x{side}.jpg", "c".repeat(64), "0".repeat(16));
+        b30_file(&dir, &name(1), 1000, 3 * B30_HOUR);
+        b30_file(&dir, &name(2), 1000, 2 * B30_HOUR);
+        b30_file(&dir, &name(3), 1000, B30_HOUR);
+        b30_file(&dir, "old_poster_300x0.jpg", 10, B30_MINUTE);
+        // The old name and the oldest copy cannot be deleted.
+        let stuck = [dir.join("old_poster_300x0.jpg"), dir.join(name(1))];
+        let mut remove = |path: &Path| {
+            if stuck.iter().any(|stuck| stuck == path) {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                std::fs::remove_file(path)
+            }
+        };
+
+        let report = sweep_image_cache_with(&dir, 1500, &mut remove).unwrap();
+        // The trim went on past them, to the next oldest, until the cap held.
+        assert_eq!(
+            (report.removed, report.freed_bytes, report.kept_bytes),
+            (2, 2000, 1000)
+        );
+        let mut kept = vec![name(1), "old_poster_300x0.jpg".to_string()];
+        kept.sort();
+        assert_eq!(b30_names(&dir), kept);
+    }
+
+    #[test]
+    fn b30_f9_a_temp_file_dated_in_the_future_is_stale() {
+        let (root, _remove) = b30_root();
+        let dir = root.join("images");
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp = format!(".{}.{}.tmp", "d".repeat(64), uuid::Uuid::new_v4().simple());
+        std::fs::write(dir.join(&temp), b"part").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(&temp))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + 2 * B30_HOUR)
+            .unwrap();
+        let report = sweep_image_cache(&dir, IMAGE_CACHE_MAX_BYTES).unwrap();
+        assert_eq!((report.removed, report.freed_bytes), (1, 4));
+        assert!(b30_names(&dir).is_empty());
+    }
+
+    #[test]
+    fn b30_f9_writes_past_the_step_call_for_a_sweep_once() {
+        let written = std::sync::atomic::AtomicU64::new(0);
+        assert!(!note_written(&written, SWEEP_AFTER_BYTES - 1));
+        assert!(note_written(&written, 1), "the step was reached");
+        assert!(!note_written(&written, 1), "the count starts again");
+        assert!(!note_written(&written, SWEEP_AFTER_BYTES - 2));
+        assert!(note_written(&written, 10 * SWEEP_AFTER_BYTES));
     }
 
     #[test]
