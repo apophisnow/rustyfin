@@ -13787,6 +13787,73 @@ async fn j2_profile_comes_from_the_device_capabilities() {
 }
 
 #[tokio::test]
+async fn j2_each_device_sees_its_own_capabilities() {
+    let state = test_state().await;
+    add_user(&state, "j2-devices", "j2-pass", false).await;
+    let (item, _, _) = j2_item(&state, "j2-devices", "Movie", "mp4", j2_h264("High 10", 10)).await;
+    let app = app(state);
+    let uri = format!("/Items/{item}/PlaybackInfo");
+    let capabilities = |token: &str, profile: serde_json::Value| {
+        let body = serde_json::json!({
+            "PlayableMediaTypes": ["Video", "Audio"],
+            "DeviceProfile": profile,
+        });
+        request(
+            "POST",
+            "/Sessions/Capabilities/Full",
+            Some(token),
+            Some(body),
+        )
+    };
+
+    // Two devices of one user sign in before either posts: Chrome, and one whose profile plays
+    // nothing
+    let (chrome, _) = g2_login_device(&app, "j2-devices", "j2-pass", "j2-devices-chrome")
+        .await
+        .unwrap();
+    let (bare, _) = g2_login_device(&app, "j2-devices", "j2-pass", "j2-devices-bare")
+        .await
+        .unwrap();
+    let (status, _) = send(&app, capabilities(&chrome, j2_chrome_profile())).await;
+    assert!(status.is_success(), "Chrome's capabilities: {status}");
+    let (status, _) = send(&app, capabilities(&bare, serde_json::json!({}))).await;
+    assert!(
+        status.is_success(),
+        "the other device's capabilities: {status}"
+    );
+
+    // A request without a profile gets the one its own device posted
+    let (sources, _) = j2_play(&app, "POST", &uri, &chrome, None).await;
+    assert_eq!(
+        j2_reasons(&sources[0]),
+        ["VideoProfileNotSupported"],
+        "Chrome"
+    );
+    assert!(sources[0]["TranscodingUrl"].is_string(), "Chrome");
+    let (sources, _) = j2_play(&app, "POST", &uri, &bare, None).await;
+    assert!(
+        sources[0]["TranscodeReasons"].is_array(),
+        "the other device"
+    );
+    assert_eq!(sources[0]["SupportsDirectPlay"], false, "the other device");
+    assert!(
+        sources[0].get("TranscodingUrl").is_none(),
+        "the other device"
+    );
+
+    // Chrome posting again leaves the other device's profile alone
+    let (status, _) = send(&app, capabilities(&chrome, j2_chrome_profile())).await;
+    assert!(status.is_success(), "Chrome's capabilities again: {status}");
+    let (sources, _) = j2_play(&app, "POST", &uri, &bare, None).await;
+    assert!(
+        sources[0].get("TranscodingUrl").is_none(),
+        "the other device, later"
+    );
+    let (sources, _) = j2_play(&app, "POST", &uri, &chrome, None).await;
+    assert!(sources[0]["TranscodingUrl"].is_string(), "Chrome, later");
+}
+
+#[tokio::test]
 async fn j2_odd_requests_never_fail_the_server() {
     let state = test_state().await;
     let (token, _) = admin_session(&state).await;
