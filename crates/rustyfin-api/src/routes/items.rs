@@ -376,11 +376,11 @@ async fn enrich_item(
                 {
                     item.series_thumb_image_tag = Some(tag.clone());
                 }
-                // Parent Thumb and Backdrop fall back to the series when the season has none
-                if item.parent_thumb_image_tag.is_none()
-                    && let Some(tag) = series_item
-                        .image_tags
-                        .get(&rustyfin_model::image::ImageType::Thumb)
+                // The series' Thumb replaces the season's, as in Jellyfin's AddInheritedImages.
+                // The parent Backdrop falls back to the series when the season has none.
+                if let Some(tag) = series_item
+                    .image_tags
+                    .get(&rustyfin_model::image::ImageType::Thumb)
                 {
                     item.parent_thumb_image_tag = Some(tag.clone());
                     item.parent_thumb_item_id = Some(series_item.id);
@@ -1047,15 +1047,15 @@ pub(crate) async fn enrich_items(
                         item.parent_backdrop_image_tags = parent.backdrop_image_tags.clone();
                         item.parent_backdrop_item_id = Some(parent.id);
                     }
-                    // Parent Thumb and Backdrop fall back to the series when the season has none
+                    // The series' Thumb replaces the season's, as in Jellyfin's AddInheritedImages.
+                    // The parent Backdrop falls back to the series when the season has none.
                     if let Some(series) = parent
                         .parent_id
                         .and_then(|sid| parent_map.get(&sid.to_string()))
                     {
-                        if item.parent_thumb_image_tag.is_none()
-                            && let Some(tag) = series
-                                .image_tags
-                                .get(&rustyfin_model::image::ImageType::Thumb)
+                        if let Some(tag) = series
+                            .image_tags
+                            .get(&rustyfin_model::image::ImageType::Thumb)
                         {
                             item.parent_thumb_image_tag = Some(tag.clone());
                             item.parent_thumb_item_id = Some(series.id);
