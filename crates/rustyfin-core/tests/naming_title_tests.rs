@@ -422,6 +422,23 @@ fn group_episode_file_season_in_key() {
 }
 
 #[test]
+fn b32_f2_versions_without_a_resolution_sort_by_stem() {
+    // Jellyfin orders them by FileNameWithoutExtension (12.4 `VideoListResolver.cs:282`, `:296-300`).
+    // By whole name, "Big Eyes (" would sort before "Big Eyes.", as a space is below a dot.
+    assert_eq!(
+        movie_groups(
+            "Big Eyes (2014)",
+            &["Big Eyes (2014) BR-DISK.m2ts", "Big Eyes.mkv"]
+        ),
+        [group(
+            "Big Eyes",
+            Some(2014),
+            &["Big Eyes.mkv", "Big Eyes (2014) BR-DISK.m2ts"]
+        )]
+    );
+}
+
+#[test]
 fn b32_series_title_and_year() {
     // Jellyfin's TitleWithYearRegex: the text before the first "(dddd)", trimmed, and that year.
     let table: &[(&str, Option<(&str, i32)>)] = &[

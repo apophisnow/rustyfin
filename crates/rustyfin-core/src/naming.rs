@@ -851,10 +851,12 @@ impl Entry {
     }
 }
 
-/// Higher resolution first, files without one last, then by file name in byte order (`VideoListResolver.cs:283-300`).
+/// Higher resolution first, files without one last, then by file name without its extension in byte order
+/// (`VideoListResolver.cs:282`, `:296-300`), then by file name.
 fn version_order(a: &Entry, b: &Entry) -> Ordering {
     b.resolution
         .cmp(&a.resolution)
+        .then_with(|| a.stem.cmp(&b.stem))
         .then_with(|| a.name.cmp(&b.name))
 }
 
