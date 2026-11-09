@@ -278,7 +278,8 @@ pub async fn batch_upsert_images(
     if images.is_empty() {
         return Ok(());
     }
-    let mut tx = pool.begin().await?;
+    // The write lock is taken first, as the scan's other writes do (see write_probe_outcome).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for img in images {
         let id_str = img.item_id.to_string();
         let type_str = img.image_type.as_str();
@@ -364,12 +365,16 @@ pub async fn get_local_images_in_scope(
 
 /// Sets the stamp, size and blurhash of each of `images`, stored images found by their item, type
 /// and index, in one transaction, so a batch of restamps costs one commit. Either every image is
-/// stored or, on error, none is.
+/// stored or, on error, none is. An empty `images` returns at once and takes no write lock.
 pub async fn update_image_versions(
     pool: &SqlitePool,
     images: &[ItemImage],
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    if images.is_empty() {
+        return Ok(());
+    }
+    // The write lock is taken first, as the scan's other writes do (see write_probe_outcome).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for img in images {
         sqlx::query(
             "UPDATE item_images SET stamp = ?, width = ?, height = ?, blurhash = ?
