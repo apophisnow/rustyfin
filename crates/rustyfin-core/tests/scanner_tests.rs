@@ -8190,6 +8190,161 @@ async fn b32_rescans_settle_series_folders_and_tvshow_nfo() {
     assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
 }
 
+/// (item path relative to the library root, image path, provider) of each image of the library, sorted.
+async fn b32_images(pool: &SqlitePool, lib: &Library) -> Vec<(String, String, String)> {
+    let root = root_of(lib);
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT m.path, i.path, i.provider FROM item_images AS i
+         JOIN media_items AS m ON m.id = i.item_id WHERE m.library_id = ?1",
+    )
+    .bind(lib.id.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut rows: Vec<_> = rows
+        .into_iter()
+        .map(|(item, image, provider)| (rel(&root, &item), image, provider))
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn b32_f4_rescans_clear_tvshow_nfo_from_loose_episodes_and_images() {
+    // Under 9d9cfb2's lookup, the metadata pass gave a series folder's tvshow.nfo to the seasons and to the
+    // episode files beside it that have no `.nfo` of their own, with the file's images under the provider `nfo`.
+    const POSTER: &str = "https://example.com/hotel-poster.jpg";
+    const OTHER: &str = "https://example.com/other.jpg";
+    const SERIES: &str = "Hotel Series (2015)";
+    const LOOSE: &str = "Hotel Series (2015)/Hotel.Series.S01E01.mkv";
+    const OWN_NFO: &str = "Hotel Series (2015)/Hotel Series S01E02.mkv";
+    const LOOSE_SEASON: &str = "Hotel Series (2015)/Season 1";
+    const SEASON_2: &str = "Hotel Series (2015)/Season 02";
+    const IN_SEASON: &str = "Hotel Series (2015)/Season 02/Hotel Series S02E01.mkv";
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    for rel in [LOOSE, OWN_NFO, IN_SEASON] {
+        touch(&root, rel);
+    }
+    let nfo = B32_TVSHOW_NFO.replace(
+        "</tvshow>",
+        &format!("<thumb aspect=\"poster\">{POSTER}</thumb></tvshow>"),
+    );
+    std::fs::write(root.join(SERIES).join("tvshow.nfo"), nfo).unwrap();
+    // Its own NFO came before tvshow.nfo under the older rule too.
+    std::fs::write(
+        root.join(SERIES).join("Hotel Series S01E02.nfo"),
+        "<episodedetails><plot>Synthetic test show.</plot></episodedetails>",
+    )
+    .unwrap();
+    scan(&fx.pool, &lib).await;
+    let shown = |rel| b32_shown(&fx.pool, &lib, rel);
+    let fresh_loose = shown(LOOSE).await;
+    let fresh_season = shown(LOOSE_SEASON).await;
+    let fresh_season_2 = shown(SEASON_2).await;
+    let loose = item_at(&fx.pool, &lib, LOOSE).await;
+    let ids: Vec<(&str, Uuid)> = {
+        let mut ids = Vec::new();
+        for rel in [SERIES, LOOSE, OWN_NFO, LOOSE_SEASON, SEASON_2, IN_SEASON] {
+            ids.push((rel, item_at(&fx.pool, &lib, rel).await));
+        }
+        ids
+    };
+    // 9d9cfb2's pass. A name that looks like a file's took the show's title.
+    exec(
+        &fx.pool,
+        "UPDATE media_items SET name = 'Hotel Series', sort_name = 'hotel series',
+             overview = 'Synthetic test show.', production_year = 2015, community_rating = 7.5,
+             official_rating = 'TV-14', genres = 'Drama|Comedy', runtime_ticks = 27000000000
+         WHERE id = ?1",
+        &[&loose.to_string()],
+    )
+    .await;
+    // So did the seasons. The other episodes didn't read the file: their values came from elsewhere, and stay.
+    for &(rel, id) in &ids[1..] {
+        if rel != SERIES && rel != LOOSE {
+            exec(
+                &fx.pool,
+                "UPDATE media_items SET overview = 'Synthetic test show.', community_rating = 7.5,
+                     genres = 'Drama|Comedy'
+                 WHERE id = ?1",
+                &[&id.to_string()],
+            )
+            .await;
+        }
+        exec(
+            &fx.pool,
+            "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+             VALUES (?1, 'Primary', 0, ?2, 'nfo')",
+            &[&id.to_string(), POSTER],
+        )
+        .await;
+    }
+    // Images that aren't the show NFO's, or that came from another provider, stay.
+    exec(
+        &fx.pool,
+        "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+         VALUES (?1, 'Backdrop', 0, ?2, 'nfo')",
+        &[&loose.to_string(), OTHER],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+         VALUES (?1, 'Thumb', 0, ?2, 'tmdb')",
+        &[&loose.to_string(), POSTER],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, provider)
+         VALUES (?1, 'Primary', 0, ?2, 'nfo')",
+        &[&ids[0].1.to_string(), POSTER],
+    )
+    .await;
+    let user = insert_user(&fx.pool).await;
+    let marks = at(600_000_000, Some(EARLY));
+    insert_marks(&fx.pool, &user, loose, &marks).await;
+
+    scan(&fx.pool, &lib).await;
+
+    assert_eq!(shown(LOOSE).await, fresh_loose);
+    assert_eq!(shown(LOOSE_SEASON).await, fresh_season);
+    assert_eq!(shown(SEASON_2).await, fresh_season_2);
+    let kept = B32Shown {
+        overview: Some("Synthetic test show.".to_string()),
+        rating: Some(7.5),
+        genres: "Drama|Comedy".to_string(),
+        ..B32Shown::default()
+    };
+    for rel in [OWN_NFO, IN_SEASON] {
+        let got = shown(rel).await;
+        assert_eq!(
+            (got.overview, got.rating, got.genres),
+            (kept.overview.clone(), kept.rating, kept.genres.clone()),
+            "{rel}"
+        );
+    }
+    let image = |rel: &str, path: &str, provider: &str| {
+        (rel.to_string(), path.to_string(), provider.to_string())
+    };
+    assert_eq!(
+        b32_images(&fx.pool, &lib).await,
+        [
+            image(SERIES, POSTER, "nfo"),
+            image(OWN_NFO, POSTER, "nfo"),
+            image(LOOSE, POSTER, "tmdb"),
+            image(LOOSE, OTHER, "nfo"),
+            image(IN_SEASON, POSTER, "nfo"),
+        ]
+    );
+    for (rel, id) in ids {
+        assert_eq!(item_at(&fx.pool, &lib, rel).await, id, "{rel}");
+    }
+    assert_eq!(marks_of(&fx.pool, &user, loose).await, Some(marks));
+}
+
 // B33: multi-episode files keep their last episode
 
 /// (path, episode, last episode) of each episode of the library, sorted by path.

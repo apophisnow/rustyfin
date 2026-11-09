@@ -912,31 +912,45 @@ async fn scan_tv_library(
         );
     }
     // A series stored under an older rule gets the name and year that its folder gives now, and what its
-    // own tvshow.nfo gives; its seasons lose what they took from that file.
+    // own tvshow.nfo gives; its seasons and the episode files directly in its folder lose what they took
+    // from that file, and the images that it gave them.
     let mut folders = Vec::with_capacity(series_folders.len());
     for (&id, walk) in &series_folders {
         let nfo = match nfo_parser::find_series_nfo(Path::new(&walk.dir)) {
             Some(nfo_path) => nfo_parser::parse_nfo(&nfo_path).await,
             None => None,
         };
-        // Under the older rule, a season read the series' tvshow.nfo when `find_nfo_for_media` found no
-        // other `.nfo` for its folder.
-        let nfo_seasons = match nfo {
-            Some(_) => walk
-                .seasons
-                .iter()
-                .filter(|(_, (name, _))| {
-                    nfo_parser::find_nfo_for_media(&Path::new(&walk.dir).join(name)).is_none()
-                })
-                .map(|(&season_id, (name, number))| (season_id, name.clone(), *number))
-                .collect(),
-            None => Vec::new(),
+        // Under the older rule, a season and a loose episode read the series' tvshow.nfo when
+        // `find_nfo_for_media` found no other `.nfo` for them.
+        let (nfo_seasons, nfo_episodes) = match nfo {
+            Some(_) => {
+                let series_dir = Path::new(&walk.dir);
+                let seasons = walk
+                    .seasons
+                    .iter()
+                    .filter(|(_, (name, _))| {
+                        nfo_parser::find_nfo_for_media(&series_dir.join(name)).is_none()
+                    })
+                    .map(|(&season_id, (name, number))| (season_id, name.clone(), *number))
+                    .collect();
+                let episodes = episode_files
+                    .values()
+                    .filter(|(series_id, _, _)| *series_id == id)
+                    .flat_map(|(_, _, files)| files)
+                    .filter(|file| file.parent() == Some(series_dir))
+                    .filter(|file| nfo_parser::find_nfo_for_media(file).is_none())
+                    .map(|file| file.to_string_lossy().into_owned())
+                    .collect();
+                (seasons, episodes)
+            }
+            None => (Vec::new(), Vec::new()),
         };
         folders.push(scan_sync::SeriesFolder {
             id,
             folder: walk.folder.clone(),
             nfo,
             nfo_seasons,
+            nfo_episodes,
         });
     }
     let settled = scan_sync::settle_series(pool, library.id, &folders).await?;

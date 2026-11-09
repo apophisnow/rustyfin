@@ -930,6 +930,9 @@ pub struct SeriesFolder {
     /// With `nfo`, its seasons that read that file under the older rule, as they found no `.nfo` of their own
     /// beside their folder: id, folder name and number.
     pub nfo_seasons: Vec<(Uuid, String, Option<i32>)>,
+    /// With `nfo`, the paths of its video files directly in its folder that read that file under the older
+    /// rule, as they found no `.nfo` of their own.
+    pub nfo_episodes: Vec<String>,
 }
 
 /// The fields of a series or a season that `settle_series` settles.
@@ -954,8 +957,13 @@ struct Shown {
 ///   metadata refresh fills it (`metadata::apply_metadata_to_item`).
 /// - A season that read that file under the older rule loses each value that is still the file's. A name that
 ///   took the show's title gets the season's folder name back.
+/// - A loose episode that read that file under the older rule does the same, and a name that took the show's
+///   title gets the file's stem back, as a new episode gets it.
+/// - The seasons and loose episodes lose the images that the file gave them, with the provider `nfo`. The
+///   series keeps its own.
 ///
-/// Only the items that differ are written, in one transaction. Returns how many changed.
+/// Only the items that differ are written, in one transaction, with the image rows that go. Returns how many
+/// changed, images included.
 pub async fn settle_series(
     pool: &SqlitePool,
     library_id: Uuid,
@@ -971,7 +979,10 @@ pub async fn settle_series(
     .await?;
     let stored: HashMap<String, Shown> = stored.into_iter().map(|s| (s.id.clone(), s)).collect();
 
-    let mut changes: Vec<(Shown, &Shown)> = Vec::new();
+    // The changes, as (new, old). The items that read the file under the older rule, with the file, lose
+    // its images too.
+    let mut changes: Vec<(Shown, Shown)> = Vec::new();
+    let mut image_items: Vec<(String, &ExternalMetadata)> = Vec::new();
     for folder in series {
         if let Some(old) = stored.get(&folder.id.to_string()) {
             let mut new = old.clone();
@@ -988,7 +999,7 @@ pub async fn settle_series(
                 fill_from_nfo(&mut new, nfo);
             }
             if new != *old {
-                changes.push((new, old));
+                changes.push((new, old.clone()));
             }
         }
         let Some(nfo) = &folder.nfo else {
@@ -999,20 +1010,59 @@ pub async fn settle_series(
                 continue;
             };
             let mut new = old.clone();
-            clear_show_nfo(&mut new, nfo, season_folder, *number);
+            clear_show_nfo(&mut new, nfo, season_folder, &season_sort_name(*number));
             if new != *old {
-                changes.push((new, old));
+                changes.push((new, old.clone()));
             }
+            image_items.push((id.to_string(), nfo));
+        }
+        for path in &folder.nfo_episodes {
+            let Some(stem) = Path::new(path).file_stem() else {
+                continue;
+            };
+            let stem = stem.to_string_lossy();
+            let Some(old) = stored_episode(pool, library_id, path).await? else {
+                continue;
+            };
+            let mut new = old.clone();
+            clear_show_nfo(&mut new, nfo, &stem, &stem.to_lowercase());
+            if new != old {
+                changes.push((new, old.clone()));
+            }
+            image_items.push((old.id, nfo));
         }
     }
-    if changes.is_empty() {
+    // The stored `nfo` image rows of these items that the file still names. Read before the write lock, so a
+    // scan with nothing to delete takes no transaction.
+    let nfo_items: HashMap<&str, &ExternalMetadata> = image_items
+        .iter()
+        .map(|(id, nfo)| (id.as_str(), *nfo))
+        .collect();
+    let stored_images: Vec<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT i.item_id, i.image_type, i.image_index, i.path
+         FROM item_images AS i JOIN media_items AS m ON m.id = i.item_id
+         WHERE m.library_id = ?1 AND m.media_type IN ('Season', 'Episode') AND i.provider = 'nfo'",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let images: Vec<(String, String, i64, String)> = stored_images
+        .into_iter()
+        .filter(|(item_id, _, _, path)| {
+            nfo_items
+                .get(item_id.as_str())
+                .is_some_and(|nfo| nfo.image_urls.iter().any(|image| image.url == *path))
+        })
+        .collect();
+    if changes.is_empty() && images.is_empty() {
         return Ok(0);
     }
 
     let mut changed = 0;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for (new, old) in changes {
-        // An item that another writer changed since it was read is left to the next scan.
+        // An item that another writer changed since it was read is left to the next scan. Its images are
+        // deleted below either way.
         changed += sqlx::query(
             "UPDATE media_items SET name = ?1, sort_name = ?2, overview = ?3, production_year = ?4,
                  community_rating = ?5, official_rating = ?6, genres = ?7, runtime_ticks = ?8
@@ -1041,6 +1091,21 @@ pub async fn settle_series(
         .await?
         .rows_affected();
     }
+    // The images that the file gave a season or an episode, under the provider `nfo`, by primary key. A
+    // series' own images are never in `image_items`.
+    for (item_id, image_type, image_index, path) in &images {
+        changed += sqlx::query(
+            "DELETE FROM item_images WHERE item_id = ?1 AND image_type = ?2 AND image_index = ?3
+                 AND provider = 'nfo' AND path = ?4",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(image_index)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
     tx.commit().await?;
     Ok(changed)
 }
@@ -1064,10 +1129,27 @@ fn fill_from_nfo(shown: &mut Shown, nfo: &ExternalMetadata) {
     shown.runtime_ticks = shown.runtime_ticks.or(nfo.runtime_ticks);
 }
 
-/// Clears each field of a season's `shown` that still holds the value of its series' `tvshow.nfo`, `nfo`. A
-/// name that took the show's title, with its sort name, becomes the one that the season's folder, `folder`,
-/// and number give.
-fn clear_show_nfo(shown: &mut Shown, nfo: &ExternalMetadata, folder: &str, number: Option<i32>) {
+/// The stored episode whose primary file is at `path`, if an item of the library has that path.
+async fn stored_episode(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    path: &str,
+) -> Result<Option<Shown>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, name, sort_name, overview, production_year, community_rating, official_rating,
+                genres, runtime_ticks
+         FROM media_items WHERE library_id = ?1 AND media_type = 'Episode' AND path = ?2",
+    )
+    .bind(library_id.to_string())
+    .bind(path)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Clears each field of a season's or an episode's `shown` that still holds the value of its series'
+/// `tvshow.nfo`, `nfo`. A name that took the show's title, with its sort name, becomes `name` and `sort_name`:
+/// a season's folder name and number give them, and an episode's file stem does.
+fn clear_show_nfo(shown: &mut Shown, nfo: &ExternalMetadata, name: &str, sort_name: &str) {
     fn clear<T: PartialEq>(field: &mut Option<T>, nfo: &Option<T>) {
         if *field == *nfo {
             *field = None;
@@ -1075,11 +1157,11 @@ fn clear_show_nfo(shown: &mut Shown, nfo: &ExternalMetadata, folder: &str, numbe
     }
     if let Some(title) = &nfo.name
         && shown.name == *title
-        && title != folder
+        && title != name
         && shown.sort_name.as_deref() == Some(&title.to_lowercase())
     {
-        shown.name = folder.to_string();
-        shown.sort_name = Some(season_sort_name(number));
+        shown.name = name.to_string();
+        shown.sort_name = Some(sort_name.to_string());
     }
     clear(&mut shown.overview, &nfo.overview);
     clear(&mut shown.production_year, &nfo.production_year);
