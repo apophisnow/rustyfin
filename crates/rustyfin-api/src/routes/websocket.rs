@@ -126,7 +126,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
     let mut broadcast_rx = state.ws_broadcast.subscribe();
     // The scans in progress, and the updates after them, taken under one lock before TimeSync
     let (scans_now, mut scans_rx) = state.task_scheduler.scans().subscribe_with_snapshot();
-    let viewer = socket_viewer(&state, &token).await;
+    let mut viewer = socket_viewer(&state, &token).await;
 
     // Create a dedicated channel for targeted command delivery to this session
     let (cmd_tx, mut cmd_rx) = broadcast::channel::<rustyfin_model::ws_event::WsEvent>(16);
@@ -276,14 +276,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, token: String) {
                 }
             }
 
-            // Close the socket once its user token stops validating
+            // Close the socket once its user token stops validating; otherwise refresh
+            // the socket's administrator rights so a demotion takes effect
             _ = recheck.tick(), if user_token => {
-                if let Err(rustyfin_auth::AuthError::InvalidToken) =
-                    rustyfin_auth::validate_token(&state.db_ro, &token).await
-                {
-                    tracing::info!("WebSocket: session {} closed: its token is no longer valid", session_id);
-                    let _ = sender.send(Message::Close(None)).await;
-                    break;
+                match rustyfin_auth::validate_token(&state.db_ro, &token).await {
+                    Ok(claims) => viewer.is_admin = claims.is_admin,
+                    Err(rustyfin_auth::AuthError::InvalidToken) => {
+                        tracing::info!("WebSocket: session {} closed: its token is no longer valid", session_id);
+                        let _ = sender.send(Message::Close(None)).await;
+                        break;
+                    }
+                    Err(_) => {}
                 }
             }
         }
