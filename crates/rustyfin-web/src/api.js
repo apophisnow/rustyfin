@@ -375,13 +375,6 @@ const API = {
         return this.get(`/Library/BrowseDirectories${q}`);
     },
 
-    // Users
-    getUsers() { return this.cachedGet('/Users', 60000); },
-    createUser(name, password, isAdministrator = false) {
-        return this.post('/Users/New', { Name: name, Password: password, IsAdministrator: isAdministrator });
-    },
-    deleteUser(id) { return this.post(`/Users/${id}/Delete`); },
-
     // Items
     getItems(params = {}) {
         const q = new URLSearchParams();
@@ -509,7 +502,9 @@ const API = {
     // Users (admin)
     getUsers() { return this.get('/Users'); },
     getMe() { return this.get('/Users/Me'); },
-    createUser(name, password) { return this.post('/Users/New', { Name: name, Password: password }); },
+    createUser(name, password, isAdministrator = false) {
+        return this.post('/Users/New', { Name: name, Password: password, IsAdministrator: isAdministrator });
+    },
     deleteUser(id) { return this.post(`/Users/${id}/Delete`); },
     changePassword(id, current, newPw) { return this.post(`/Users/${id}/Password`, { CurrentPw: current, NewPw: newPw }); },
     updatePolicy(id, policy) { return this.post(`/Users/${id}/Policy`, policy); },
