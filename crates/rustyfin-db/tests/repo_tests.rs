@@ -2359,3 +2359,87 @@ async fn b32_both_upserts_and_the_item_reads_keep_a_season_virtual() {
     seasons.sort_by_key(|season| season.0);
     assert_eq!(seasons, expected);
 }
+
+#[tokio::test]
+async fn b32_f9_both_upserts_update_the_last_episode_and_the_location_type() {
+    // B31 made both upserts ON CONFLICT(id) DO UPDATE, so each SET list must name both columns.
+    let temp_db = test_pool().await;
+    let pool = temp_db.pool.clone();
+    let lib = make_library("TV", LibraryContentType::TvShows);
+    rustyfin_db::repo_library::create_library(&pool, &lib)
+        .await
+        .unwrap();
+    let series = MediaItem {
+        id: Uuid::new_v4(),
+        name: "Hotel Series".to_string(),
+        media_type: MediaType::Series,
+        path: "/media/tv/Hotel Series".to_string(),
+        library_id: lib.id,
+        ..MediaItem::default_dto_fields()
+    };
+    rustyfin_db::repo_media::upsert_media_item(&pool, &series)
+        .await
+        .unwrap();
+    let single = b32_season(&series, 1, LocationType::Virtual);
+    let batched = b32_season(&series, 2, LocationType::Virtual);
+    let single_episode = b33_episode(lib.id, single.id, 3, Some(4));
+    let batched_episode = b33_episode(lib.id, batched.id, 5, Some(6));
+    for item in [&single, &single_episode] {
+        rustyfin_db::repo_media::upsert_media_item(&pool, item)
+            .await
+            .unwrap();
+    }
+    rustyfin_db::repo_media::batch_upsert_media_items(
+        &pool,
+        &[batched.clone(), batched_episode.clone()],
+    )
+    .await
+    .unwrap();
+
+    // Each one again, with new values.
+    let single = MediaItem {
+        location_type: LocationType::FileSystem,
+        ..single
+    };
+    let batched = MediaItem {
+        location_type: LocationType::FileSystem,
+        ..batched
+    };
+    let single_episode = MediaItem {
+        index_number_end: None,
+        ..single_episode
+    };
+    let batched_episode = MediaItem {
+        index_number_end: Some(7),
+        ..batched_episode
+    };
+    for item in [&single, &single_episode] {
+        rustyfin_db::repo_media::upsert_media_item(&pool, item)
+            .await
+            .unwrap();
+    }
+    rustyfin_db::repo_media::batch_upsert_media_items(
+        &pool,
+        &[batched.clone(), batched_episode.clone()],
+    )
+    .await
+    .unwrap();
+
+    for (item, want) in [
+        (&single, (None, LocationType::FileSystem)),
+        (&batched, (None, LocationType::FileSystem)),
+        (&single_episode, (None, LocationType::FileSystem)),
+        (&batched_episode, (Some(7), LocationType::FileSystem)),
+    ] {
+        let stored = rustyfin_db::repo_media::get_item_by_id(&pool, item.id)
+            .await
+            .unwrap()
+            .expect("the item is stored");
+        assert_eq!(
+            (stored.index_number_end, stored.location_type),
+            want,
+            "{}",
+            item.name
+        );
+    }
+}
