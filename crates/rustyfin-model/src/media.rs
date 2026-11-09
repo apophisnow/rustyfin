@@ -197,6 +197,8 @@ pub struct MediaItem {
     pub sort_name: Option<String>,
     pub overview: Option<String>,
     pub media_type: MediaType,
+    // Missing from a Virtual item's output, so a copy read back without it gets an empty path.
+    #[serde(default)]
     pub path: String,
     pub parent_id: Option<Uuid>,
     pub library_id: Uuid,
@@ -740,8 +742,12 @@ impl Serialize for MediaItem {
         // A season with no folder has no Path in Jellyfin 12.4 (`Resolvers/TV/SeasonResolver.cs:63`,
         // `TV/SeriesMetadataService.cs:456-463`), which makes it Virtual (`Entities/BaseItem.cs:348-365`).
         // Such a season is stored with a made-up path that the scan finds it by.
-        let path = (self.location_type != LocationType::Virtual).then_some(&self.path);
-        s.serialize_field("Path", &path)?;
+        // Jellyfin leaves out a null field, so a Virtual item has no Path key at all.
+        if self.location_type != LocationType::Virtual {
+            s.serialize_field("Path", &self.path)?;
+        } else {
+            s.skip_field("Path")?;
+        }
         s.serialize_field("ParentId", &self.parent_id)?;
         s.serialize_field("LibraryId", &self.library_id)?;
         s.serialize_field("ProductionYear", &self.production_year)?;
@@ -752,8 +758,13 @@ impl Serialize for MediaItem {
         s.serialize_field("PremiereDate", &self.premiere_date)?;
         s.serialize_field("RunTimeTicks", &self.runtime_ticks)?;
         s.serialize_field("IndexNumber", &self.index_number)?;
-        // Jellyfin 12.4 gives it for episodes (`Dto/DtoService.cs:1517-1520`); no other item has one.
-        s.serialize_field("IndexNumberEnd", &self.index_number_end)?;
+        // Jellyfin 12.4 gives it only to an episode that has one (`Dto/DtoService.cs:1517-1521`), and
+        // leaves the key out otherwise.
+        if self.index_number_end.is_some() {
+            s.serialize_field("IndexNumberEnd", &self.index_number_end)?;
+        } else {
+            s.skip_field("IndexNumberEnd")?;
+        }
         s.serialize_field("ParentIndexNumber", &self.parent_index_number)?;
         s.serialize_field("MediaSources", &self.media_sources)?;
         // --- MediaItem DTO Fields ---
@@ -1144,5 +1155,44 @@ mod tests {
         let json = serde_json::to_value(&folder).unwrap();
         assert_eq!(json["LocationType"], "FileSystem");
         assert_eq!(json["Path"], "/tv/One Night (2023)/Season 1");
+    }
+
+    #[test]
+    fn b32_f8_items_leave_out_a_path_and_an_end_they_lack() {
+        // Jellyfin leaves out null fields, and gives IndexNumberEnd only where it has one (12.4
+        // `Dto/DtoService.cs:1517-1521`).
+        let made_up = MediaItem {
+            media_type: MediaType::Season,
+            path: "/tv/One Night (2023)/Season 1".to_string(),
+            location_type: LocationType::Virtual,
+            index_number: Some(1),
+            ..MediaItem::default_dto_fields()
+        };
+        let json = serde_json::to_value(&made_up).unwrap();
+        let fields = json.as_object().unwrap();
+        assert_eq!(fields.get("Path"), None);
+        assert_eq!(fields.get("IndexNumberEnd"), None);
+        // A copy of it reads back as the same Virtual season.
+        let read: MediaItem = serde_json::from_value(json).unwrap();
+        assert_eq!(read.id, made_up.id);
+        assert_eq!(read.location_type, LocationType::Virtual);
+        assert_eq!(read.index_number, Some(1));
+
+        let double = MediaItem {
+            media_type: MediaType::Episode,
+            path: "/tv/One Night (2023)/Season 1/One Night S01E03-E04.mkv".to_string(),
+            index_number: Some(3),
+            index_number_end: Some(4),
+            ..MediaItem::default_dto_fields()
+        };
+        let json = serde_json::to_value(&double).unwrap();
+        assert_eq!(json["Path"], double.path.as_str());
+        assert_eq!(json["IndexNumberEnd"], 4);
+        let single = MediaItem {
+            index_number_end: None,
+            ..double
+        };
+        let json = serde_json::to_value(&single).unwrap();
+        assert_eq!(json.as_object().unwrap().get("IndexNumberEnd"), None);
     }
 }
