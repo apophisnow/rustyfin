@@ -427,6 +427,7 @@ function cardImage(item, landscape) {
         || pick(item.SeriesId, 'Thumb', item.SeriesThumbImageTag)
         || pick(item.ParentBackdropItemId, 'Backdrop', item.ParentBackdropImageTags?.[0])
         || pick(id, 'Primary', item.ImageTags?.Primary, true)
+        || pick(item.SeriesId, 'Primary', item.SeriesPrimaryImageTag, true)
         || null;
 }
 
@@ -461,12 +462,18 @@ function itemCard(item, options = {}) {
     const thumbSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 150, format: 'webp', tag: picture.tag }) : '';
     const fullSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 250, tag: picture.tag }) : '';
     // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
-    const isEpisodeCard = isBackdrop && type === 'Episode';
-    const cardTitle = isEpisodeCard ? (item.SeriesName || name) : name;
     const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
-    const episodeLine = hasNumbers
-        ? t('home.episode_line', { season: item.ParentIndexNumber, episode: item.IndexNumber, name })
-        : name;
+    const isEpisodeCard = isBackdrop && type === 'Episode' && !!item.SeriesName && hasNumbers;
+    const cardTitle = isEpisodeCard ? item.SeriesName : name;
+    const episodeLine = isEpisodeCard
+        ? t('home.episode_line', {
+            season: item.ParentIndexNumber,
+            episode: item.IndexNumberEnd != null && item.IndexNumberEnd !== item.IndexNumber
+                ? `${item.IndexNumber}-${item.IndexNumberEnd}`
+                : item.IndexNumber,
+            name,
+        })
+        : '';
 
     const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
     const streamType = type === 'Audio' ? 'Audio' : 'Videos';
