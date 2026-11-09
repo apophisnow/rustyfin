@@ -3276,6 +3276,50 @@ async fn b30_p2_an_upload_changes_the_picture_and_every_tag() {
     assert_ne!(after, before, "the tag did not change with the picture");
 }
 
+/// Sends a GET and returns the status, the `Cache-Control` header and the body.
+async fn b30_get_cached(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    let request = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .map(|value| value.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, cache_control, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn b30_f6_only_a_tagged_request_is_cached_for_long() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    for bounds in ["", "maxWidth=32&"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
+        let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cache_control, "public, max-age=86400", "{uri}");
+        // Without the tag, the answer may not be kept long: the picture can change under its URL.
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}");
+        let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(cache_control, "public, max-age=300", "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn b30_p2_a_rescan_finds_a_poster_replaced_in_place() {
     let state = test_state().await;

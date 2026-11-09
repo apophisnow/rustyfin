@@ -82,9 +82,17 @@ async fn serve_image(
     index: i32,
     max_width: Option<u32>,
     max_height: Option<u32>,
+    tagged: bool,
 ) -> Result<Response, ApiError> {
     let image_type = ImageType::from_str(image_type_str)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
+    // A tag names one version of the picture, so a tagged URL can be kept long. An untagged URL
+    // can change under the same address when the picture is replaced, so it is kept only briefly.
+    let cache_control = if tagged {
+        "public, max-age=86400"
+    } else {
+        "public, max-age=300"
+    };
 
     let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
     // Imported people keep their images in `person_images`; try those before giving up.
@@ -134,7 +142,7 @@ async fn serve_image(
         };
         return Ok(Response::builder()
             .header(header::CONTENT_TYPE, guess_content_type(&img.path, false))
-            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .header(header::CACHE_CONTROL, cache_control)
             .header(header::CONTENT_LENGTH, meta.len().to_string())
             .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
             .unwrap());
@@ -184,7 +192,7 @@ async fn serve_image(
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(bytes))
         .unwrap())
 }
@@ -202,6 +210,7 @@ async fn get_item_image(
         index,
         query.max_width,
         query.max_height,
+        query.tag.as_deref().is_some_and(|t| !t.is_empty()),
     )
     .await
 }
@@ -218,6 +227,7 @@ async fn get_item_image_indexed(
         image_index,
         query.max_width,
         query.max_height,
+        query.tag.as_deref().is_some_and(|t| !t.is_empty()),
     )
     .await
 }
