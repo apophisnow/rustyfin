@@ -163,6 +163,12 @@ body {
   transform: scale(1.06);
 }
 
+/* Letterboxed artwork (no cropping) */
+.jf-card img.jf-img-contain {
+  object-fit: contain;
+  background: var(--jf-bg-darkest);
+}
+
 /* Play button overlay */
 .jf-play-overlay {
   position: absolute;

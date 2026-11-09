@@ -413,6 +413,23 @@ function toggleSidebar() {
 }
 
 // --- Media Card Renderer (12.x Style) ---
+// Picks card artwork from tags the item carries, so no image is requested that doesn't exist.
+// Returns { id, type, tag, contain } or null (null means the type icon is shown).
+function cardImage(item, landscape) {
+    const id = item.Id || item.id;
+    const pick = (imgId, type, tag, contain = false) => (imgId && tag ? { id: imgId, type, tag, contain } : null);
+    if (!landscape) return pick(id, 'Primary', item.ImageTags?.Primary);
+    const isEpisode = (item.Type || item.type) === 'Episode';
+    return pick(id, 'Thumb', item.ImageTags?.Thumb)
+        || pick(id, 'Backdrop', item.BackdropImageTags?.[0])
+        || (isEpisode ? pick(id, 'Primary', item.ImageTags?.Primary) : null)
+        || pick(item.ParentThumbItemId, 'Thumb', item.ParentThumbImageTag)
+        || pick(item.SeriesId, 'Thumb', item.SeriesThumbImageTag)
+        || pick(item.ParentBackdropItemId, 'Backdrop', item.ParentBackdropImageTags?.[0])
+        || pick(id, 'Primary', item.ImageTags?.Primary, true)
+        || null;
+}
+
 function itemCard(item, options = {}) {
     // rawName goes into the onclick code, which translates the fallback itself
     const rawName = item.Name || item.name || '';
@@ -422,19 +439,23 @@ function itemCard(item, options = {}) {
     const id = item.Id || item.id;
     const played = item.UserData?.Played || item.user_data?.played || false;
     const fav = item.UserData?.IsFavorite || item.user_data?.is_favorite || false;
-    const progress = item.UserData?.PlayedPercentage || item.user_data?.played_percentage || 0;
+    const progress = item.UserData?.PlayedPercentage || item.user_data?.played_percentage || item.CompletionPercentage || 0;
     const rating = item.CommunityRating || item.community_rating;
     // Use explicit backdrop option if provided; otherwise derive from type
     const isBackdrop = options.backdrop !== undefined ? options.backdrop : type === 'Episode';
 
     // Progressive image loading: thumbnail for fast first paint,
     // full-res loaded on hover only to save bandwidth
-    const thumbSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 150, format: 'webp', tag: item.BackdropImageTags?.[0] })
-        : API.imageUrl(id, 'Primary', { maxWidth: 150, format: 'webp', tag: item.ImageTags?.Primary });
-    const fullSrc = isBackdrop
-        ? API.imageUrl(id, 'Backdrop', { maxWidth: 250, tag: item.BackdropImageTags?.[0] })
-        : API.imageUrl(id, 'Primary', { maxWidth: 250, tag: item.ImageTags?.Primary });
+    const picture = cardImage(item, isBackdrop);
+    const thumbSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 150, format: 'webp', tag: picture.tag }) : '';
+    const fullSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 250, tag: picture.tag }) : '';
+    // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
+    const isEpisodeCard = isBackdrop && type === 'Episode';
+    const cardTitle = isEpisodeCard ? (item.SeriesName || name) : name;
+    const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
+    const episodeLine = hasNumbers
+        ? t('home.episode_line', { season: item.ParentIndexNumber, episode: item.IndexNumber, name })
+        : name;
 
     const canPlay = ['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video'].includes(type);
     const streamType = type === 'Audio' ? 'Audio' : 'Videos';
@@ -448,13 +469,14 @@ function itemCard(item, options = {}) {
     return `
     <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}">
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
+            ${picture ? `
             <div class="jf-poster-skeleton"></div>
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
-            <img src="${thumbSrc}" alt="${escapeHtml(name)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200"
+            <img src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
                  data-full-src="${fullSrc}"
                  onload="this.style.opacity='0.8';this.classList.remove('blur-sm','scale-105');const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';"
-                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';">
-            <div class="hidden items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5 z-[3]" style="display:none">
+                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';const ic=this.nextElementSibling;if(ic)ic.style.display='flex';">` : ''}
+            <div class="${picture ? 'hidden items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5 z-[3]' : 'flex items-center justify-center h-full text-4xl text-white/20 absolute inset-0 bg-white/5'}"${picture ? ' style="display:none"' : ''}>
                 ${typeIcons[type] || '📁'}
             </div>
 
@@ -486,11 +508,12 @@ function itemCard(item, options = {}) {
         </div>
 
         <div class="p-3">
-            <p class="text-xs sm:text-sm font-semibold truncate text-white group-hover:text-[#38bdf8] transition-colors" title="${escapeHtml(name)}">${escapeHtml(name)}</p>
+            <p class="text-xs sm:text-sm font-semibold truncate text-white group-hover:text-[#38bdf8] transition-colors" title="${escapeHtml(cardTitle)}">${escapeHtml(cardTitle)}</p>
             <div class="flex items-center gap-1.5 text-[11px] text-white/40 mt-0.5">
+                ${isEpisodeCard ? `<span class="truncate">${escapeHtml(episodeLine)}</span>` : `
                 ${year ? `<span>${year}</span>` : ''}
                 ${year && type ? `<span>·</span>` : ''}
-                <span class="truncate">${escapeHtml(type)}</span>
+                <span class="truncate">${escapeHtml(type)}</span>`}
             </div>
         </div>
     </div>`;
@@ -499,9 +522,10 @@ function itemCard(item, options = {}) {
 // --- Create a single card DOM element (avoids innerHTML parsing overhead) ---
 function createCardElement(item, wrapperClass = '', cardOptions = {}) {
     const wrapper = document.createElement('div');
-    wrapper.className = wrapperClass;
     wrapper.innerHTML = itemCard(item, cardOptions);
-    return wrapper.firstElementChild;
+    const card = wrapper.firstElementChild;
+    if (card && wrapperClass) card.classList.add(...wrapperClass.split(/\s+/).filter(Boolean));
+    return card;
 }
 
 function sectionRow(title, items, moreAction = null, options = {}) {
@@ -1592,7 +1616,8 @@ async function renderSearch(term) {
             Id: h.Id || h.id || h.ItemId,
             Name: h.Name || h.name,
             Type: h.Type || h.type,
-            ProductionYear: h.ProductionYear || h.production_year
+            ProductionYear: h.ProductionYear || h.production_year,
+            ...(h.PrimaryImageTag ? { ImageTags: { Primary: h.PrimaryImageTag } } : {})
         }));
 
         page.innerHTML = `
