@@ -802,7 +802,8 @@ async fn scan_tv_library(
                     index_number: season_number,
                     parent_index_number: None,
                     media_sources: Vec::new(),
-                    location_type: season_location(&season_path),
+                    // A new season with no stat result is a folder; the next scan settles it.
+                    location_type: season_location(&season_path).await.unwrap_or_default(),
                     ..MediaItem::default_dto_fields()
                 };
                 new_items.push(season_item);
@@ -879,15 +880,15 @@ async fn scan_tv_library(
         );
     }
     // A season stored under an older rule loses the Path of a folder that it doesn't have, and a season whose
-    // folder has appeared since gets its Path.
-    let season_folders: Vec<(Uuid, LocationType)> = series_folders
-        .values()
-        .flat_map(|walk| {
-            walk.seasons
-                .iter()
-                .map(|(&id, (name, _))| (id, season_location(&format!("{}/{}", walk.dir, name))))
-        })
-        .collect();
+    // folder has appeared since gets its Path. A season whose stat fails is left out, so it keeps its location.
+    let mut season_folders: Vec<(Uuid, LocationType)> = Vec::new();
+    for walk in series_folders.values() {
+        for (&id, (name, _)) in &walk.seasons {
+            if let Some(location) = season_location(&format!("{}/{}", walk.dir, name)).await {
+                season_folders.push((id, location));
+            }
+        }
+    }
     let settled = scan_sync::settle_season_folders(pool, library.id, &season_folders).await?;
     if settled > 0 {
         tracing::info!(
@@ -1846,11 +1847,20 @@ async fn list_root_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBu
 /// The location type of the season stored at `path`: Virtual where that folder doesn't exist, as for a season
 /// made for the episode files in its series' folder, and FileSystem where it does. Jellyfin 12.4 gives such a
 /// season no Path (`Resolvers/TV/SeasonResolver.cs:63`), which makes it Virtual (`Entities/BaseItem.cs:348-365`).
-fn season_location(path: &str) -> LocationType {
-    if Path::new(path).is_dir() {
-        LocationType::FileSystem
-    } else {
-        LocationType::Virtual
+/// None when the stat fails for another reason, so the caller keeps the stored location.
+async fn season_location(path: &str) -> Option<LocationType> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_dir() => Some(LocationType::FileSystem),
+        Ok(_) => Some(LocationType::Virtual),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(LocationType::Virtual)
+        }
+        Err(_) => None,
     }
 }
 
@@ -1872,4 +1882,35 @@ fn parse_season_number(name: &str, series_folder: &str) -> Option<i32> {
 /// The sort name that the scan gives a season numbered `number`.
 pub(crate) fn season_sort_name(number: Option<i32>) -> String {
     format!("season {:04}", number.unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn b32_f6_a_failed_stat_keeps_a_seasons_stored_location() {
+        let dir = std::env::temp_dir().join(format!("b32-f6-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("Season 1")).unwrap();
+        std::fs::write(dir.join("file"), b"").unwrap();
+        std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
+        let at = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
+
+        assert_eq!(
+            season_location(&at("Season 1")).await,
+            Some(LocationType::FileSystem)
+        );
+        // No folder: nothing there, a file, or a path under a file.
+        for rel in ["Season 2", "file", "file/Season 1"] {
+            assert_eq!(
+                season_location(&at(rel)).await,
+                Some(LocationType::Virtual),
+                "{rel}"
+            );
+        }
+        // Any other error, here a symlink loop, says nothing about the folder.
+        assert_eq!(season_location(&at("loop")).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
