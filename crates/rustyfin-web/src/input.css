@@ -11,6 +11,8 @@
   --rf-ember: #f97316;
   --rf-ember-glow: rgba(249, 115, 22, 0.4);
   --jf-bg-darkest: #07090e;
+  /* daisyUI paints the page with --root-bg; below the one-viewport body it would show its grey */
+  --root-bg: var(--jf-bg-darkest);
   --jf-bg-dark: #0d1117;
   --jf-bg-card: #151a23;
   --jf-bg-surface: #1e2430;
