@@ -258,17 +258,27 @@ async fn restamp_local_images(pool: &SqlitePool, library: &Library, scope: &Scan
         }
     };
 
-    let mut count = 0;
+    // The blurhashes are computed first, so the stores below run as one batch.
+    let mut counted_images = 0;
+    let mut batch = Vec::with_capacity(changed.len());
     for (mut img, counted) in changed {
         if counted {
             img.blurhash = crate::image_proxy::compute_blurhash(&img.path, None).await;
+            counted_images += 1;
         }
-        match rustyfin_db::repo_image::update_image_version(pool, &img).await {
-            Ok(()) => count += u32::from(counted),
-            Err(e) => tracing::warn!("failed to store the version of '{}': {}", img.path, e),
+        batch.push(img);
+    }
+    match rustyfin_db::repo_image::update_image_versions(pool, &batch).await {
+        Ok(()) => counted_images,
+        Err(e) => {
+            tracing::warn!(
+                "failed to store the versions of the images of library '{}': {}",
+                library.name,
+                e
+            );
+            0
         }
     }
-    count
 }
 
 /// Serializes the scans that write items. Held until the probes they queued have finished.

@@ -242,6 +242,16 @@ async fn main() {
         jellyfin_import: Default::default(),
     };
 
+    // A scheduled library scan clears the same caches as a scan from the API or the monitor.
+    {
+        let cache = state.cache.clone();
+        let image_cache = state.image_cache.clone();
+        task_scheduler.set_on_scan(move || {
+            cache.invalidate_on_scan();
+            image_cache.invalidate_all();
+        });
+    }
+
     // Background task: scheduled tasks (library scan, metadata refresh, cache cleanup)
     {
         let shutdown_rx = state.shutdown_tx.subscribe();

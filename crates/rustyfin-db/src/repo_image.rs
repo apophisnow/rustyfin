@@ -362,20 +362,28 @@ pub async fn get_local_images_in_scope(
         .collect())
 }
 
-/// Sets the stamp, size and blurhash of a stored image, which is found by its item, type and index.
-pub async fn update_image_version(pool: &SqlitePool, img: &ItemImage) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE item_images SET stamp = ?, width = ?, height = ?, blurhash = ?
-         WHERE item_id = ? AND image_type = ? AND image_index = ?",
-    )
-    .bind(img.stamp)
-    .bind(img.width)
-    .bind(img.height)
-    .bind(&img.blurhash)
-    .bind(img.item_id.to_string())
-    .bind(img.image_type.as_str())
-    .bind(img.image_index)
-    .execute(pool)
-    .await?;
-    Ok(())
+/// Sets the stamp, size and blurhash of each of `images`, stored images found by their item, type
+/// and index, in one transaction, so a batch of restamps costs one commit. Either every image is
+/// stored or, on error, none is.
+pub async fn update_image_versions(
+    pool: &SqlitePool,
+    images: &[ItemImage],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for img in images {
+        sqlx::query(
+            "UPDATE item_images SET stamp = ?, width = ?, height = ?, blurhash = ?
+             WHERE item_id = ? AND image_type = ? AND image_index = ?",
+        )
+        .bind(img.stamp)
+        .bind(img.width)
+        .bind(img.height)
+        .bind(&img.blurhash)
+        .bind(img.item_id.to_string())
+        .bind(img.image_type.as_str())
+        .bind(img.image_index)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
 }
