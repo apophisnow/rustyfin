@@ -270,36 +270,27 @@ pub async fn prepare(req: &ImportRequest, data_dir: &Path) -> Result<Prepared, I
     })
 }
 
-/// Fills the account facts of each suggested match from the database (B36), so the report shows
-/// the accounts as they are before the import creates any.
-async fn fill_suggested_facts(db: &SqlitePool, users: &mut [UserRow]) -> Result<(), ImportError> {
-    if users.iter().all(|user| user.suggested_match.is_none()) {
-        return Ok(());
-    }
-    let accounts = rustyfin_db::repo_user::get_all_users(db)
-        .await
-        .map_err(ImportError::Db)?;
-    let pending: HashSet<Uuid> = rustyfin_db::repo_setup_code::pending_users(db)
-        .await
-        .map_err(ImportError::Db)?
-        .into_iter()
-        .map(|row| row.user_id)
-        .collect();
-    for suggested in users
-        .iter_mut()
-        .filter_map(|user| user.suggested_match.as_mut())
-    {
-        if let Some(account) = accounts
+/// Fills the account facts of each suggested match from the users the plan read (B36), so the
+/// report shows the accounts as they are before the import creates any. A suggestion whose
+/// account isn't among `accounts` is dropped, never sent with placeholder facts.
+fn fill_suggested_facts(accounts: &[User], pending: &HashSet<Uuid>, users: &mut [UserRow]) {
+    for user in users.iter_mut() {
+        let Some(suggested) = user.suggested_match.as_mut() else {
+            continue;
+        };
+        match accounts
             .iter()
             .find(|account| account.id == suggested.user_id)
         {
-            suggested.is_administrator = account.is_administrator;
-            suggested.created_at = account.created_at;
-            suggested.last_login_date = account.last_login_date;
+            Some(account) => {
+                suggested.is_administrator = account.is_administrator;
+                suggested.created_at = account.created_at;
+                suggested.last_login_date = account.last_login_date;
+                suggested.setup_code_pending = pending.contains(&suggested.user_id);
+            }
+            None => user.suggested_match = None,
         }
-        suggested.setup_code_pending = pending.contains(&suggested.user_id);
     }
-    Ok(())
 }
 
 /// The planning `preview` and `run` share (spec 2.20, 2.26). A run passes its handle: it then
@@ -318,9 +309,13 @@ async fn plan_report(
     let libraries = rustyfin_db::repo_library::get_all_libraries(db)
         .await
         .map_err(ImportError::Db)?;
-    let rustyfin_users = rustyfin_db::repo_jellyfin_import::user_names(db)
+    let accounts = rustyfin_db::repo_user::get_all_users(db)
         .await
         .map_err(ImportError::Db)?;
+    let rustyfin_users: Vec<(Uuid, String)> = accounts
+        .iter()
+        .map(|account| (account.id, account.name.clone()))
+        .collect();
     let targets = rustyfin_db::repo_jellyfin_import::import_targets(db)
         .await
         .map_err(ImportError::Db)?;
@@ -350,7 +345,15 @@ async fn plan_report(
         &req.confirmed_matches,
         &rustyfin_users,
     );
-    fill_suggested_facts(db, &mut users).await?;
+    if users.iter().any(|user| user.suggested_match.is_some()) {
+        let pending: HashSet<Uuid> = rustyfin_db::repo_setup_code::pending_users(db)
+            .await
+            .map_err(ImportError::Db)?
+            .into_iter()
+            .map(|row| row.user_id)
+            .collect();
+        fill_suggested_facts(&accounts, &pending, &mut users);
+    }
     if let Some(handle) = handle {
         create_users(db, &mut users, rustyfin_users, handle).await?;
     }

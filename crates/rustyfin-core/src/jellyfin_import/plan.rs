@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use rustyfin_db::repo_jellyfin_import::ImportTarget;
 use rustyfin_model::media::MediaType;
+use rustyfin_model::user::NameMatch;
 use uuid::Uuid;
 
 use super::paths::{PathMapping, translate_path};
@@ -71,7 +72,7 @@ pub fn plan_users(
                     .map(|(account, name)| SuggestedMatch {
                         user_id: *account,
                         name: name.clone(),
-                        // The facts are filled from the database by the caller.
+                        // The caller fills these in from the accounts it read, or drops the match.
                         is_administrator: false,
                         created_at: DateTime::<Utc>::UNIX_EPOCH,
                         last_login_date: None,
@@ -96,14 +97,14 @@ pub fn plan_users(
     rows
 }
 
-/// The names of the other accounts that differ from `account`'s name only in case, sorted by
-/// (lowercase, name).
+/// The names of the other accounts whose names sign-in treats as `account`'s name (`names_match`)
+/// but that differ from it, sorted by (lowercase, name).
 fn case_variant_names(account: Uuid, name: &str, rustyfin_users: &[(Uuid, String)]) -> Vec<String> {
-    let lower = name.to_lowercase();
+    let matcher = NameMatch::new(name);
     let mut names: Vec<String> = rustyfin_users
         .iter()
         .filter(|(other, other_name)| {
-            *other != account && other_name != name && other_name.to_lowercase() == lower
+            *other != account && other_name != name && matcher.matches(other_name)
         })
         .map(|(_, other_name)| other_name.clone())
         .collect();
