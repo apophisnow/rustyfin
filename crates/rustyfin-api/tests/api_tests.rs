@@ -26380,11 +26380,21 @@ fn b20_people(item: &serde_json::Value) -> Vec<B20Person> {
 }
 
 /// Alpha's people after an import of the metadata world: in Jellyfin's list order, Ann once (her
-/// first credit), Nora without a kind, and only Ann with a portrait.
-fn b20_alpha_people() -> Vec<B20Person> {
+/// first credit), Nora without a kind, and only Ann with a portrait, tagged by its stored path.
+async fn b20_alpha_people(state: &AppState) -> Vec<B20Person> {
+    let ann = b20_person_id(state, "Ann Actor").await;
+    let path: String = sqlx::query_scalar(
+        "SELECT path FROM person_images \
+         WHERE person_id = ? AND image_type = 'Primary' AND image_index = 0",
+    )
+    .bind(&ann)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    let tag = rustyfin_core::image_proxy::image_tag(&path, None);
     vec![
         b20_person("Dan Director", "Director", None, None),
-        b20_person("Ann Actor", "Actor", Some("Hero"), Some("Primary_0")),
+        b20_person("Ann Actor", "Actor", Some("Hero"), Some(&tag)),
         b20_person("Nora Nobody", "Unknown", None, None),
     ]
 }
@@ -26591,7 +26601,11 @@ async fn b20_import_metadata_fills_empty_fields() {
         );
 
         let alpha = b20_get_item(&w, m.alpha).await;
-        assert_eq!(b20_people(&alpha), b20_alpha_people(), "{name}");
+        assert_eq!(
+            b20_people(&alpha),
+            b20_alpha_people(&w.state).await,
+            "{name}"
+        );
         assert_eq!(alpha["OriginalTitle"], "Alfa", "{name}");
         assert_eq!(alpha["CriticRating"], 88.0, "{name}");
         assert_eq!(alpha["ProviderIds"]["tmdb"], "111", "{name}");
@@ -26753,7 +26767,7 @@ async fn b20_import_metadata_replaces_with_jellyfins() {
     );
 
     let alpha = b20_get_item(&w, m.alpha).await;
-    assert_eq!(b20_people(&alpha), b20_alpha_people());
+    assert_eq!(b20_people(&alpha), b20_alpha_people(&w.state).await);
     let show = b20_get_item(&w, m.show).await;
     let sam = b20_person("Sam Showrunner", "Creator", None, None);
     assert_eq!(
