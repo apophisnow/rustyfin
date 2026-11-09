@@ -1497,6 +1497,10 @@ impl ItemsQuery {
             .unwrap_or(0)
             .max(0)
     }
+    /// The StartIndex as sent, before `start_index` clamps negatives to 0.
+    fn start_index_requested(&self) -> i64 {
+        self.start_index.or(self.start_index_lower).unwrap_or(0)
+    }
     fn limit(&self) -> i64 {
         self.limit.filter(|&limit| limit >= 0).unwrap_or(10_000)
     }
@@ -1788,7 +1792,7 @@ async fn get_items(
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
-        start_index,
+        start_index: query.start_index_requested(),
     }))
 }
 
@@ -1921,7 +1925,8 @@ async fn get_similar(
     let item = rustyfin_db::repo_media::get_item_by_id(&state.db_ro, id)
         .await?
         .ok_or(ApiError::NotFound("item not found".into()))?;
-    let limit = query.limit.unwrap_or(12);
+    let limit = query.limit.filter(|&limit| limit >= 0).unwrap_or(12);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 
     let config = state.config.read().await;
     let tmdb = state.tmdb.api(config.tmdb_api_key.as_deref());
@@ -1935,7 +1940,7 @@ async fn get_similar(
 
         // For each TMDb similar item, find the local item by tmdb_id
         for (similar_tmdb_id, _name) in tmdb_similar {
-            if similar.len() >= limit as usize {
+            if similar.len() >= limit {
                 break;
             }
             // Find local item by tmdb_id
@@ -1959,8 +1964,8 @@ async fn get_similar(
     }
 
     // Priority 2: Local algorithm fills remaining slots
-    if similar.len() < limit as usize {
-        let remaining = limit - similar.len() as i64;
+    if similar.len() < limit {
+        let remaining = i64::try_from(limit - similar.len()).unwrap_or(i64::MAX);
         let local_similar =
             rustyfin_db::repo_media::get_similar_items(&state.db_ro, &item, remaining).await?;
 
@@ -1968,7 +1973,7 @@ async fn get_similar(
         let existing_ids: std::collections::HashSet<String> =
             similar.iter().map(|i| i.id.to_string()).collect();
         for local_item in local_similar {
-            if similar.len() >= limit as usize {
+            if similar.len() >= limit {
                 break;
             }
             if !existing_ids.contains(&local_item.id.to_string()) {

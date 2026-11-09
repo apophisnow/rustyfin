@@ -3484,11 +3484,12 @@ async fn b30_p5_items_reads_negative_paging_as_jellyfin_does() {
     assert_eq!(status, StatusCode::OK, "{all}");
     assert_eq!(all["Items"].as_array().map(Vec::len), Some(2), "{all}");
 
-    // Jellyfin skips only for a positive StartIndex, so a negative one is 0, and says so.
+    // Jellyfin skips only for a positive StartIndex, so a negative one reads from the start, and
+    // the answer echoes the request's value as Jellyfin's `QueryResult` does.
     let (status, body) =
         send_authed(&app, "GET", &format!("{uri}&StartIndex=-1"), &token, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["StartIndex"], 0, "{body}");
+    assert_eq!(body["StartIndex"], -1, "{body}");
     assert_eq!(body["Items"], all["Items"]);
     // A negative Limit is no limit.
     let (status, body) = send_authed(&app, "GET", &format!("{uri}&Limit=-1"), &token, None).await;
@@ -3503,6 +3504,38 @@ async fn b30_p5_items_reads_negative_paging_as_jellyfin_does() {
         serde_json::json!([all["Items"][1]]),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn b30_f12_similar_reads_a_negative_limit_as_none() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    for n in 0..13 {
+        j6_add_item(
+            &state,
+            lib.library,
+            None,
+            &format!("B30 Similar {n}"),
+            "Movie",
+        )
+        .await;
+    }
+    let app = app(state);
+    let count = |body: &serde_json::Value| body["Items"].as_array().map(Vec::len);
+
+    let uri = format!("/Items/{}/Similar", lib.movie);
+    let (status, plain) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert_eq!(count(&plain), Some(12), "the default limit: {plain}");
+    // Limit=-1 was cast to a huge count, so every one of the 13 others came back.
+    let (status, body) =
+        send_authed(&app, "GET", &format!("{uri}?Limit=-1"), &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(count(&body), Some(12), "{body}");
+    let (status, body) =
+        send_authed(&app, "GET", &format!("{uri}?Limit=3"), &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(count(&body), Some(3), "{body}");
 }
 
 /// Makes the search index again after a test dropped it, as migration 006 made it.
