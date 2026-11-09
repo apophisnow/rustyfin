@@ -304,6 +304,25 @@ pub async fn get_session_capabilities(
     Ok(row.map(|r| r.0))
 }
 
+/// The capabilities JSON of the most recently active session of `user_id` on `device_id`, skipping
+/// sessions whose capabilities are empty or `{}`.
+pub async fn get_device_capabilities(
+    pool: &SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT capabilities FROM sessions \
+         WHERE user_id = ?1 AND device_id = ?2 AND capabilities NOT IN ('', '{}') \
+         ORDER BY last_activity DESC, rowid DESC LIMIT 1",
+    )
+    .bind(user_id.to_string())
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
 pub async fn get_now_playing_item(
     pool: &SqlitePool,
     session_id: &str,
