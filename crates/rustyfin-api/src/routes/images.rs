@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -75,6 +75,18 @@ struct ImageQuery {
     quality: Option<u32>,
 }
 
+/// Whether an `If-None-Match` header names `etag` (or is `*`). Weak and strong forms both match,
+/// as RFC 9110 has it for GET.
+fn etag_matches(if_none_match: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = if_none_match.and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn serve_image(
     state: &AppState,
     id: Uuid,
@@ -82,17 +94,11 @@ async fn serve_image(
     index: i32,
     max_width: Option<u32>,
     max_height: Option<u32>,
-    tagged: bool,
+    tag: Option<&str>,
+    if_none_match: Option<&HeaderValue>,
 ) -> Result<Response, ApiError> {
     let image_type = ImageType::from_str(image_type_str)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown image type: {}", image_type_str)))?;
-    // A tag names one version of the picture, so a tagged URL can be kept long. An untagged URL
-    // can change under the same address when the picture is replaced, so it is kept only briefly.
-    let cache_control = if tagged {
-        "public, max-age=86400"
-    } else {
-        "public, max-age=300"
-    };
 
     let found = rustyfin_db::repo_image::get_image(&state.db_ro, id, &image_type, index).await?;
     // Imported people keep their images in `person_images`; try those before giving up.
@@ -101,6 +107,16 @@ async fn serve_image(
         None => rustyfin_db::repo_image::get_person_image(&state.db_ro, id, &image_type, index)
             .await?
             .ok_or_else(|| ApiError::NotFound("image not found".into()))?,
+    };
+
+    // The URL's tag names one version of the picture. When it is the current one, the answer
+    // never changes and is kept for a year. A missing or stale tag gets whatever picture is
+    // current, which can change under the same URL, so it is kept only briefly.
+    let current_tag = rustyfin_core::image_proxy::image_tag(&img.path, img.stamp);
+    let cache_control = if tag.is_some_and(|t| t.eq_ignore_ascii_case(&current_tag)) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=300"
     };
 
     // A remote image is kept in the data dir on first use, so a restart reads it from disk rather
@@ -145,6 +161,18 @@ async fn serve_image(
         }
     };
 
+    // The ETag names the bytes sent: this version of the picture at this rendition. A client
+    // that has them gets a 304 before anything is read or rendered.
+    let etag = format!("\"{}-{}\"", current_tag, rendition.key());
+    if etag_matches(if_none_match, &etag) {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, cache_control)
+            .body(Body::empty())
+            .unwrap());
+    }
+
     // A local original too big for the memory cache is streamed from its file, not held in memory
     let is_remote = img.path.starts_with("http://") || img.path.starts_with("https://");
     if rendition == rustyfin_core::image_proxy::Rendition::Original
@@ -165,6 +193,7 @@ async fn serve_image(
         return Ok(Response::builder()
             .header(header::CONTENT_TYPE, guess_content_type(&img.path, false))
             .header(header::CACHE_CONTROL, cache_control)
+            .header(header::ETAG, &etag)
             .header(header::CONTENT_LENGTH, meta.len().to_string())
             .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
             .unwrap());
@@ -215,6 +244,7 @@ async fn serve_image(
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, cache_control)
+        .header(header::ETAG, &etag)
         .body(Body::from(bytes))
         .unwrap())
 }
@@ -223,6 +253,7 @@ async fn get_item_image(
     State(state): State<AppState>,
     Path((id, image_type_str)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let index = query.image_index.unwrap_or(0);
     serve_image(
@@ -232,7 +263,8 @@ async fn get_item_image(
         index,
         query.max_width,
         query.max_height,
-        query.tag.as_deref().is_some_and(|t| !t.is_empty()),
+        query.tag.as_deref(),
+        headers.get(header::IF_NONE_MATCH),
     )
     .await
 }
@@ -241,6 +273,7 @@ async fn get_item_image_indexed(
     State(state): State<AppState>,
     Path((id, image_type_str, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<ImageQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     serve_image(
         &state,
@@ -249,7 +282,8 @@ async fn get_item_image_indexed(
         image_index,
         query.max_width,
         query.max_height,
-        query.tag.as_deref().is_some_and(|t| !t.is_empty()),
+        query.tag.as_deref(),
+        headers.get(header::IF_NONE_MATCH),
     )
     .await
 }
