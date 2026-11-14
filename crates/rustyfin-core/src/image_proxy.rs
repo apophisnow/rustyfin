@@ -315,10 +315,17 @@ pub async fn render_image(
         return Ok(bytes);
     }
 
+    // A grid-sized copy is made from the grid master when that is on disk (image_warmer prepares
+    // it after scans): decoding a 480x720 JPEG takes a few ms, the original far longer.
+    let master = grid_master_for(source_path, stamp, width, height, cache_dir).await;
+
     // Read, then decode, resize and encode off the async threads: one per CPU, within the memory
     // budget. The blocking task holds the permits, so a request dropped mid-render frees them only
     // when the work ends.
-    let source_bytes = read_image_bytes(source_path, http_client).await?;
+    let source_bytes = match master {
+        Some(bytes) => bytes,
+        None => read_image_bytes(source_path, http_client).await?,
+    };
     let memory = RENDER_MEMORY
         .acquire_many(render_cost_mib(&source_bytes, width, height))
         .await
@@ -353,6 +360,49 @@ pub async fn render_image(
     }
 
     Ok(bytes)
+}
+
+/// The bounds of the grid master: the copy of each picture that `image_warmer` prepares after a
+/// scan, named like a `Copy` of these bounds. It covers every grid width step up to 480 px, and
+/// smaller grid copies are made from it.
+pub const GRID_MASTER: (u32, u32) = (480, 720);
+
+/// The disk name of a source's grid master.
+pub fn grid_master_name(source_path: &str, stamp: Option<i64>) -> String {
+    cached_copy_name(source_path, stamp, GRID_MASTER.0, GRID_MASTER.1)
+}
+
+/// The grid master's bytes, when a copy of `width`x`height` can be made from it: the master is on
+/// disk and whole, it is not itself the copy asked for, and it is at least that large.
+async fn grid_master_for(
+    source_path: &str,
+    stamp: Option<i64>,
+    width: u32,
+    height: u32,
+    cache_dir: &Path,
+) -> Option<Vec<u8>> {
+    if (width, height) == GRID_MASTER || width > GRID_MASTER.0 {
+        return None;
+    }
+    let bytes = fs::read(cache_dir.join(grid_master_name(source_path, stamp)))
+        .await
+        .ok()?;
+    if !is_whole_jpeg(&bytes) {
+        return None;
+    }
+    let (mw, mh) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    // The copy's own size, fitted to the master as it would be to the original
+    let (tw, th) = fit_target(mw, mh, width, height);
+    (tw <= mw && th <= mh && (tw < mw || th < mh)).then_some(bytes)
+}
+
+/// Whether every render slot is taken, so background work should wait for clients' renders.
+pub fn renders_busy() -> bool {
+    RENDER_SLOTS.available_permits() == 0
 }
 
 /// How many bytes of disk copies are written between sweeps of the cache folder.
@@ -780,17 +830,22 @@ pub async fn compute_blurhash(
     http_client: Option<&reqwest::Client>,
 ) -> Option<String> {
     let bytes = read_image_bytes(source_path, http_client).await.ok()?;
-    let img = decode_limited(&bytes).ok()?;
-    // Downscale to a small image for faster encoding
-    let small = img.resize(16, 16, FilterType::Triangle);
-    let rgba = small.to_rgba8();
-    let width = rgba.width() as usize;
-    let height = rgba.height() as usize;
-    let pixels = rgba.as_raw();
+    tokio::task::spawn_blocking(move || blurhash_of(&bytes))
+        .await
+        .ok()?
+}
 
-    // Use 4x4 components for a short hash
-    let hash = blurhash::encode(4, 4, width as u32, height as u32, pixels.as_slice()).ok()?;
-    Some(hash)
+/// The BlurHash of an image's bytes (4x4 components, from a 32 px rendition). A JPEG is decoded at
+/// 1/8 scale where it can be, so this costs a few ms even for a large original.
+pub fn blurhash_of(bytes: &[u8]) -> Option<String> {
+    let small = match decode_scaled_jpeg(bytes, 32, 32) {
+        Some(rgb) => image::DynamicImage::ImageRgb8(rgb),
+        None => decode_limited(bytes)
+            .ok()?
+            .resize(32, 32, FilterType::Triangle),
+    };
+    let rgba = small.to_rgba8();
+    blurhash::encode(4, 4, rgba.width(), rgba.height(), rgba.as_raw()).ok()
 }
 
 /// The most the disk copies of images may total; `sweep_image_cache` trims them to this.
