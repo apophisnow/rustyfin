@@ -12,8 +12,24 @@ function fn(head) {
     return source.slice(start, source.indexOf('\n}\n', start) + 3);
 }
 const context = vm.createContext({});
-vm.runInContext(fn('function posterWindow(velocity, vh) {') + fn('function posterPlan(entries, vw, vh, win, max) {'), context);
-const { posterWindow, posterPlan } = context;
+const widths = source.split('\n').find(l => l.startsWith('const POSTER_WIDTHS ='));
+assert.ok(widths, 'app.js has POSTER_WIDTHS');
+vm.runInContext(
+    widths.replace('const ', 'var ') + '\n' + fn('function posterWidth(cssWidth, dpr) {')
+        + fn('function posterWindow(velocity, vh) {') + fn('function posterPlan(entries, vw, vh, win, max) {'),
+    context,
+);
+const { posterWidth, posterWindow, posterPlan } = context;
+
+test('a card asks for the smallest width step that covers about its device pixels', () => {
+    assert.equal(posterWidth(123, 1), 160); // 1280 px desktop, 7 columns
+    assert.equal(posterWidth(123, 2), 240);
+    assert.equal(posterWidth(170, 2), 320); // 390 px phone, 2 columns
+    assert.equal(posterWidth(170, 3), 480); // 459 device px wanted: 480 covers it
+    assert.equal(posterWidth(288, 2), 640); // a landscape row card
+    assert.equal(posterWidth(2000, 3), 960); // never more than the largest step
+    assert.equal(posterWidth(100, undefined), 160);
+});
 
 const VH = 800;
 const VW = 1280;
