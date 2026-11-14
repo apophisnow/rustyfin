@@ -1620,6 +1620,9 @@ let libraryQuery = null;
 let libraryTotal = null;
 let libraryObserver = null;
 let libraryRequested = new Set();
+// The lean index of the current load (every item's name, picture tag and BlurHash, by position):
+// a placeholder near the viewport becomes a lite card from it at once, before its page arrives
+let libraryIndex = null;
 let letterClicks = 0;
 // The letter rail: the anchor of the last jump ({ k, first }) and the pending frame of an update
 let railAnchor = null;
@@ -1846,6 +1849,7 @@ function startLibraryLoad(libId) {
     libraryObserver = null;
     libraryQuery = libraryListQuery(libId);
     libraryTotal = null;
+    libraryIndex = null;
     libraryRequested = new Set([0]); // the first page is requested by the load itself
     railAnchor = null;
     return ++libraryGen;
@@ -1856,6 +1860,54 @@ async function fetchLibraryPage(startIndex) {
     const data = await API.getItems({ ...libraryQuery, StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE });
     const items = data.Items || data.items || [];
     return { items, total: data.TotalRecordCount || data.total_record_count || items.length };
+}
+
+// The lean index of the whole list: the list query with EnableUserData=false and the Primary
+// picture only, which the server answers without user data or null fields (about 35 bytes of
+// gzip an item). Cards made from it get their watch state when their page arrives.
+async function loadLibraryIndex(gen) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries({ ...libraryQuery, EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1 })) {
+        if (v !== undefined && v !== null && v !== '') q.set(k, v);
+    }
+    try {
+        const data = await API.get('/Items?' + q.toString());
+        if (gen !== libraryGen) return;
+        libraryIndex = data.Items || data.items || [];
+        libraryIndexArrived();
+    } catch (e) {
+        console.warn('Library index failed; pages still load', e);
+    }
+}
+
+// A card from the index in place of placeholder `ph`; its page later fills in the rest
+function liteCard(ph) {
+    const item = libraryIndex?.[Number(ph.dataset.i)];
+    if (!item) return;
+    const card = createCardElement(item);
+    card.dataset.letter = railLetter(item);
+    card.dataset.lite = '1';
+    ph.replaceWith(card);
+    libraryObserver?.unobserve(ph);
+}
+
+// Gives a card the full item from its page, keeping its picture and BlurHash elements (already
+// loading or shown) so nothing flashes, and the card element itself (the poster loader tracks it)
+function upgradeCard(card, item) {
+    const full = createCardElement(item);
+    const oldImg = card.querySelector('img.jf-thumb-img');
+    const freshImg = full.querySelector('img.jf-thumb-img');
+    if (oldImg && freshImg && oldImg.dataset.imgTag === freshImg.dataset.imgTag) {
+        freshImg.replaceWith(oldImg);
+        const oldHash = card.querySelector('canvas.jf-blurhash');
+        const freshHash = full.querySelector('canvas.jf-blurhash');
+        if (oldHash && freshHash) freshHash.replaceWith(oldHash);
+        // A picture already shown keeps its skeleton hidden
+        if (oldImg.style.opacity) full.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.display = 'none'; });
+    }
+    card.replaceChildren(...full.childNodes);
+    card.dataset.letter = railLetter(item);
+    delete card.dataset.lite;
 }
 
 // Fills #lib-grid-container with one child per item: cards for the loaded items, placeholders for the rest
@@ -1887,13 +1939,15 @@ function fillLibraryGrid(items, total) {
     }
     grid.appendChild(frag);
 
-    // A placeholder that comes near the viewport requests its page, once per load
+    // A placeholder that comes near the viewport becomes a lite card (once the index is here) and
+    // requests its page, once per load
     const gen = libraryGen;
     libraryObserver = new IntersectionObserver(entries => {
         if (gen !== libraryGen) return; // a newer load has replaced this observer
         for (const entry of entries) {
             if (!entry.isIntersecting) continue;
             const page = Math.floor(Number(entry.target.dataset.i) / LIBRARY_PAGE_SIZE);
+            liteCard(entry.target);
             if (libraryRequested.has(page)) continue;
             libraryRequested.add(page);
             loadLibraryPage(gen, page);
@@ -1901,6 +1955,19 @@ function fillLibraryGrid(items, total) {
     }, { rootMargin: '200% 0px' });
     grid.querySelectorAll('[data-i]').forEach(ph => libraryObserver.observe(ph));
     scheduleRailUpdate();
+    if (items.length < total) loadLibraryIndex(gen);
+}
+
+// The index arrived: placeholders already near the viewport become lite cards
+function libraryIndexArrived() {
+    const grid = $('lib-grid');
+    if (!grid) return;
+    const near = [];
+    for (const ph of grid.querySelectorAll('[data-i]')) {
+        const r = ph.getBoundingClientRect();
+        if (r.bottom > -2 * innerHeight && r.top < 3 * innerHeight) near.push(ph);
+    }
+    near.forEach(liteCard);
 }
 
 // Puts the cards of one page in place of its placeholders
@@ -1910,12 +1977,17 @@ async function loadLibraryPage(gen, page) {
         if (gen !== libraryGen) return;
         const grid = $('lib-grid');
         items.forEach((item, j) => {
-            const placeholder = grid?.children[page * LIBRARY_PAGE_SIZE + j];
-            if (!placeholder) return;
+            const cell = grid?.children[page * LIBRARY_PAGE_SIZE + j];
+            if (!cell) return;
+            if (cell.dataset.lite) {
+                upgradeCard(cell, item);
+                return;
+            }
+            if (!cell.hasAttribute('data-i')) return;
             const card = createCardElement(item);
             card.dataset.letter = railLetter(item);
-            placeholder.replaceWith(card);
-            libraryObserver.unobserve(placeholder);
+            cell.replaceWith(card);
+            libraryObserver.unobserve(cell);
         });
         scheduleRailUpdate();
     } catch (e) {
