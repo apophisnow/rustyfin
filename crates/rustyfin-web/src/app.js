@@ -1523,7 +1523,7 @@ async function renderFavorites() {
                     <h1 class="text-2xl lg:text-3xl font-extrabold text-white tracking-tight">${t('favorites.title')}</h1>
                     <span class="text-xs text-white/40">(${total})</span>
                 </div>
-                <div id="fav-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
+                <div id="fav-grid" class="jf-card-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
                 ${hasMore ? `
                 <div id="fav-infinite-container" class="text-center mt-8">
                     <div id="infinite-scroll-spinner" class="jf-infinite-spinner" style="display:none"><div class="jf-spinner"></div></div>
@@ -2326,7 +2326,7 @@ async function renderPerson(personId) {
             ${items.length > 0 ? `
             <div>
                 <h2 class="text-xl font-bold text-white mb-4">${t('person.known_for', { count: items.length })}</h2>
-                <div id="person-known-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
+                <div id="person-known-grid" class="jf-card-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
             </div>` : `<p class="text-white/40">${t('person.no_items')}</p>`}
         </div>`;
         // Populate KnownFor grid using DocumentFragment
@@ -2379,7 +2379,7 @@ async function renderSearch(term) {
         page.innerHTML = `
         <div class="jf-page">
             <h1 class="text-2xl font-bold mb-6 text-white">${t('search.results_for', { term: escapeHtml(term), count: items.length })}</h1>
-            <div id="search-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
+            <div id="search-grid" class="jf-card-grid grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-4"></div>
         </div>`;
         // Populate search grid using DocumentFragment
         const gridEl = $('search-grid');
