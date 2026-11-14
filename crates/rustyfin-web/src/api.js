@@ -266,6 +266,7 @@ const API = {
         localStorage.setItem('rustyfin_user_id', this.userId);
         localStorage.setItem('rustyfin_user_name', this.userName);
         localStorage.setItem('rustyfin_is_admin', this.isAdmin.toString());
+        this.announceImageOwner();
     },
 
     // Ends an OpenID Connect sign-in. The flow cookie from oidcStart() picks the flow. The device header is sent as login() sends it, so the token belongs to this browser.
@@ -308,7 +309,17 @@ const API = {
         this.userName = null;
         this.isAdmin = false;
         ['rustyfin_token', 'rustyfin_user_id', 'rustyfin_user_name', 'rustyfin_is_admin'].forEach(k => localStorage.removeItem(k));
+        this.announceImageOwner();
         if (this.onSignedOut) this.onSignedOut();
+    },
+
+    // Tells the service worker whose session this is (sw.js): it empties its image cache for
+    // another user or after sign-out. Signed out, the page empties it too, in case no worker
+    // controls this page yet.
+    announceImageOwner() {
+        const userId = this.token ? this.userId : null;
+        navigator.serviceWorker?.controller?.postMessage({ type: 'image-owner', userId });
+        if (!userId) globalThis.caches?.delete('rustyfin-images-v1').catch(() => {});
     },
 
     isLoggedIn() {
@@ -630,4 +641,10 @@ const LiveLog = {
 
 if (typeof window !== 'undefined') {
     window.LiveLog = LiveLog;
+}
+
+// The service worker learns the session's user on every page load and when it takes control
+if (typeof navigator !== 'undefined' && navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('controllerchange', () => API.announceImageOwner());
+    API.announceImageOwner();
 }
