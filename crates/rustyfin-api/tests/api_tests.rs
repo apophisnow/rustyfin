@@ -4008,6 +4008,210 @@ async fn b152_blur_hashes_are_keyed_by_type_and_tag_in_details_and_lists() {
     assert!(blurhash::decode(stored, 4, 4, 1.0).is_ok(), "{stored}");
 }
 
+// B152: the web client's library index (Fields given empty, EnableUserData=false,
+// EnableImageTypes=Primary, ImageTypeLimit=1) carries names, the Primary tag and BlurHash, no user
+// data, no optional fields and no null fields (as Jellyfin)
+#[tokio::test]
+async fn b152_a_lean_list_has_names_pictures_and_blurhashes_only() {
+    use rustyfin_model::image::ImageType::Backdrop;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    let backdrop = state.data_dir.join("b152-backdrop.jpg");
+    b30_set_image(&state, id, Backdrop, &backdrop.to_string_lossy(), Some(3)).await;
+    rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+        .await
+        .unwrap();
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let uri = "/Items?IncludeItemTypes=Photo&Recursive=true";
+    let (status, full) = send_authed(&app, "GET", uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let uri =
+        format!("{uri}&Fields=&EnableUserData=false&EnableImageTypes=Primary&ImageTypeLimit=1");
+    let (status, lean) = send_authed(&app, "GET", &uri, &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{lean}");
+    for optional in [
+        "Overview",
+        "Genres",
+        "Tags",
+        "Studios",
+        "People",
+        "ProviderIds",
+        "Path",
+    ] {
+        assert!(
+            lean["Items"][0].get(optional).is_none(),
+            "{optional}: {lean}"
+        );
+    }
+
+    assert_eq!(lean["TotalRecordCount"], full["TotalRecordCount"]);
+    let item = &lean["Items"][0];
+    let fields = item.as_object().unwrap();
+    assert_eq!(item["Id"], full["Items"][0]["Id"]);
+    assert_eq!(item["Name"], "B30 Photo");
+    assert_eq!(item["Type"], full["Items"][0]["Type"]);
+    assert_eq!(
+        item["ImageTags"],
+        serde_json::json!({ "Primary": tag }),
+        "{item}"
+    );
+    assert_eq!(item["BackdropImageTags"], serde_json::json!([]), "{item}");
+    let hash = item["ImageBlurHashes"]["Primary"][&tag]
+        .as_str()
+        .unwrap_or_else(|| panic!("{item}"));
+    assert!(blurhash::decode(hash, 4, 4, 1.0).is_ok());
+    assert!(!fields.contains_key("UserData"), "{item}");
+    assert!(
+        fields.values().all(|v| !v.is_null()),
+        "no null fields: {item}"
+    );
+    assert!(
+        item.to_string().len() * 2 < full["Items"][0].to_string().len(),
+        "the lean item is less than half the full one"
+    );
+    // The full list keeps its shape: user data and every field
+    assert!(
+        full["Items"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("UserData")
+    );
+}
+
+// B152 F13: EnableUserData=false leaves out UserData and nothing else, as in Jellyfin: a
+// third-party request with normal Fields gets the same movie, series and episode fields as without
+// it (no lean answer), and the episode keeps its series fields
+#[tokio::test]
+async fn b152_enable_user_data_false_drops_only_user_data() {
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let base = "/Items?Recursive=true&IncludeItemTypes=Movie,Series,Episode&SortBy=SortName\
+                &Fields=ChildCount,ProviderIds,Overview,PrimaryImageAspectRatio";
+    let (status, full) = send_authed(&app, "GET", base, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    let uri = format!("{base}&EnableUserData=false");
+    let (status, without) = send_authed(&app, "GET", &uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{without}");
+
+    let items = |body: &serde_json::Value| body["Items"].as_array().unwrap().clone();
+    let (full, without) = (items(&full), items(&without));
+    let ids: Vec<_> = full.iter().map(|i| i["Id"].clone()).collect();
+    for id in [lib.movie, lib.series, lib.episode] {
+        assert!(ids.contains(&serde_json::json!(id)), "{id} listed");
+    }
+    assert_eq!(full.len(), without.len());
+    for (a, b) in full.iter().zip(&without) {
+        let mut a = a.as_object().unwrap().clone();
+        let mut b = b.as_object().unwrap().clone();
+        assert!(b["UserData"].is_null(), "no user data: {b:?}");
+        if a["Id"] == serde_json::json!(lib.episode) {
+            assert!(
+                a["UserData"].is_object(),
+                "an episode always has user data: {a:?}"
+            );
+        }
+        a.remove("UserData");
+        b.remove("UserData");
+        let b = &b;
+        // The same keys and values, the per-user ones aside
+        let differ: Vec<&String> = a
+            .keys()
+            .chain(b.keys())
+            .filter(|k| a.get(*k) != b.get(*k))
+            .collect();
+        assert!(differ.is_empty(), "{}: {differ:?}", a["Type"]);
+    }
+    let episode = without
+        .iter()
+        .find(|i| i["Id"] == serde_json::json!(lib.episode))
+        .unwrap();
+    assert_eq!(
+        episode["SeriesId"],
+        serde_json::json!(lib.series),
+        "{episode}"
+    );
+    assert!(episode["SeriesName"].is_string(), "{episode}");
+}
+
+// B152 F14: EnableImageTypes naming no known type keeps every image (Jellyfin applies it only when
+// it holds a type); EnableImages=false sends none
+#[tokio::test]
+async fn b152_image_options_follow_jellyfin() {
+    use rustyfin_model::image::ImageType::Backdrop;
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    for (i, stamp) in [(0, 3), (1, 4)] {
+        let path = state.data_dir.join(format!("b152-backdrop-{i}.jpg"));
+        let image = rustyfin_model::image::ItemImage {
+            item_id: id,
+            image_type: Backdrop,
+            image_index: i,
+            path: path.to_string_lossy().into_owned(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: Some(stamp),
+        };
+        rustyfin_db::repo_image::upsert_image(&state.db, &image)
+            .await
+            .unwrap();
+    }
+    let get = |query: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let uri = format!("/Items?IncludeItemTypes=Photo&Recursive=true{query}");
+            let (status, body) = send_authed(&app, "GET", &uri, &token, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["Items"][0].clone()
+        }
+    };
+    let all = get("").await;
+    assert_eq!(
+        all["BackdropImageTags"].as_array().unwrap().len(),
+        2,
+        "{all}"
+    );
+    for query in [
+        "&EnableImageTypes=",
+        "&EnableImageTypes=Foo",
+        "&enableImageTypes=Foo,",
+    ] {
+        let item = get(query).await;
+        assert_eq!(item["ImageTags"], all["ImageTags"], "{query}");
+        assert_eq!(
+            item["BackdropImageTags"], all["BackdropImageTags"],
+            "{query}"
+        );
+    }
+    let one = get("&ImageTypeLimit=1").await;
+    assert_eq!(
+        one["BackdropImageTags"].as_array().unwrap().len(),
+        1,
+        "{one}"
+    );
+    assert_eq!(one["ImageTags"], all["ImageTags"]);
+    let backdrops = get("&EnableImageTypes=Backdrop").await;
+    assert!(
+        backdrops["ImageTags"].get("Primary").is_none(),
+        "{backdrops}"
+    );
+    assert_eq!(backdrops["BackdropImageTags"], all["BackdropImageTags"]);
+    let none = get("&EnableImages=false").await;
+    assert_eq!(none["ImageTags"], serde_json::json!({}), "{none}");
+    assert_eq!(none["BackdropImageTags"], serde_json::json!([]), "{none}");
+    assert_eq!(none["ImageBlurHashes"], serde_json::json!({}), "{none}");
+}
+
 // B152: images answer If-None-Match with 304, and only a current tag is kept for good
 #[tokio::test]
 async fn b152_images_carry_an_etag_and_answer_304_when_unchanged() {

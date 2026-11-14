@@ -207,15 +207,37 @@ pub async fn get_images_batch(
     pool: &SqlitePool,
     item_ids: &[Uuid],
 ) -> Result<std::collections::HashMap<String, Vec<ItemImage>>, sqlx::Error> {
-    if item_ids.is_empty() {
+    get_images_batch_of(pool, item_ids, None, None).await
+}
+
+/// `get_images_batch` for the image types `types` only (all when None) and the first `per_type`
+/// of each (all when None), so a list that shows one picture an item reads one row an item.
+pub async fn get_images_batch_of(
+    pool: &SqlitePool,
+    item_ids: &[Uuid],
+    types: Option<&[ImageType]>,
+    per_type: Option<usize>,
+) -> Result<std::collections::HashMap<String, Vec<ItemImage>>, sqlx::Error> {
+    if item_ids.is_empty() || types.is_some_and(|t| t.is_empty()) || per_type == Some(0) {
         return Ok(std::collections::HashMap::new());
     }
 
     let id_strs: Vec<String> = item_ids.iter().map(|id| id.to_string()).collect();
     let placeholders: Vec<String> = (0..id_strs.len()).map(|i| format!("?{}", i + 1)).collect();
+    // The type names come from ImageType::as_str and the count is a number, so both are inlined
+    let type_clause = types
+        .map(|types| {
+            let names: Vec<String> = types.iter().map(|t| format!("'{}'", t.as_str())).collect();
+            format!(" AND image_type IN ({})", names.join(","))
+        })
+        .unwrap_or_default();
+    let index_clause = per_type
+        .map(|n| format!(" AND image_index < {n}"))
+        .unwrap_or_default();
     let query = format!(
         "SELECT item_id, image_type, image_index, path, provider, width, height, blurhash, stamp
-         FROM item_images WHERE item_id IN ({}) ORDER BY item_id, image_type, image_index",
+         FROM item_images WHERE item_id IN ({}){type_clause}{index_clause}
+         ORDER BY item_id, image_type, image_index",
         placeholders.join(",")
     );
 

@@ -715,6 +715,102 @@ pub(crate) async fn enrich_items(
     data_dir: &std::path::Path,
     skip_blurhash: bool,
 ) {
+    enrich_items_with(
+        pool,
+        server_id,
+        user_id,
+        items,
+        http_client,
+        tmdb_api,
+        data_dir,
+        skip_blurhash,
+        &ImageOptions::default(),
+    )
+    .await
+}
+
+/// Jellyfin's image DTO options: EnableImages=false sends no image, EnableImageTypes keeps only
+/// the types it names (all when it names none it knows), ImageTypeLimit keeps that many images of
+/// a type (backdrops are the type with several). The default keeps everything.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ImageOptions {
+    pub types: Option<Vec<rustyfin_model::image::ImageType>>,
+    pub limit: Option<usize>,
+}
+
+impl ImageOptions {
+    fn narrows(&self) -> bool {
+        self.types.is_some() || self.limit.is_some()
+    }
+
+    fn sends(&self, image_type: rustyfin_model::image::ImageType) -> bool {
+        self.limit != Some(0) && self.types.as_ref().is_none_or(|t| t.contains(&image_type))
+    }
+
+    /// Leaves out the images of an enriched item these options don't send: its own, its parents'
+    /// and its series', and the BlurHashes of the images left out.
+    fn apply(&self, item: &mut MediaItem) {
+        use rustyfin_model::image::ImageType as T;
+        if !self.narrows() {
+            return;
+        }
+        item.image_tags.retain(|t, _| self.sends(*t));
+        if !self.sends(T::Backdrop) {
+            item.backdrop_image_tags.clear();
+            item.parent_backdrop_image_tags.clear();
+        }
+        if let Some(n) = self.limit {
+            item.backdrop_image_tags.truncate(n);
+            item.parent_backdrop_image_tags.truncate(n);
+        }
+        if !self.sends(T::Primary) {
+            item.series_primary_image_tag = None;
+            item.parent_primary_image_tag = None;
+        }
+        if !self.sends(T::Thumb) {
+            item.series_thumb_image_tag = None;
+            item.parent_thumb_image_tag = None;
+        }
+        if !self.sends(T::Logo) {
+            item.parent_logo_image_tag = None;
+        }
+        if !self.sends(T::Art) {
+            item.parent_art_image_tag = None;
+        }
+        let kept: std::collections::HashSet<&String> = item
+            .image_tags
+            .values()
+            .chain(&item.backdrop_image_tags)
+            .chain(&item.parent_backdrop_image_tags)
+            .chain(&item.series_primary_image_tag)
+            .chain(&item.series_thumb_image_tag)
+            .chain(&item.parent_primary_image_tag)
+            .chain(&item.parent_thumb_image_tag)
+            .chain(&item.parent_logo_image_tag)
+            .chain(&item.parent_art_image_tag)
+            .collect();
+        let kept: std::collections::HashSet<String> = kept.into_iter().cloned().collect();
+        item.image_blur_hashes.retain(|_, by_tag| {
+            by_tag.retain(|tag, _| kept.contains(tag));
+            !by_tag.is_empty()
+        });
+    }
+}
+
+/// `enrich_items` with Jellyfin's image options: the image rows read are only those `images`
+/// sends, and the answer is narrowed to them (see `ImageOptions`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn enrich_items_with(
+    pool: &SqlitePool,
+    server_id: &str,
+    user_id: Option<Uuid>,
+    items: &mut [MediaItem],
+    http_client: &reqwest::Client,
+    tmdb_api: Option<&TmdbApi>,
+    data_dir: &std::path::Path,
+    skip_blurhash: bool,
+    images: &ImageOptions,
+) {
     if items.is_empty() {
         return;
     }
@@ -800,19 +896,30 @@ pub(crate) async fn enrich_items(
             .unwrap_or_default()
     };
 
-    // Batch query 6: All images for all items - populates image_tags
-    let images_map = rustyfin_db::repo_image::get_images_batch(pool, &item_ids)
-        .await
-        .unwrap_or_default();
+    // Batch query 6: All images for all items - populates image_tags. Only the image types and
+    // counts the answer sends are read (one row an item for a Primary-only list).
+    let images_map = rustyfin_db::repo_image::get_images_batch_of(
+        pool,
+        &item_ids,
+        images.types.as_deref(),
+        images.limit,
+    )
+    .await
+    .unwrap_or_default();
 
     // Batch query 7: Images for parent items too (needed for inherited image tags)
     let parent_image_ids: Vec<Uuid> = parent_map.values().map(|p| p.id).collect();
     let parent_images_map = if parent_image_ids.is_empty() {
         std::collections::HashMap::new()
     } else {
-        rustyfin_db::repo_image::get_images_batch(pool, &parent_image_ids)
-            .await
-            .unwrap_or_default()
+        rustyfin_db::repo_image::get_images_batch_of(
+            pool,
+            &parent_image_ids,
+            images.types.as_deref(),
+            images.limit,
+        )
+        .await
+        .unwrap_or_default()
     };
 
     // Batch query 8: People for all items
@@ -1406,6 +1513,10 @@ pub(crate) async fn enrich_items(
             item.trailer_count = Some(item.remote_trailers.len() as i32);
         }
     }
+
+    for item in items.iter_mut() {
+        images.apply(item);
+    }
 }
 
 pub fn routes() -> Router<AppState> {
@@ -1505,6 +1616,20 @@ struct ItemsQuery {
     image_types_limit: Option<i32>,
     #[serde(rename = "imageTypesLimit")]
     image_types_limit_lower: Option<i32>,
+    // Jellyfin's DTO options: EnableUserData=false leaves out UserData only; EnableImages,
+    // EnableImageTypes and ImageTypeLimit narrow the images (see `ImageOptions`)
+    enable_user_data: Option<bool>,
+    #[serde(rename = "enableUserData")]
+    enable_user_data_lower: Option<bool>,
+    enable_image_types: Option<String>,
+    #[serde(rename = "enableImageTypes")]
+    enable_image_types_lower: Option<String>,
+    image_type_limit: Option<usize>,
+    #[serde(rename = "imageTypeLimit")]
+    image_type_limit_lower: Option<usize>,
+    enable_images: Option<bool>,
+    #[serde(rename = "enableImages")]
+    enable_images_lower: Option<bool>,
     is_favorite: Option<bool>,
     #[serde(rename = "isFavorite")]
     is_favorite_lower: Option<bool>,
@@ -1657,6 +1782,45 @@ impl ItemsQuery {
     fn fields(&self) -> Option<&str> {
         self.fields.as_deref().or(self.fields_lower.as_deref())
     }
+    fn enable_user_data(&self) -> bool {
+        self.enable_user_data
+            .or(self.enable_user_data_lower)
+            .unwrap_or(true)
+    }
+    /// The image options: EnableImages=false sends none; EnableImageTypes keeps the types it
+    /// names, and naming none it knows (or none at all) keeps all of them, as Jellyfin applies
+    /// the list only when it holds a type.
+    fn image_options(&self) -> ImageOptions {
+        let types: Option<Vec<rustyfin_model::image::ImageType>> = self
+            .enable_image_types
+            .as_deref()
+            .or(self.enable_image_types_lower.as_deref())
+            .map(|types| {
+                types
+                    .split(',')
+                    .filter_map(|t| rustyfin_model::image::ImageType::from_str(t.trim()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|types| !types.is_empty());
+        let enabled = self
+            .enable_images
+            .or(self.enable_images_lower)
+            .unwrap_or(true);
+        ImageOptions {
+            types,
+            limit: if enabled {
+                self.image_type_limit.or(self.image_type_limit_lower)
+            } else {
+                Some(0)
+            },
+        }
+    }
+    /// Whether Fields is given and names no field: Jellyfin's "no optional fields" (see
+    /// `minimal_result`).
+    fn fields_given_empty(&self) -> bool {
+        self.fields()
+            .is_some_and(|fields| fields.split(',').all(|f| f.trim().is_empty()))
+    }
     fn image_types_limit(&self) -> Option<i32> {
         self.image_types_limit.or(self.image_types_limit_lower)
     }
@@ -1805,7 +1969,7 @@ async fn get_items(
     State(state): State<AppState>,
     Query(query): Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<QueryResult>, ApiError> {
+) -> Result<Response, ApiError> {
     let media_types: Option<Vec<String>> = query
         .include_item_types()
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
@@ -1909,26 +2073,78 @@ async fn get_items(
         items
     };
 
-    // Enrich items with all response fields using batch queries
+    // Enrich items with all response fields using batch queries. EnableUserData=false enriches
+    // for no user, which leaves out UserData and the per-user counts, and nothing else. With
+    // Fields given empty no optional field is sent, so the trailers aren't looked up.
     // Skip blurhash for list views to avoid per-item disk I/O
-    let tmdb = state.tmdb.api(None);
-    enrich_items(
+    let minimal = query.fields_given_empty();
+    let tmdb = if minimal { None } else { state.tmdb.api(None) };
+    enrich_items_with(
         &state.db_ro,
         &state.server_id,
-        Some(claims.sub),
+        query.enable_user_data().then_some(claims.sub),
         &mut items,
         &state.http_client,
         tmdb.as_ref(),
         &state.data_dir,
         true, // skip_blurhash for list views
+        &query.image_options(),
     )
     .await;
 
+    if minimal {
+        return Ok(
+            Json(minimal_result(items, total, query.start_index_requested())).into_response(),
+        );
+    }
     Ok(Json(QueryResult {
         items,
         total_record_count: total,
         start_index: query.start_index_requested(),
-    }))
+    })
+    .into_response())
+}
+
+/// Jellyfin's optional item fields (ItemFields) that Rustyfin fills on every item, by JSON name.
+/// An answer to a request that gives Fields empty leaves them out, as Jellyfin does.
+const OPTIONAL_ITEM_FIELDS: &[&str] = &[
+    "Overview",
+    "Genres",
+    "GenreItems",
+    "Tags",
+    "Studios",
+    "People",
+    "ProviderIds",
+    "ExternalUrls",
+    "Chapters",
+    "MediaSources",
+    "MediaStreams",
+    "Path",
+    "Taglines",
+    "ProductionLocations",
+    "RemoteTrailers",
+    "OriginalTitle",
+    "Etag",
+    "ScreenshotImageTags",
+];
+
+/// The answer to a list request that gives Fields empty (Jellyfin's "no optional fields"): each
+/// item without the optional fields and without null fields, as Jellyfin's serializer leaves those
+/// out (JsonIgnoreCondition.WhenWritingNull). The base fields, user data and images stay. The web
+/// client's library index asks this way, so a whole library stays small.
+fn minimal_result(items: Vec<MediaItem>, total: i64, start_index: i64) -> Value {
+    let items: Vec<Value> = items
+        .iter()
+        .map(|item| match serde_json::to_value(item) {
+            Ok(Value::Object(mut fields)) => {
+                fields.retain(|k, v| !v.is_null() && !OPTIONAL_ITEM_FIELDS.contains(&k.as_str()));
+                Value::Object(fields)
+            }
+            Ok(other) => other,
+            Err(_) => Value::Null,
+        })
+        .collect();
+    json!({ "Items": items, "TotalRecordCount": total, "StartIndex": start_index })
 }
 
 async fn get_item(
@@ -2280,7 +2496,7 @@ async fn get_user_items(
     Path(_user_id): Path<Uuid>,
     Query(query): Query<ItemsQuery>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<QueryResult>, ApiError> {
+) -> Result<Response, ApiError> {
     // Delegate to get_items with the user's claims
     get_items(State(state), Query(query), Extension(claims)).await
 }
