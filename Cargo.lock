@@ -3388,6 +3388,7 @@ version = "0.17.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "blurhash",
  "chrono",
  "dashmap",
  "form_urlencoded",

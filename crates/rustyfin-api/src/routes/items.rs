@@ -112,6 +112,17 @@ fn set_image_tags(item: &mut MediaItem, images: &[rustyfin_model::image::ItemIma
     item.backdrop_image_tags = backdrop_tags;
 }
 
+/// Adds an image's BlurHash to an item, under its type and tag (Jellyfin's ImageBlurHashes).
+fn add_blur_hash(item: &mut MediaItem, img: &rustyfin_model::image::ItemImage, hash: String) {
+    item.image_blur_hashes
+        .entry(img.image_type.as_str().to_string())
+        .or_default()
+        .insert(
+            rustyfin_core::image_proxy::image_tag(&img.path, img.stamp),
+            hash,
+        );
+}
+
 /// Load the image tags of an item read with `get_parent_item` or `get_album_for_audio`, which
 /// leave them empty.
 async fn load_image_tags(pool: &SqlitePool, item: &mut MediaItem) {
@@ -256,8 +267,7 @@ async fn enrich_item(
         for img in images {
             // Use pre-computed blurhash from the database if available
             if let Some(ref hash) = img.blurhash {
-                let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                item.image_blur_hashes.insert(key, hash.clone());
+                add_blur_hash(item, &img, hash.clone());
             } else if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
                 // Fall back to on-demand computation for images without stored blurhash
                 let full_path = data_dir.join(&img.path);
@@ -270,8 +280,7 @@ async fn enrich_item(
                 )
                 .await
                 {
-                    let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                    item.image_blur_hashes.insert(key, hash);
+                    add_blur_hash(item, &img, hash);
                 }
             }
         }
@@ -930,9 +939,10 @@ pub(crate) async fn enrich_items(
             item.backdrop_image_tags = backdrop_tags;
         }
 
-        // ImageBlurHashes: prefer stored values, fall back to on-demand computation
-        if !skip_blurhash {
-            // Use images from the batch-loaded map if available
+        // ImageBlurHashes: stored values always (lists paint them at once, as Jellyfin's do); an
+        // image without one is computed on demand only when `skip_blurhash` is false. The image
+        // warmer stores the missing ones in the background.
+        {
             let images_for_blurhash = images_map
                 .get(&item.id.to_string())
                 .cloned()
@@ -940,9 +950,11 @@ pub(crate) async fn enrich_items(
             for img in images_for_blurhash {
                 // Use pre-computed blurhash from the database if available
                 if let Some(ref hash) = img.blurhash {
-                    let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                    item.image_blur_hashes.insert(key, hash.clone());
-                } else if !img.path.starts_with("http://") && !img.path.starts_with("https://") {
+                    add_blur_hash(item, &img, hash.clone());
+                } else if !skip_blurhash
+                    && !img.path.starts_with("http://")
+                    && !img.path.starts_with("https://")
+                {
                     // Fall back to on-demand computation
                     let full_path = data_dir.join(&img.path);
                     if let Ok(Some(hash)) = tokio::time::timeout(
@@ -954,8 +966,7 @@ pub(crate) async fn enrich_items(
                     )
                     .await
                     {
-                        let key = format!("{}-{}", img.image_type.as_str(), img.image_index);
-                        item.image_blur_hashes.insert(key, hash);
+                        add_blur_hash(item, &img, hash);
                     }
                 }
             }

@@ -3968,6 +3968,46 @@ async fn b30_f6_only_a_tagged_request_is_cached_for_long() {
     }
 }
 
+// B152: ImageBlurHashes has Jellyfin's shape ({type: {tag: hash}}), and lists carry stored hashes
+#[tokio::test]
+async fn b152_blur_hashes_are_keyed_by_type_and_tag_in_details_and_lists() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state.clone());
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [200, 30, 30])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+    let listed = || async {
+        let uri = "/Items?IncludeItemTypes=Photo&Recursive=true";
+        let (status, list) = send_authed(&app, "GET", uri, &token, None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        list["Items"][0]["ImageBlurHashes"].clone()
+    };
+
+    // Details compute a missing hash; a list only sends stored ones
+    let (status, details) = send_authed(&app, "GET", &format!("/Items/{id}"), &token, None).await;
+    assert_eq!(status, StatusCode::OK, "{details}");
+    let hashes = details["ImageBlurHashes"].as_object().unwrap();
+    assert_eq!(hashes.keys().collect::<Vec<_>>(), ["Primary"], "{details}");
+    let by_tag = hashes["Primary"].as_object().unwrap();
+    assert_eq!(by_tag.keys().collect::<Vec<_>>(), [&tag], "{details}");
+    let hash = by_tag[&tag].as_str().unwrap();
+    assert!(blurhash::decode(hash, 4, 4, 1.0).is_ok(), "{hash}");
+    assert_eq!(listed().await, serde_json::json!({}));
+
+    // The image warmer stores it, and the list sends it from then on
+    let report =
+        rustyfin_core::image_warmer::warm_pass(&state.db, &state.data_dir, &state.http_client)
+            .await
+            .unwrap();
+    assert_eq!(report.hashed, 1, "{report:?}");
+    let hashes = listed().await;
+    let stored = hashes["Primary"][&tag]
+        .as_str()
+        .unwrap_or_else(|| panic!("{hashes}"));
+    assert!(blurhash::decode(stored, 4, 4, 1.0).is_ok(), "{stored}");
+}
+
 // B152: images answer If-None-Match with 304, and only a current tag is kept for good
 #[tokio::test]
 async fn b152_images_carry_an_etag_and_answer_304_when_unchanged() {
