@@ -39,31 +39,6 @@ function hide(id) {
     el.style.setProperty('display', 'none', 'important');
 }
 
-function initLazyImages(root = document) {
-    // Hover-based full-res image loading: swap thumbnail for full-res on card hover
-    root.querySelectorAll('img.jf-thumb-img[data-full-src]').forEach(img => {
-        if (img.dataset.lazyBound) return;
-        const card = img.closest('.jf-card');
-        if (!card) return;
-        img.dataset.lazyBound = '1';
-
-        card.addEventListener('mouseenter', () => {
-            if (img.dataset.fullLoaded) return;
-            img.dataset.fullLoaded = '1';
-            const fullSrc = img.dataset.fullSrc;
-            const fullImg = new Image();
-            fullImg.decode().then(() => {
-                img.src = fullSrc;
-                img.style.opacity = '1';
-                img.classList.remove('blur-sm', 'scale-105');
-            }).catch(() => {
-                // Full-res failed; keep thumbnail
-                delete img.dataset.fullLoaded;
-            });
-            fullImg.src = fullSrc;
-        }, { once: true });
-    });
-}
 
 // --- BlurHash previews (https://blurha.sh): cards paint the server's ImageBlurHashes at once ---
 const BLURHASH_DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~';
@@ -132,6 +107,17 @@ function paintBlurhashes(root) {
 // for the page's own requests, and stops pictures that are no longer near.
 const POSTER_MAX_LOADING = 5;
 
+// The widths card pictures are asked for. A few fixed steps, so the server, the browser and the
+// service worker share their copies between screens and card sizes.
+const POSTER_WIDTHS = [160, 240, 320, 480, 640, 960];
+
+// The width to ask for a picture shown cssWidth px wide at devicePixelRatio dpr: the smallest step
+// that is at least 90% of the device pixels (a picture a little short of them looks the same).
+function posterWidth(cssWidth, dpr) {
+    const want = cssWidth * (dpr || 1) * 0.9;
+    return POSTER_WIDTHS.find(w => w >= want) ?? POSTER_WIDTHS[POSTER_WIDTHS.length - 1];
+}
+
 // The band of the page, relative to the viewport's top, that pictures are loaded in: 2 screens
 // ahead in the scroll direction, up to 3 when scrolling fast, and half a screen behind.
 // velocity is in px per ms, negative when scrolling up.
@@ -176,7 +162,8 @@ const posterLoader = {
 
     // Takes the cards with a picture to load under root (root included)
     watch(root) {
-        const imgs = root.matches?.('img[data-src]') ? [root] : root.querySelectorAll?.('img[data-src]') || [];
+        const pictures = 'img[data-src], img[data-img-tag]';
+        const imgs = root.matches?.(pictures) ? [root] : root.querySelectorAll?.(pictures) || [];
         if (!imgs.length) return;
         this.io ??= new IntersectionObserver(entries => {
             for (const e of entries) {
@@ -233,12 +220,20 @@ const posterLoader = {
         });
         const { start, stop } = posterPlan(entries, innerWidth, innerHeight, posterWindow(this.velocity, innerHeight), POSTER_MAX_LOADING);
         for (const i of stop) this.stop(cards[i]);
-        for (const i of start) this.start(cards[i], entries[i].bottom > 0 && entries[i].top < innerHeight);
+        for (const i of start) {
+            const r = entries[i];
+            this.start(cards[i], r.bottom > 0 && r.top < innerHeight, r.right - r.left);
+        }
     },
 
-    start(card, onScreen) {
+    // Starts a picture. One without a fixed data-src gets the width step for its card's width.
+    start(card, onScreen, cssWidth) {
         const img = card._poster;
         img.fetchPriority = onScreen ? 'high' : 'low';
+        if (!img.dataset.src) {
+            const { imgId, imgType, imgTag } = img.dataset;
+            img.dataset.src = API.imageUrl(imgId, imgType, { maxWidth: posterWidth(cssWidth, devicePixelRatio), tag: imgTag });
+        }
         const done = () => {
             if (!img.getAttribute('src')) return; // a stopped load
             card._posterDone = true;
@@ -283,7 +278,6 @@ new MutationObserver(records => {
 // both the skeleton and the BlurHash and shows the type icon instead.
 function posterLoaded(img) {
     img.style.opacity = '0.8';
-    img.classList.remove('blur-sm', 'scale-105');
     img.parentElement?.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.display = 'none'; });
 }
 function posterFailed(img) {
@@ -1184,11 +1178,8 @@ function itemCard(item, options = {}) {
     // Use explicit backdrop option if provided; otherwise derive from type
     const isBackdrop = options.backdrop !== undefined ? options.backdrop : type === 'Episode';
 
-    // Progressive image loading: thumbnail for fast first paint,
-    // full-res loaded on hover only to save bandwidth
+    // One picture per card, sized by the poster loader for the card's width when it starts
     const picture = cardImage(item, isBackdrop);
-    const thumbSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 150, format: 'webp', tag: picture.tag }) : '';
-    const fullSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 250, tag: picture.tag }) : '';
     // The picture's BlurHash, painted under it until it loads (Jellyfin's ImageBlurHashes shape)
     const blurhash = picture ? item.ImageBlurHashes?.[picture.type]?.[picture.tag] : null;
     // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
@@ -1221,9 +1212,8 @@ function itemCard(item, options = {}) {
             ${blurhash
                 ? `<canvas class="jf-blurhash" width="${isBackdrop ? 32 : 20}" height="${isBackdrop ? 18 : 30}" data-blurhash="${escapeHtml(blurhash)}" aria-hidden="true"></canvas>`
                 : '<div class="jf-poster-skeleton"></div>'}
-            <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
-            <img data-src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
-                 data-full-src="${fullSrc}" onload="posterLoaded(this)" onerror="posterFailed(this)">` : ''}
+            <img alt="${escapeHtml(cardTitle)}" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
+                 data-img-id="${escapeHtml(picture.id)}" data-img-type="${escapeHtml(picture.type)}" data-img-tag="${escapeHtml(picture.tag)}" onload="posterLoaded(this)" onerror="posterFailed(this)">` : ''}
             <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
                 ${icon(typeIcons[type] || 'Folder', { size: 40 })}
             </div>
@@ -1578,7 +1568,6 @@ function appendFavoriteCards(items) {
         if (card) frag.appendChild(card);
     }
     grid.appendChild(frag);
-    initLazyImages(grid);
 }
 
 async function loadMoreFavoritesInfinite(initialTotal) {
@@ -1875,7 +1864,6 @@ function fillLibraryGrid(items, total) {
         }
     }
     grid.appendChild(frag);
-    initLazyImages(grid);
 
     // A placeholder that comes near the viewport requests its page, once per load
     const gen = libraryGen;
@@ -1906,7 +1894,6 @@ async function loadLibraryPage(gen, page) {
             card.dataset.letter = railLetter(item);
             placeholder.replaceWith(card);
             libraryObserver.unobserve(placeholder);
-            initLazyImages(card);
         });
         scheduleRailUpdate();
     } catch (e) {
@@ -2353,7 +2340,6 @@ async function renderPerson(personId) {
                 });
                 gridEl.appendChild(fragment);
             }
-            initLazyImages();
         }
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
@@ -2405,7 +2391,6 @@ async function renderSearch(term) {
             });
             gridEl.appendChild(fragment);
         }
-        initLazyImages();
     } catch (e) {
         page.innerHTML = `<div class="p-6 rounded-xl bg-red-500/10 text-red-400">${escapeHtml(e.message)}</div>`;
     }
