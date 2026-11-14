@@ -3955,13 +3955,104 @@ async fn b30_f6_only_a_tagged_request_is_cached_for_long() {
         let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
         let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
-        assert_eq!(cache_control, "public, max-age=86400", "{uri}");
+        // B152: a current tag names this exact picture for good
+        assert_eq!(
+            cache_control, "public, max-age=31536000, immutable",
+            "{uri}"
+        );
         // Without the tag, the answer may not be kept long: the picture can change under its URL.
         let uri = format!("/Items/{id}/Images/Primary?{bounds}");
         let (status, cache_control, _) = b30_get_cached(&app, &uri, &token).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(cache_control, "public, max-age=300", "{uri}");
     }
+}
+
+// B152: images answer If-None-Match with 304, and only a current tag is kept for good
+#[tokio::test]
+async fn b152_images_carry_an_etag_and_answer_304_when_unchanged() {
+    let state = test_state().await;
+    let (token, _) = admin_session(&state).await;
+    let id = b30_photo(&state).await;
+    let app = app(state);
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [255, 0, 0])).await;
+    let tag = b30_primary_tag(&app, &token, id, "Photo").await;
+
+    let get = |uri: String, if_none_match: Option<String>| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let mut request = Request::builder()
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"));
+            if let Some(etag) = if_none_match {
+                request = request.header("If-None-Match", etag);
+            }
+            let resp = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (status, etag, cache_control) =
+                (resp.status(), header("etag"), header("cache-control"));
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, etag, cache_control, body.len())
+        }
+    };
+
+    let mut etags = Vec::new();
+    for bounds in ["", "maxWidth=32&"] {
+        let uri = format!("/Items/{id}/Images/Primary?{bounds}tag={tag}");
+        let (status, etag, _, len) = get(uri.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            len > 0 && etag.starts_with('"') && etag.ends_with('"'),
+            "{uri}: {etag}"
+        );
+        // The same picture asked again with its ETag: 304, no body, the same caching
+        for sent in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"other\", {etag}"),
+            "*".into(),
+        ] {
+            let (status, again, cache_control, len) = get(uri.clone(), Some(sent.clone())).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{uri} with {sent}");
+            assert_eq!(
+                (again.as_str(), len),
+                (etag.as_str(), 0),
+                "{uri} with {sent}"
+            );
+            assert_eq!(cache_control, "public, max-age=31536000, immutable");
+        }
+        let (status, _, _, _) = get(uri.clone(), Some("\"other\"".into())).await;
+        assert_eq!(status, StatusCode::OK, "{uri} with another ETag");
+        etags.push(etag);
+    }
+    assert_ne!(etags[0], etags[1], "each size has its own ETag");
+
+    // A stale tag still gets the picture, but only for a short while: it may be the wrong one
+    let uri =
+        format!("/Items/{id}/Images/Primary?maxWidth=32&tag=0123456789abcdef0123456789abcdef");
+    let (status, etag, cache_control, _) = get(uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        etag, etags[1],
+        "the ETag names the picture sent, whatever the URL's tag"
+    );
+    assert_eq!(cache_control, "public, max-age=300");
+
+    // A new picture gets a new ETag, so the old one no longer matches
+    b30_upload(&app, &token, id, &b30_jpeg(64, 96, [0, 0, 255])).await;
+    let uri = format!("/Items/{id}/Images/Primary?maxWidth=32");
+    let (status, etag, _, _) = get(uri, Some(etags[1].clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(etag, etags[1]);
 }
 
 #[tokio::test]
