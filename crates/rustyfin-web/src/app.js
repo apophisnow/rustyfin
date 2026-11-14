@@ -125,11 +125,157 @@ function paintBlurhashes(root) {
     }
 }
 
-// Cards come from many renderers (grids, rows, innerHTML strings), so new ones are painted as they
-// are added to the page
+// --- Poster loader: card pictures (img[data-src]) start here, not by the browser's lazy loading ---
+// Lazy loading starts a picture only once its card is close, keeps loading pictures already
+// scrolled past, and gives them the same priority as the ones on screen. This loader looks
+// further ahead in the scroll direction, starts what is on screen first, keeps a connection free
+// for the page's own requests, and stops pictures that are no longer near.
+const POSTER_MAX_LOADING = 5;
+
+// The band of the page, relative to the viewport's top, that pictures are loaded in: 2 screens
+// ahead in the scroll direction, up to 3 when scrolling fast, and half a screen behind.
+// velocity is in px per ms, negative when scrolling up.
+function posterWindow(velocity, vh) {
+    const screensPerSecond = (Math.abs(velocity) * 1000) / vh;
+    const ahead = vh * Math.min(3, 2 + screensPerSecond / 2);
+    const behind = vh / 2;
+    return velocity < 0 ? { top: -ahead, bottom: vh + behind } : { top: -behind, bottom: vh + ahead };
+}
+
+// Which pictures to start and which to stop. entries are { top, bottom, left, right, loading }
+// (rects relative to the viewport). Pictures in the window start closest first (on screen first,
+// then by distance) while fewer than max load; loading ones that left the window stop. Returns
+// { start, stop } as entry indexes.
+function posterPlan(entries, vw, vh, win, max) {
+    const distance = r => Math.max(0, r.top - vh, -r.bottom) + Math.max(0, r.left - vw, -r.right);
+    const inWindow = r => r.bottom > win.top && r.top < win.bottom;
+    const stop = [];
+    let loading = 0;
+    entries.forEach((r, i) => {
+        if (!r.loading) return;
+        if (inWindow(r)) loading++;
+        else stop.push(i);
+    });
+    const start = entries
+        .map((r, i) => ({ i, d: distance(r), ok: !r.loading && r.bottom > r.top && inWindow(r) }))
+        .filter(c => c.ok)
+        .sort((a, b) => a.d - b.d)
+        .slice(0, Math.max(0, max - loading))
+        .map(c => c.i);
+    return { start, stop };
+}
+
+const posterLoader = {
+    near: new Set(), // cards in or near the viewport whose picture has not loaded
+    loading: new Set(),
+    velocity: 0,
+    lastY: window.scrollY,
+    lastScroll: 0,
+    queued: false,
+    io: null,
+
+    // Takes the cards with a picture to load under root (root included)
+    watch(root) {
+        const imgs = root.matches?.('img[data-src]') ? [root] : root.querySelectorAll?.('img[data-src]') || [];
+        if (!imgs.length) return;
+        this.io ??= new IntersectionObserver(entries => {
+            for (const e of entries) {
+                // A card scrolled sideways out of a row is clipped by it, so it never intersects;
+                // it counts as near while its row is, and starts after the cards in view
+                const r = e.boundingClientRect;
+                const inNearRow = e.target.parentElement?.classList.contains('jf-scroll-row')
+                    && r.bottom > -3 * innerHeight && r.top < 4 * innerHeight;
+                if (e.isIntersecting || inNearRow) this.near.add(e.target);
+                else this.near.delete(e.target);
+            }
+            this.schedule();
+        }, { rootMargin: '300% 0px' });
+        for (const img of imgs) {
+            if (img.getAttribute('src')) continue;
+            const card = img.closest('.jf-card') || img;
+            card._poster = img;
+            this.io.observe(card);
+            // Cards already near start now, not a frame later when the observer reports them
+            const r = card.getBoundingClientRect();
+            if (r.bottom > -3 * innerHeight && r.top < 4 * innerHeight) this.near.add(card);
+        }
+        this.run();
+    },
+
+    onScroll() {
+        const now = performance.now();
+        const y = window.scrollY;
+        const dt = now - this.lastScroll;
+        if (dt > 0 && dt < 200) this.velocity = 0.7 * this.velocity + 0.3 * ((y - this.lastY) / dt);
+        else this.velocity = 0;
+        this.lastY = y;
+        this.lastScroll = now;
+        this.schedule();
+    },
+
+    schedule() {
+        if (this.queued) return;
+        this.queued = true;
+        requestAnimationFrame(() => { this.queued = false; this.run(); });
+    },
+
+    run() {
+        if (performance.now() - this.lastScroll > 200) this.velocity = 0;
+        const cards = [...this.near].filter(card => {
+            if (card.isConnected && card._poster && !card._posterDone) return true;
+            this.forget(card);
+            return false;
+        });
+        for (const card of this.loading) if (!this.near.has(card)) this.stop(card);
+        const entries = cards.map(card => {
+            const r = card.getBoundingClientRect();
+            return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, loading: this.loading.has(card) };
+        });
+        const { start, stop } = posterPlan(entries, innerWidth, innerHeight, posterWindow(this.velocity, innerHeight), POSTER_MAX_LOADING);
+        for (const i of stop) this.stop(cards[i]);
+        for (const i of start) this.start(cards[i], entries[i].bottom > 0 && entries[i].top < innerHeight);
+    },
+
+    start(card, onScreen) {
+        const img = card._poster;
+        img.fetchPriority = onScreen ? 'high' : 'low';
+        const done = () => {
+            if (!img.getAttribute('src')) return; // a stopped load
+            card._posterDone = true;
+            this.loading.delete(card);
+            this.forget(card);
+            this.schedule();
+        };
+        img.addEventListener('load', done, { once: true });
+        img.addEventListener('error', done, { once: true });
+        this.loading.add(card);
+        img.src = img.dataset.src;
+    },
+
+    // Stops a picture's load (dropping src aborts its request); it starts again when it comes near
+    stop(card) {
+        this.loading.delete(card);
+        if (!card._posterDone) card._poster.removeAttribute('src');
+    },
+
+    forget(card) {
+        this.near.delete(card);
+        this.loading.delete(card);
+        this.io?.unobserve(card);
+    },
+};
+document.addEventListener('scroll', () => posterLoader.onScroll(), { capture: true, passive: true });
+window.addEventListener('resize', () => posterLoader.schedule());
+
+// Cards come from many renderers (grids, rows, innerHTML strings), so new ones are painted and
+// their pictures queued as they are added to the page
 new MutationObserver(records => {
     for (const record of records) {
-        for (const node of record.addedNodes) if (node.nodeType === 1) paintBlurhashes(node);
+        for (const node of record.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            paintBlurhashes(node);
+            posterLoader.watch(node);
+        }
     }
 }).observe(document.documentElement, { childList: true, subtree: true });
 
@@ -141,6 +287,7 @@ function posterLoaded(img) {
     img.parentElement?.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.display = 'none'; });
 }
 function posterFailed(img) {
+    if (!img.getAttribute('src')) return; // a load the poster loader stopped
     img.style.display = 'none';
     img.parentElement?.querySelectorAll('.jf-poster-skeleton, .jf-blurhash').forEach(el => { el.style.display = 'none'; });
     const ic = img.nextElementSibling;
@@ -1075,7 +1222,7 @@ function itemCard(item, options = {}) {
                 ? `<canvas class="jf-blurhash" width="${isBackdrop ? 32 : 20}" height="${isBackdrop ? 18 : 30}" data-blurhash="${escapeHtml(blurhash)}" aria-hidden="true"></canvas>`
                 : '<div class="jf-poster-skeleton"></div>'}
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
-            <img src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
+            <img data-src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
                  data-full-src="${fullSrc}" onload="posterLoaded(this)" onerror="posterFailed(this)">` : ''}
             <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
                 ${icon(typeIcons[type] || 'Folder', { size: 40 })}

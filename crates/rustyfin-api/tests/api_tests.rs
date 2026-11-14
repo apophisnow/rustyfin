@@ -17967,6 +17967,11 @@ fn b152_blurhash_decoder() {
 }
 
 #[test]
+fn b152_poster_loader_plan() {
+    b124_node_test("b152_poster_loader.mjs");
+}
+
+#[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");
     for id in ["cfg-tmdb", "cfg-omdb", "cfg-fanart"] {
