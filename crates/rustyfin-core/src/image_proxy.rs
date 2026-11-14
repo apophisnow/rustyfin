@@ -23,11 +23,30 @@ pub const RESIZE_BUFFER_MAX_BYTES: u64 = 64 << 20;
 /// The most bytes read from a remote image.
 pub const REMOTE_IMAGE_MAX_BYTES: u64 = 20 << 20;
 
-/// How many copies may be decoded, resized and encoded at once: one per CPU, from 2 to 8.
-static RENDER_SLOTS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
+/// How many copies for clients may be decoded, resized and encoded at once: one per CPU, from 2
+/// to 8.
+static RENDER_SLOT_COUNT: LazyLock<usize> = LazyLock::new(|| {
     let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
-    tokio::sync::Semaphore::new(cpus.clamp(2, 8))
+    cpus.clamp(2, 8)
 });
+static RENDER_SLOTS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(*RENDER_SLOT_COUNT));
+
+/// Background renders (`RenderFor::Background`) have a lane of their own, one at a time, so they
+/// never take one of the clients' slots.
+static BACKGROUND_LANE: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
+/// Who a render is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderFor {
+    /// A request waiting on it: it queues for a slot and its memory.
+    Client,
+    /// Work nobody waits on (image_warmer): it starts only while no client render runs, uses its
+    /// own lane, and takes memory only when that is free at once, so it never queues ahead of a
+    /// client.
+    Background,
+}
 
 /// The memory, in MiB, that the renders running at once may hold together. A render takes its
 /// estimate (`render_cost_mib`) from it first, so large sources never run many at a time.
@@ -300,6 +319,26 @@ pub async fn render_image(
     cache_dir: &Path,
     http_client: Option<&reqwest::Client>,
 ) -> Result<Vec<u8>, String> {
+    render_image_for(
+        source_path,
+        stamp,
+        rendition,
+        cache_dir,
+        http_client,
+        RenderFor::Client,
+    )
+    .await
+}
+
+/// `render_image` for a client or for background work (see `RenderFor`).
+pub async fn render_image_for(
+    source_path: &str,
+    stamp: Option<i64>,
+    rendition: Rendition,
+    cache_dir: &Path,
+    http_client: Option<&reqwest::Client>,
+    who: RenderFor,
+) -> Result<Vec<u8>, String> {
     let Rendition::Copy { width, height } = rendition else {
         return read_image_bytes(source_path, http_client).await;
     };
@@ -326,14 +365,20 @@ pub async fn render_image(
         Some(bytes) => bytes,
         None => read_image_bytes(source_path, http_client).await?,
     };
-    let memory = RENDER_MEMORY
-        .acquire_many(render_cost_mib(&source_bytes, width, height))
-        .await
-        .map_err(|e| format!("failed to render image: {}", e))?;
-    let slot = RENDER_SLOTS
-        .acquire()
-        .await
-        .map_err(|e| format!("failed to render image: {}", e))?;
+    let cost = render_cost_mib(&source_bytes, width, height);
+    let (memory, slot) = match who {
+        RenderFor::Client => (
+            RENDER_MEMORY
+                .acquire_many(cost)
+                .await
+                .map_err(|e| format!("failed to render image: {}", e))?,
+            RENDER_SLOTS
+                .acquire()
+                .await
+                .map_err(|e| format!("failed to render image: {}", e))?,
+        ),
+        RenderFor::Background => background_permits(cost).await?,
+    };
     let bytes = tokio::task::spawn_blocking(move || {
         let _permits = (memory, slot);
         encode_copy(&source_bytes, width, height)
@@ -400,9 +445,35 @@ async fn grid_master_for(
     (tw <= mw && th <= mh && (tw < mw || th < mh)).then_some(bytes)
 }
 
-/// Whether every render slot is taken, so background work should wait for clients' renders.
-pub fn renders_busy() -> bool {
-    RENDER_SLOTS.available_permits() == 0
+/// Whether a client render is running.
+pub fn clients_rendering() -> bool {
+    RENDER_SLOTS.available_permits() < *RENDER_SLOT_COUNT
+}
+
+/// The permits of a background render: the background lane, then, once no client render runs,
+/// its memory if that is free at once. Otherwise it backs off and tries again, so it never waits
+/// in the memory queue ahead of a client.
+async fn background_permits(
+    cost: u32,
+) -> Result<
+    (
+        tokio::sync::SemaphorePermit<'static>,
+        tokio::sync::SemaphorePermit<'static>,
+    ),
+    String,
+> {
+    let lane = BACKGROUND_LANE
+        .acquire()
+        .await
+        .map_err(|e| format!("failed to render image: {}", e))?;
+    loop {
+        if !clients_rendering()
+            && let Ok(memory) = RENDER_MEMORY.try_acquire_many(cost)
+        {
+            return Ok((memory, lane));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// How many bytes of disk copies are written between sweeps of the cache folder.
@@ -575,8 +646,8 @@ fn decode_scaled_jpeg(source: &[u8], width: u32, height: u32) -> Option<image::R
 }
 
 /// The memory, in MiB, that a render of `source` at `width`x`height` is counted as holding. A JPEG
-/// decoded at reduced scale holds its bytes, its coefficients (up to 3 bytes a source pixel for a
-/// progressive one) and a few RGB buffers no larger than 4 times the copy. Anything else may decode
+/// decoded at reduced scale holds its bytes, its coefficients (up to 6 bytes a source pixel for a
+/// progressive 4:4:4 one) and a few RGB buffers no larger than 4 times the copy. Anything else may decode
 /// up to `MAX_DECODE_BYTES`, so it counts as half the budget, and two run at a time as before.
 pub fn render_cost_mib(source: &[u8], width: u32, height: u32) -> u32 {
     let Some((_, w, h, _)) = scaled_jpeg_header(source) else {
@@ -585,7 +656,8 @@ pub fn render_cost_mib(source: &[u8], width: u32, height: u32) -> u32 {
     let (tw, th) = fit_target(w, h, width, height);
     let pixels = u64::from(w) * u64::from(h);
     let copy = u64::from(tw) * u64::from(th);
-    let bytes = source.len() as u64 + 3 * pixels + 3 * 3 * pixels.min(4 * copy) + 3 * copy;
+    // Progressive coefficients are i16 per sample: up to 6 bytes a pixel at 4:4:4
+    let bytes = source.len() as u64 + 6 * pixels + 3 * 3 * pixels.min(4 * copy) + 3 * copy;
     (bytes.div_ceil(1 << 20) as u32).clamp(1, RENDER_BUDGET_MIB / 2)
 }
 
@@ -673,6 +745,12 @@ static PART_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// The file a remote image is kept in: `store_dir/<h[0..2]>/<h><.ext>`, where `h` is the lower-case
 /// hex SHA-256 of the URL and `.ext` is the URL path's extension when it is 1-5 ASCII alphanumerics.
+/// The file a remote image is kept in, when it has been downloaded already.
+pub fn stored_remote_image(url: &str, store_dir: &Path) -> Option<std::path::PathBuf> {
+    let path = remote_image_file(url, store_dir);
+    path.is_file().then_some(path)
+}
+
 fn remote_image_file(url: &str, store_dir: &Path) -> std::path::PathBuf {
     let h = hex(&Sha256::digest(url.as_bytes()));
     let ext = reqwest::Url::parse(url)
@@ -2003,11 +2081,11 @@ mod tests {
     fn b152_render_cost_counts_scaled_jpegs_small_and_the_rest_as_half_the_budget() {
         let poster = b152_jpeg(2000, 3000, [1, 2, 3], [4, 5, 6]);
         let cost = render_cost_mib(&poster, 250, 375);
-        // A 6 MP poster: about 17 MiB of coefficients and a few small buffers
-        assert!((10..=32).contains(&cost), "{cost}");
+        // A 6 MP poster: up to 34 MiB of coefficients and a few small buffers
+        assert!((30..=48).contains(&cost), "{cost}");
         assert!(
-            RENDER_BUDGET_MIB / cost >= 8,
-            "eight posters fit the budget at once"
+            RENDER_BUDGET_MIB / cost >= 5,
+            "five posters fit the budget at once"
         );
         let mut png = std::io::Cursor::new(Vec::new());
         image::RgbImage::from_pixel(20, 30, image::Rgb([1, 2, 3]))
