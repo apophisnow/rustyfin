@@ -17960,6 +17960,12 @@ fn b145_icons() {
     b124_node_test("b145_icons.mjs");
 }
 
+// B152: library grid images keep up with scrolling (web client)
+#[test]
+fn b152_blurhash_decoder() {
+    b124_node_test("b152_blurhash.mjs");
+}
+
 #[test]
 fn b142_settings_key_inputs_hide_keys() {
     let app_js = b124_web_source("app.js");
