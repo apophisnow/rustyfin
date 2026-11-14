@@ -23,8 +23,23 @@ pub const RESIZE_BUFFER_MAX_BYTES: u64 = 64 << 20;
 /// The most bytes read from a remote image.
 pub const REMOTE_IMAGE_MAX_BYTES: u64 = 20 << 20;
 
-/// How many copies may be decoded, resized and encoded at once.
-static RENDERS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(2));
+/// How many copies may be decoded, resized and encoded at once: one per CPU, from 2 to 8.
+static RENDER_SLOTS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+    tokio::sync::Semaphore::new(cpus.clamp(2, 8))
+});
+
+/// The memory, in MiB, that the renders running at once may hold together. A render takes its
+/// estimate (`render_cost_mib`) from it first, so large sources never run many at a time.
+pub const RENDER_BUDGET_MIB: u32 = 256;
+
+/// The share of `RENDER_BUDGET_MIB` that each render holds.
+static RENDER_MEMORY: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(RENDER_BUDGET_MIB as usize));
+
+/// The most pixels a JPEG source may have to be decoded at reduced scale (`decode_scaled_jpeg`);
+/// a larger one goes the general way, two at a time.
+pub const SCALED_JPEG_MAX_PIXELS: u64 = 24_000_000;
 
 /// Whether a source is a remote `http://` or `https://` image.
 fn is_remote(source_path: &str) -> bool {
@@ -300,15 +315,20 @@ pub async fn render_image(
         return Ok(bytes);
     }
 
-    // Read, then decode, resize and encode off the async threads, two at a time. The blocking task
-    // holds the permit, so a request dropped mid-render frees it only when the work ends.
+    // Read, then decode, resize and encode off the async threads: one per CPU, within the memory
+    // budget. The blocking task holds the permits, so a request dropped mid-render frees them only
+    // when the work ends.
     let source_bytes = read_image_bytes(source_path, http_client).await?;
-    let permit = RENDERS
+    let memory = RENDER_MEMORY
+        .acquire_many(render_cost_mib(&source_bytes, width, height))
+        .await
+        .map_err(|e| format!("failed to render image: {}", e))?;
+    let slot = RENDER_SLOTS
         .acquire()
         .await
         .map_err(|e| format!("failed to render image: {}", e))?;
     let bytes = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permits = (memory, slot);
         encode_copy(&source_bytes, width, height)
     })
     .await
@@ -403,17 +423,12 @@ fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage, String> {
 /// Decodes a source and encodes it as a JPEG copy that fits within `width`x`height`. This is the
 /// CPU work of a `Copy`, run off the async threads.
 fn encode_copy(source: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    if let Some(rgb) = decode_scaled_jpeg(source, width, height) {
+        return encode_jpeg(image::DynamicImage::ImageRgb8(rgb));
+    }
     let mut img = decode_limited(source)?;
-    // Fitting to both bounds at once re-rounds, so try each bound alone and keep the larger.
     let (w, h) = (img.width(), img.height());
-    let target = [
-        target_size(w, h, Some(width), None),
-        target_size(w, h, None, Some(height)),
-    ]
-    .into_iter()
-    .filter(|&(tw, th)| tw <= width && th <= height)
-    .max_by_key(|&(tw, th)| u64::from(tw) * u64::from(th))
-    .unwrap_or_else(|| target_size(w, h, Some(width), Some(height)));
+    let target = fit_target(w, h, width, height);
     if target != (w, h) {
         let plan = resize_plan((w, h), target);
         if let Some((fw, fh)) = plan.first {
@@ -426,12 +441,102 @@ fn encode_copy(source: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String
         };
     }
 
-    // Encode as JPEG; the encoder rejects alpha, so the image goes in as RGB
+    encode_jpeg(img)
+}
+
+/// Encodes an image as JPEG; the encoder rejects alpha, so the image goes in as RGB.
+fn encode_jpeg(img: image::DynamicImage) -> Result<Vec<u8>, String> {
     let mut buf = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(img.to_rgb8())
+    image::DynamicImage::ImageRgb8(img.into_rgb8())
         .write_to(&mut buf, image::ImageFormat::Jpeg)
         .map_err(|e| format!("failed to encode image: {}", e))?;
     Ok(buf.into_inner())
+}
+
+/// The size a `w`x`h` source is copied at to fit within `width`x`height`. Fitting to both bounds
+/// at once re-rounds, so each bound is tried alone and the larger fit is kept.
+fn fit_target(w: u32, h: u32, width: u32, height: u32) -> (u32, u32) {
+    [
+        target_size(w, h, Some(width), None),
+        target_size(w, h, None, Some(height)),
+    ]
+    .into_iter()
+    .filter(|&(tw, th)| tw <= width && th <= height)
+    .max_by_key(|&(tw, th)| u64::from(tw) * u64::from(th))
+    .unwrap_or_else(|| target_size(w, h, Some(width), Some(height)))
+}
+
+/// The header of a JPEG that `decode_scaled_jpeg` takes: its size and channel count (1 or 3).
+/// `None` for another format, CMYK or 16-bit samples, a side over `MAX_DECODE_SIDE`, or more than
+/// `SCALED_JPEG_MAX_PIXELS`.
+fn scaled_jpeg_header(source: &[u8]) -> Option<(jpeg_decoder::Decoder<&[u8]>, u32, u32, usize)> {
+    if !source.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut decoder = jpeg_decoder::Decoder::new(source);
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    let (w, h) = (u32::from(info.width), u32::from(info.height));
+    let channels = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => 1,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        _ => return None,
+    };
+    let fits = w > 0
+        && h > 0
+        && w <= MAX_DECODE_SIDE
+        && h <= MAX_DECODE_SIDE
+        && u64::from(w) * u64::from(h) <= SCALED_JPEG_MAX_PIXELS;
+    fits.then_some((decoder, w, h, channels))
+}
+
+/// Decodes a JPEG at the smallest of 1/8, 1/4, 1/2 or full scale that still covers the copy's
+/// size, so most of the work of a large source is skipped, then resizes it to that size with SIMD
+/// Lanczos3. `None` when the source is not a JPEG this takes (`scaled_jpeg_header`) or does not
+/// decode here, so the general path decodes it.
+fn decode_scaled_jpeg(source: &[u8], width: u32, height: u32) -> Option<image::RgbImage> {
+    let (mut decoder, w, h, channels) = scaled_jpeg_header(source)?;
+    let (tw, th) = fit_target(w, h, width, height);
+    decoder.set_max_decoding_buffer_size(MAX_DECODE_BYTES as usize);
+    decoder
+        .scale(u16::try_from(tw).ok()?, u16::try_from(th).ok()?)
+        .ok()?;
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let (sw, sh) = (u32::from(info.width), u32::from(info.height));
+    if pixels.len() != sw as usize * sh as usize * channels {
+        return None;
+    }
+    let rgb = if channels == 1 {
+        pixels.iter().flat_map(|&l| [l, l, l]).collect()
+    } else {
+        pixels
+    };
+    if (sw, sh) == (tw, th) {
+        return image::RgbImage::from_raw(tw, th, rgb);
+    }
+    use fast_image_resize as fr;
+    let src = fr::images::Image::from_vec_u8(sw, sh, rgb, fr::PixelType::U8x3).ok()?;
+    let mut dst = fr::images::Image::new(tw, th, fr::PixelType::U8x3);
+    let options =
+        fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3));
+    fr::Resizer::new().resize(&src, &mut dst, &options).ok()?;
+    image::RgbImage::from_raw(tw, th, dst.into_vec())
+}
+
+/// The memory, in MiB, that a render of `source` at `width`x`height` is counted as holding. A JPEG
+/// decoded at reduced scale holds its bytes, its coefficients (up to 3 bytes a source pixel for a
+/// progressive one) and a few RGB buffers no larger than 4 times the copy. Anything else may decode
+/// up to `MAX_DECODE_BYTES`, so it counts as half the budget, and two run at a time as before.
+pub fn render_cost_mib(source: &[u8], width: u32, height: u32) -> u32 {
+    let Some((_, w, h, _)) = scaled_jpeg_header(source) else {
+        return RENDER_BUDGET_MIB / 2;
+    };
+    let (tw, th) = fit_target(w, h, width, height);
+    let pixels = u64::from(w) * u64::from(h);
+    let copy = u64::from(tw) * u64::from(th);
+    let bytes = source.len() as u64 + 3 * pixels + 3 * 3 * pixels.min(4 * copy) + 3 * copy;
+    (bytes.div_ceil(1 << 20) as u32).clamp(1, RENDER_BUDGET_MIB / 2)
 }
 
 /// A file last modified longer ago than this is stale: a disk copy this old is marked as used when
@@ -1783,5 +1888,79 @@ mod tests {
         let png = root.join("wide.png");
         b30_grey_png(&png, 3000, 2);
         assert_eq!(read_dimensions(png.to_str().unwrap()), Ok((3000, 2)));
+    }
+
+    // B152: grid renditions
+
+    /// A JPEG of `width`x`height`, left half `left` and right half `right`.
+    fn b152_jpeg(width: u32, height: u32, left: [u8; 3], right: [u8; 3]) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(width, height, |x, _| {
+            image::Rgb(if x < width / 2 { left } else { right })
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn b152_a_large_jpeg_is_decoded_at_reduced_scale_to_the_planned_size() {
+        let source = b152_jpeg(2000, 3000, [200, 40, 40], [40, 40, 200]);
+        for (width, height) in [(160, 240), (250, 4096), (480, 720), (333, 500)] {
+            let rgb = decode_scaled_jpeg(&source, width, height).expect("the scaled path takes it");
+            assert_eq!(
+                rgb.dimensions(),
+                fit_target(2000, 3000, width, height),
+                "{width}x{height}"
+            );
+            // The halves keep their colours: no channel swap, no smear across the middle
+            let left = rgb.get_pixel(rgb.width() / 8, rgb.height() / 2).0;
+            let right = rgb.get_pixel(rgb.width() * 7 / 8, rgb.height() / 2).0;
+            assert!(left[0] > 150 && left[2] < 90, "left {left:?}");
+            assert!(right[2] > 150 && right[0] < 90, "right {right:?}");
+        }
+        let copy = encode_copy(&source, 160, 240).unwrap();
+        let img = image::load_from_memory(&copy).unwrap();
+        assert_eq!((img.width(), img.height()), (160, 240));
+    }
+
+    #[test]
+    fn b152_a_grey_jpeg_takes_the_scaled_path_and_other_formats_do_not() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(800, 1200, image::Luma([90])))
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .unwrap();
+        let rgb = decode_scaled_jpeg(buf.get_ref(), 200, 300).expect("a grey JPEG is taken");
+        assert_eq!(rgb.dimensions(), (200, 300));
+        let p = rgb.get_pixel(100, 150).0;
+        assert!(p.iter().all(|&c| c.abs_diff(90) <= 3), "{p:?}");
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(800, 1200, image::Rgb([1, 2, 3]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_scaled_jpeg(png.get_ref(), 200, 300).is_none());
+        assert!(decode_scaled_jpeg(&[0xFF, 0xD8, 0xFF, 0xD9], 200, 300).is_none());
+    }
+
+    #[test]
+    fn b152_render_cost_counts_scaled_jpegs_small_and_the_rest_as_half_the_budget() {
+        let poster = b152_jpeg(2000, 3000, [1, 2, 3], [4, 5, 6]);
+        let cost = render_cost_mib(&poster, 250, 375);
+        // A 6 MP poster: about 17 MiB of coefficients and a few small buffers
+        assert!((10..=32).contains(&cost), "{cost}");
+        assert!(
+            RENDER_BUDGET_MIB / cost >= 8,
+            "eight posters fit the budget at once"
+        );
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(20, 30, image::Rgb([1, 2, 3]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(
+            render_cost_mib(png.get_ref(), 10, 15),
+            RENDER_BUDGET_MIB / 2
+        );
     }
 }
