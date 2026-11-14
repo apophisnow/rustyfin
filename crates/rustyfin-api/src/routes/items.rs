@@ -1309,6 +1309,47 @@ pub(crate) async fn enrich_items(
             }
         }
 
+        // --- BlurHashes of the parent and series pictures the item names, as Jellyfin sends
+        // them, so a card that shows one of those can paint it at once ---
+        let shown: std::collections::HashSet<String> = item
+            .parent_thumb_image_tag
+            .iter()
+            .chain(&item.series_thumb_image_tag)
+            .chain(&item.series_primary_image_tag)
+            .chain(&item.parent_logo_image_tag)
+            .chain(&item.parent_art_image_tag)
+            .chain(&item.parent_backdrop_image_tags)
+            .cloned()
+            .collect();
+        if !shown.is_empty() {
+            let mut owners = [
+                item.parent_id,
+                item.series_id,
+                item.parent_thumb_item_id,
+                item.parent_backdrop_item_id,
+            ];
+            owners.sort();
+            let mut last = None;
+            for owner in owners.into_iter().flatten() {
+                if last == Some(owner) {
+                    continue;
+                }
+                last = Some(owner);
+                for img in parent_images_map
+                    .get(&owner.to_string())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(hash) = &img.blurhash
+                        && shown
+                            .contains(&rustyfin_core::image_proxy::image_tag(&img.path, img.stamp))
+                    {
+                        add_blur_hash(item, img, hash.clone());
+                    }
+                }
+            }
+        }
+
         // --- GenreItems from genres, with the ids that /Genres or /MusicGenres lists ---
         if item.genre_items.is_empty() && !item.genres.is_empty() {
             let kind = rustyfin_db::repo_by_name::genre_kind_of(item.media_type);

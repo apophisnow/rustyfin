@@ -4213,6 +4213,63 @@ async fn b30_f2_hint_tags_change_with_the_image() {
     assert_eq!(second, details["ImageTags"]["Primary"], "{details}");
 }
 
+// B152 F10: a listed episode carries the BlurHashes of the series pictures it names, as Jellyfin's
+// ImageBlurHashes does, so a card showing the series thumb paints its preview
+#[tokio::test]
+async fn b152_a_listed_episode_carries_its_series_blur_hashes() {
+    use rustyfin_core::image_proxy::image_tag;
+    use rustyfin_model::image::ImageType::{Primary, Thumb};
+
+    let state = test_state().await;
+    let lib = j6_seed(&state).await;
+    let app = app(state.clone());
+    let primary = state.data_dir.join("b152-series-primary.jpg");
+    let primary = primary.to_string_lossy();
+    let thumb = state.data_dir.join("b152-series-thumb.jpg");
+    let thumb = thumb.to_string_lossy();
+    b30_set_image(&state, lib.series, Primary, &primary, Some(5)).await;
+    b30_set_image(&state, lib.series, Thumb, &thumb, Some(6)).await;
+    for (image_type, path, stamp, hash) in [
+        (Primary, &primary, 5, "LKO2?U%2Tw=w"),
+        (Thumb, &thumb, 6, "L00000fQfQfQ"),
+    ] {
+        let img = rustyfin_model::image::ItemImage {
+            item_id: lib.series,
+            image_type,
+            image_index: 0,
+            path: path.to_string(),
+            provider: "local".to_string(),
+            width: None,
+            height: None,
+            blurhash: None,
+            stamp: Some(stamp),
+        };
+        assert!(
+            rustyfin_db::repo_image::set_image_blurhash(&state.db, &img, hash)
+                .await
+                .unwrap()
+        );
+    }
+
+    let uri = "/Items?IncludeItemTypes=Episode&Recursive=true";
+    let (status, list) = send_authed(&app, "GET", uri, &lib.token, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let episode = list["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["Id"] == serde_json::json!(lib.episode))
+        .unwrap_or_else(|| panic!("no episode in {list}"));
+    assert_eq!(
+        episode["ImageBlurHashes"],
+        serde_json::json!({
+            "Primary": { image_tag(&primary, Some(5)): "LKO2?U%2Tw=w" },
+            "Thumb": { image_tag(&thumb, Some(6)): "L00000fQfQfQ" },
+        }),
+        "{episode}"
+    );
+}
+
 #[tokio::test]
 async fn b30_f14_an_episodes_details_carry_its_series_tags() {
     use rustyfin_core::image_proxy::image_tag;
