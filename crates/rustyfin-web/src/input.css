@@ -22,6 +22,9 @@
   --jf-accent: #00a4dc;
   --jf-text-main: #f0f3f8;
   --jf-text-muted: #8b949e;
+  /* Skeletons: anything not painted yet, a step lighter than the surface so it never reads as a
+     black gap */
+  --jf-skeleton: color-mix(in srgb, var(--jf-text-muted) 22%, var(--jf-bg-surface));
 }
 
 [data-theme="dark"] {
@@ -829,6 +832,19 @@ img.jf-thumb-img {
   overflow: hidden;
 }
 
+/* A library cell whose item has not arrived: the skeleton colour in the poster box and two bars
+   in place of the title lines (drawn as backgrounds, so the cell keeps a card's exact size) */
+.jf-card-pending .jf-poster {
+  background: var(--jf-skeleton);
+}
+.jf-card-pending .p-3 > * {
+  background: linear-gradient(var(--jf-skeleton), var(--jf-skeleton)) no-repeat left center / 70% 60%;
+  border-radius: 0.25rem;
+}
+.jf-card-pending .p-3 > * + * {
+  background-size: 40% 60%;
+}
+
 /* A card's BlurHash: a tiny canvas stretched over the poster box, under the picture */
 .jf-blurhash {
   position: absolute;
@@ -841,7 +857,7 @@ img.jf-thumb-img {
 .jf-poster-skeleton {
   position: absolute;
   inset: 0;
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.02) 25%, rgba(255, 255, 255, 0.06) 50%, rgba(255, 255, 255, 0.02) 75%);
+  background: linear-gradient(90deg, var(--jf-skeleton) 25%, color-mix(in srgb, var(--jf-skeleton) 85%, var(--jf-text-main)) 50%, var(--jf-skeleton) 75%);
   background-size: 200% 100%;
   animation: jfSkeleton 1.8s infinite;
   z-index: 0;
