@@ -1,125 +1,217 @@
 // Scroll benchmark for poster grids. Paste into the browser console (or run it through a browser
-// automation tool) on a page with a grid, then call:
+// automation tool) on a page with a grid, then call rfScrollBench.run(opts) and poll
+// rfScrollBench.result() (null while running). rfScrollBench.start({ speed }) is run in 'steady'.
 //
-//   rfScrollBench.start({ speed: 1500 })   // px per second, from the top to the end of the page
-//   rfScrollBench.result()                 // null while running, then a summary object
+// Each grid cell overlapping the viewport is in one stage per frame:
+//   placeholder - a library cell whose item has not arrived ([data-i]): a skeleton, counted
+//                 apart from what is painted
+//   colour      - a placeholder painted in its picture's BlurHash average colour (data-tint)
+//   blank       - a card that shows nothing yet (no painted BlurHash, no loaded picture)
+//   preview     - its BlurHash canvas is painted
+//   poster      - its <img> has loaded and is not transparent
+// Cards without a picture (they show their type icon) are left out. `skipped` counts viewport cells
+// content-visibility still skips.
 //
-// Every animation frame it scrolls the page by speed/fps and looks at each grid cell that overlaps
-// the viewport. A cell counts as "preview" once it paints a BlurHash (`.jf-blurhash`) and as
-// "poster" once its <img> has loaded and is not transparent. Cards without a picture are left out.
-// The summary has, for the cells that entered the viewport, the time from entering to a preview or
-// poster (0 when already shown), the share shown within 100 ms, and the mean share of blank cells
-// in the viewport per frame. It also sums the image requests from Resource Timing, with the query
-// (which carries api_key) stripped, so no token is ever part of the output.
+// Modes:
+//   steady { speed, maxMs }  px/s from the top to the end (or for maxMs), driven from the page
+//   fling  { v0, tau, from } v = v0 * exp(-t / tau) px/s, from the current position (or `from`,
+//                            a fraction of the page)
+//   jump   { to }            an instant scroll to a fraction of the page (a scrollbar drag, End)
+//   rail   { letter }        a click on the library's letter rail
+//   watch                    records while real input (wheel, touch, scrollbar) scrolls; the
+//                            motion starts at the first change and stops at the last change
+//                            before 250 ms without one
+// The summary has, for cells that entered the viewport during the motion, the time from entering to
+// a preview or poster (0 when already shown) and the share within 100 ms; the mean share of each
+// stage in the viewport during the motion; after the stop, the shares at 0-2000 ms and the time
+// until the viewport has no blanks and only posters; frame counts; and the library page and image
+// requests from Resource Timing, with the query (which carries api_key) left out.
 (() => {
     const state = { running: false, summary: null };
+    const STAGES = ['blank', 'preview', 'poster'];
+
+    function stage(cell) {
+        if (cell.hasAttribute('data-i')) return cell.dataset.tint ? 'colour' : 'placeholder';
+        const img = cell.querySelector('img');
+        if (img && img.complete && img.naturalWidth > 0 && getComputedStyle(img).opacity !== '0') return 'poster';
+        const canvas = cell.querySelector('canvas.jf-blurhash');
+        if (canvas && !canvas.hasAttribute('data-blurhash')) return 'preview';
+        if (!img) return 'noimage';
+        return 'blank';
+    }
 
     const percentile = (sorted, p) =>
         sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))] : null;
-    const round = (n) => (n == null || !Number.isFinite(n) ? n : Math.round(n));
+    const round = n => (n == null || !Number.isFinite(n) ? n : Math.round(n));
 
-    // 'poster', 'preview', 'none' or 'noimage' (a card that shows its type icon, not a picture)
-    function cellStatus(cell) {
-        if (!cell.classList.contains('jf-card')) return 'none'; // a placeholder awaiting its page
-        const img = cell.querySelector('img');
-        if (img && img.complete && img.naturalWidth > 0 && getComputedStyle(img).opacity !== '0') return 'poster';
-        if (cell.querySelector('.jf-blurhash')) return 'preview';
-        if (!img) return 'noimage';
-        return 'none';
-    }
-
-    function start(opts = {}) {
-        const speed = opts.speed || 1500;
+    function run(opts = {}) {
+        const mode = opts.mode || 'steady';
         const selector = opts.selector || '#lib-grid > *';
-        const settleMs = opts.settleMs ?? 2000;
+        const watchMs = opts.watchMs ?? (mode === 'steady' ? 2000 : 4000);
         const scroller = document.scrollingElement;
         performance.clearResourceTimings();
-        performance.setResourceTimingBufferSize(10000);
-        scroller.scrollTop = 0;
+        performance.setResourceTimingBufferSize(20000);
         state.running = true;
         state.summary = null;
-
-        const cells = new Map(); // grid index -> { enter, preview, poster }
-        let blankSum = 0;
-        let frames = 0;
+        const cells = new Map(); // grid index -> { enter, shown, poster }
+        const motion = { frames: 0, placeholder: 0, colour: 0, blank: 0, preview: 0, poster: 0, skipped: 0 };
+        const after = [];
+        const recent = [];
+        let stopAt = null;
+        let t0 = performance.now();
+        let lastFrame = null;
         let maxGap = 0;
-        let last = null;
-        const t0 = performance.now();
-        let end = null;
+        const max = () => scroller.scrollHeight - innerHeight;
+
+        if (mode === 'steady') scroller.scrollTop = 0;
+        if (mode === 'fling' && opts.from != null) scroller.scrollTop = opts.from * max();
+        if (mode === 'jump') {
+            scroller.scrollTop = opts.to * max();
+            stopAt = performance.now();
+        }
+        if (mode === 'rail') {
+            const btn = document.querySelector(`[data-action="jump-letter"][data-letter="${opts.letter}"]`);
+            if (!btn) {
+                state.running = false;
+                state.summary = { error: `no rail letter ${opts.letter}` };
+                return 'no rail';
+            }
+            const y0 = scroller.scrollTop;
+            btn.click();
+            const landed = () => (scroller.scrollTop !== y0 ? (stopAt = performance.now()) : requestAnimationFrame(landed));
+            requestAnimationFrame(landed);
+        }
+        const flingStart = scroller.scrollTop;
+        let lastY = scroller.scrollTop;
+        let lastChange = null;
+        let moved = mode !== 'watch';
+
+        function snapshot(t) {
+            const c = { placeholder: 0, colour: 0, blank: 0, preview: 0, poster: 0, skipped: 0, total: 0 };
+            const all = document.querySelectorAll(selector);
+            for (let i = 0; i < all.length; i++) {
+                const r = all[i].getBoundingClientRect();
+                if (r.bottom <= 0 || r.top >= innerHeight) continue;
+                const s = stage(all[i]);
+                if (s === 'noimage') continue;
+                c[s]++;
+                c.total++;
+                if (all[i].checkVisibility && !all[i].checkVisibility({ contentVisibilityAuto: true })) c.skipped++;
+                if (stopAt == null) {
+                    // A virtual grid's cells carry their list position; others are in list order
+                    const key = all[i].dataset.pos ?? i;
+                    let cell = cells.get(key);
+                    if (!cell) cells.set(key, (cell = { enter: t, shown: null, poster: null }));
+                    if (s !== 'placeholder' && s !== 'blank' && cell.shown == null) cell.shown = t;
+                    if (s === 'poster' && cell.poster == null) cell.poster = t;
+                }
+            }
+            return c;
+        }
 
         function frame(now) {
+            if (lastFrame != null && stopAt == null) maxGap = Math.max(maxGap, now - lastFrame);
+            lastFrame = now;
             const t = now - t0;
-            if (last != null && end == null) maxGap = Math.max(maxGap, now - last);
-            last = now;
-            const max = scroller.scrollHeight - innerHeight;
-            if (end == null) {
-                scroller.scrollTop = Math.min(max, (speed * t) / 1000);
-                if (scroller.scrollTop >= max - 1) end = now;
-            }
-            const grid = document.querySelectorAll(selector);
-            let visible = 0;
-            let blank = 0;
-            for (let i = 0; i < grid.length; i++) {
-                const r = grid[i].getBoundingClientRect();
-                if (r.bottom <= 0 || r.top >= innerHeight) continue;
-                const status = cellStatus(grid[i]);
-                if (status === 'noimage') continue;
-                visible++;
-                let c = cells.get(i);
-                if (!c) {
-                    c = { enter: t, preview: null, poster: null };
-                    cells.set(i, c);
+            // The cells are counted before this frame moves the page: they are what the last frame
+            // painted, after its scroll event (which a page-driven scroll fires only next frame)
+            const c = moved ? snapshot(t) : null;
+            if (stopAt == null && mode === 'steady') {
+                scroller.scrollTop = Math.min(max(), (opts.speed * t) / 1000);
+                if (scroller.scrollTop >= max() - 1 || (opts.maxMs && t >= opts.maxMs)) stopAt = now;
+            } else if (stopAt == null && mode === 'fling') {
+                const tau = opts.tau || 325;
+                scroller.scrollTop = Math.min(max(), flingStart + (opts.v0 * tau * (1 - Math.exp(-t / tau))) / 1000);
+                if (opts.v0 * Math.exp(-t / tau) < 20 || scroller.scrollTop >= max() - 1) stopAt = now;
+            } else if (stopAt == null && mode === 'watch') {
+                if (scroller.scrollTop !== lastY) {
+                    if (!moved) t0 = now;
+                    moved = true;
+                    lastChange = now;
+                    lastY = scroller.scrollTop;
+                } else if (moved && now - lastChange > 250) {
+                    stopAt = lastChange;
+                    for (const r of recent) if (r.now >= stopAt) after.push({ t: r.now - stopAt, ...r.c });
+                } else if (!moved && now - t0 > 30000) {
+                    stopAt = now;
                 }
-                if (status === 'none') blank++;
-                if (status !== 'none' && c.preview == null) c.preview = t;
-                if (status === 'poster' && c.poster == null) c.poster = t;
             }
-            if (end == null && visible) {
-                blankSum += blank / visible;
-                frames++;
+            if (!moved) {
+                requestAnimationFrame(frame);
+                return;
             }
-            if (end != null && now - end >= settleMs) return finish(t);
+            if (!c) {
+                requestAnimationFrame(frame); // the first frame that moved: counted from the next
+                return;
+            }
+            if (stopAt == null) {
+                if (mode === 'watch') {
+                    recent.push({ now, c });
+                    if (recent.length > 60) recent.shift();
+                }
+                if (c.total) {
+                    motion.frames++;
+                    for (const k of ['placeholder', 'colour', ...STAGES, 'skipped']) motion[k] += c[k] / c.total;
+                }
+            } else {
+                after.push({ t: now - stopAt, ...c });
+                if (now - stopAt >= watchMs) return finish();
+            }
             requestAnimationFrame(frame);
         }
 
-        function finish(t) {
+        function finish() {
+            const pct = (s, k) => (s.total ? round((100 * s[k]) / s.total) : null);
+            const at = ms => {
+                const s = after.find(a => a.t >= ms) || after[after.length - 1];
+                return s && { placeholder: pct(s, 'placeholder'), colour: pct(s, 'colour'), blank: pct(s, 'blank'), preview: pct(s, 'preview'), poster: pct(s, 'poster') };
+            };
+            const firstAll = test => {
+                const s = after.find(a => a.total && test(a));
+                return s ? round(s.t) : null;
+            };
+            const m = k => (motion.frames ? round((100 * motion[k]) / motion.frames) : null);
             const list = [...cells.values()];
-            const lat = (key) =>
-                list.map((c) => (c[key] == null ? Infinity : c[key] - c.enter)).sort((a, b) => a - b);
-            const shown = lat('preview');
+            const lat = key => list.map(c => (c[key] == null ? Infinity : c[key] - c.enter)).sort((a, b) => a - b);
+            const shown = lat('shown');
             const posters = lat('poster');
-            const within = (arr, ms) => (arr.length ? (100 * arr.filter((x) => x <= ms).length) / arr.length : null);
-            const images = performance
-                .getEntriesByType('resource')
-                .filter((e) => /\/Items\/[^/]+\/Images\//.test(new URL(e.name).pathname));
-            // Through a service worker, transferSize is 0 whether its cache or the network answered
-            const viaWorker = images.filter((e) => e.workerStart > 0);
-            const cached = images.filter((e) => !e.workerStart && e.transferSize === 0 && e.decodedBodySize > 0);
-            const ttfb = images
-                .filter((e) => !cached.includes(e) && e.responseStart > 0)
-                .map((e) => e.responseStart - e.requestStart)
-                .sort((a, b) => a - b);
+            const within = (arr, ms) => (arr.length ? round((100 * arr.filter(x => x <= ms).length) / arr.length) : null);
+            const path = e => new URL(e.name).pathname;
+            const entries = performance.getEntriesByType('resource');
+            const pages = entries
+                .filter(e => path(e) === '/Items' || /\/Users\/[^/]+\/Items$/.test(path(e)))
+                .map(e => ({
+                    start: round(e.startTime - stopAt),
+                    queued: round(e.requestStart - e.startTime),
+                    ms: round(e.responseEnd - e.startTime),
+                    kb: round((e.transferSize || e.encodedBodySize) / 1024),
+                }));
+            const images = entries.filter(e => /\/Items\/[^/]+\/Images\//.test(path(e)));
             state.summary = {
-                speedPxPerS: speed,
+                mode,
                 viewport: `${innerWidth}x${innerHeight}@${devicePixelRatio}`,
-                scrollMs: round(t - settleMs),
-                frames,
+                motionMs: round(stopAt - t0),
+                frames: motion.frames,
                 maxFrameGapMs: round(maxGap),
                 cellsEntered: list.length,
-                shownWithin100msPct: round(within(shown, 100)),
-                posterWithin100msPct: round(within(posters, 100)),
-                shownP50Ms: round(percentile(shown, 0.5)),
+                shownWithin100msPct: within(shown, 100),
+                posterWithin100msPct: within(posters, 100),
                 shownP95Ms: round(percentile(shown, 0.95)),
-                posterP50Ms: round(percentile(posters, 0.5)),
                 posterP95Ms: round(percentile(posters, 0.95)),
-                neverPoster: posters.filter((x) => x === Infinity).length,
-                blankInViewportPct: frames ? round((100 * blankSum) / frames) : null,
+                duringMotionPct: { placeholder: m('placeholder'), colour: m('colour'), blank: m('blank'), preview: m('preview'), poster: m('poster'), skipped: m('skipped') },
+                // What the viewport painted from the items (BlurHash colour, BlurHash or poster), the
+                // skeletons of cells without their item left out
+                paintedDuringMotionPct: motion.frames ? round((100 * (motion.colour + motion.preview + motion.poster)) / motion.frames) : null,
+                gridCells: document.querySelectorAll(selector).length,
+                domNodes: document.getElementsByTagName('*').length,
+                afterStop: { 0: at(0), 50: at(50), 100: at(100), 250: at(250), 500: at(500), 1000: at(1000), 2000: at(2000) },
+                msToNoBlank: firstAll(a => a.placeholder === 0 && a.blank === 0),
+                msToAllCards: firstAll(a => a.placeholder === 0 && a.colour === 0 && a.blank === 0),
+                msToAllPosters: firstAll(a => a.poster === a.total),
+                pages: pages.filter(p => p.start > -1000).slice(-12),
+                pageCount: pages.length,
                 imageRequests: images.length,
-                imageRequestsFromCache: cached.length,
-                imageRequestsViaServiceWorker: viaWorker.length,
-                imageKB: round(images.reduce((s, e) => s + (e.transferSize || 0), 0) / 1024),
-                imageTtfbP50Ms: round(percentile(ttfb, 0.5)),
-                imageTtfbP95Ms: round(percentile(ttfb, 0.95)),
+                stopAt,
             };
             state.running = false;
         }
@@ -128,5 +220,9 @@
         return 'started';
     }
 
-    window.rfScrollBench = { start, result: () => (state.running ? null : state.summary) };
+    window.rfScrollBench = {
+        run,
+        start: (opts = {}) => run({ ...opts, mode: 'steady' }),
+        result: () => (state.running ? null : state.summary),
+    };
 })();
