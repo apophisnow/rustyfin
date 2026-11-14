@@ -1979,7 +1979,7 @@ function fillLibraryGrid(items, total) {
     const grid = container.firstElementChild;
 
     const template = document.createElement('div');
-    template.innerHTML = '<div class="jf-card"><div class="jf-poster"></div><div class="p-3"><p class="text-xs sm:text-sm">&nbsp;</p><div class="text-[11px] mt-0.5">&nbsp;</div></div></div>';
+    template.innerHTML = '<div class="jf-card jf-card-pending"><div class="jf-poster"></div><div class="p-3"><p class="text-xs sm:text-sm">&nbsp;</p><div class="text-[11px] mt-0.5">&nbsp;</div></div></div>';
     const placeholder = template.firstElementChild;
     const frag = document.createDocumentFragment();
     for (let i = 0; i < total; i++) {
