@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use rustyfin_core::image_proxy;
-use rustyfin_core::image_warmer::{WarmReport, warm_pass};
+use rustyfin_core::image_warmer::{WarmReport, warm_budget, warm_pass, warm_pass_within};
 use rustyfin_model::image::{ImageType, ItemImage};
 use rustyfin_model::library::{Library, LibraryContentType};
 use rustyfin_model::media::{MediaItem, MediaType};
@@ -154,7 +154,8 @@ async fn b152_a_pass_prepares_masters_and_blurhashes_once() {
         again,
         WarmReport {
             ready: 2,
-            failed: 1,
+            // The broken picture is not tried again in this process
+            skipped: 1,
             ..WarmReport::default()
         }
     );
@@ -188,4 +189,110 @@ async fn b152_grid_copies_come_from_the_master_and_larger_ones_from_the_original
     assert!(copy(480, 720).await.is_ok());
     // A copy larger than the master needs the original
     assert!(copy(640, 960).await.is_err());
+}
+
+#[test]
+fn b152_the_budget_counts_every_copy_in_the_cache() {
+    let cap = 1 << 30;
+    assert_eq!(warm_budget(0, cap), cap / 2);
+    assert_eq!(warm_budget(cap / 2 - 10, cap), 10);
+    assert_eq!(warm_budget(cap, cap), 0);
+    // A 12,000-poster library at about 66 KB a master: the first ~8,100 get masters, then the
+    // cache stands at half its cap and later passes write nothing more (no churn)
+    let master = 66 << 10;
+    let fitted = warm_budget(0, cap) / master;
+    assert!((7_000..9_000).contains(&fitted), "{fitted}");
+    assert!(warm_budget(fitted * master, cap) < master);
+}
+
+#[tokio::test]
+async fn b152_masters_stop_at_the_cache_share_and_blurhashes_go_on() {
+    let fx = Fixture::new().await;
+    let mut images = Vec::new();
+    for name in ["A", "B", "C"] {
+        let poster = fx.dir.join("film").join(format!("{name}.jpg"));
+        write_jpeg(&poster, 1000, 1500);
+        images.push(fx.movie(name, &poster, None).await);
+    }
+    // Copies already in the cache leave room for one master (a pass writes one only with 128 KiB
+    // free), on a cache capped at 2 MiB
+    let cache = fx.dir.join("cache").join("images");
+    std::fs::create_dir_all(&cache).unwrap();
+    let cap = 2 << 20;
+    std::fs::write(
+        cache.join("client-copies"),
+        vec![0u8; (1 << 20) - (128 << 10) - 1],
+    )
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    let report = warm_pass_within(&fx.pool, &fx.dir, &client, cap)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.prepared, report.hashed, report.capped),
+        (1, 3, true),
+        "{report:?}"
+    );
+    assert!(fx.master(&images[0]).exists() && !fx.master(&images[1]).exists());
+    for img in &images {
+        assert!(
+            fx.stored_blurhash(img).await.is_some(),
+            "{} got a BlurHash",
+            img.path
+        );
+    }
+    // The next pass counts that master too: nothing more is written, nothing is evicted
+    let again = warm_pass_within(&fx.pool, &fx.dir, &client, cap)
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.prepared, again.hashed, again.ready, again.capped),
+        (0, 0, 3, true),
+        "{again:?}"
+    );
+    assert!(fx.master(&images[0]).exists());
+}
+
+#[tokio::test]
+async fn b152_a_blurhash_is_not_stored_for_a_picture_replaced_meanwhile() {
+    let fx = Fixture::new().await;
+    let poster = fx.dir.join("film").join("p.jpg");
+    write_jpeg(&poster, 100, 150);
+    let img = fx.movie("A", &poster, None).await;
+    // The row's stamp moves on (the file was replaced) after the pass read it
+    let read_before = ItemImage {
+        stamp: Some(41),
+        ..img.clone()
+    };
+    assert!(
+        !rustyfin_db::repo_image::set_image_blurhash(&fx.pool, &read_before, "LKO2?U%2Tw=w")
+            .await
+            .unwrap()
+    );
+    assert!(fx.stored_blurhash(&img).await.is_none());
+    // So is a path that changed, and a row that has a hash already keeps it
+    let moved = ItemImage {
+        path: "/elsewhere.jpg".into(),
+        ..img.clone()
+    };
+    assert!(
+        !rustyfin_db::repo_image::set_image_blurhash(&fx.pool, &moved, "LKO2?U%2Tw=w")
+            .await
+            .unwrap()
+    );
+    assert!(
+        rustyfin_db::repo_image::set_image_blurhash(&fx.pool, &img, "LKO2?U%2Tw=w")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !rustyfin_db::repo_image::set_image_blurhash(&fx.pool, &img, "L00000fQfQfQ")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        fx.stored_blurhash(&img).await.as_deref(),
+        Some("LKO2?U%2Tw=w")
+    );
 }

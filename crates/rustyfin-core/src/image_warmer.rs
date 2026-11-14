@@ -4,25 +4,48 @@
 //! and its BlurHash, where it has none yet. Remote originals are kept in the data dir as the
 //! image route does on first use.
 //!
-//! It works one picture at a time and waits while clients' renders take every slot, so it never
-//! delays a page. A pass writes at most `WARM_PASS_MAX_BYTES` of masters, half the disk cache's
-//! cap, so it never evicts what clients use; a library larger than that warms its top part.
+//! It renders in the background lane (`image_proxy::RenderFor::Background`): one picture at a
+//! time, only while no client render runs, and never queued for memory ahead of a client.
+//!
+//! Masters are written only while the whole disk image cache stays under `WARM_SHARE` of its cap,
+//! counting the copies already there, so a pass never pushes the cache to its sweep and never
+//! evicts what clients (or an earlier pass) stored. A library too large for that warms its top
+//! part; its other pictures still get a BlurHash when their original is on disk already.
+//! A picture that fails is not tried again until the server restarts.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use rustyfin_model::image::ItemImage;
 use sqlx::SqlitePool;
 
 use crate::image_proxy;
 
-/// The most bytes of grid masters one pass writes.
-pub const WARM_PASS_MAX_BYTES: u64 = image_proxy::IMAGE_CACHE_MAX_BYTES / 2;
+/// The share of the disk image cache's cap that masters may fill it to: half.
+pub const WARM_SHARE: (u64, u64) = (1, 2);
 
 /// How long a pass waits after a kick, so that a burst of kicks makes one pass.
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 static KICKS: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+/// Pictures (path and stamp) that failed in this process, so a broken or missing remote picture
+/// is not fetched again on every scan.
+type PictureKey = (String, Option<i64>);
+static FAILED: LazyLock<Mutex<HashSet<PictureKey>>> = LazyLock::new(Default::default);
+
+fn failed_before(img: &ItemImage) -> bool {
+    FAILED
+        .lock()
+        .is_ok_and(|s| s.contains(&(img.path.clone(), img.stamp)))
+}
+
+fn note_failed(img: &ItemImage) {
+    if let Ok(mut s) = FAILED.lock() {
+        s.insert((img.path.clone(), img.stamp));
+    }
+}
 
 /// What a pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -31,13 +54,15 @@ pub struct WarmReport {
     pub prepared: u32,
     /// BlurHashes stored.
     pub hashed: u32,
-    /// Pictures that had both already.
+    /// Pictures that had what they could get already.
     pub ready: u32,
     /// Pictures that could not be read or decoded.
     pub failed: u32,
+    /// Pictures skipped because they failed in an earlier pass.
+    pub skipped: u32,
     /// Bytes of masters written.
     pub bytes: u64,
-    /// Whether the pass stopped at `WARM_PASS_MAX_BYTES`.
+    /// Whether masters stopped at the cache share.
     pub capped: bool,
 }
 
@@ -56,14 +81,15 @@ pub fn start(pool: SqlitePool, data_dir: PathBuf, http_client: reqwest::Client) 
             match warm_pass(&pool, &data_dir, &http_client).await {
                 Ok(r) if r.prepared > 0 || r.hashed > 0 || r.failed > 0 => tracing::info!(
                     "prepared grid images: {} copies ({} KiB), {} BlurHashes, {} already ready, \
-                     {} failed{} in {:.1} s",
+                     {} failed, {} failed before{} in {:.1} s",
                     r.prepared,
                     r.bytes / 1024,
                     r.hashed,
                     r.ready,
                     r.failed,
+                    r.skipped,
                     if r.capped {
-                        ", stopped at the size cap,"
+                        ", copies stopped at the cache's share,"
                     } else {
                         ""
                     },
@@ -83,30 +109,55 @@ pub fn kick() {
     }
 }
 
-/// One pass over every item's Primary image, the top of each library first.
+/// One pass over every item's Primary image, the top of each library first, within the disk
+/// image cache's cap.
 pub async fn warm_pass(
     pool: &SqlitePool,
     data_dir: &Path,
     http_client: &reqwest::Client,
 ) -> Result<WarmReport, sqlx::Error> {
+    warm_pass_within(
+        pool,
+        data_dir,
+        http_client,
+        image_proxy::IMAGE_CACHE_MAX_BYTES,
+    )
+    .await
+}
+
+/// `warm_pass` for a cache whose cap is `cache_cap` bytes.
+pub async fn warm_pass_within(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    http_client: &reqwest::Client,
+    cache_cap: u64,
+) -> Result<WarmReport, sqlx::Error> {
     let images = rustyfin_db::repo_image::list_primary_images(pool).await?;
     let cache_dir = data_dir.join("cache").join("images");
     let store = data_dir.join("metadata").join("remote-images");
+    let dir = cache_dir.clone();
+    let in_cache = tokio::task::spawn_blocking(move || folder_bytes(&dir))
+        .await
+        .unwrap_or(0);
+    let mut budget = warm_budget(in_cache, cache_cap);
     let mut report = WarmReport::default();
     for img in images {
-        if report.bytes >= WARM_PASS_MAX_BYTES {
-            report.capped = true;
-            break;
+        if failed_before(&img) {
+            report.skipped += 1;
+            continue;
         }
-        while image_proxy::renders_busy() {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        match warm_one(pool, &img, &cache_dir, &store, http_client).await {
-            Ok((written, hashed)) => {
+        match warm_one(pool, &img, &cache_dir, &store, http_client, budget).await {
+            Ok(Warmed {
+                written,
+                hashed,
+                capped,
+            }) => {
                 if written > 0 {
                     report.prepared += 1;
                     report.bytes += written;
+                    budget = budget.saturating_sub(written);
                 }
+                report.capped |= capped;
                 if hashed {
                     report.hashed += 1;
                 }
@@ -116,6 +167,7 @@ pub async fn warm_pass(
             }
             Err(e) => {
                 report.failed += 1;
+                note_failed(&img);
                 tracing::debug!(path = %img.path, "could not prepare grid image: {}", e);
             }
         }
@@ -123,52 +175,122 @@ pub async fn warm_pass(
     Ok(report)
 }
 
-/// Prepares one picture: its grid master if missing, and its BlurHash if it has none. Returns the
-/// bytes of master written (0 when it was there) and whether a BlurHash was stored.
+/// The bytes of masters a pass may write when the cache holds `in_cache` bytes: up to
+/// `WARM_SHARE` of the cap, all copies counted.
+pub fn warm_budget(in_cache: u64, cache_cap: u64) -> u64 {
+    (cache_cap / WARM_SHARE.1 * WARM_SHARE.0).saturating_sub(in_cache)
+}
+
+/// The total size of the files in `dir` (0 when it can't be read).
+fn folder_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// What `warm_one` did.
+struct Warmed {
+    /// Bytes of master written (0 when it was there, or there was no room).
+    written: u64,
+    /// Whether a BlurHash was stored.
+    hashed: bool,
+    /// Whether the master was missing and the budget had no room for it.
+    capped: bool,
+}
+
+/// Prepares one picture: its grid master if missing and `budget` has room, and its BlurHash if it
+/// has none (from the master, else from an original already on disk).
 async fn warm_one(
     pool: &SqlitePool,
     img: &ItemImage,
     cache_dir: &Path,
     store: &Path,
     http_client: &reqwest::Client,
-) -> Result<(u64, bool), String> {
-    let source = if img.path.starts_with("http://") || img.path.starts_with("https://") {
-        image_proxy::localize_remote_image_checked(&img.path, store, Some(http_client))
-            .await
-            .map_err(|e| e.to_string())?
-            .to_string_lossy()
-            .into_owned()
+    budget: u64,
+) -> Result<Warmed, String> {
+    let remote = img.path.starts_with("http://") || img.path.starts_with("https://");
+    // A downloaded remote original, or the local file; for a remote one not downloaded yet, None
+    let on_disk = if remote {
+        image_proxy::stored_remote_image(&img.path, store).map(|p| p.to_string_lossy().into_owned())
     } else {
-        img.path.clone()
+        Some(img.path.clone())
     };
-    let master_path = cache_dir.join(image_proxy::grid_master_name(&source, img.stamp));
-    let existed = tokio::fs::metadata(&master_path)
-        .await
-        .is_ok_and(|m| m.len() > 0);
+    let master_path =
+        |source: &str| cache_dir.join(image_proxy::grid_master_name(source, img.stamp));
+    let existed = on_disk
+        .as_deref()
+        .is_some_and(|s| std::fs::metadata(master_path(s)).is_ok_and(|m| m.len() > 0));
     if existed && img.blurhash.is_some() {
-        return Ok((0, false));
+        return Ok(Warmed {
+            written: 0,
+            hashed: false,
+            capped: false,
+        });
     }
-    let master = image_proxy::render_image(
-        &source,
-        img.stamp,
-        image_proxy::Rendition::Copy {
-            width: image_proxy::GRID_MASTER.0,
-            height: image_proxy::GRID_MASTER.1,
-        },
-        cache_dir,
-        Some(http_client),
-    )
-    .await?;
-    let written = if existed { 0 } else { master.len() as u64 };
-    let mut hashed = false;
-    if img.blurhash.is_none() {
-        let hash = tokio::task::spawn_blocking(move || image_proxy::blurhash_of(&master))
+    // A master takes about 60-100 KB; without room for one, only the BlurHash is made
+    let room = budget >= 128 << 10;
+    let mut warmed = Warmed {
+        written: 0,
+        hashed: false,
+        capped: !existed && !room,
+    };
+    let picture = if existed || room {
+        let source = match on_disk {
+            Some(source) => source,
+            None => image_proxy::localize_remote_image_checked(&img.path, store, Some(http_client))
+                .await
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let master = image_proxy::render_image_for(
+            &source,
+            img.stamp,
+            image_proxy::Rendition::Copy {
+                width: image_proxy::GRID_MASTER.0,
+                height: image_proxy::GRID_MASTER.1,
+            },
+            cache_dir,
+            Some(http_client),
+            image_proxy::RenderFor::Background,
+        )
+        .await?;
+        if !existed {
+            warmed.written = master.len() as u64;
+        }
+        Some(master)
+    } else if img.blurhash.is_none()
+        && let Some(source) = on_disk
+    {
+        // Only a JPEG decoded at 1/8 scale (a few MiB), and only while no client render runs
+        let bytes = tokio::fs::read(&source).await.map_err(|e| e.to_string())?;
+        if image_proxy::render_cost_mib(&bytes, 32, 32) >= image_proxy::RENDER_BUDGET_MIB / 2 {
+            return Ok(warmed);
+        }
+        while image_proxy::clients_rendering() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    if img.blurhash.is_none()
+        && let Some(bytes) = picture
+    {
+        let hash = tokio::task::spawn_blocking(move || image_proxy::blurhash_of(&bytes))
             .await
             .map_err(|e| e.to_string())?
-            .ok_or("could not decode the grid master")?;
-        hashed = rustyfin_db::repo_image::set_image_blurhash(pool, img, &hash)
+            .ok_or("could not decode the picture")?;
+        warmed.hashed = rustyfin_db::repo_image::set_image_blurhash(pool, img, &hash)
             .await
             .map_err(|e| e.to_string())?;
     }
-    Ok((written, hashed))
+    Ok(warmed)
 }
