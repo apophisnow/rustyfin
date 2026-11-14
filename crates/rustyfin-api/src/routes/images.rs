@@ -299,6 +299,7 @@ async fn upload_item_image(
     // Drop the answers and the pictures that name the old one
     state.cache.invalidate_item(&id.to_string());
     state.image_cache.invalidate_item(&id.to_string());
+    rustyfin_core::image_warmer::kick();
 
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -323,6 +324,7 @@ async fn refresh_item(
     // Invalidate cached item details and images after metadata refresh
     state.cache.invalidate_item(&id.to_string());
     state.image_cache.invalidate_item(&id.to_string());
+    rustyfin_core::image_warmer::kick();
 
     Ok(Json(json!({ "status": "ok" })))
 }
