@@ -138,6 +138,14 @@ body {
   scroll-margin-top: 4.5rem;
 }
 
+/* Other poster grids (favourites, search, a person's titles): off-screen cards skip layout and
+   paint too. Their columns vary, so a card not yet drawn is counted at a typical poster card's
+   height until it has been drawn once ("auto" keeps its real height after that). */
+.jf-card-grid > .jf-card {
+  content-visibility: auto;
+  contain-intrinsic-height: auto 17rem;
+}
+
 .jf-poster {
   aspect-ratio: 2/3;
   background: var(--jf-bg-surface);
