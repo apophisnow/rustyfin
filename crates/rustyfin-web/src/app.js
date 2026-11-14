@@ -65,6 +65,88 @@ function initLazyImages(root = document) {
     });
 }
 
+// --- BlurHash previews (https://blurha.sh): cards paint the server's ImageBlurHashes at once ---
+const BLURHASH_DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~';
+
+// RGBA pixels (a Uint8ClampedArray of w*h*4) for a BlurHash, or null when the hash is malformed
+function decodeBlurhash(hash, w, h) {
+    if (typeof hash !== 'string' || hash.length < 6) return null;
+    const digits = [];
+    for (const ch of hash) {
+        const d = BLURHASH_DIGITS.indexOf(ch);
+        if (d < 0) return null;
+        digits.push(d);
+    }
+    const num = (a, b) => digits.slice(a, b).reduce((v, d) => v * 83 + d, 0);
+    const nx = (digits[0] % 9) + 1, ny = Math.floor(digits[0] / 9) + 1;
+    if (digits.length !== 4 + 2 * nx * ny) return null;
+    const toLinear = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+    const toSrgb = v => {
+        v = Math.min(1, Math.max(0, v));
+        return Math.round((v <= 0.0031308 ? v * 12.92 : 1.055 * v ** (1 / 2.4) - 0.055) * 255);
+    };
+    const maxAc = (digits[1] + 1) / 166;
+    const ac = q => Math.sign(q - 9) * ((q - 9) / 9) ** 2 * maxAc;
+    const dc = num(2, 6);
+    const colors = [[toLinear(dc >> 16), toLinear((dc >> 8) & 255), toLinear(dc & 255)]];
+    for (let i = 1; i < nx * ny; i++) {
+        const v = num(4 + 2 * i, 6 + 2 * i);
+        colors.push([ac(Math.floor(v / 361)), ac(Math.floor(v / 19) % 19), ac(v % 19)]);
+    }
+    const cosX = [], cosY = [];
+    for (let i = 0; i < nx; i++) for (let x = 0; x < w; x++) cosX[i * w + x] = Math.cos((Math.PI * x * i) / w);
+    for (let j = 0; j < ny; j++) for (let y = 0; y < h; y++) cosY[j * h + y] = Math.cos((Math.PI * y * j) / h);
+    const px = new Uint8ClampedArray(w * h * 4);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let r = 0, g = 0, b = 0;
+            for (let j = 0; j < ny; j++) {
+                for (let i = 0; i < nx; i++) {
+                    const basis = cosX[i * w + x] * cosY[j * h + y];
+                    const c = colors[i + j * nx];
+                    r += c[0] * basis; g += c[1] * basis; b += c[2] * basis;
+                }
+            }
+            const o = 4 * (x + y * w);
+            px[o] = toSrgb(r); px[o + 1] = toSrgb(g); px[o + 2] = toSrgb(b); px[o + 3] = 255;
+        }
+    }
+    return px;
+}
+
+// Paints each canvas[data-blurhash] under root (root included) once
+function paintBlurhashes(root) {
+    const canvases = root.matches?.('canvas[data-blurhash]') ? [root] : root.querySelectorAll?.('canvas[data-blurhash]') || [];
+    for (const canvas of canvases) {
+        const px = decodeBlurhash(canvas.dataset.blurhash, canvas.width, canvas.height);
+        delete canvas.dataset.blurhash;
+        if (px) canvas.getContext('2d').putImageData(new ImageData(px, canvas.width, canvas.height), 0, 0);
+        else canvas.remove();
+    }
+}
+
+// Cards come from many renderers (grids, rows, innerHTML strings), so new ones are painted as they
+// are added to the page
+new MutationObserver(records => {
+    for (const record of records) {
+        for (const node of record.addedNodes) if (node.nodeType === 1) paintBlurhashes(node);
+    }
+}).observe(document.documentElement, { childList: true, subtree: true });
+
+// A card's picture loaded: it fades in over its BlurHash, which stays under it. A failed one drops
+// both the skeleton and the BlurHash and shows the type icon instead.
+function posterLoaded(img) {
+    img.style.opacity = '0.8';
+    img.classList.remove('blur-sm', 'scale-105');
+    img.parentElement?.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.display = 'none'; });
+}
+function posterFailed(img) {
+    img.style.display = 'none';
+    img.parentElement?.querySelectorAll('.jf-poster-skeleton, .jf-blurhash').forEach(el => { el.style.display = 'none'; });
+    const ic = img.nextElementSibling;
+    if (ic) ic.style.display = 'flex';
+}
+
 // Lucide icon as an SVG string. name is a key of window.lucideIcons (src/icons.js); an unknown name gives ''.
 function icon(name, { size = 16, class: cls = '', label } = {}) {
     const nodes = window.lucideIcons?.[name];
@@ -960,6 +1042,8 @@ function itemCard(item, options = {}) {
     const picture = cardImage(item, isBackdrop);
     const thumbSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 150, format: 'webp', tag: picture.tag }) : '';
     const fullSrc = picture ? API.imageUrl(picture.id, picture.type, { maxWidth: 250, tag: picture.tag }) : '';
+    // The picture's BlurHash, painted under it until it loads (Jellyfin's ImageBlurHashes shape)
+    const blurhash = picture ? item.ImageBlurHashes?.[picture.type]?.[picture.tag] : null;
     // Episode landscape cards: series name on the title line, "S1:E2 · name" on the second line
     const hasNumbers = item.ParentIndexNumber != null && item.IndexNumber != null;
     const isEpisodeCard = isBackdrop && type === 'Episode' && !!item.SeriesName && hasNumbers;
@@ -987,12 +1071,12 @@ function itemCard(item, options = {}) {
     <div class="jf-card group" data-action="navigate" data-page="detail" data-id="${escapeHtml(id)}">
         <div class="${isBackdrop ? 'jf-poster-backdrop' : 'jf-poster'}">
             ${picture ? `
-            <div class="jf-poster-skeleton"></div>
+            ${blurhash
+                ? `<canvas class="jf-blurhash" width="${isBackdrop ? 32 : 20}" height="${isBackdrop ? 18 : 30}" data-blurhash="${escapeHtml(blurhash)}" aria-hidden="true"></canvas>`
+                : '<div class="jf-poster-skeleton"></div>'}
             <!-- Thumbnail loads first for instant visual feedback; full-res swaps on hover -->
             <img src="${thumbSrc}" alt="${escapeHtml(cardTitle)}" decoding="async" loading="lazy" class="jf-thumb-img absolute inset-0 w-full h-full object-cover z-[1] opacity-0 blur-sm scale-105 transition-opacity duration-200${picture.contain ? ' jf-img-contain' : ''}"
-                 data-full-src="${fullSrc}"
-                 onload="this.style.opacity='0.8';this.classList.remove('blur-sm','scale-105');const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';"
-                 onerror="this.style.display='none';const sk=this.previousElementSibling;if(sk&&sk.classList.contains('jf-poster-skeleton'))sk.style.display='none';const ic=this.nextElementSibling;if(ic)ic.style.display='flex';">` : ''}
+                 data-full-src="${fullSrc}" onload="posterLoaded(this)" onerror="posterFailed(this)">` : ''}
             <div class="${picture ? 'hidden' : 'flex'} items-center justify-center h-full text-white/20 absolute inset-0 bg-white/5"${picture ? ' style="display:none"' : ''}>
                 ${icon(typeIcons[type] || 'Folder', { size: 40 })}
             </div>
