@@ -133,9 +133,10 @@ const API = {
         return error;
     },
 
-    async get(path) {
+    // init: extra fetch options, such as an AbortSignal
+    async get(path, init = {}) {
         const sent = this.token;
-        const res = await fetch(this.base + path, { headers: this.headers() });
+        const res = await fetch(this.base + path, { headers: this.headers(), ...init });
         if (!res.ok) {
             // A late 401 for an older token must not sign out the user who signed in since.
             if (res.status === 401 && sent && this.token === sent) {

@@ -89,6 +89,19 @@ function decodeBlurhash(hash, w, h) {
     return px;
 }
 
+// A BlurHash's average colour as a CSS colour (its DC component: digits 2-5), or null
+function blurhashAverage(hash) {
+    if (typeof hash !== 'string' || hash.length < 6) return null;
+    let v = 0;
+    for (const ch of hash.slice(2, 6)) {
+        const d = BLURHASH_DIGITS.indexOf(ch);
+        if (d < 0) return null;
+        v = v * 83 + d;
+    }
+    if (v > 0xffffff) return null;
+    return `rgb(${v >> 16}, ${(v >> 8) & 255}, ${v & 255})`;
+}
+
 // Paints each canvas[data-blurhash] under root (root included) once
 function paintBlurhashes(root) {
     const canvases = root.matches?.('canvas[data-blurhash]') ? [root] : root.querySelectorAll?.('canvas[data-blurhash]') || [];
@@ -1618,11 +1631,17 @@ async function loadMoreFavoritesInfinite(initialTotal) {
 let libraryGen = 0;
 let libraryQuery = null;
 let libraryTotal = null;
-let libraryObserver = null;
+// Page requests in flight for the current load: page number -> AbortController
+let libraryInFlight = new Map();
+let libraryLastY = 0;
+let libraryDir = 1;
+let libraryUpdateQueued = false;
 let libraryRequested = new Set();
 // The lean index of the current load (every item's name, picture tag and BlurHash, by position):
 // a placeholder near the viewport becomes a lite card from it at once, before its page arrives
 let libraryIndex = null;
+// The full items of the pages that arrived, by position; cells become cards from them near the screen
+let libraryItems = [];
 let letterClicks = 0;
 // The letter rail: the anchor of the last jump ({ k, first }) and the pending frame of an update
 let railAnchor = null;
@@ -1845,19 +1864,24 @@ function libraryListQuery(libId) {
 
 // Starts a load: a new generation, and the observer of the previous load is dropped
 function startLibraryLoad(libId) {
-    libraryObserver?.disconnect();
-    libraryObserver = null;
+    for (const controller of libraryInFlight.values()) controller.abort();
+    libraryInFlight = new Map();
     libraryQuery = libraryListQuery(libId);
     libraryTotal = null;
     libraryIndex = null;
+    libraryItems = [];
     libraryRequested = new Set([0]); // the first page is requested by the load itself
     railAnchor = null;
     return ++libraryGen;
 }
 
 // One page of the current load, with the total record count
-async function fetchLibraryPage(startIndex) {
-    const data = await API.getItems({ ...libraryQuery, StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE });
+async function fetchLibraryPage(startIndex, signal) {
+    const params = { ...libraryQuery, StartIndex: startIndex, Limit: LIBRARY_PAGE_SIZE };
+    // A page the scroll position asks for can be dropped, so it goes past the shared GET cache
+    const data = signal
+        ? await API.get('/Items?' + new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')).toString(), { signal })
+        : await API.getItems(params);
     const items = data.Items || data.items || [];
     return { items, total: data.TotalRecordCount || data.total_record_count || items.length };
 }
@@ -1871,13 +1895,29 @@ async function loadLibraryIndex(gen) {
         if (v !== undefined && v !== null && v !== '') q.set(k, v);
     }
     try {
-        const data = await API.get('/Items?' + q.toString());
+        // Low priority: the first screens' pages and posters come first
+        const data = await API.get('/Items?' + q.toString(), { priority: 'low' });
         if (gen !== libraryGen) return;
         libraryIndex = data.Items || data.items || [];
         libraryIndexArrived();
     } catch (e) {
         console.warn('Library index failed; pages still load', e);
     }
+}
+
+// The full card of `item` in place of placeholder `ph`
+function fullCard(ph, item) {
+    const card = createCardElement(item);
+    card.dataset.letter = railLetter(item);
+    ph.replaceWith(card);
+}
+
+// The cells within a screen of the viewport, or null before the grid is measured
+function libraryNearRange() {
+    const geom = libraryGeom;
+    if (!geom || libraryTotal == null) return null;
+    const viewTop = window.scrollY - geom.top;
+    return libraryCellRange(viewTop - innerHeight, viewTop + 2 * innerHeight, geom.rowHeight, geom.cols, libraryTotal);
 }
 
 // A card from the index in place of placeholder `ph`; its page later fills in the rest
@@ -1888,7 +1928,15 @@ function liteCard(ph) {
     card.dataset.letter = railLetter(item);
     card.dataset.lite = '1';
     ph.replaceWith(card);
-    libraryObserver?.unobserve(ph);
+}
+
+// Whether a lite card must be drawn again for its full item: it shows another item (the list's
+// order moved between the two requests), or the item has watch state the index leaves out. Most
+// cards of a library have none, so their page changes nothing on screen.
+function liteCardDiffers(card, item) {
+    const data = item.UserData || {};
+    return card.dataset.id !== String(item.Id || item.id)
+        || Boolean(data.Played || data.IsFavorite || data.PlayedPercentage > 0);
 }
 
 // Gives a card the full item from its page, keeping its picture and BlurHash elements (already
@@ -1939,61 +1987,204 @@ function fillLibraryGrid(items, total) {
     }
     grid.appendChild(frag);
 
-    // A placeholder that comes near the viewport becomes a lite card (once the index is here) and
-    // requests its page, once per load
-    const gen = libraryGen;
-    libraryObserver = new IntersectionObserver(entries => {
-        if (gen !== libraryGen) return; // a newer load has replaced this observer
-        for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
-            const page = Math.floor(Number(entry.target.dataset.i) / LIBRARY_PAGE_SIZE);
-            liteCard(entry.target);
-            if (libraryRequested.has(page)) continue;
-            libraryRequested.add(page);
-            loadLibraryPage(gen, page);
-        }
-    }, { rootMargin: '200% 0px' });
-    grid.querySelectorAll('[data-i]').forEach(ph => libraryObserver.observe(ph));
     scheduleRailUpdate();
-    if (items.length < total) loadLibraryIndex(gen);
+    libraryLastY = window.scrollY;
+    libraryUpdate();
+    if (items.length < total) loadLibraryIndex(libraryGen);
 }
 
-// The index arrived: placeholders already near the viewport become lite cards
+// The index arrived: placeholders near the viewport become lite cards
 function libraryIndexArrived() {
-    const grid = $('lib-grid');
-    if (!grid) return;
-    const near = [];
-    for (const ph of grid.querySelectorAll('[data-i]')) {
-        const r = ph.getBoundingClientRect();
-        if (r.bottom > -2 * innerHeight && r.top < 3 * innerHeight) near.push(ph);
-    }
-    near.forEach(liteCard);
+    libraryGeom = null; // the header above the grid may have changed meanwhile
+    libraryUpdate();
 }
 
-// Puts the cards of one page in place of its placeholders
+// How many library pages may load at once; the rest of the browser's connections stay free for
+// the posters
+const LIBRARY_PAGES_AT_ONCE = 2;
+
+// The first and last grid cells in a band of the page. viewTop and viewBottom are relative to the
+// grid's top; rowHeight is the distance between two rows' tops. null when the grid has no rows.
+function libraryCellRange(viewTop, viewBottom, rowHeight, cols, total) {
+    if (!(rowHeight > 0) || !(cols > 0) || !(total > 0)) return null;
+    const firstRow = Math.max(0, Math.floor(viewTop / rowHeight));
+    const lastRow = Math.max(firstRow, Math.floor(viewBottom / rowHeight));
+    const first = Math.min(total - 1, firstRow * cols);
+    return { first, last: Math.min(total - 1, Math.max(first, (lastRow + 1) * cols - 1)) };
+}
+
+// The pages to request for cells `range`, in order: the pages covering it, nearest its middle
+// first (on a tie, the one ahead), then `ahead` pages further in the scroll direction (dir < 0:
+// up), then one behind.
+// Pages in `held` (requested already) are left out.
+function libraryPagePlan(range, dir, pageSize, total, held, ahead = 2) {
+    const pages = Math.ceil(total / pageSize);
+    const first = Math.floor(range.first / pageSize);
+    const last = Math.floor(range.last / pageSize);
+    const mid = (first + last) / 2;
+    const order = [];
+    for (let p = first; p <= last; p++) order.push(p);
+    order.sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid) || (dir < 0 ? a - b : b - a));
+    for (let k = 1; k <= ahead; k++) order.push(dir < 0 ? first - k : last + k);
+    order.push(dir < 0 ? last + 1 : first - 1);
+    return order.filter(p => p >= 0 && p < pages && !held.has(p));
+}
+
+// Fills the library around the scroll position: placeholders on and near the screen become lite
+// cards (once the index is here), the pages covering the screen are requested first, then their
+// neighbours in the scroll direction, a few at a time, and requests far from a new landing are
+// dropped. Runs on every scroll event, on resize and when a page or the index arrives; it needs
+// no observer, so a fling that jumps far still starts the right pages on its first frame.
+let librarySettle = null;
+let libraryLastScroll = 0;
+let libraryLastSpeed = 0;
+// Above this speed (screens a second) the page is flying: rows pass in a few frames
+const LIBRARY_FLYING_SPEED = 8;
+
+// A placeholder painted in its picture's BlurHash average colour, while the page flies past it
+function tintPlaceholder(cell) {
+    const i = Number(cell.dataset.i);
+    const item = libraryItems[i] || libraryIndex?.[i];
+    const tag = item?.ImageTags?.Primary;
+    const color = tag ? blurhashAverage(item.ImageBlurHashes?.Primary?.[tag]) : null;
+    if (!color) return;
+    cell.dataset.tint = '1';
+    cell.firstElementChild.style.backgroundColor = color;
+}
+
+// The grid's geometry: its column count, the distance between two rows' tops and its top in page
+// coordinates. Measured when the grid is built, on resize and when the index arrives, not on each
+// scroll, where reading layout right after new cards would lay out the whole grid every event.
+let libraryGeom = null;
+function measureLibraryGrid() {
+    const grid = $('lib-grid');
+    if (!grid?.children.length) return (libraryGeom = null);
+    const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+    const first = grid.children[0];
+    const below = grid.children[cols];
+    const rowHeight = below ? below.offsetTop - first.offsetTop : first.offsetHeight;
+    return (libraryGeom = { grid, cols, rowHeight, top: grid.getBoundingClientRect().top + window.scrollY });
+}
+
+// speed: screens a second, for a scroll event; other callers leave it out and inherit the last
+// event's speed while it is recent (a page arriving mid-fling must not build cards the fling
+// leaves); 0 means the scroll has settled
+function libraryUpdate(speed = null) {
+    const grid = $('lib-grid');
+    if (!grid || libraryTotal == null || !grid.children.length) return;
+    if (speed == null) speed = performance.now() - libraryLastScroll < 150 ? libraryLastSpeed : 0;
+    const gen = libraryGen;
+    const geom = libraryGeom?.grid === grid ? libraryGeom : measureLibraryGrid();
+    const { cols, rowHeight } = geom;
+    const viewTop = window.scrollY - geom.top;
+    const screen = libraryCellRange(viewTop, viewTop + innerHeight, rowHeight, cols, libraryTotal);
+    if (!screen) return;
+    if (speed > LIBRARY_FLYING_SPEED) {
+        // The page flies: the rows on screen now are gone in a few frames, so they only take
+        // their BlurHash's average colour, one style write a cell; the cards come when it slows
+        // down or stops
+        for (let i = screen.first; i <= screen.last; i++) {
+            const cell = grid.children[i];
+            if (cell?.hasAttribute('data-i') && !cell.dataset.tint) tintPlaceholder(cell);
+        }
+        clearTimeout(librarySettle);
+        librarySettle = setTimeout(() => libraryUpdate(0), 150);
+    } else {
+        // Cards for the screen, two screens ahead in the scroll direction (the poster loader's
+        // lookahead) and half a screen behind: the full card when its page is here, else a lite
+        // card from the index. A steady scroll makes a row or so a frame.
+        const near = libraryDir < 0
+            ? libraryCellRange(viewTop - 2 * innerHeight, viewTop + 1.5 * innerHeight, rowHeight, cols, libraryTotal)
+            : libraryCellRange(viewTop - innerHeight / 2, viewTop + 3 * innerHeight, rowHeight, cols, libraryTotal);
+        for (let i = near.first; i <= near.last; i++) {
+            const cell = grid.children[i];
+            if (!cell?.hasAttribute('data-i')) continue;
+            if (libraryItems[i]) fullCard(cell, libraryItems[i]);
+            else liteCard(cell);
+        }
+    }
+    // Requests far from the screen (more than two pages away) are dropped
+    const firstPage = Math.floor(screen.first / LIBRARY_PAGE_SIZE);
+    const lastPage = Math.floor(screen.last / LIBRARY_PAGE_SIZE);
+    for (const [page, controller] of libraryInFlight) {
+        if (page < firstPage - 2 || page > lastPage + 2) {
+            controller.abort();
+            libraryInFlight.delete(page);
+            libraryRequested.delete(page);
+        }
+    }
+    for (const page of libraryPagePlan(screen, libraryDir, LIBRARY_PAGE_SIZE, libraryTotal, libraryRequested)) {
+        if (libraryInFlight.size >= LIBRARY_PAGES_AT_ONCE) break;
+        libraryRequested.add(page);
+        loadLibraryPage(gen, page);
+    }
+}
+
+function scheduleLibraryUpdate() {
+    if (libraryUpdateQueued) return;
+    libraryUpdateQueued = true;
+    requestAnimationFrame(() => { libraryUpdateQueued = false; libraryUpdate(); });
+}
+
+// Scroll events come once a frame, before the frame's animation callbacks and paint, so updating
+// here (not a frame later) fills the cells a fling lands on in the very frame it lands
+window.addEventListener('scroll', () => {
+    if (libraryTotal == null) return;
+    const y = window.scrollY;
+    const now = performance.now();
+    if (y !== libraryLastY) libraryDir = y > libraryLastY ? 1 : -1;
+    // Screens a second since the last event (a jump with no recent event counts as a fling)
+    const dt = Math.max(1, now - libraryLastScroll);
+    const speed = dt > 200 ? Math.abs(y - libraryLastY) / innerHeight * 10 : (Math.abs(y - libraryLastY) / innerHeight) * (1000 / dt);
+    libraryLastY = y;
+    libraryLastScroll = now;
+    libraryLastSpeed = speed;
+    libraryUpdate(speed);
+}, { passive: true });
+// A fling or drag that ends (where the browser says so) gets its cards at once, not 100 ms later
+window.addEventListener('scrollend', () => {
+    if (libraryTotal == null) return;
+    clearTimeout(librarySettle);
+    libraryUpdate(0);
+});
+window.addEventListener('resize', () => {
+    if (libraryTotal == null) return;
+    libraryGeom = null;
+    scheduleLibraryUpdate();
+});
+
+// Puts the cards of one page in place of its placeholders (or upgrades its lite cards)
 async function loadLibraryPage(gen, page) {
+    const controller = new AbortController();
+    libraryInFlight.set(page, controller);
     try {
-        const { items } = await fetchLibraryPage(page * LIBRARY_PAGE_SIZE);
+        const { items } = await fetchLibraryPage(page * LIBRARY_PAGE_SIZE, controller.signal);
         if (gen !== libraryGen) return;
         const grid = $('lib-grid');
+        // Every item is kept; only the cells near the screen become cards now, the others when the
+        // scroll brings them near (a page often arrives for rows a fling has already left)
+        const near = libraryNearRange();
         items.forEach((item, j) => {
-            const cell = grid?.children[page * LIBRARY_PAGE_SIZE + j];
+            const i = page * LIBRARY_PAGE_SIZE + j;
+            libraryItems[i] = item;
+            const cell = grid?.children[i];
             if (!cell) return;
             if (cell.dataset.lite) {
-                upgradeCard(cell, item);
+                if (liteCardDiffers(cell, item)) upgradeCard(cell, item);
+                else delete cell.dataset.lite;
                 return;
             }
-            if (!cell.hasAttribute('data-i')) return;
-            const card = createCardElement(item);
-            card.dataset.letter = railLetter(item);
-            cell.replaceWith(card);
-            libraryObserver.unobserve(cell);
+            if (cell.hasAttribute('data-i') && near && i >= near.first && i <= near.last) fullCard(cell, item);
         });
         scheduleRailUpdate();
     } catch (e) {
         if (gen !== libraryGen) return;
         libraryRequested.delete(page);
-        toast(t('library.load_failed', { message: e.message }), 'error');
+        if (e.name !== 'AbortError') toast(t('library.load_failed', { message: e.message }), 'error');
+    } finally {
+        if (libraryInFlight.get(page) === controller) libraryInFlight.delete(page);
+        // The next pages the screen needs
+        if (gen === libraryGen) scheduleLibraryUpdate();
     }
 }
 

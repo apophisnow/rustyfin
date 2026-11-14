@@ -39,6 +39,16 @@ test('the reference hash decodes to opaque pixels that vary across the picture',
     assert.notDeepEqual(first, last, 'a 4x3 hash is not flat');
 });
 
+test('the average colour is the hash DC component', () => {
+    const start = source.indexOf('function blurhashAverage(hash) {');
+    assert.ok(start >= 0, 'app.js has blurhashAverage');
+    vm.runInContext(source.slice(start, source.indexOf('\n}\n', start) + 3), context);
+    assert.equal(context.blurhashAverage('00' + base83((12 << 16) | (200 << 8) | 99, 4)), 'rgb(12, 200, 99)');
+    // A many-component hash: its DC digits (2-5) alone, whatever follows
+    assert.equal(context.blurhashAverage('L0' + base83(0x102030, 4) + 'WB2yk8pyo0adR*.7kCMdnj'), 'rgb(16, 32, 48)');
+    for (const bad of [null, 'L', '00~~~~', '00!AAA']) assert.equal(context.blurhashAverage(bad), null, String(bad));
+});
+
 test('a malformed hash gives null', () => {
     for (const hash of [null, undefined, '', 'L', 'LEHV6nWB2yk8pyo0adR*.7kCMdn', 'LEHV6nWB2yk8pyo0adR*.7kCMdnj!', '00"AAAA']) {
         assert.equal(decode(hash, 4, 4), null, String(hash));

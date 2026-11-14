@@ -18238,6 +18238,11 @@ fn b152_poster_loader_runtime() {
 }
 
 #[test]
+fn b152_library_pages() {
+    b124_node_test("b152_library_pages.mjs");
+}
+
+#[test]
 fn b152_service_worker() {
     b124_node_test("b152_service_worker.mjs");
 }
