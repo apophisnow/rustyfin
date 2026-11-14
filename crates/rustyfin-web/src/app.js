@@ -174,10 +174,16 @@ const posterLoader = {
     queued: false,
     io: null,
 
-    // Takes the cards with a picture to load under root (root included)
-    watch(root) {
+    // Takes the cards with a picture to load under each of roots (roots included), all at once: no
+    // layout is read here, and one run in the next frame measures them together, so a page of new
+    // cards costs one layout, not one per card
+    watch(roots) {
         const pictures = 'img[data-src], img[data-img-tag]';
-        const imgs = root.matches?.(pictures) ? [root] : root.querySelectorAll?.(pictures) || [];
+        const imgs = [];
+        for (const root of roots) {
+            if (root.matches?.(pictures)) imgs.push(root);
+            else if (root.querySelectorAll) imgs.push(...root.querySelectorAll(pictures));
+        }
         if (!imgs.length) return;
         this.io ??= new IntersectionObserver(entries => {
             for (const e of entries) {
@@ -197,11 +203,10 @@ const posterLoader = {
             card._poster = img;
             this.watched.add(card);
             this.io.observe(card);
-            // Cards already near start now, not a frame later when the observer reports them
-            const r = card.getBoundingClientRect();
-            if (r.bottom > -3 * innerHeight && r.top < 4 * innerHeight) this.near.add(card);
+            // Counted as near until the observer says otherwise, so the next run sizes it up
+            this.near.add(card);
         }
-        this.run();
+        this.schedule();
     },
 
     onScroll() {
@@ -300,20 +305,23 @@ window.addEventListener('hashchange', () => posterLoader.sweep());
 // their pictures queued as they are added to the pages (in <main>; the player, dialogs and the
 // sidebar hold no cards and are not watched)
 new MutationObserver(records => {
+    const added = [];
     for (const record of records) {
         for (const node of record.addedNodes) {
             if (node.nodeType !== 1) continue;
             paintBlurhashes(node);
-            posterLoader.watch(node);
+            added.push(node);
         }
     }
+    posterLoader.watch(added);
 }).observe(document.querySelector('main') || document.documentElement, { childList: true, subtree: true });
 
 // A card's picture loaded: it fades in over its BlurHash, which stays under it. A failed one drops
 // both the skeleton and the BlurHash and shows the type icon instead.
 function posterLoaded(img) {
     img.style.opacity = '0.8';
-    img.parentElement?.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.display = 'none'; });
+    // visibility, not display: hiding it repaints, but lays nothing out again
+    img.parentElement?.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.visibility = 'hidden'; el.style.animation = 'none'; });
 }
 function posterFailed(img) {
     if (!img.getAttribute('src')) return; // a load the poster loader stopped
@@ -1951,7 +1959,7 @@ function upgradeCard(card, item) {
         const freshHash = full.querySelector('canvas.jf-blurhash');
         if (oldHash && freshHash) freshHash.replaceWith(oldHash);
         // A picture already shown keeps its skeleton hidden
-        if (oldImg.style.opacity) full.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.display = 'none'; });
+        if (oldImg.style.opacity) full.querySelectorAll('.jf-poster-skeleton').forEach(el => { el.style.visibility = 'hidden'; });
     }
     card.replaceChildren(...full.childNodes);
     card.dataset.letter = railLetter(item);

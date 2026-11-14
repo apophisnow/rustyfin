@@ -70,9 +70,12 @@ function setup(cards) {
     });
     vm.runInContext(code, context);
     const loader = context.posterLoader;
-    // A page of cards is added at once, as the renderers do
-    loader.watch({ matches: () => false, querySelectorAll: () => cards.map(c => c.img) });
     const frame = () => { while (frames.length) frames.shift()(); loader.run(); };
+    // A page of cards is added at once, as the renderers do; nothing starts before the next frame
+    loader.watch([{ matches: () => false, querySelectorAll: () => cards.map(c => c.img) }]);
+    assert.equal(loader.loading.size, 0, 'watch reads no layout and starts nothing itself');
+    assert.equal(frames.length, 1, 'one frame is asked for the whole page');
+    frame();
     return { loader, frame };
 }
 
@@ -130,8 +133,9 @@ test('cards removed from the page are stopped and forgotten', () => {
     assert.ok(!loader.loading.has(cards[0]) && !loader.watched.has(cards[0]));
     // A sweep (route change) drops detached cards that were not near too
     const far = makeCard(2, 20000);
-    loader.watch(far.img);
-    assert.ok(loader.watched.has(far) && !loader.near.has(far));
+    loader.watch([far.img]);
+    frame();
+    assert.ok(loader.watched.has(far) && far.img.getAttribute('src') === null, 'far: watched, not started');
     far.isConnected = false;
     loader.sweep();
     assert.ok(!loader.watched.has(far));
