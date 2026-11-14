@@ -116,29 +116,37 @@ body {
   border-color: var(--jf-border-hover);
 }
 
-/* Library grid. Columns and gap are set here, not with Tailwind classes, because the card
-   height below is computed from them. Breakpoints are Tailwind's sm, md, lg and xl. */
+/* Library grid. Columns and gap are set here, not with Tailwind classes, because the virtual grid
+   reads them to place its cells. Breakpoints are Tailwind's sm, md, lg and xl. */
 .jf-lib-grid {
   --jf-cols: 2;
-  --jf-card-text: calc(2.625rem + 16.5px);
   display: grid;
   grid-template-columns: repeat(var(--jf-cols), minmax(0, 1fr));
   gap: 1rem;
   container-type: inline-size;
 }
-@media (width >= 40rem) { .jf-lib-grid { --jf-cols: 3; --jf-card-text: calc(2.875rem + 16.5px); } }
+@media (width >= 40rem) { .jf-lib-grid { --jf-cols: 3; } }
 @media (width >= 48rem) { .jf-lib-grid { --jf-cols: 4; } }
 @media (width >= 64rem) { .jf-lib-grid { --jf-cols: 5; } }
 @media (width >= 80rem) { .jf-lib-grid { --jf-cols: 7; } }
 
-/* Library grid cards: skip off-screen layout, and keep scroll targets clear of the header.
-   A skipped card must be as tall as a rendered one or jump targets move: the content box is
-   the poster ((column width - 2px border) x 1.5) plus the text body (padding, title line at
-   text-xs or sm:text-sm, mt-0.5, 11px type line). */
-.jf-lib-grid > * {
-  content-visibility: auto;
-  contain-intrinsic-height: auto calc(((100cqw - (var(--jf-cols) - 1) * 1rem) / var(--jf-cols) - 2px) * 1.5 + var(--jf-card-text));
-  scroll-margin-top: 4.5rem;
+/* The library grid is virtual (app.js libraryView): it keeps the whole list's height, and only
+   the cells near the viewport are in it, each placed by the script at its row and column. Its
+   columns and gap above still drive the cell size. Contained, so a cell coming or going lays out
+   only itself. */
+.jf-vgrid {
+  display: block;
+  position: relative;
+  contain: layout;
+}
+.jf-vgrid > * {
+  position: absolute;
+  /* No paint containment: it would clip the card's hover lift, shadow, glow and focus outline */
+  contain: layout style;
+}
+/* A cell holds one card (the link to its item), as tall as the cell */
+.jf-vgrid > * > .jf-card {
+  height: 100%;
 }
 
 /* Other poster grids (favourites, search, a person's titles): off-screen cards skip layout and
