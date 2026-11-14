@@ -17972,6 +17972,11 @@ fn b152_poster_loader_plan() {
 }
 
 #[test]
+fn b152_poster_loader_runtime() {
+    b124_node_test("b152_poster_loader_runtime.mjs");
+}
+
+#[test]
 fn b152_service_worker() {
     b124_node_test("b152_service_worker.mjs");
 }

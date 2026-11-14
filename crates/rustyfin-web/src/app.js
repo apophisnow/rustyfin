@@ -154,6 +154,7 @@ function posterPlan(entries, vw, vh, win, max) {
 const posterLoader = {
     near: new Set(), // cards in or near the viewport whose picture has not loaded
     loading: new Set(),
+    watched: new Set(), // every card the observer watches, so cards of a page left behind are dropped
     velocity: 0,
     lastY: window.scrollY,
     lastScroll: 0,
@@ -181,6 +182,7 @@ const posterLoader = {
             if (img.getAttribute('src')) continue;
             const card = img.closest('.jf-card') || img;
             card._poster = img;
+            this.watched.add(card);
             this.io.observe(card);
             // Cards already near start now, not a frame later when the observer reports them
             const r = card.getBoundingClientRect();
@@ -220,10 +222,17 @@ const posterLoader = {
         });
         const { start, stop } = posterPlan(entries, innerWidth, innerHeight, posterWindow(this.velocity, innerHeight), POSTER_MAX_LOADING);
         for (const i of stop) this.stop(cards[i]);
-        for (const i of start) {
-            const r = entries[i];
-            this.start(cards[i], r.bottom > 0 && r.top < innerHeight, r.right - r.left);
-        }
+        const onScreen = r => r.bottom > 0 && r.top < innerHeight;
+        for (const i of start) this.start(cards[i], onScreen(entries[i]), entries[i].right - entries[i].left);
+        // A picture started ahead of the screen gets the high priority once its card is on it
+        entries.forEach((r, i) => {
+            if (r.loading && onScreen(r) && !stop.includes(i)) cards[i]._poster.fetchPriority = 'high';
+        });
+    },
+
+    // Drops the cards no longer in the page (a page left, a grid redrawn)
+    sweep() {
+        for (const card of this.watched) if (!card.isConnected) this.forget(card);
     },
 
     // Starts a picture. One without a fixed data-src gets the width step for its card's width.
@@ -235,14 +244,15 @@ const posterLoader = {
             img.dataset.src = API.imageUrl(imgId, imgType, { maxWidth: posterWidth(cssWidth, devicePixelRatio), tag: imgTag });
         }
         const done = () => {
-            if (!img.getAttribute('src')) return; // a stopped load
+            this.unlisten(card);
             card._posterDone = true;
             this.loading.delete(card);
             this.forget(card);
             this.schedule();
         };
-        img.addEventListener('load', done, { once: true });
-        img.addEventListener('error', done, { once: true });
+        card._posterDoneListener = done;
+        img.addEventListener('load', done);
+        img.addEventListener('error', done);
         this.loading.add(card);
         img.src = img.dataset.src;
     },
@@ -250,20 +260,32 @@ const posterLoader = {
     // Stops a picture's load (dropping src aborts its request); it starts again when it comes near
     stop(card) {
         this.loading.delete(card);
+        this.unlisten(card);
         if (!card._posterDone) card._poster.removeAttribute('src');
     },
 
+    unlisten(card) {
+        const done = card._posterDoneListener;
+        if (!done) return;
+        card._poster.removeEventListener('load', done);
+        card._poster.removeEventListener('error', done);
+        card._posterDoneListener = null;
+    },
+
     forget(card) {
+        this.stop(card);
         this.near.delete(card);
-        this.loading.delete(card);
+        this.watched.delete(card);
         this.io?.unobserve(card);
     },
 };
 document.addEventListener('scroll', () => posterLoader.onScroll(), { capture: true, passive: true });
 window.addEventListener('resize', () => posterLoader.schedule());
+window.addEventListener('hashchange', () => posterLoader.sweep());
 
 // Cards come from many renderers (grids, rows, innerHTML strings), so new ones are painted and
-// their pictures queued as they are added to the page
+// their pictures queued as they are added to the pages (in <main>; the player, dialogs and the
+// sidebar hold no cards and are not watched)
 new MutationObserver(records => {
     for (const record of records) {
         for (const node of record.addedNodes) {
@@ -272,7 +294,7 @@ new MutationObserver(records => {
             posterLoader.watch(node);
         }
     }
-}).observe(document.documentElement, { childList: true, subtree: true });
+}).observe(document.querySelector('main') || document.documentElement, { childList: true, subtree: true });
 
 // A card's picture loaded: it fades in over its BlurHash, which stays under it. A failed one drops
 // both the skeleton and the BlurHash and shows the type icon instead.
