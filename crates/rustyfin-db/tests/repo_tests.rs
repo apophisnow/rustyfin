@@ -783,7 +783,8 @@ async fn test_get_media_sources_batch_and_ordering() {
 }
 
 // R1 play: a multi-version item lists its own file's source first, then the others widest
-// first, whatever order they were stored in; attachment streams are left out.
+// first, whatever order they were stored in; attachment streams are left out. The own file is
+// not the widest, so "own first" and "widest first" give different answers.
 #[tokio::test]
 async fn r1play_versions_list_the_items_own_file_first() {
     let temp_db = test_pool().await;
@@ -800,7 +801,7 @@ async fn r1play_versions_list_the_items_own_file_first() {
     .bind(lib.id.to_string())
     .bind("Alderlune")
     .bind("Movie")
-    .bind("/media/Alderlune 2160p.mkv")
+    .bind("/media/Alderlune 1080p.mp4")
     .execute(&pool)
     .await
     .unwrap();
@@ -840,13 +841,13 @@ async fn r1play_versions_list_the_items_own_file_first() {
             supports_direct_play: true,
         }
     };
-    // Stored in the "wrong" order: a narrow version, a wide one, then the item's own file
+    // Stored in the "wrong" order: the narrowest, the widest, then the item's own file
     for s in [
         source("/media/Alderlune 720p.mkv", 1280, &["video", "audio"]),
-        source("/media/Alderlune 1080p.mp4", 1920, &["video", "audio"]),
+        source("/media/Alderlune 2160p.mkv", 3840, &["video", "audio"]),
         source(
-            "/media/Alderlune 2160p.mkv",
-            3840,
+            "/media/Alderlune 1080p.mp4",
+            1920,
             &["video", "audio", "subtitle", "attachment"],
         ),
     ] {
@@ -855,8 +856,8 @@ async fn r1play_versions_list_the_items_own_file_first() {
             .unwrap();
     }
     let want = [
-        "/media/Alderlune 2160p.mkv",
         "/media/Alderlune 1080p.mp4",
+        "/media/Alderlune 2160p.mkv",
         "/media/Alderlune 720p.mkv",
     ];
     let paths = |sources: &[rustyfin_model::media_source::MediaSourceResponse]| {
