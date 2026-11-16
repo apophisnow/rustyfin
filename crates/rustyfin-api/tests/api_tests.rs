@@ -5438,7 +5438,14 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
         .unwrap();
     // Stored as before 094: the lowercased name
     let mut ids = HashMap::new();
-    for name in ["Nemo", "The Meridian", "Lion", "28 Days", "Zodiac", "Theory"] {
+    for name in [
+        "Nemo",
+        "The Meridian",
+        "Lion",
+        "28 Days",
+        "Zodiac",
+        "Theory",
+    ] {
         let id = uuid::Uuid::new_v4();
         sqlx::query(
             "INSERT INTO media_items (id, library_id, name, sort_name, media_type, path) \
@@ -5487,15 +5494,22 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
     let body = list(String::new()).await;
     assert_eq!(
         names(&body),
-        ["28 Days", "Lion", "The Meridian", "Nemo", "Theory", "Zodiac"]
+        [
+            "28 Days",
+            "Lion",
+            "The Meridian",
+            "Nemo",
+            "Theory",
+            "Zodiac"
+        ]
     );
-    let matrix = body["Items"]
+    let meridian = body["Items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|item| item["Name"] == "The Meridian")
         .unwrap();
-    assert_eq!(matrix["SortName"], "matrix");
+    assert_eq!(meridian["SortName"], "meridian");
     // The letters go by the sort name only, as in Jellyfin; '#' holds what starts with no letter,
     // and Z holds Zodiac
     assert_eq!(
@@ -5515,14 +5529,14 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
 
     // The editor's forced sort name is returned as written and sorts the item; clearing it
     // brings the automatic one back
-    let matrix_id = ids["The Meridian"];
+    let meridian_id = ids["The Meridian"];
     let save = |body: serde_json::Value| {
         let (app, admin) = (app.clone(), admin.clone());
         async move {
             let (status, text) = send_authed(
                 &app,
                 "POST",
-                &format!("/Items/{matrix_id}"),
+                &format!("/Items/{meridian_id}"),
                 &admin,
                 Some(&body.to_string()),
             )
@@ -5532,7 +5546,7 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
     };
     save(serde_json::json!({"ForcedSortName": "Zzz Meridian"})).await;
     let (status, item) =
-        send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+        send_authed(&app, "GET", &format!("/Items/{meridian_id}"), &admin, None).await;
     assert_eq!(status, StatusCode::OK, "{item}");
     assert_eq!(item["ForcedSortName"], "Zzz Meridian");
     assert_eq!(item["SortName"], "zzz meridian");
@@ -5541,11 +5555,11 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
         "The Meridian"
     );
     // A rescan's save keeps it
-    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, matrix_id)
+    let mut rescanned = rustyfin_db::repo_media::get_item_by_id(&state.db, meridian_id)
         .await
         .unwrap()
         .unwrap();
-    rescanned.sort_name = Some("matrix".to_string());
+    rescanned.sort_name = Some("meridian".to_string());
     rustyfin_db::repo_media::upsert_media_item(&state.db, &rescanned)
         .await
         .unwrap();
@@ -5554,9 +5568,9 @@ async fn r3sortname_items_sort_and_filter_by_jellyfins_sort_name() {
         "The Meridian"
     );
     save(serde_json::json!({"ForcedSortName": ""})).await;
-    let (_, item) = send_authed(&app, "GET", &format!("/Items/{matrix_id}"), &admin, None).await;
+    let (_, item) = send_authed(&app, "GET", &format!("/Items/{meridian_id}"), &admin, None).await;
     assert!(item["ForcedSortName"].is_null(), "{item}");
-    assert_eq!(item["SortName"], "matrix");
+    assert_eq!(item["SortName"], "meridian");
 }
 
 /// The sort lists round-trip through /System/Configuration, and saving other ones makes the
@@ -30756,7 +30770,7 @@ async fn b23_comma_lists_apply_in_order_on_both_item_lists() {
 #[tokio::test]
 async fn b23_toolbar_sorts_reverse_exactly_and_page_stably() {
     let state = test_state().await;
-    let drift= |name, year| B23Item {
+    let drift = |name, year| B23Item {
         name,
         sort_name: "drift",
         media_type: "Movie",
