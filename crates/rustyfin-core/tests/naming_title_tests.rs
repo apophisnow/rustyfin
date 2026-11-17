@@ -54,7 +54,7 @@ fn clean_name_table() {
         ),
         (
             "the.mangle.2013.720p.bluray.x264.dts-quillgrp",
-            "the machine",
+            "the mangle",
             Some(2013),
         ),
         (
@@ -76,10 +76,14 @@ fn clean_name_table() {
         ("News.2010.10.12", "News 2010 10 12", None),
         ("Brindlemoor ()", "Brindlemoor", None),
         ("Hollow Pockets 2 (0)", "Hollow Pockets 2", None),
-        ("The Wandering Clerk () Bluray-1080p", "The Wandering Clerk", None),
+        (
+            "The Wandering Clerk () Bluray-1080p",
+            "The Wandering Clerk",
+            None,
+        ),
         (
             "Mild Ferns TV Series 2007 - IMDb ()",
-            "Mad Men TV Series",
+            "Mild Ferns TV Series",
             Some(2007),
         ),
     ];
@@ -161,7 +165,10 @@ fn movie_groups(folder: &str, names: &[&str]) -> Vec<Group> {
 #[test]
 fn group_arvel() {
     assert_eq!(
-        movie_groups("Arvel (2012)", &["Arvel.mkv", "Arvel (2012) Bluray-2160p.mkv"]),
+        movie_groups(
+            "Arvel (2012)",
+            &["Arvel.mkv", "Arvel (2012) Bluray-2160p.mkv"]
+        ),
         [group(
             "Arvel",
             Some(2012),
@@ -206,8 +213,16 @@ fn group_alderlune3_two_films() {
             ]
         ),
         [
-            group("Alderlunes", Some(1986), &["Alderlunes (1986) Bluray-1080p.mkv"]),
-            group("Alderlune³", Some(1992), &["Alderlune³ (1992) Bluray-1080p.mkv"]),
+            group(
+                "Alderlunes",
+                Some(1986),
+                &["Alderlunes (1986) Bluray-1080p.mkv"]
+            ),
+            group(
+                "Alderlune³",
+                Some(1992),
+                &["Alderlune³ (1992) Bluray-1080p.mkv"]
+            ),
         ]
     );
 }
@@ -243,12 +258,18 @@ fn group_fickle_gardens_folder_year() {
     assert_eq!(
         movie_groups(
             "Fickle Gardens (2007)",
-            &["Fickle Gardens.mkv", "Fickle Gardens (2008) Bluray-1080p.mkv"]
+            &[
+                "Fickle Gardens.mkv",
+                "Fickle Gardens (2008) Bluray-1080p.mkv"
+            ]
         ),
         [group(
             "Fickle Gardens",
             Some(2007),
-            &["Fickle Gardens (2008) Bluray-1080p.mkv", "Fickle Gardens.mkv"]
+            &[
+                "Fickle Gardens (2008) Bluray-1080p.mkv",
+                "Fickle Gardens.mkv"
+            ]
         )]
     );
 }

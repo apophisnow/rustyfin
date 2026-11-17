@@ -910,7 +910,7 @@ async fn apply_metadata_to_item(
     let before = updated.clone();
     let mut changed = false;
 
-    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Mission:
+    // A provider's title replaces the name parsed from the path, as in Jellyfin ("Marble:
     // Harbor - Low Tide Part One", not the folder's "Marble Harbor - ..."), unless
     // the name is locked or an NFO has a title. An NFO's title (`replace_name` false) replaces
     // only a name that still looks like a file name. Seasons keep "Season N".

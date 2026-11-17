@@ -478,7 +478,7 @@ fn tree(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 }
 
 /// Writes the movies of `fresh_scan_merges_versions` and `rescans_add_no_sources`: two
-/// versions of Argo, one file of Heat, and one movie at the library root.
+/// versions of Arvel, one file of Heat, and one movie at the library root.
 fn write_films(fx: &Fixture, root: &Path) {
     clip(fx, root, "Arvel (2012)/Arvel.mkv", 2);
     clip(fx, root, "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv", 3);
@@ -486,7 +486,7 @@ fn write_films(fx: &Fixture, root: &Path) {
     clip(fx, root, "The Attic.mkv", 3);
 }
 
-/// The items that `write_films` must give. The 2160p Argo is the primary; it is the longer
+/// The items that `write_films` must give. The 2160p Arvel is the primary; it is the longer
 /// clip, so a runtime taken from `Arvel.mkv` fails `assert_groups`.
 const FILM_GROUPS: &[(&str, &[&str])] = &[
     (
@@ -735,9 +735,9 @@ async fn scan_skips_ignored_dirs_and_files() {
     assert_eq!(
         paths(&fx.pool, &film, "Movie").await,
         [
-            "Velloran (1984)/Velloran (1984).mkv",
             "Arvel (2012)/Arvel (2012).mkv",
             "Sample Movie (2010)/Sample Movie (2010).mkv",
+            "Velloran (1984)/Velloran (1984).mkv",
         ]
     );
     // `Featurettes/` next to a movie holds its extras, as in Jellyfin: not a library item, but Velloran's.
@@ -1030,10 +1030,10 @@ async fn concurrent_rescans_remove_items_in_both_libraries() {
         let lib = fx.library(name, LibraryContentType::Movies).await;
         let root = root_of(&lib);
         // The real file is already known, so the rescans only remove.
-        let arvel= touch(&root, "Arvel (2012)/Arvel (2012).mkv");
+        let arvel = touch(&root, "Arvel (2012)/Arvel (2012).mkv");
         insert_item(&fx.pool, &lib, "Movie", &arvel, None).await;
         for i in 0..20 {
-            let junk = touch(&root, &format!("Arvel (2012)/.@__thumb/Argo {i}.mkv"));
+            let junk = touch(&root, &format!("Arvel (2012)/.@__thumb/Arvel {i}.mkv"));
             let id = insert_item(&fx.pool, &lib, "Movie", &junk, None)
                 .await
                 .to_string();
@@ -1205,17 +1205,17 @@ async fn movie_titles_are_clean() {
             "Hazel Mirrors",
             Some(2012),
         ),
-        (
-            "The Tin Ladle ()/The Tin Ladle (2023) WEBDL-2160p.mkv",
-            "The Tin Ladle",
-            Some(2023),
-        ),
+        ("The Attic.avi", "The Attic", None),
         (
             "The Mangle (2013)/the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv",
             "The Mangle",
             Some(2013),
         ),
-        ("The Attic.avi", "The Attic", None),
+        (
+            "The Tin Ladle ()/The Tin Ladle (2023) WEBDL-2160p.mkv",
+            "The Tin Ladle",
+            Some(2023),
+        ),
     ];
     for (rel, _, _) in files {
         touch(&root, rel);
@@ -1247,7 +1247,11 @@ async fn movie_titles_are_clean() {
     assert_eq!(
         got,
         [
-            ("Arvel (2012)/Arvel (2012) Bluray-2160p.mkv", "Movie", "Arvel"),
+            (
+                "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv",
+                "Movie",
+                "Arvel"
+            ),
             ("Beach (2012).jpg", "Photo", "Beach (2012)"),
             ("Live (2012).mp3", "Audio", "Live (2012)"),
         ]
@@ -1322,16 +1326,16 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let fx = Fixture::new().await;
     let lib = fx.library("film", LibraryContentType::Movies).await;
     let root = root_of(&lib);
-    let arvel= "Arvel (2012)/Arvel.mkv";
+    let arvel = "Arvel (2012)/Arvel.mkv";
     let arvel_uhd = "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv";
-    let pudding= "Odd Pudding (2003)/Odd Pudding (2003).mkv";
+    let pudding = "Odd Pudding (2003)/Odd Pudding (2003).mkv";
     let pudding_cut = "Odd Pudding (2003)/Odd Pudding.mkv";
-    let vane_uhd = "Ember Ridge (1941)/Ember Ridge (1941) Bluray-2160p.mkv";
-    let vane_cd1 = "Ember Ridge (1941)/Ember Ridge cd1.mkv";
-    let vane_cd2 = "Ember Ridge (1941)/Ember Ridge cd2.mkv";
+    let vane_uhd = "Clover Vane (1941)/Clover Vane (1941) Bluray-2160p.mkv";
+    let vane_cd1 = "Clover Vane (1941)/Clover Vane cd1.mkv";
+    let vane_cd2 = "Clover Vane (1941)/Clover Vane cd2.mkv";
     let seven = "Se7en (1995)/Se7en (1995).mkv";
     let thumb = "Se7en (1995)/.@__thumb/Se7en (1995).mkv";
-    let machine = "The Mangle (2013)/The Mangle (2013) Bluray-1080p.mkv";
+    let mangle = "The Mangle (2013)/The Mangle (2013) Bluray-1080p.mkv";
     let scene = "The Mangle (2013)/the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv";
     // Every other version is longer or shorter than its primary, so a runtime taken from the
     // wrong file shows.
@@ -1344,7 +1348,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         (vane_cd1, 3),
         (vane_cd2, 3),
         (seven, 2),
-        (machine, 2),
+        (mangle, 2),
         (scene, 3),
     ] {
         clip(&fx, &root, file, secs);
@@ -1358,12 +1362,12 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         &lib,
         &[
             (arvel_uhd, &[arvel_uhd, arvel]),
-            (pudding, &[pudding, pudding_cut]),
             // cd1 and cd2 stack into one movie (Jellyfin's StackResolver), which is the primary of
             // its versions (OrganizeAlternateVersions prefers the one with parts); cd2 is its part.
             (vane_cd1, &[vane_cd1, vane_uhd]),
+            (pudding, &[pudding, pudding_cut]),
             (seven, &[seven]),
-            (machine, &[machine, scene]),
+            (mangle, &[mangle, scene]),
         ],
     )
     .await;
@@ -1377,9 +1381,9 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         ..Movie::default()
     };
 
-    // Argo: the versions were split into two items. user1 played the first; user2 played the
+    // Arvel: the versions were split into two items. user1 played the first; user2 played the
     // first too, and has an unplayed row of its own on the second. The rows combine, so both
-    // users have played Argo (G9b).
+    // users have played Arvel (G9b).
     let a1 = insert_movie(&old, &lib, &root.join(arvel), Movie::default()).await;
     old_probe(&old, &lib, a1, &[arvel]).await;
     let a2 = insert_movie(&old, &lib, &root.join(arvel_uhd), year(2012)).await;
@@ -1422,7 +1426,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let set = Uuid::new_v4().to_string();
     exec(
         &old,
-        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Ridge', ?2)",
+        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Vane', ?2)",
         &[&set, &user1],
     )
     .await;
@@ -1440,8 +1444,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     insert_movie(&old, &lib, &root.join(thumb), year(1995)).await;
 
     // The Mangle: the scene version was added again by each rescan.
-    let m = insert_movie(&old, &lib, &root.join(machine), year(2013)).await;
-    old_probe(&old, &lib, m, &[machine, scene, scene]).await;
+    let m = insert_movie(&old, &lib, &root.join(mangle), year(2013)).await;
+    old_probe(&old, &lib, m, &[mangle, scene, scene]).await;
 
     let s_id = s.to_string();
     let sources_of_s = |ids: Vec<(String, String)>| -> Vec<(String, String)> {
@@ -1454,11 +1458,11 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     assert_eq!(snapshot(&old, &lib).await, fresh);
     for (file, id) in [
         (arvel_uhd, a2),
-        (pudding, b),
         (vane_cd1, c1),
         (vane_cd2, c2),
+        (pudding, b),
         (seven, s),
-        (machine, m),
+        (mangle, m),
     ] {
         assert_eq!(item_at(&old, &lib, file).await, id, "the item at {file}");
     }
@@ -1526,7 +1530,10 @@ async fn concurrent_scans_both_succeed() {
 
     assert_eq!(
         paths(&fx.pool, &film, "Movie").await,
-        ["Arvel (2012)/Arvel (2012).mkv", "Heat (1995)/Heat (1995).mkv"]
+        [
+            "Arvel (2012)/Arvel (2012).mkv",
+            "Heat (1995)/Heat (1995).mkv"
+        ]
     );
     assert_eq!(paths(&fx.pool, &tv, "Series").await, ["Show"]);
     assert_eq!(paths(&fx.pool, &tv, "Season").await, ["Show/Season 1"]);
@@ -1546,7 +1553,7 @@ async fn rescan_keeps_names_from_metadata() {
     let fx = Fixture::new().await;
     let lib = fx.library("film", LibraryContentType::Movies).await;
     let root = root_of(&lib);
-    let arvel= touch(&root, "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv");
+    let arvel = touch(&root, "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv");
     let heat = touch(&root, "Heat (1995)/Heat (1995).mkv");
     let seven = touch(&root, "Se7en (1995)/Se7en (1995).mkv");
     let from_metadata = Movie {
@@ -6040,7 +6047,7 @@ async fn b18_rescan_rereads_changed_movies() {
     let root = root_of(&lib);
     write_films(&fx, &root);
     let arvel_uhd = "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv";
-    let arvel= "Arvel (2012)/Arvel.mkv";
+    let arvel = "Arvel (2012)/Arvel.mkv";
     let heat = "Heat (1995)/Heat (1995).mkv";
     let room = "The Attic.mkv";
     let files = [arvel_uhd, arvel, heat, room];
@@ -7024,7 +7031,12 @@ async fn b18_scoped_rescans_reread_only_their_scope() {
     // Both files are replaced by longer clips.
     clip(&fx, &root, "Arvel (2012)/Arvel (2012).mkv", 3);
     clip(&fx, &root, "Heat (1995)/Heat (1995).mkv", 3);
-    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Arvel (2012)"))).await;
+    let changes = b18_rescan(
+        &fx.pool,
+        &lib,
+        &ScanScope::Folder(root.join("Arvel (2012)")),
+    )
+    .await;
     assert_eq!(changes, (0, 0, 1), "Arvel's folder");
     let after = b18_source_ids(&fx.pool, &lib).await;
     assert_eq!(
