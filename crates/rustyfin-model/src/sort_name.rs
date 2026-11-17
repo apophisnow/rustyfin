@@ -1,5 +1,5 @@
 //! Sort names, as Jellyfin 10.11 makes them (`BaseItem.CreateSortName` and `ModifySortChunks`,
-//! with the `Episode`, `Audio`, `Season` and `Person` overrides): "The Meridian" sorts as "matrix",
+//! with the `Episode`, `Audio`, `Season` and `Person` overrides): "The Meridian" sorts as "meridian",
 //! "Part 2" before "Part 10".
 
 use std::sync::{LazyLock, RwLock};
@@ -214,13 +214,13 @@ mod tests {
 
     #[test]
     fn r3sortname_a_leading_article_is_dropped() {
-        assert_eq!(sort("The Meridian"), "matrix");
+        assert_eq!(sort("The Meridian"), "meridian");
         assert_eq!(sort("A Most Patient Harbor"), "most patient harbor");
         assert_eq!(
             sort("An American Werewolf in London"),
             "american werewolf in london"
         );
-        assert_eq!(sort("  The Meridian  "), "matrix");
+        assert_eq!(sort("  The Meridian  "), "meridian");
     }
 
     #[test]
@@ -288,7 +288,7 @@ mod tests {
             rules.remove_characters,
             SortRules::default().remove_characters
         );
-        assert_eq!(create_sort_name("Die Harbor", &rules), "hard");
+        assert_eq!(create_sort_name("Die Harbor", &rules), "harbor");
         assert_eq!(create_sort_name("The Meridian", &rules), "the meridian");
         assert_ne!(rules.fingerprint(), SortRules::default().fingerprint());
     }
@@ -314,8 +314,11 @@ mod tests {
         );
         assert_eq!(
             item_sort_name(MediaType::Movie, "The Meridian", None, None, &rules),
-            "matrix"
+            "meridian"
         );
-        assert_eq!(forced_sort_name("Meridian, The 2"), "meridian, the 0000000002");
+        assert_eq!(
+            forced_sort_name("Meridian, The 2"),
+            "meridian, the 0000000002"
+        );
     }
 }
