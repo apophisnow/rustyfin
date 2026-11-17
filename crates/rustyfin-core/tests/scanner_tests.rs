@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustyfin_core::scan_progress::{ScanRegistry, ScanState, ScanStatus, ScanTicket, ScanUpdate};
 use rustyfin_core::scanner::{ScanChanges, ScanScope};
-use rustyfin_core::scheduler::{TASK_LIBRARY_SCAN, TaskScheduler};
+use rustyfin_core::scheduler::{TASK_LIBRARY_SCAN, TASK_METADATA_REFRESH, TaskScheduler};
 use rustyfin_core::tmdb_client::{TmdbApi, TmdbClient, TmdbKey, TmdbSettings};
 use rustyfin_core::{probe, scanner};
 use rustyfin_model::library::{Library, LibraryContentType};
@@ -478,7 +478,7 @@ fn tree(root: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 }
 
 /// Writes the movies of `fresh_scan_merges_versions` and `rescans_add_no_sources`: two
-/// versions of Argo, one file of Heat, and one movie at the library root.
+/// versions of Arvel, one file of Heat, and one movie at the library root.
 fn write_films(fx: &Fixture, root: &Path) {
     clip(fx, root, "Arvel (2012)/Arvel.mkv", 2);
     clip(fx, root, "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv", 3);
@@ -486,7 +486,7 @@ fn write_films(fx: &Fixture, root: &Path) {
     clip(fx, root, "The Attic.mkv", 3);
 }
 
-/// The items that `write_films` must give. The 2160p Argo is the primary; it is the longer
+/// The items that `write_films` must give. The 2160p Arvel is the primary; it is the longer
 /// clip, so a runtime taken from `Arvel.mkv` fails `assert_groups`.
 const FILM_GROUPS: &[(&str, &[&str])] = &[
     (
@@ -735,9 +735,9 @@ async fn scan_skips_ignored_dirs_and_files() {
     assert_eq!(
         paths(&fx.pool, &film, "Movie").await,
         [
-            "Velloran (1984)/Velloran (1984).mkv",
             "Arvel (2012)/Arvel (2012).mkv",
             "Sample Movie (2010)/Sample Movie (2010).mkv",
+            "Velloran (1984)/Velloran (1984).mkv",
         ]
     );
     // `Featurettes/` next to a movie holds its extras, as in Jellyfin: not a library item, but Velloran's.
@@ -1030,10 +1030,10 @@ async fn concurrent_rescans_remove_items_in_both_libraries() {
         let lib = fx.library(name, LibraryContentType::Movies).await;
         let root = root_of(&lib);
         // The real file is already known, so the rescans only remove.
-        let arvel= touch(&root, "Arvel (2012)/Arvel (2012).mkv");
+        let arvel = touch(&root, "Arvel (2012)/Arvel (2012).mkv");
         insert_item(&fx.pool, &lib, "Movie", &arvel, None).await;
         for i in 0..20 {
-            let junk = touch(&root, &format!("Arvel (2012)/.@__thumb/Argo {i}.mkv"));
+            let junk = touch(&root, &format!("Arvel (2012)/.@__thumb/Arvel {i}.mkv"));
             let id = insert_item(&fx.pool, &lib, "Movie", &junk, None)
                 .await
                 .to_string();
@@ -1205,17 +1205,17 @@ async fn movie_titles_are_clean() {
             "Hazel Mirrors",
             Some(2012),
         ),
-        (
-            "The Tin Ladle ()/The Tin Ladle (2023) WEBDL-2160p.mkv",
-            "The Tin Ladle",
-            Some(2023),
-        ),
+        ("The Attic.avi", "The Attic", None),
         (
             "The Mangle (2013)/the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv",
             "The Mangle",
             Some(2013),
         ),
-        ("The Attic.avi", "The Attic", None),
+        (
+            "The Tin Ladle ()/The Tin Ladle (2023) WEBDL-2160p.mkv",
+            "The Tin Ladle",
+            Some(2023),
+        ),
     ];
     for (rel, _, _) in files {
         touch(&root, rel);
@@ -1247,7 +1247,11 @@ async fn movie_titles_are_clean() {
     assert_eq!(
         got,
         [
-            ("Arvel (2012)/Arvel (2012) Bluray-2160p.mkv", "Movie", "Arvel"),
+            (
+                "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv",
+                "Movie",
+                "Arvel"
+            ),
             ("Beach (2012).jpg", "Photo", "Beach (2012)"),
             ("Live (2012).mp3", "Audio", "Live (2012)"),
         ]
@@ -1322,16 +1326,16 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let fx = Fixture::new().await;
     let lib = fx.library("film", LibraryContentType::Movies).await;
     let root = root_of(&lib);
-    let arvel= "Arvel (2012)/Arvel.mkv";
+    let arvel = "Arvel (2012)/Arvel.mkv";
     let arvel_uhd = "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv";
-    let pudding= "Odd Pudding (2003)/Odd Pudding (2003).mkv";
+    let pudding = "Odd Pudding (2003)/Odd Pudding (2003).mkv";
     let pudding_cut = "Odd Pudding (2003)/Odd Pudding.mkv";
     let vane_uhd = "Clover Vane (1941)/Clover Vane (1941) Bluray-2160p.mkv";
     let vane_cd1 = "Clover Vane (1941)/Clover Vane cd1.mkv";
     let vane_cd2 = "Clover Vane (1941)/Clover Vane cd2.mkv";
     let seven = "Se7en (1995)/Se7en (1995).mkv";
     let thumb = "Se7en (1995)/.@__thumb/Se7en (1995).mkv";
-    let machine = "The Mangle (2013)/The Mangle (2013) Bluray-1080p.mkv";
+    let mangle = "The Mangle (2013)/The Mangle (2013) Bluray-1080p.mkv";
     let scene = "The Mangle (2013)/the.mangle.2013.720p.bluray.x264.dts-quillgrp.mkv";
     // Every other version is longer or shorter than its primary, so a runtime taken from the
     // wrong file shows.
@@ -1344,7 +1348,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         (vane_cd1, 3),
         (vane_cd2, 3),
         (seven, 2),
-        (machine, 2),
+        (mangle, 2),
         (scene, 3),
     ] {
         clip(&fx, &root, file, secs);
@@ -1358,10 +1362,12 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         &lib,
         &[
             (arvel_uhd, &[arvel_uhd, arvel]),
+            // cd1 and cd2 stack into one movie (Jellyfin's StackResolver), which is the primary of
+            // its versions (OrganizeAlternateVersions prefers the one with parts); cd2 is its part.
+            (vane_cd1, &[vane_cd1, vane_uhd]),
             (pudding, &[pudding, pudding_cut]),
-            (vane_uhd, &[vane_uhd, vane_cd1, vane_cd2]),
             (seven, &[seven]),
-            (machine, &[machine, scene]),
+            (mangle, &[mangle, scene]),
         ],
     )
     .await;
@@ -1375,9 +1381,9 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         ..Movie::default()
     };
 
-    // Argo: the versions were split into two items. user1 played the first; user2 played the
+    // Arvel: the versions were split into two items. user1 played the first; user2 played the
     // first too, and has an unplayed row of its own on the second. The rows combine, so both
-    // users have played Argo (G9b).
+    // users have played Arvel (G9b).
     let a1 = insert_movie(&old, &lib, &root.join(arvel), Movie::default()).await;
     old_probe(&old, &lib, a1, &[arvel]).await;
     let a2 = insert_movie(&old, &lib, &root.join(arvel_uhd), year(2012)).await;
@@ -1395,8 +1401,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let b = insert_movie(&old, &lib, &root.join(pudding), year(2003)).await;
     old_probe(&old, &lib, b, &[pudding, pudding_cut]).await;
 
-    // Clover Vane: two items. The second, made first, survives; the first holds the 2160p
-    // file as a version and is in a collection.
+    // The stacked movie: two items. The first holds the 2160p file as a version and is in a
+    // collection; it stays the movie, and the second, its part 2, becomes its part.
     let made = |date| Movie {
         date_created: Some(date),
         ..Movie::default()
@@ -1420,7 +1426,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     let set = Uuid::new_v4().to_string();
     exec(
         &old,
-        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Kane', ?2)",
+        "INSERT INTO collections (id, name, user_id) VALUES (?1, 'Vane', ?2)",
         &[&set, &user1],
     )
     .await;
@@ -1438,8 +1444,8 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     insert_movie(&old, &lib, &root.join(thumb), year(1995)).await;
 
     // The Mangle: the scene version was added again by each rescan.
-    let m = insert_movie(&old, &lib, &root.join(machine), year(2013)).await;
-    old_probe(&old, &lib, m, &[machine, scene, scene]).await;
+    let m = insert_movie(&old, &lib, &root.join(mangle), year(2013)).await;
+    old_probe(&old, &lib, m, &[mangle, scene, scene]).await;
 
     let s_id = s.to_string();
     let sources_of_s = |ids: Vec<(String, String)>| -> Vec<(String, String)> {
@@ -1452,10 +1458,11 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
     assert_eq!(snapshot(&old, &lib).await, fresh);
     for (file, id) in [
         (arvel_uhd, a2),
+        (vane_cd1, c1),
+        (vane_cd2, c2),
         (pudding, b),
-        (vane_uhd, c2),
         (seven, s),
-        (machine, m),
+        (mangle, m),
     ] {
         assert_eq!(item_at(&old, &lib, file).await, id, "the item at {file}");
     }
@@ -1474,7 +1481,7 @@ async fn upgrade_from_old_state_matches_fresh_scan() {
         .fetch_all(&old)
         .await
         .unwrap();
-    assert_eq!(in_set, [c2.to_string()]);
+    assert_eq!(in_set, [c1.to_string()]);
     assert_eq!(
         sources_of_s(source_ids(&old, &lib).await),
         s_before,
@@ -1523,7 +1530,10 @@ async fn concurrent_scans_both_succeed() {
 
     assert_eq!(
         paths(&fx.pool, &film, "Movie").await,
-        ["Arvel (2012)/Arvel (2012).mkv", "Heat (1995)/Heat (1995).mkv"]
+        [
+            "Arvel (2012)/Arvel (2012).mkv",
+            "Heat (1995)/Heat (1995).mkv"
+        ]
     );
     assert_eq!(paths(&fx.pool, &tv, "Series").await, ["Show"]);
     assert_eq!(paths(&fx.pool, &tv, "Season").await, ["Show/Season 1"]);
@@ -1543,7 +1553,7 @@ async fn rescan_keeps_names_from_metadata() {
     let fx = Fixture::new().await;
     let lib = fx.library("film", LibraryContentType::Movies).await;
     let root = root_of(&lib);
-    let arvel= touch(&root, "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv");
+    let arvel = touch(&root, "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv");
     let heat = touch(&root, "Heat (1995)/Heat (1995).mkv");
     let seven = touch(&root, "Se7en (1995)/Se7en (1995).mkv");
     let from_metadata = Movie {
@@ -4435,15 +4445,22 @@ async fn r1scan_metadata_refresh_upgrades_identified_items_by_id() {
             .map(|r| r.end_time_utc);
         assert!(sched.start_task(TASK_METADATA_REFRESH).await);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut started = tokio::time::Instant::now();
         loop {
-            let ended = sched
-                .get_task(TASK_METADATA_REFRESH)
-                .await
-                .unwrap()
-                .last_execution_result
-                .map(|r| r.end_time_utc);
+            let task = sched.get_task(TASK_METADATA_REFRESH).await.unwrap();
+            let ended = task.last_execution_result.map(|r| r.end_time_utc);
             if ended.is_some() && ended != before {
                 break;
+            }
+            // The previous run records its result before it lets go of the task, so a start
+            // right after it can be skipped as "running already": still idle a second later with
+            // no new result means it was, and it is started again
+
+            if task.state == rustyfin_model::scheduled_task::TaskState::Idle
+                && started.elapsed() > Duration::from_secs(1)
+            {
+                assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+                started = tokio::time::Instant::now();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -4738,7 +4755,7 @@ async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (done, mut ended) = tokio::sync::mpsc::unbounded_channel();
     let counted = calls.clone();
-    sched.set_on_scan(move || {
+    sched.set_on_items_changed(move || {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = done.send(());
     });
@@ -4754,6 +4771,31 @@ async fn b30_f8_a_scheduled_scan_calls_back_once_it_ends() {
         .await
         .unwrap();
     assert!(stored > 0, "called back before the scan stored anything");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// R3 core reliability: the scheduled metadata refresh writes items, so it calls back too, and
+// the server drops what it cached of them.
+#[tokio::test]
+async fn r3rel_a_scheduled_metadata_refresh_calls_back_once_it_ends() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("R3 Films", LibraryContentType::Movies).await;
+    let root = root_of(&lib);
+    touch(&root, "Sample Film (2001)/Sample Film (2001).mkv");
+    let sched = TaskScheduler::new(fx.pool.clone(), Arc::new(fx.dir.clone()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (done, mut ended) = tokio::sync::mpsc::unbounded_channel();
+    let counted = calls.clone();
+    sched.set_on_items_changed(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = done.send(());
+    });
+
+    assert!(sched.start_task(TASK_METADATA_REFRESH).await);
+    tokio::time::timeout(Duration::from_secs(60), ended.recv())
+        .await
+        .expect("no call back within 60 s of the scheduled metadata refresh");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
@@ -6005,7 +6047,7 @@ async fn b18_rescan_rereads_changed_movies() {
     let root = root_of(&lib);
     write_films(&fx, &root);
     let arvel_uhd = "Arvel (2012)/Arvel (2012) Bluray-2160p.mkv";
-    let arvel= "Arvel (2012)/Arvel.mkv";
+    let arvel = "Arvel (2012)/Arvel.mkv";
     let heat = "Heat (1995)/Heat (1995).mkv";
     let room = "The Attic.mkv";
     let files = [arvel_uhd, arvel, heat, room];
@@ -6550,6 +6592,111 @@ async fn b18_tv_rescan_removes_gone_episodes_seasons_and_series() {
     assert_eq!(paths(pool, &lib, "Series").await, ["Show A"]);
 }
 
+// R3 core reliability: a scan keeps what a locked item holds, as Jellyfin's IsLocked does.
+
+/// Locks the item at `rel` (LockData), and returns its id.
+async fn r3rel_lock(pool: &SqlitePool, lib: &Library, media_type: &str, rel: &str) -> String {
+    let path = root_of(lib).join(rel).to_string_lossy().into_owned();
+    let id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ?1 AND media_type = ?2 AND path = ?3",
+    )
+    .bind(lib.id.to_string())
+    .bind(media_type)
+    .bind(&path)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{media_type} at {path}: {e}"));
+    sqlx::query(
+        "INSERT INTO item_metadata_extras (item_id, lock_data) VALUES (?1, 1)
+         ON CONFLICT(item_id) DO UPDATE SET lock_data = 1",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// (index_number, parent_index_number, production_year) of the item `id`.
+async fn r3rel_numbers(pool: &SqlitePool, id: &str) -> (Option<i32>, Option<i32>, Option<i32>) {
+    sqlx::query_as(
+        "SELECT index_number, parent_index_number, production_year FROM media_items WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_the_numbers_of_locked_episodes_and_seasons() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let locked_file = "Sample Show/Season 1/Sample Show S01E02.mkv";
+    let open_file = "Sample Show/Season 1/Sample Show S01E03.mkv";
+    touch(&root, locked_file);
+    touch(&root, open_file);
+    scan(pool, &lib).await;
+
+    // An admin corrects the numbers; the locked items keep them, an unlocked episode follows its
+    // file again.
+    let locked = r3rel_lock(pool, &lib, "Episode", locked_file).await;
+    let season = r3rel_lock(pool, &lib, "Season", "Sample Show/Season 1").await;
+    let open_path = root.join(open_file).to_string_lossy().into_owned();
+    for (sql, id) in [
+        (
+            "UPDATE media_items SET index_number = 5, parent_index_number = 3 WHERE id = ?",
+            locked.clone(),
+        ),
+        (
+            "UPDATE media_items SET index_number = 7 WHERE id = ?",
+            season.clone(),
+        ),
+    ] {
+        sqlx::query(sql).bind(id).execute(pool).await.unwrap();
+    }
+    sqlx::query("UPDATE media_items SET index_number = 9 WHERE path = ?")
+        .bind(&open_path)
+        .execute(pool)
+        .await
+        .unwrap();
+    scan(pool, &lib).await;
+
+    assert_eq!(r3rel_numbers(pool, &locked).await, (Some(5), Some(3), None));
+    assert_eq!(r3rel_numbers(pool, &season).await.0, Some(7));
+    let open: Option<i32> =
+        sqlx::query_scalar("SELECT index_number FROM media_items WHERE path = ?")
+            .bind(&open_path)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(open, Some(3));
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_the_year_of_a_locked_movie() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("films", LibraryContentType::Movies).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let file = "Sample Film (2001)/Sample Film (2001).mkv";
+    touch(&root, file);
+    scan(pool, &lib).await;
+    let film = r3rel_lock(pool, &lib, "Movie", file).await;
+    assert_eq!(r3rel_numbers(pool, &film).await.2, Some(2001));
+
+    // An admin clears the year and locks the item; a scan doesn't fill it again.
+    sqlx::query("UPDATE media_items SET production_year = NULL WHERE id = ?")
+        .bind(&film)
+        .execute(pool)
+        .await
+        .unwrap();
+    scan(pool, &lib).await;
+    assert_eq!(r3rel_numbers(pool, &film).await.2, None);
+}
+
 /// B18 criterion 5: a music rescan removes the tracks of a removed album folder, then the album,
 /// and the tracks of a removed artist folder, then its album and the artist. It also removes an
 /// album row that has no tracks.
@@ -6989,7 +7136,12 @@ async fn b18_scoped_rescans_reread_only_their_scope() {
     // Both files are replaced by longer clips.
     clip(&fx, &root, "Arvel (2012)/Arvel (2012).mkv", 3);
     clip(&fx, &root, "Heat (1995)/Heat (1995).mkv", 3);
-    let changes = b18_rescan(&fx.pool, &lib, &ScanScope::Folder(root.join("Arvel (2012)"))).await;
+    let changes = b18_rescan(
+        &fx.pool,
+        &lib,
+        &ScanScope::Folder(root.join("Arvel (2012)")),
+    )
+    .await;
     assert_eq!(changes, (0, 0, 1), "Arvel's folder");
     let after = b18_source_ids(&fx.pool, &lib).await;
     assert_eq!(
@@ -9773,6 +9925,7 @@ async fn b32_rescans_settle_series_folders_and_tvshow_nfo() {
     };
     insert_marks(&fx.pool, &user, hotel, &favorite).await;
     insert_marks(&fx.pool, &user, season, &favorite).await;
+    stored_under_the_older_rule(&fx.pool).await;
 
     scan(&fx.pool, &lib).await;
 
@@ -9837,6 +9990,18 @@ async fn b32_images(pool: &SqlitePool, lib: &Library) -> Vec<(String, String, St
         .collect();
     rows.sort();
     rows
+}
+
+/// Lists every stored season and episode as stored under the older tvshow.nfo rule, as migration
+/// 114 lists those of a database from before it.
+async fn stored_under_the_older_rule(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO show_nfo_cleanup (item_id)
+         SELECT id FROM media_items WHERE media_type IN ('Season', 'Episode')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -9936,6 +10101,7 @@ async fn b32_f4_rescans_clear_tvshow_nfo_from_loose_episodes_and_images() {
     let user = insert_user(&fx.pool).await;
     let marks = at(600_000_000, Some(EARLY));
     insert_marks(&fx.pool, &user, loose, &marks).await;
+    stored_under_the_older_rule(&fx.pool).await;
 
     scan(&fx.pool, &lib).await;
 
@@ -10001,6 +10167,106 @@ async fn b33_episode_ends(
 
 const B33_DOUBLE: &str = "Hotel Series/Season 01/Hotel Series - S01E03-E04 - Double Booking.mkv";
 const B33_SINGLE: &str = "Hotel Series/Season 01/Hotel Series - S01E05.mkv";
+
+// R3 core reliability: Jellyfin gives a season or an episode nothing of its series' NFO, so a scan
+// clears only what the older rule gave, once, and never a locked field.
+
+const R3REL_TVSHOW_NFO: &str = "<tvshow><title>Sample Show</title><year>2015</year>\
+    <plot>Synthetic plot.</plot><mpaa>TV-14</mpaa><genre>Drama</genre></tvshow>";
+const R3REL_SEASON: &str = "Sample Show (2015)/Season 01";
+const R3REL_LOOSE: &str = "Sample Show (2015)/Sample Show S01E02.mkv";
+
+/// A TV library with one series that has a tvshow.nfo, a season folder and an episode file beside
+/// the season, scanned once.
+async fn r3rel_show(fx: &Fixture) -> Library {
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let root = root_of(&lib);
+    touch(&root, &format!("{R3REL_SEASON}/Sample Show S01E01.mkv"));
+    touch(&root, R3REL_LOOSE);
+    std::fs::write(root.join("Sample Show (2015)/tvshow.nfo"), R3REL_TVSHOW_NFO).unwrap();
+    scan(&fx.pool, &lib).await;
+    lib
+}
+
+/// Gives the item at `rel` the series NFO's overview, year, rating and genres, as a provider or an
+/// admin can.
+async fn r3rel_give_show_values(pool: &SqlitePool, lib: &Library, rel: &str) -> String {
+    let id = item_at(pool, lib, rel).await.to_string();
+    exec(
+        pool,
+        "UPDATE media_items SET overview = 'Synthetic plot.', production_year = 2015,
+             official_rating = 'TV-14', genres = 'Drama' WHERE id = ?1",
+        &[&id],
+    )
+    .await;
+    id
+}
+
+#[tokio::test]
+async fn r3rel_a_rescan_keeps_season_and_episode_values_that_equal_the_series_nfo() {
+    let fx = Fixture::new().await;
+    let lib = r3rel_show(&fx).await;
+    for rel in [R3REL_SEASON, R3REL_LOOSE] {
+        r3rel_give_show_values(&fx.pool, &lib, rel).await;
+    }
+    scan(&fx.pool, &lib).await;
+    for rel in [R3REL_SEASON, R3REL_LOOSE] {
+        let shown = b32_shown(&fx.pool, &lib, rel).await;
+        assert_eq!(shown.overview.as_deref(), Some("Synthetic plot."), "{rel}");
+        assert_eq!(shown.year, Some(2015), "{rel}");
+        assert_eq!(shown.official_rating.as_deref(), Some("TV-14"), "{rel}");
+        assert_eq!(shown.genres, "Drama", "{rel}");
+    }
+}
+
+#[tokio::test]
+async fn r3rel_the_older_rule_is_cleared_once_and_never_from_locked_or_refreshed_items() {
+    let fx = Fixture::new().await;
+    let lib = r3rel_show(&fx).await;
+    // Stored under the older rule: the season locked its overview, and a provider has answered for
+    // the loose episode since.
+    let season = r3rel_give_show_values(&fx.pool, &lib, R3REL_SEASON).await;
+    let loose = r3rel_give_show_values(&fx.pool, &lib, R3REL_LOOSE).await;
+    exec(
+        &fx.pool,
+        "INSERT INTO item_metadata_extras (item_id, locked_fields) VALUES (?1, 'Overview')",
+        &[&season],
+    )
+    .await;
+    exec(
+        &fx.pool,
+        "INSERT INTO item_metadata_extras (item_id, provider_refreshed_at)
+         VALUES (?1, '2026-01-01T00:00:00Z')",
+        &[&loose],
+    )
+    .await;
+    stored_under_the_older_rule(&fx.pool).await;
+    scan(&fx.pool, &lib).await;
+
+    let shown = b32_shown(&fx.pool, &lib, R3REL_SEASON).await;
+    assert_eq!(shown.overview.as_deref(), Some("Synthetic plot."), "locked");
+    assert_eq!(shown.year, None);
+    assert_eq!(shown.official_rating, None);
+    assert_eq!(shown.genres, "");
+    let shown = b32_shown(&fx.pool, &lib, R3REL_LOOSE).await;
+    assert_eq!(shown.official_rating.as_deref(), Some("TV-14"), "refreshed");
+    assert_eq!(shown.genres, "Drama", "refreshed");
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM show_nfo_cleanup WHERE item_id IN (?1, ?2)")
+            .bind(&season)
+            .bind(&loose)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "each is settled once");
+
+    // Values the season gets later are its own.
+    r3rel_give_show_values(&fx.pool, &lib, R3REL_SEASON).await;
+    scan(&fx.pool, &lib).await;
+    let shown = b32_shown(&fx.pool, &lib, R3REL_SEASON).await;
+    assert_eq!(shown.official_rating.as_deref(), Some("TV-14"));
+    assert_eq!(shown.genres, "Drama");
+}
 
 #[tokio::test]
 async fn b33_multi_episode_files_store_their_last_episode() {
@@ -10182,4 +10448,208 @@ async fn b32_rescans_settle_whether_a_season_has_a_folder() {
     assert_eq!(item_at(&fx.pool, &lib, B32_LOOSE_SEASON).await, season);
     assert_eq!(item_at(&fx.pool, &lib, MOVED).await, episode);
     assert_eq!(marks_of(&fx.pool, &user, season).await, Some(favorite));
+}
+
+/// A virtual item (no file, see `repo_virtual`) under `parent`, stored and marked as one.
+async fn insert_virtual(
+    pool: &SqlitePool,
+    lib: &Library,
+    media_type: rustyfin_model::media::MediaType,
+    parent: Option<Uuid>,
+    name: &str,
+    parent_index: Option<i32>,
+    index: i32,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let item = rustyfin_model::media::MediaItem {
+        id,
+        name: name.to_string(),
+        sort_name: Some(name.to_lowercase()),
+        media_type,
+        path: String::new(),
+        parent_id: parent,
+        library_id: lib.id,
+        index_number: Some(index),
+        parent_index_number: parent_index,
+        location_type: rustyfin_model::media::LocationType::Virtual,
+        ..rustyfin_model::media::MediaItem::default_dto_fields()
+    };
+    rustyfin_db::repo_media::upsert_media_item(pool, &item)
+        .await
+        .unwrap();
+    rustyfin_db::repo_virtual::mark_virtual(pool, &[id])
+        .await
+        .unwrap();
+    id
+}
+
+/// Whether a row with this id is stored.
+async fn exists(pool: &SqlitePool, id: Uuid) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    n == 1
+}
+
+/// Show A with a real Season 1 episode, plus virtual S1E2, a virtual Season 2 and its virtual S2E1.
+/// Returns (series, season 1, season 2, S1E2, S2E1).
+async fn show_with_virtuals(fx: &Fixture, lib: &Library) -> (Uuid, Uuid, Uuid, Uuid, Uuid) {
+    let pool = &fx.pool;
+    touch(&root_of(lib), "Show A/Season 1/Show A S01E01.mkv");
+    scan(pool, lib).await;
+    let series = item_at(pool, lib, "Show A").await;
+    let season1 = item_at(pool, lib, "Show A/Season 1").await;
+    let s1e2 = insert_virtual(
+        pool,
+        lib,
+        rustyfin_model::media::MediaType::Episode,
+        Some(season1),
+        "Show A S01E02",
+        Some(1),
+        2,
+    )
+    .await;
+    let season2 = insert_virtual(
+        pool,
+        lib,
+        rustyfin_model::media::MediaType::Season,
+        Some(series),
+        "Season 2",
+        None,
+        2,
+    )
+    .await;
+    let s2e1 = insert_virtual(
+        pool,
+        lib,
+        rustyfin_model::media::MediaType::Episode,
+        Some(season2),
+        "Show A S02E01",
+        Some(2),
+        1,
+    )
+    .await;
+    (series, season1, season2, s1e2, s2e1)
+}
+
+#[tokio::test]
+async fn r3missing_scan_turns_a_virtual_episode_into_the_arriving_file() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let root = root_of(&lib);
+    let (series, _season1, season2, s1e2, s2e1) = show_with_virtuals(&fx, &lib).await;
+    let user = Uuid::parse_str(&insert_user(pool).await).unwrap();
+    rustyfin_db::repo_playback::mark_played(pool, user, s1e2)
+        .await
+        .unwrap();
+
+    touch(&root, "Show A/Season 1/Show A S01E02.mkv");
+    touch(&root, "Show A/Season 2/Show A S02E01.mkv");
+    scan(pool, &lib).await;
+
+    assert_eq!(
+        item_at(pool, &lib, "Show A/Season 1/Show A S01E02.mkv").await,
+        s1e2
+    );
+    assert_eq!(
+        item_at(pool, &lib, "Show A/Season 2/Show A S02E01.mkv").await,
+        s2e1
+    );
+    assert_eq!(item_at(pool, &lib, "Show A/Season 2").await, season2);
+    assert_eq!(item_at(pool, &lib, "Show A").await, series);
+    for id in [s1e2, s2e1, season2] {
+        assert!(
+            !rustyfin_db::repo_virtual::is_virtual(pool, id)
+                .await
+                .unwrap()
+        );
+    }
+    for id in [s1e2, s2e1] {
+        let location: String =
+            sqlx::query_scalar("SELECT location_type FROM media_items WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            location,
+            rustyfin_model::media::LocationType::FileSystem.as_str()
+        );
+    }
+    let played: bool =
+        sqlx::query_scalar("SELECT played FROM user_item_data WHERE user_id = ?1 AND item_id = ?2")
+            .bind(user.to_string())
+            .bind(s1e2.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(played);
+    // One row per slot: the virtual S1E2 and S2E1 became the files, with no second copy.
+    assert_eq!(episodes(pool, &lib).await.len(), 3);
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM media_items WHERE media_type = 'Episode' AND \
+             ((parent_index_number = 1 AND index_number = 2) OR (parent_index_number = 2 AND index_number = 1))"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        paths(pool, &lib, "Season").await,
+        ["Show A/Season 1", "Show A/Season 2"]
+    );
+}
+
+#[tokio::test]
+async fn r3missing_scan_keeps_virtual_items() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    let (series, season1, season2, s1e2, s2e1) = show_with_virtuals(&fx, &lib).await;
+
+    scan(pool, &lib).await;
+
+    for id in [series, season1, season2, s1e2, s2e1] {
+        assert!(exists(pool, id).await, "{id} was removed by a scan");
+    }
+    assert!(
+        rustyfin_db::repo_virtual::is_virtual(pool, s1e2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        rustyfin_db::repo_virtual::is_virtual(pool, season2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        rustyfin_db::repo_virtual::is_virtual(pool, s2e1)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn r3missing_removed_series_takes_its_virtual_items() {
+    let fx = Fixture::new().await;
+    let lib = fx.library("tv", LibraryContentType::TvShows).await;
+    let pool = &fx.pool;
+    // A second show keeps the library's root listed, so a missing folder is removed.
+    touch(&root_of(&lib), "Other/Other S01E01.mkv");
+    let (series, season1, season2, s1e2, s2e1) = show_with_virtuals(&fx, &lib).await;
+    let s1e1 = item_at(pool, &lib, "Show A/Season 1/Show A S01E01.mkv").await;
+    std::fs::remove_dir_all(root_of(&lib).join("Show A")).unwrap();
+
+    scan(pool, &lib).await;
+
+    for id in [series, season1, season2, s1e1, s1e2, s2e1] {
+        assert!(
+            !exists(pool, id).await,
+            "{id} survived the removal of its series"
+        );
+    }
 }

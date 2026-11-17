@@ -613,6 +613,8 @@ async fn test_get_items_filtered_no_overflow() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -671,6 +673,8 @@ async fn r3player_random_sort_returns_every_match() {
                 start,
                 limit,
                 true,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1129,6 +1133,8 @@ async fn test_filtered_query_with_genres_and_tags() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1205,6 +1211,8 @@ async fn test_filtered_query_with_name_starts_with() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1243,6 +1251,8 @@ async fn test_filtered_query_with_name_starts_with() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1267,6 +1277,8 @@ async fn test_filtered_query_with_name_starts_with() {
         0,
         100,
         false,
+        None,
+        None,
         None,
         None,
         None,
@@ -1668,7 +1680,7 @@ async fn j5_years_are_positive_production_years_and_studios_come_from_item_studi
     let shows = j5_library(pool, "J5 Shows", LibraryContentType::TvShows).await;
     let up = j5_item(pool, films, None, "Up", "Movie", "", Some(2009)).await;
     let coco = j5_item(pool, films, None, "Coco", "Movie", "", Some(2017)).await;
-    j5_item(pool, films, None, "Matrix", "Movie", "", Some(1999)).await;
+    j5_item(pool, films, None, "Meridian", "Movie", "", Some(1999)).await;
     j5_item(pool, films, None, "Beowulf", "Movie", "", Some(800)).await;
     j5_item(pool, films, None, "Undated", "Movie", "", None).await;
     j5_item(pool, films, None, "Zero", "Movie", "", Some(0)).await;
@@ -2590,8 +2602,8 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
     rustyfin_db::repo_library::create_library(&db.pool, &lib)
         .await
         .unwrap();
-    let mut item = make_movie(lib.id, "Matrix");
-    item.sort_name = Some("matrix".to_string());
+    let mut item = make_movie(lib.id, "Meridian");
+    item.sort_name = Some("meridian".to_string());
     rustyfin_db::repo_media::upsert_media_item(&db.pool, &item)
         .await
         .unwrap();
@@ -2609,7 +2621,7 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
     let read = get(item.id).await;
     let mut refreshed = read.clone();
     refreshed.name = "The Meridian".to_string();
-    refreshed.sort_name = Some("matrix".to_string());
+    refreshed.sort_name = Some("meridian".to_string());
     refreshed.overview = Some("A hacker learns the truth.".to_string());
 
     // Meanwhile the editor forces a sort name, as POST /Items/{id} saves it
@@ -2629,7 +2641,7 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
         .unwrap();
     assert_eq!(written, ["overview"]);
     let after = get(item.id).await;
-    assert_eq!(after.name, "Matrix");
+    assert_eq!(after.name, "Meridian");
     assert_eq!(after.sort_name.as_deref(), Some("meridian, the 0000000001"));
     assert_eq!(
         after.overview.as_deref(),
@@ -2645,7 +2657,7 @@ async fn r3sortname_an_edit_during_a_refresh_keeps_its_sort_name() {
         .await
         .unwrap();
     let mut stale_edit = read.clone();
-    stale_edit.sort_name = Some("matrix".to_string());
+    stale_edit.sort_name = Some("meridian".to_string());
     let written = rustyfin_db::repo_media::save_refresh_changes(&db.pool, &read, &stale_edit)
         .await
         .unwrap();

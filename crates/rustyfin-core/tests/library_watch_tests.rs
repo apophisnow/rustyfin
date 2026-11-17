@@ -885,7 +885,7 @@ fn a_symlinked_folder_is_polled_and_reported_by_its_path_in_the_library() {
     assert_eq!(poller.poll(), vec![tree.at("Heat (1995)")]);
 
     tick();
-    let alderlune= tree.outside("elsewhere/Alderlune (1979)");
+    let alderlune = tree.outside("elsewhere/Alderlune (1979)");
     write(&alderlune.join("Alderlune (1979).mkv"), 10);
     std::os::unix::fs::symlink(&alderlune, tree.at("Alderlune (1979)")).unwrap();
     assert_eq!(poller.poll(), vec![tree.at("Alderlune (1979)")]);
@@ -1761,7 +1761,7 @@ mod kernel {
         wait_watched(&watcher, &tree.root(), 4).await;
 
         write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
-        let alderlune= folder_unit(&lib, tree.at("Alderlune (1979)"));
+        let alderlune = folder_unit(&lib, tree.at("Alderlune (1979)"));
         recorder.wait_for(&alderlune, 1).await;
         wait_watched(&watcher, &tree.root(), 5).await;
         quiet_period().await;
@@ -1840,7 +1840,10 @@ mod kernel {
         let _logs = captured_logs();
         let tree = Tree::new();
         movie_tree(&tree);
-        write(&tree.outside("incoming/Alderlune (1979)/Alderlune (1979).mkv"), 10);
+        write(
+            &tree.outside("incoming/Alderlune (1979)/Alderlune (1979).mkv"),
+            10,
+        );
         write(
             &tree.outside("incoming/Alderlune (1979)/extras/Trailer.mkv"),
             10,
@@ -1866,7 +1869,7 @@ mod kernel {
         assert_eq!(recorder.count(&old_up), 1, "{:?}", recorder.calls());
 
         // Moved in from outside the library, with a subfolder.
-        let alderlune= folder_unit(&lib, tree.at("Alderlune (1979)"));
+        let alderlune = folder_unit(&lib, tree.at("Alderlune (1979)"));
         std::fs::rename(
             tree.outside("incoming/Alderlune (1979)"),
             tree.at("Alderlune (1979)"),
@@ -2074,7 +2077,7 @@ mod kernel {
             &tree.outside("elsewhere/Bellmora (1985)/Bellmora (1985).en.srt"),
             10,
         );
-        let bellmora= folder_unit(&lib, tree.at("Bellmora (1985)"));
+        let bellmora = folder_unit(&lib, tree.at("Bellmora (1985)"));
         recorder.wait_for(&bellmora, 1).await;
         quiet_period().await;
         assert_rescans_since(&recorder, 0, &[bellmora]);
@@ -2159,7 +2162,7 @@ mod kernel {
         // A new folder takes the watched path over the limit too. The folder is still rescanned, the
         // path is polled from then on, and the limit is not warned about again.
         write(&tree.at("Alderlune (1979)/Alderlune (1979).mkv"), 10);
-        let alderlune= folder_unit(&lib, tree.at("Alderlune (1979)"));
+        let alderlune = folder_unit(&lib, tree.at("Alderlune (1979)"));
         recorder.wait_for(&alderlune, 1).await;
         let monitored = wait_monitored(&watcher, "the watched path polled", |m| {
             monitor_of(m, &tree.root()).is_some_and(|p| p.method == Method::Poll && p.ready)
