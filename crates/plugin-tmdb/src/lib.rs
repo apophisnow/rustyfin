@@ -1532,10 +1532,12 @@ mod tests {
             {"id": 228527, "name": "Owl Hollow"}
         ]);
         assert_eq!(
-            best_match(results(listed.clone()), "owl hollow").unwrap().id,
+            best_match(results(listed.clone()), "owl hollow")
+                .unwrap()
+                .id,
             228527
         );
-        assert_eq!(best_match(results(listed), "Night").unwrap().id, 231889);
+        assert_eq!(best_match(results(listed), "Hollow").unwrap().id, 231889);
         let original = json!([{"id": 1, "title": "Other"}, {"id": 2, "title": "Didi", "original_title": "弟弟"}]);
         assert_eq!(best_match(results(original), "弟弟").unwrap().id, 2);
         assert!(best_match(Vec::new(), "x").is_none());
